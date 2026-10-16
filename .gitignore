@@ -1,0 +1,37 @@
+# Локальные данные приложения: базы, индексы, журналы, сессии
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+*.log
+logs/
+cookies*
+*.cookies
+.env
+.env.*
+secrets/
+
+# Фикстуры с реальными данными: в репозиторий попадают только обезличенные
+fixtures/raw/
+golden/
+
+# Rust
+/target/
+**/target/
+
+# Node
+node_modules/
+dist/
+.svelte-kit/
+
+# ОС и редакторы
+Thumbs.db
+Desktop.ini
+.DS_Store
+.vscode/
+.idea/
+
+# Временные файлы Office и прочее
+~$*
+*.tmp
