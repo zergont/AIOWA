@@ -35,3 +35,7 @@ Desktop.ini
 # Временные файлы Office и прочее
 ~$*
 *.tmp
+
+# Запасной каталог сборки спайка
+spike/owa-probe/target2/
+/target2/

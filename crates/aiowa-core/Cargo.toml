@@ -1,0 +1,11 @@
+[package]
+name = "aiowa-core"
+description = "Доменные типы AIOWA без ввода-вывода"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+serde.workspace = true
+jiff.workspace = true
+thiserror.workspace = true

@@ -1,0 +1,26 @@
+[package]
+name = "aiowa-cli"
+description = "Консольная утилита aiowa: вход, папки, синхронизация, поиск"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "aiowa"
+path = "src/main.rs"
+
+[dependencies]
+aiowa-core.workspace = true
+aiowa-transport.workspace = true
+aiowa-transport-owa.workspace = true
+aiowa-store.workspace = true
+aiowa-sync.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+keyring.workspace = true
+rpassword.workspace = true
+secrecy.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+jiff.workspace = true

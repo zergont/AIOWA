@@ -159,6 +159,41 @@ X-OWA-UrlPostData: <JSON запроса в URL-кодировке>   — при 
 | `GetConversationItems` с `ShapeName: ItemPart` | работает: 20 узлов, `UniqueBody` типа HTML, не усечён, `Subject` и `InternetMessageId` присутствуют |
 | Задержки | обычный вызов 130–260 мс; `SyncFolderItems` первый вызов 4,5 с; первый `FindConversation` в свежей сессии однажды занял 49,6 с (повторить замер) |
 
+## 5b'. Формы `SyncFolderItems` и `GetItem` (снято утилитой, 16.10.2026)
+
+**`SyncFolderItems`** (`RequestServerVersion: Exchange2013`), запрос: `Body {ItemShape {BaseShape:"IdOnly", AdditionalProperties?}, SyncFolderId {TargetFolderId{BaseFolderId}}, MaxChangesReturned, SyncScope:"NormalItems", SyncState?}`. Ответ `Body.ResponseMessages.Items[0]`:
+
+```json
+{ "__type": "SyncFolderItemsResponseMessage:#Exchange", "ResponseClass": "Success", "ResponseCode": "NoError",
+  "Changes": { "Changes": [
+      { "__type": "SyncFolderItemsCreateType:#Exchange", "ChangeType": "Create",
+        "Item": { "__type": "Message:#Exchange", "ItemId": { "Id": "…", "ChangeKey": "…" }, "...": "запрошенные свойства" } } ] },
+  "SyncState": "…616 символов…", "TotalCount": 0 }
+```
+
+- Изменения лежат во вложенном массиве `Changes.Changes[]`; `ChangeType` принимает `Create`, `Update`, `Delete`, `ReadFlagChange` (последние два в этой сессии не наблюдались, форма по EWS: у `Delete` только `ItemId`, у `ReadFlagChange` `ItemId` и `IsRead`).
+- `IncludesLastItemInRange` в ответе не было; есть `TotalCount` (семантика уточняется: 0 при неполной выдаче?).
+- `AdditionalProperties` работают: и `item:Subject`, и `Subject` дают поле `Subject` у элементов. Значит метаданные можно получать прямо в синхронизации, без отдельного прохода `GetItem`.
+
+**`GetItem`** (`RequestServerVersion: V2017_08_18`), запрос: `Body {ItemShape, ItemIds:[ItemId{Id, ChangeKey}], ShapeName?}`. Ответ `Body.ResponseMessages.Items[0].Items[0]`. Варианты формы, все `NoError`, 145–285 мс на одно письмо:
+
+| Форма | Ключей | Что приходит |
+|---|---|---|
+| `IdOnly` + `AdditionalProperties` (с префиксами `item:`/`message:` или без) | 8 | ровно запрошенное; `UniqueBody` доступен и вне контекста беседы (22 644 символа HTML) |
+| `ShapeName: "ItemPart"` | 43 | **рабочая форма для тел**: `UniqueBody`, `Attachments`, `From`, `Sender`, `ToRecipients`, `CcRecipients`, `DisplayTo`, `ConversationId`, `ConversationThreadId`, `InternetMessageId`, `ParentFolderId`, `ItemClass`, `IsRead`, `IsDraft`, `Flag`, `Importance`, `Sensitivity`, `Size`, `Preview`, `DateTimeReceived/Sent/Created`, `LastModifiedTime`, `HasAttachments`, `HasBlockedImages`, `IconIndex`, `RecipientCounts`, `ExtendedProperty` |
+| `ShapeName: "ItemNormalizedBody"` | 42 | то же, но `NormalizedBody` (полное тело после нормализации) вместо `UniqueBody` |
+| `ShapeName: "MailListItem"` | 28 | **форма для списка**: без тел и получателей; `Subject`, `From`, `Sender`, `DisplayTo`, даты, `IsRead`, `Flag`, `Importance`, `Size`, `Preview`, `ConversationId`, `ParentFolderId`, `ItemClass`, `HasAttachments`, `IconIndex`, `InstanceKey` |
+| `BaseShape: "AllProperties"`, `MaximumBodySize: 4096` | 61 | плюс `Body` (усечён ровно до 4 096 символов), `InternetMessageHeaders`, `References`, `InReplyTo`, `ConversationTopic`, `ConversationIndex`, `IsFromMe`, `ReceivedBy`, `EffectiveRights`, `LastModifiedName`; `UniqueBody` отсутствует |
+
+Вывод для синхронизации: `SyncFolderItems` с `AdditionalProperties` (или проверить `ShapeName: MailListItem` в нём) даёт метаданные списка; `GetItem` пачками с `ShapeName: ItemPart` даёт тела, получателей и вложения. Полное тело с цитатами при необходимости — отдельным `GetItem` с `ItemNormalizedBody`.
+
+Уточнения по итогам клиента `aiowa` (16.10.2026):
+- Имена свойств лучше давать со стандартными префиксами EWS: без префикса `LastModifiedTime` отвергается (`Invalid value 'LastModifiedTime' for enum PropertyUriEnum`, HTTP 500), тогда как `item:LastModifiedTime` принимается. Список, который работает в `SyncFolderItems`: `item:Subject`, `item:DateTimeReceived`, `item:DateTimeSent`, `item:LastModifiedTime`, `message:From`, `message:Sender`, `item:DisplayTo`, `message:IsRead`, `item:IsDraft`, `item:HasAttachments`, `item:Importance`, `item:Size`, `item:ItemClass`, `item:ConversationId`, `message:InternetMessageId`, `item:Preview`, `item:Flag`, `item:ParentFolderId`.
+- `SyncFolderHierarchy` с `BaseShape: IdOnly` и `AdditionalProperties: [DisplayName, ...]` молча не отдаёт `DisplayName` (счётчики и `DistinguishedFolderId` приходят). С `BaseShape: AllProperties` имена есть.
+- Темп `SyncFolderItems` по 512 с метаданными: первый вызов по папке 27 с (сервер строит состояние), далее 4–7 с на пачку. Полная выгрузка метаданных двух папок (77 177 входящих + 25 011 отправленных = 102 188 писем, 200 пачек) заняла 1 242 с вместе с телами 1 845 писем за 90 дней, без единой ошибки и без троттлинга при одном потоке запросов.
+- Признак конца выдачи `IncludesLastItemInRange` сервер в этой сборке не присылает: последняя пачка просто короче запрошенного (377 и 435 элементов). Клиент считает папку завершённой по короткой пачке, а на случай ровно кратного числа элементов — по пустой выдаче.
+- `TimeZoneContext.TimeZoneDefinition.Id = "UTC"` принимается; даты приходят со смещением `+00:00`/`Z` и разбираются `jiff`.
+
 ## 5c. Лимит сессий на ящик
 
 После примерно десяти входов подряд без выхода (каждый запуск утилиты открывал новую сессию и не закрывал её) сервер начал отвергать новые входы: `POST /owa/auth.owa` → 302 на `/OWA` → 302 на `/owa/auth/errorfe.aspx?httpCode=500&owaError=Microsoft.Exchange.Data.Storage.TooManyObjectsOpenedException&inex=Microsoft.Mapi.MapiExceptionSessionLimit`. Это лимит одновременных MAPI-сессий на ящик (по умолчанию в Exchange 16 сессий OWA на пользователя). Браузерная OWA, уже вошедшая, продолжает работать; страдают только новые входы, в том числе и браузера пользователя, если он откроет OWA заново.
@@ -169,6 +204,16 @@ X-OWA-UrlPostData: <JSON запроса в URL-кодировке>   — при 
 - повторный вход только после `440`/`401`/редиректа на `logon.aspx`, не «на всякий случай»;
 - на ошибку `errorfe.aspx` с `MapiExceptionSessionLimit` отвечать ожиданием (сессии освобождаются по тайм-ауту бездействия), а не новыми попытками входа;
 - в тестах и спайках: `logoff` в конце каждой команды.
+
+## 5d. Жизнь сессии при простое
+
+| Простой без единого запроса | Результат |
+|---|---|
+| 30 мин | сессия жива: `GetFolder` → `NoError`, первый запрос после паузы 1 155 мс против 130–160 мс в активной сессии (сервер поднимает состояние сессии заново) |
+| 60 мин | сессия жива: `GetFolder` → `NoError`, первый запрос после паузы 1 031 мс; `logoff.owa` после этого ответил 302 |
+| 120 мин | замер идёт |
+
+Вход под давлением лишних сессий (перед срабатыванием лимита) занимал около 8 с вместо 2–3 с.
 
 ## 6. Что это значит для клиента
 

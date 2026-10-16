@@ -1,0 +1,54 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+# Спайк живёт отдельно: у него свой Cargo.lock и свои каталоги сборки.
+exclude = ["spike/owa-probe"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace.dependencies]
+# внутренние крейты
+aiowa-core = { path = "crates/aiowa-core" }
+aiowa-transport = { path = "crates/aiowa-transport" }
+aiowa-transport-owa = { path = "crates/aiowa-transport-owa" }
+aiowa-store = { path = "crates/aiowa-store" }
+aiowa-sync = { path = "crates/aiowa-sync" }
+
+# общие
+anyhow = "1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+jiff = { version = "0.2", features = ["serde"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+secrecy = "0.10"
+
+# асинхронность и сеть
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal"] }
+async-trait = "0.1"
+# TLS только системный (Schannel): сервер работает на TLS 1.2 с CBC-шифром, которого нет в rustls.
+reqwest = { version = "0.13", default-features = false, features = ["cookies", "json", "gzip", "form", "query", "native-tls", "charset", "system-proxy"] }
+url = "2"
+percent-encoding = "2"
+
+# хранилище
+# FTS5 входит в bundled-сборку SQLite по умолчанию; отдельной фичи в rusqlite 0.40 нет.
+rusqlite = { version = "0.40", default-features = false, features = ["bundled", "cache", "modern_sqlite"] }
+# Миграции делаем сами через PRAGMA user_version: внешний крейт миграций привязан к своей версии rusqlite.
+zstd = "0.14"
+html2text = "0.17"
+
+# CLI
+clap = { version = "4", features = ["derive", "env"] }
+keyring = "4"
+rpassword = "7"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 4
+strip = "debuginfo"

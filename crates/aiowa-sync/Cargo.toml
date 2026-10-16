@@ -1,0 +1,15 @@
+[package]
+name = "aiowa-sync"
+description = "Движок синхронизации: транспорт → хранилище"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+aiowa-core.workspace = true
+aiowa-transport.workspace = true
+aiowa-store.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+jiff.workspace = true

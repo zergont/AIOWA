@@ -65,6 +65,8 @@ enum Cmd {
         #[arg(long, default_value_t = 20)]
         idle_min: u64,
     },
+    /// Снять формы ответов: SyncFolderItems (структура Changes) и варианты GetItem
+    Shapes,
 }
 
 // ---------------------------------------------------------------------------
@@ -514,6 +516,144 @@ fn print_conversations(v: &Value) {
     println!("Всего бесед в папке: {}", v["Body"]["TotalConversationsInView"]);
 }
 
+/// Структура JSON без значений: строки → s(len), массивы → [array(n), форма первого].
+fn shape(v: &Value, depth: usize) -> Value {
+    if depth > 8 {
+        return json!("…");
+    }
+    match v {
+        Value::Array(a) => {
+            if a.is_empty() {
+                json!([])
+            } else {
+                json!([format!("array({})", a.len()), shape(&a[0], depth + 1)])
+            }
+        }
+        Value::Object(m) => {
+            let mut o = serde_json::Map::new();
+            for (k, x) in m {
+                o.insert(k.clone(), shape(x, depth + 1));
+            }
+            Value::Object(o)
+        }
+        Value::String(s) => json!(format!("s({})", s.chars().count())),
+        Value::Number(_) => json!("n"),
+        Value::Bool(_) => json!("b"),
+        Value::Null => Value::Null,
+    }
+}
+
+fn item_keys(item: &Value) -> Vec<String> {
+    let mut keys: Vec<String> = item.as_object().map(|o| o.keys().cloned().collect()).unwrap_or_default();
+    keys.sort();
+    keys
+}
+
+fn cmd_shapes(s: &Session) {
+    println!("\n=== SyncFolderItems: структура ответа ===");
+    let first_id: Option<(String, Option<String>)> = match s.sync_folder_items("inbox", 3, None) {
+        Ok((v, took)) => {
+            let item = &v["Body"]["ResponseMessages"]["Items"][0];
+            println!("{} за {} мс", response_code(&v), took.as_millis());
+            println!("форма Items[0]: {}", serde_json::to_string_pretty(&shape(item, 0)).unwrap_or_default());
+            let changes = &item["Changes"];
+            let raw = serde_json::to_string(changes).unwrap_or_default();
+            println!("Changes (сырой, до 1500 символов): {}", truncate(&raw, 1500));
+            // Ищем первый ItemId в любой форме Changes.
+            fn find_item_id(v: &Value) -> Option<(String, Option<String>)> {
+                match v {
+                    Value::Object(m) => {
+                        if let Some(item_id) = m.get("ItemId") {
+                            if let Some(id) = item_id.get("Id").and_then(|x| x.as_str()) {
+                                return Some((id.to_string(), item_id.get("ChangeKey").and_then(|x| x.as_str()).map(String::from)));
+                            }
+                        }
+                        m.values().find_map(find_item_id)
+                    }
+                    Value::Array(a) => a.iter().find_map(find_item_id),
+                    _ => None,
+                }
+            }
+            find_item_id(changes)
+        }
+        Err(e) => {
+            println!("[fail] {e}");
+            None
+        }
+    };
+
+    println!("\n=== SyncFolderItems с дополнительными свойствами ===");
+    for (label, uri) in [("item:Subject", "item:Subject"), ("Subject", "Subject")] {
+        let body = json!({
+            "__type": "SyncFolderItemsRequest:#Exchange",
+            "ItemShape": { "__type": "ItemResponseShape:#Exchange", "BaseShape": "IdOnly",
+                "AdditionalProperties": [ { "__type": "PropertyUri:#Exchange", "FieldURI": uri } ] },
+            "SyncFolderId": { "__type": "TargetFolderId:#Exchange", "BaseFolderId": { "__type": "DistinguishedFolderId:#Exchange", "Id": "inbox" } },
+            "MaxChangesReturned": 2,
+            "SyncScope": "NormalItems"
+        });
+        let env = s.envelope("SyncFolderItems", "Exchange2013", body);
+        match s.call("SyncFolderItems", &env, Transport::Body, Headers::Full) {
+            Ok((_, v, took)) => {
+                let raw = serde_json::to_string(&v["Body"]["ResponseMessages"]["Items"][0]["Changes"]).unwrap_or_default();
+                println!("[{label}] {} за {} мс; Subject в выдаче: {}", response_code(&v), took.as_millis(), raw.contains("\"Subject\""));
+            }
+            Err(e) => println!("[{label}] {e}"),
+        }
+    }
+
+    let Some((id, change_key)) = first_id else {
+        println!("\nНет ItemId для проверки GetItem");
+        return;
+    };
+    println!("\n=== GetItem: варианты формы ===");
+    let item_id = json!({ "__type": "ItemId:#Exchange", "Id": id, "ChangeKey": change_key });
+    let variants: Vec<(&str, Value)> = vec![
+        ("IdOnly + FieldURI с префиксами (item:Subject, message:From, item:UniqueBody…)", json!({
+            "__type": "ItemResponseShape:#Exchange", "BaseShape": "IdOnly",
+            "AdditionalProperties": [
+                { "__type": "PropertyUri:#Exchange", "FieldURI": "item:Subject" },
+                { "__type": "PropertyUri:#Exchange", "FieldURI": "item:DateTimeReceived" },
+                { "__type": "PropertyUri:#Exchange", "FieldURI": "message:From" },
+                { "__type": "PropertyUri:#Exchange", "FieldURI": "item:HasAttachments" },
+                { "__type": "PropertyUri:#Exchange", "FieldURI": "item:UniqueBody" },
+                { "__type": "PropertyUri:#Exchange", "FieldURI": "message:InternetMessageId" } ] })),
+        ("IdOnly + FieldURI без префиксов (Subject, From, UniqueBody…)", json!({
+            "__type": "ItemResponseShape:#Exchange", "BaseShape": "IdOnly",
+            "AdditionalProperties": [
+                { "__type": "PropertyUri:#Exchange", "FieldURI": "Subject" },
+                { "__type": "PropertyUri:#Exchange", "FieldURI": "DateTimeReceived" },
+                { "__type": "PropertyUri:#Exchange", "FieldURI": "From" },
+                { "__type": "PropertyUri:#Exchange", "FieldURI": "HasAttachments" },
+                { "__type": "PropertyUri:#Exchange", "FieldURI": "UniqueBody" },
+                { "__type": "PropertyUri:#Exchange", "FieldURI": "InternetMessageId" } ] })),
+        ("ShapeName ItemPart", json!({ "__type": "ItemResponseShape:#Exchange", "BaseShape": "IdOnly", "FilterHtmlContent": true, "MaximumBodySize": 2097152 })),
+        ("ShapeName ItemNormalizedBody", json!({ "__type": "ItemResponseShape:#Exchange", "BaseShape": "IdOnly", "FilterHtmlContent": true, "MaximumBodySize": 2097152 })),
+        ("ShapeName MailListItem", json!({ "__type": "ItemResponseShape:#Exchange", "BaseShape": "IdOnly" })),
+        ("AllProperties, тело до 4 КБ", json!({ "__type": "ItemResponseShape:#Exchange", "BaseShape": "AllProperties", "FilterHtmlContent": true, "MaximumBodySize": 4096 })),
+    ];
+    for (label, item_shape) in variants {
+        let mut body = json!({
+            "__type": "GetItemRequest:#Exchange",
+            "ItemShape": item_shape,
+            "ItemIds": [ item_id.clone() ]
+        });
+        if let Some(name) = label.strip_prefix("ShapeName ") {
+            body["ShapeName"] = json!(name);
+        }
+        let env = s.envelope("GetItem", "V2017_08_18", body);
+        match s.call("GetItem", &env, Transport::Body, Headers::Full) {
+            Ok((_, v, took)) => {
+                let item = &v["Body"]["ResponseMessages"]["Items"][0]["Items"][0];
+                let ub = item["UniqueBody"]["Value"].as_str().map(|x| x.chars().count());
+                let b = item["Body"]["Value"].as_str().map(|x| x.chars().count());
+                println!("[{label}]\n   {} за {} мс; ключей {}; UniqueBody {:?} симв.; Body {:?} симв.\n   ключи: {}", response_code(&v), took.as_millis(), item_keys(item).len(), ub, b, item_keys(item).join(", "));
+            }
+            Err(e) => println!("[{label}]\n   {e}"),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Команды
 
@@ -666,6 +806,11 @@ fn main() -> Result<()> {
             s.logoff();
         }
         Cmd::Soak { idle_min } => cmd_soak(&cli, &password, *idle_min)?,
+        Cmd::Shapes => {
+            let s = login(&cli, &password, false)?;
+            cmd_shapes(&s);
+            s.logoff();
+        }
         Cmd::SetPassword | Cmd::ForgetPassword => unreachable!(),
     }
     Ok(())
