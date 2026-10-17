@@ -110,6 +110,17 @@ pub struct SyncReport {
     pub elapsed: Duration,
 }
 
+/// Итог загрузки тела одного письма по требованию (`Engine::fetch_body`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BodyFetchOutcome {
+    /// Тело сохранено, `body_state = 1`.
+    Stored,
+    /// Письма на сервере больше нет (`ErrorItemNotFound`); локально помечено удалённым.
+    Gone,
+    /// Сервер отказал по этому письму; локально `body_state = 2`.
+    Failed { code: String, message: String },
+}
+
 /// Итог скачивания одного вложения.
 #[derive(Debug, Clone)]
 pub struct FetchedAttachment {
@@ -381,9 +392,12 @@ impl Engine {
                 async move { t.get_items(&ids, ItemFetchShape::WithUniqueBody).await }
             })
             .await;
+            // Помечаем пачку отказом только по ответу сервера об операции; отклонённый вход,
+            // истёкшая сессия, сеть и неожиданные HTTP-ответы останавливают запуск, иначе
+            // временная беда закрепилась бы в базе как `body_state = 2` навсегда.
             let results = match result {
                 Ok(r) => r,
-                Err(SyncError::Transport(e)) if !e.is_retryable() && !e.needs_reauth() => {
+                Err(SyncError::Transport(e)) if e.is_item_failure() => {
                     warn!(folder = name, error = %e, count = ids.len(), "пачка тел отвергнута целиком, помечена как ошибка");
                     self.emit(SyncEvent::Warning { stage: SyncStage::Bodies, folder: Some(name.to_string()), message: format!("пачка тел ({}) отвергнута: {e}", ids.len()) });
                     self.store.mark_body_failed(self.account, &ids)?;
@@ -464,7 +478,9 @@ impl Engine {
                         }
                         done += 1;
                     }
-                    Err(SyncError::Transport(e)) if !e.is_retryable() && !e.needs_reauth() => {
+                    // По вложению поэлементны также слишком большой ответ и неожиданный ответ на запрос
+                    // файла (например, не файловое вложение); сессия, вход и сеть — нет.
+                    Err(SyncError::Transport(e)) if e.is_item_failure() || matches!(e, TransportError::TooLarge { .. }) || (matches!(e, TransportError::Protocol { .. }) && !e.is_retryable()) => {
                         warn!(folder = name, attachment = todo.name.as_deref().unwrap_or("?"), error = %e, "вложение не скачано");
                         self.emit(SyncEvent::Warning { stage: SyncStage::Attachments, folder: Some(name.to_string()), message: format!("вложение «{}» не скачано: {e}", todo.name.as_deref().unwrap_or("?")) });
                         self.store.mark_attachment_failed(todo.attachment_pk, FETCH_FAILED)?;
@@ -483,8 +499,58 @@ impl Engine {
         Ok(())
     }
 
+    /// Тело одного письма по требованию (открытие в окне): зеркало `fetch_bodies` для одного
+    /// идентификатора. Отказ сервера по письму записывается в базу и возвращается как итог;
+    /// временные ошибки повторяются, а истёкшая сессия, отклонённый вход, сеть и исчерпанные
+    /// повторы приходят как `Err` без записи в базу — вызывающий решает, сбрасывать ли транспорт.
+    pub async fn fetch_body(&self, id: &ItemId, folder_pk: i64) -> Result<BodyFetchOutcome> {
+        let transport = self.transport.clone();
+        let ids = vec![id.clone()];
+        let ids_for_call = ids.clone();
+        let result = with_retry("GetItem", || {
+            let t = transport.clone();
+            let ids = ids_for_call.clone();
+            async move { t.get_items(&ids, ItemFetchShape::WithUniqueBody).await }
+        })
+        .await;
+        let results = match result {
+            Ok(r) => r,
+            Err(SyncError::Transport(e)) if e.is_item_failure() => {
+                warn!(item = %id.id, error = %e, "тело по требованию: вызов отвергнут, помечено как ошибка");
+                self.store.mark_body_failed(self.account, &ids)?;
+                let (code, message) = match e {
+                    TransportError::Server { code, message } => (code, message),
+                    other => ("TransportError".to_string(), other.to_string()),
+                };
+                return Ok(BodyFetchOutcome::Failed { code, message });
+            }
+            Err(e) => return Err(e),
+        };
+        let Some(first) = results.into_iter().next() else {
+            self.store.mark_body_failed(self.account, &ids)?;
+            return Ok(BodyFetchOutcome::Failed { code: "EmptyResponse".into(), message: "сервер вернул пустой ответ".into() });
+        };
+        match first {
+            ItemResult::Ok(m) => {
+                self.store.store_full_messages(self.account, folder_pk, &[m])?;
+                Ok(BodyFetchOutcome::Stored)
+            }
+            ItemResult::Failed { id, code, message } => {
+                if code == "ErrorItemNotFound" {
+                    self.store.mark_items_deleted(self.account, &[id])?;
+                    Ok(BodyFetchOutcome::Gone)
+                } else {
+                    warn!(item = %id.id, code, message = %message, "тело по требованию не загружено");
+                    self.store.mark_body_failed(self.account, &[id])?;
+                    Ok(BodyFetchOutcome::Failed { code, message })
+                }
+            }
+        }
+    }
+
     /// Скачивает одно вложение, извлекает текст (в блокирующем потоке) и кладёт в кэш.
     /// Ошибка транспорта возвращается как есть: решение о пометке принимает вызывающий.
+    /// Для картинок (`image/*`) извлечение сразу даёт `Unsupported`, то есть почти бесплатно.
     pub async fn fetch_one_attachment(&self, todo: &AttachmentTodo, max_bytes: u64, max_chars: usize) -> Result<FetchedAttachment> {
         let transport = self.transport.clone();
         let id = todo.server_id.clone();

@@ -16,7 +16,7 @@ use reqwest::redirect::Policy;
 use reqwest::{Client, StatusCode, Url};
 use secrecy::ExposeSecret;
 use serde_json::Value;
-use std::sync::atomic::{AtomicI64, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tokio::sync::{Mutex, Semaphore};
@@ -65,6 +65,10 @@ struct Inner {
     /// Растёт при каждом успешном входе; нужен для single-flight повторного входа.
     generation: AtomicU64,
     relogin: Mutex<()>,
+    /// Выставляется в `logoff`: клоны транспорта, оставшиеся у синхронизации или команды окна,
+    /// больше не входят заново, иначе разлогиненный транспорт воскрешал бы сессию, которую
+    /// никто не отслеживает и не завершает (а лимит сессий на ящик мал).
+    closed: AtomicBool,
     permits: Semaphore,
     /// Какой путь скачивания вложений принял сервер: 0 не известно, 1 GET `service.svc/s/GetFileAttachment`,
     /// 2 операция `GetAttachment` с base64 в JSON.
@@ -112,6 +116,13 @@ fn classify_redirect(location: &str) -> TransportError {
 impl OwaTransport {
     /// Входит на сервер и возвращает готовый транспорт.
     pub async fn connect(creds: Credentials, config: OwaConfig) -> Result<Self> {
+        let t = Self::prepare(creds, config)?;
+        t.login().await?;
+        Ok(t)
+    }
+
+    /// Транспорт без входа: HTTP-клиент, cookie-банка и состояние сессии.
+    fn prepare(creds: Credentials, config: OwaConfig) -> Result<Self> {
         let jar = Arc::new(Jar::default());
         // Только HTTP/1.1: сервер работает на TLS 1.2 с CBC-шифром, а HTTP/2 поверх таких шифров запрещён.
         let client = Client::builder()
@@ -136,11 +147,10 @@ impl OwaTransport {
             action_id: AtomicI64::new(-1),
             generation: AtomicU64::new(0),
             relogin: Mutex::new(()),
+            closed: AtomicBool::new(false),
             attachment_mode: AtomicU8::new(ATTACHMENT_MODE_UNKNOWN),
         });
-        let t = Self { inner };
-        t.login().await?;
-        Ok(t)
+        Ok(Self { inner })
     }
 
     fn owa_url(&self) -> Url {
@@ -229,8 +239,15 @@ impl OwaTransport {
     }
 
     /// Повторный вход один раз на поколение сессии: параллельные вызовы не плодят входов.
+    /// После `logoff` входа нет: вызывающий получает `SessionExpired` и берёт новый транспорт.
     async fn relogin_once(&self, seen_generation: u64) -> Result<()> {
+        if self.inner.closed.load(Ordering::SeqCst) {
+            return Err(TransportError::SessionExpired);
+        }
         let _guard = self.inner.relogin.lock().await;
+        if self.inner.closed.load(Ordering::SeqCst) {
+            return Err(TransportError::SessionExpired);
+        }
         if self.inner.generation.load(Ordering::SeqCst) != seen_generation {
             return Ok(());
         }
@@ -571,10 +588,12 @@ impl MailTransport for OwaTransport {
     }
 
     async fn logoff(&self) -> Result<()> {
+        // Сначала защёлка, потом запрос: даже если GET не дошёл, транспорт больше не входит.
+        self.inner.closed.store(true, Ordering::SeqCst);
+        *self.inner.canary.write().expect("canary lock") = None;
         let url = self.inner.base.join("owa/logoff.owa").expect("url");
         let r = self.inner.client.get(url).send().await.map_err(net)?;
         debug!(status = %r.status(), "logoff.owa");
-        *self.inner.canary.write().expect("canary lock") = None;
         Ok(())
     }
 
@@ -600,6 +619,21 @@ mod tests {
         assert_eq!(parse_content_disposition_filename("attachment; filename=\"a.pdf\"; filename*=UTF-8''%D0%A1%D1%87%D1%91%D1%82.pdf"), Some("Счёт.pdf".into()));
         assert_eq!(parse_content_disposition_filename("attachment; filename=%d0%a1%d1%87%d1%91%d1%82.pdf"), Some("Счёт.pdf".into()), "OWA кодирует процентами обычный filename");
         assert_eq!(parse_content_disposition_filename("inline"), None);
+    }
+
+    /// После `logoff` клон транспорта не входит заново: `call` отдаёт `SessionExpired`,
+    /// поколение сессии не растёт (ни одного POST auth.owa).
+    #[tokio::test]
+    async fn logged_off_transport_does_not_relogin() {
+        let creds = Credentials { host: "127.0.0.1:1".into(), user: "u".into(), password: secrecy::SecretString::from("p".to_string()) };
+        let t = OwaTransport::prepare(creds, OwaConfig { timeout: Duration::from_secs(2), ..OwaConfig::default() }).unwrap();
+        let clone = t.clone();
+        // Сервера нет, GET logoff.owa упадёт сетью — защёлка всё равно выставлена.
+        let _ = t.logoff().await;
+        assert!(t.inner.closed.load(Ordering::SeqCst));
+        let r = clone.call("GetItem", protocol::V_2017, serde_json::json!({})).await;
+        assert!(matches!(r, Err(TransportError::SessionExpired)), "{r:?}");
+        assert_eq!(t.inner.generation.load(Ordering::SeqCst), 0, "повторного входа не было");
     }
 
     #[test]

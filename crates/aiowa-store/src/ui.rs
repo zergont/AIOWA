@@ -54,6 +54,42 @@ pub struct ConversationCursor {
     pub conversation_pk: i64,
 }
 
+/// Ключ состояния письма в беседе: по нему окно решает, перечитывать ли беседу целиком
+/// после синхронизации. Дёшево: один запрос без тел, вложений и файлов.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MessageKey {
+    pub item_pk: i64,
+    pub body_state: i64,
+    pub is_read: bool,
+    /// Вложений с файлом в кэше (по базе, без проверки диска).
+    pub cached: i64,
+}
+
+/// Выборка заголовка письма в порядке, который разбирает `head_row`.
+const HEAD_SELECT: &str = "SELECT i.item_pk, i.folder_pk, f.display_name, i.subject, i.from_name, i.from_email, i.display_to, i.received_at, i.sent_at,
+        i.is_read, i.is_draft, i.has_attachments, i.importance, i.preview, i.body_state
+ FROM items i LEFT JOIN folders f ON f.folder_pk = i.folder_pk";
+
+fn head_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<MessageHead> {
+    Ok(MessageHead {
+        item_pk: r.get(0)?,
+        folder_pk: r.get(1)?,
+        folder_name: r.get(2)?,
+        subject: r.get(3)?,
+        from_name: r.get(4)?,
+        from_email: r.get(5)?,
+        display_to: r.get(6)?,
+        received_at: ms_ts(r.get(7)?),
+        sent_at: ms_ts(r.get(8)?),
+        is_read: r.get::<_, i64>(9)? != 0,
+        is_draft: r.get::<_, i64>(10)? != 0,
+        has_attachments: r.get::<_, i64>(11)? != 0,
+        importance: r.get(12)?,
+        preview: r.get(13)?,
+        body_state: r.get(14)?,
+    })
+}
+
 impl Store {
     /// Страница бесед папки, свежие первыми; `after` — курсор предыдущей страницы.
     pub fn conversations_page(&self, account: AccountId, folder_pk: i64, after: Option<ConversationCursor>, limit: usize) -> Result<Vec<ConversationRow>> {
@@ -102,33 +138,35 @@ impl Store {
     /// Письма беседы во всех папках, старые первыми (как читается переписка).
     pub fn conversation_messages(&self, account: AccountId, conversation_pk: i64) -> Result<Vec<MessageHead>> {
         self.with_conn(|c| {
+            let mut st = c.prepare_cached(&format!(
+                "{HEAD_SELECT} WHERE i.conversation_pk = ?1 AND i.account_id = ?2 AND i.deleted = 0
+                 ORDER BY COALESCE(i.received_at, i.sent_at) ASC, i.item_pk ASC"
+            ))?;
+            let rows = st.query_map(params![conversation_pk, account.0], head_row)?;
+            Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+        })
+    }
+
+    /// Ключи писем беседы в том же порядке, что `conversation_messages`.
+    pub fn conversation_keys(&self, account: AccountId, conversation_pk: i64) -> Result<Vec<MessageKey>> {
+        self.with_conn(|c| {
             let mut st = c.prepare_cached(
-                "SELECT i.item_pk, i.folder_pk, f.display_name, i.subject, i.from_name, i.from_email, i.display_to, i.received_at, i.sent_at,
-                        i.is_read, i.is_draft, i.has_attachments, i.importance, i.preview, i.body_state
-                 FROM items i LEFT JOIN folders f ON f.folder_pk = i.folder_pk
+                "SELECT i.item_pk, i.body_state, i.is_read,
+                        (SELECT COUNT(*) FROM attachments a WHERE a.item_pk = i.item_pk AND a.local_path IS NOT NULL)
+                 FROM items i
                  WHERE i.conversation_pk = ?1 AND i.account_id = ?2 AND i.deleted = 0
                  ORDER BY COALESCE(i.received_at, i.sent_at) ASC, i.item_pk ASC",
             )?;
-            let rows = st.query_map(params![conversation_pk, account.0], |r| {
-                Ok(MessageHead {
-                    item_pk: r.get(0)?,
-                    folder_pk: r.get(1)?,
-                    folder_name: r.get(2)?,
-                    subject: r.get(3)?,
-                    from_name: r.get(4)?,
-                    from_email: r.get(5)?,
-                    display_to: r.get(6)?,
-                    received_at: ms_ts(r.get(7)?),
-                    sent_at: ms_ts(r.get(8)?),
-                    is_read: r.get::<_, i64>(9)? != 0,
-                    is_draft: r.get::<_, i64>(10)? != 0,
-                    has_attachments: r.get::<_, i64>(11)? != 0,
-                    importance: r.get(12)?,
-                    preview: r.get(13)?,
-                    body_state: r.get(14)?,
-                })
-            })?;
+            let rows = st.query_map(params![conversation_pk, account.0], |r| Ok(MessageKey { item_pk: r.get(0)?, body_state: r.get(1)?, is_read: r.get::<_, i64>(2)? != 0, cached: r.get(3)? }))?;
             Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+        })
+    }
+
+    /// Заголовок одного не удалённого письма (для области чтения после загрузки тела).
+    pub fn message_head(&self, item_pk: i64) -> Result<Option<MessageHead>> {
+        self.with_conn(|c| {
+            let mut st = c.prepare_cached(&format!("{HEAD_SELECT} WHERE i.item_pk = ?1 AND i.deleted = 0"))?;
+            Ok(st.query_row(params![item_pk], head_row).optional()?)
         })
     }
 

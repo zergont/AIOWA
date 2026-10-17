@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { untrack } from "svelte";
   import type { Conversation, Message } from "../api";
   import MessageCard from "./MessageCard.svelte";
 
@@ -6,14 +7,42 @@
     conversation: Conversation | null;
     messages: Message[];
     loading: boolean;
+    /** Догрузить письмо с сервера; ошибку пробрасывает, карточка покажет её у себя. */
+    onfetch: (itemPk: number) => Promise<void>;
   }
-  let { conversation, messages, loading }: Props = $props();
+  let { conversation, messages, loading, onfetch }: Props = $props();
 
   // Последнее письмо развёрнуто, остальные свёрнуты до заголовка.
+  // Раскрытие пересчитывается только при смене беседы: точечная замена письма (догрузка тела)
+  // и перечитывание после синхронизации не должны сворачивать то, что открыл пользователь.
   let expanded = $state<Set<number>>(new Set());
+  let expandedFor: number | null = null;
+  let knownPks = new Set<number>();
   $effect(() => {
+    const pk = conversation?.conversation_pk ?? null;
     const last = messages[messages.length - 1];
-    expanded = new Set(last ? [last.item_pk] : []);
+    if (pk === null) {
+      expandedFor = null;
+      knownPks = new Set();
+      return;
+    }
+    if (expandedFor !== pk) {
+      // Новая беседа: письма приходят чуть позже выбора, ждём первую непустую выдачу.
+      if (!last) return;
+      expandedFor = pk;
+      knownPks = new Set(messages.map((m) => m.item_pk));
+      expanded = new Set([last.item_pk]);
+      return;
+    }
+    // Та же беседа: пришедшее по синхронизации новое последнее письмо раскрываем, остальное не трогаем.
+    const fresh = messages.filter((m) => !knownPks.has(m.item_pk));
+    if (!fresh.length) return;
+    knownPks = new Set(messages.map((m) => m.item_pk));
+    if (last && fresh.some((m) => m.item_pk === last.item_pk)) {
+      untrack(() => {
+        if (!expanded.has(last.item_pk)) expanded = new Set([...expanded, last.item_pk]);
+      });
+    }
   });
   function toggle(pk: number) {
     const next = new Set(expanded);
@@ -50,7 +79,7 @@
         <div class="caption loading">Загрузка…</div>
       {/if}
       {#each messages as m (m.item_pk)}
-        <MessageCard message={m} expanded={expanded.has(m.item_pk)} ontoggle={() => toggle(m.item_pk)} />
+        <MessageCard message={m} expanded={expanded.has(m.item_pk)} ontoggle={() => toggle(m.item_pk)} {onfetch} />
       {/each}
     </div>
   </div>

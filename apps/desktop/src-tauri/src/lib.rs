@@ -1,20 +1,31 @@
 //! AIOWA desktop: команды Tauri поверх локальной базы. Чтение из SQLite, синхронизация
 //! с сервером по кнопке и по таймеру (`sync.rs`): один транспорт OWA на процесс, logoff при выходе.
+//! Тело письма и вложения, которых ещё нет локально, догружаются по требованию (`ondemand.rs`).
 //!
 //! HTML писем очищается ammonia на стороне Rust и показывается во фрейме с sandbox и CSP;
-//! удалённые картинки и внешние ресурсы не загружаются.
+//! удалённые картинки и внешние ресурсы не загружаются. Инлайновые картинки (`src="cid:…"`)
+//! подставляются из кэша вложений как `data:`-URI прямо при очистке.
 
 use aiowa_core::{AccountId, BodyType};
-use aiowa_store::ui::ConversationCursor;
-use aiowa_store::Store;
+use aiowa_store::ui::{ConversationCursor, MessageHead};
+use aiowa_store::{AttachmentRow, Store};
+use base64::Engine as _;
 use jiff::Timestamp;
 use serde::Serialize;
-use std::collections::HashMap;
+use std::borrow::Cow;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tauri::State;
+use tracing::warn;
 
+mod ondemand;
 mod sync;
+
+/// Лимит одной инлайновой картинки: больше не скачиваем и не подставляем.
+pub(crate) const INLINE_IMAGE_MAX_BYTES: u64 = 8 * 1024 * 1024;
+/// Лимит суммарных подстановок `data:` в одно письмо.
+pub(crate) const INLINE_TOTAL_MAX_BYTES: u64 = 16 * 1024 * 1024;
 
 struct AppState {
     store: Arc<Store>,
@@ -24,6 +35,9 @@ struct AppState {
 }
 
 type CmdResult<T> = std::result::Result<T, String>;
+
+/// Нормализованный Content-ID → `data:`-URI картинки из кэша.
+type InlineMap = HashMap<String, String>;
 
 fn err<E: std::fmt::Display>(e: E) -> String {
     e.to_string()
@@ -71,17 +85,19 @@ struct RecipientDto {
 }
 
 #[derive(Serialize)]
-struct AttachmentDto {
+pub(crate) struct AttachmentDto {
     attachment_pk: i64,
     name: Option<String>,
     content_type: Option<String>,
     size: Option<i64>,
     is_inline: bool,
+    /// Файл вложения есть в кэше на диске (открытие и сохранение не потребуют сети).
     cached: bool,
+    content_id: Option<String>,
 }
 
 #[derive(Serialize)]
-struct MessageDto {
+pub(crate) struct MessageDto {
     item_pk: i64,
     folder_pk: i64,
     folder_name: Option<String>,
@@ -105,6 +121,16 @@ struct MessageDto {
     attachments: Vec<AttachmentDto>,
 }
 
+/// Ключ состояния письма для `conversation_key`: по нему окно решает, перечитывать ли беседу.
+#[derive(Serialize)]
+struct MessageKeyDto {
+    item_pk: i64,
+    body_state: i64,
+    is_read: bool,
+    /// Вложений с файлом в кэше по базе (без проверки диска).
+    cached: i64,
+}
+
 #[derive(Serialize)]
 struct SearchHitDto {
     item_pk: i64,
@@ -118,20 +144,174 @@ struct SearchHitDto {
     attachment_name: Option<String>,
 }
 
+/// Ключ сопоставления `src="cid:…"` с `Content-ID` вложения: без схемы `cid:`, URL-декодирован,
+/// без угловых скобок и пробелов по краям, в нижнем регистре. На нашем сервере Content-ID приходит
+/// без скобок (`image001.jpg@01DD5D86.89427E20`), а в теле стоит `src="cid:image001.jpg@…"`,
+/// но у других отправителей бывают `<…>` и кодирование.
+pub(crate) fn normalize_cid(raw: &str) -> String {
+    let s = raw.trim();
+    let s = if s.get(..4).is_some_and(|p| p.eq_ignore_ascii_case("cid:")) { &s[4..] } else { s };
+    let decoded = percent_encoding::percent_decode_str(s).decode_utf8_lossy();
+    decoded.trim().trim_start_matches('<').trim_end_matches('>').trim().to_lowercase()
+}
+
+/// MIME-тип картинки для `data:`-URI: из записи вложения, а если он неизвестен — по сигнатуре файла.
+/// Не картинка → `None` (в тело письма подставляются только изображения).
+fn image_mime(content_type: Option<&str>, bytes: &[u8]) -> Option<String> {
+    if let Some(ct) = content_type {
+        let ct = ct.split(';').next().unwrap_or(ct).trim().to_ascii_lowercase();
+        if ct.starts_with("image/") {
+            return Some(ct);
+        }
+        return None;
+    }
+    let sniffed = if bytes.starts_with(b"\x89PNG") {
+        "image/png"
+    } else if bytes.starts_with(b"\xFF\xD8\xFF") {
+        "image/jpeg"
+    } else if bytes.starts_with(b"GIF8") {
+        "image/gif"
+    } else if bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        "image/webp"
+    } else if bytes.starts_with(b"BM") {
+        "image/bmp"
+    } else {
+        return None;
+    };
+    Some(sniffed.to_string())
+}
+
+/// Content-ID, на которые ссылается HTML (`src="cid:…"`, `url(cid:…)`), в нормализованном виде.
+/// Нужно, чтобы не читать и не кодировать картинки, которых в показываемом тексте нет: у ответов
+/// Outlook картинки цитируемой истории перевложены в каждое письмо, а в UniqueBody их нет.
+pub(crate) fn referenced_cids(html: &str) -> HashSet<String> {
+    let mut out = HashSet::new();
+    // Только ASCII приводится к нижнему регистру, поэтому байтовые смещения совпадают с исходником.
+    let lower = html.to_ascii_lowercase();
+    let mut from = 0;
+    while let Some(pos) = lower[from..].find("cid:") {
+        let start = from + pos + 4;
+        let rest = &html[start..];
+        let end = rest.find(|c: char| matches!(c, '"' | '\'' | ')' | '>' | '<') || c.is_whitespace()).unwrap_or(rest.len());
+        let key = normalize_cid(&rest[..end]);
+        if !key.is_empty() {
+            out.insert(key);
+        }
+        from = start + end;
+    }
+    out
+}
+
+/// Вложения письма для показа: `cached` проверяется по диску (исчезнувший файл забывается в базе),
+/// а инлайновые картинки из кэша, на которые ссылается тело (`wanted`), собираются в карту для
+/// подстановки вместо `cid:`. `wanted = None` — тела в HTML нет, подставлять некуда. Сети нет.
+pub(crate) fn prepare_attachments(store: &Store, item_pk: i64, wanted: Option<&HashSet<String>>) -> CmdResult<(Vec<AttachmentRow>, InlineMap)> {
+    let mut rows = store.attachments_of_item(item_pk).map_err(err)?;
+    let mut map = InlineMap::new();
+    let mut total: u64 = 0;
+    for a in rows.iter_mut() {
+        let Some(path) = a.local_path.clone() else { continue };
+        if !path.is_file() {
+            a.local_path = None;
+            if let Err(e) = store.forget_attachment_file(a.attachment_pk) {
+                warn!(attachment_pk = a.attachment_pk, error = %e, "не удалось забыть исчезнувший файл кэша");
+            }
+            continue;
+        }
+        let Some(wanted) = wanted else { continue };
+        if !a.is_inline {
+            continue;
+        }
+        let Some(cid) = a.content_id.as_deref() else { continue };
+        let key = normalize_cid(cid);
+        if key.is_empty() || !wanted.contains(&key) || map.contains_key(&key) {
+            continue;
+        }
+        let len = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(u64::MAX);
+        if len > INLINE_IMAGE_MAX_BYTES || total.saturating_add(len) > INLINE_TOTAL_MAX_BYTES {
+            continue;
+        }
+        let Ok(bytes) = std::fs::read(&path) else { continue };
+        let Some(mime) = image_mime(a.content_type.as_deref(), &bytes) else { continue };
+        total += bytes.len() as u64;
+        map.insert(key, format!("data:{mime};base64,{}", base64::engine::general_purpose::STANDARD.encode(&bytes)));
+    }
+    Ok((rows, map))
+}
+
 /// Очистка HTML письма. Инлайновые стили разрешены: без них деловая почта нечитаема,
-/// а внешние ресурсы из CSS всё равно блокирует CSP фрейма.
-fn sanitize_html(html: &str) -> String {
+/// а внешние ресурсы из CSS всё равно блокирует CSP фрейма. `src="cid:…"` у картинок
+/// заменяется на `data:` из карты; несопоставленные `cid:` теряют атрибут `src`.
+fn sanitize_html(html: &str, inline: &Arc<InlineMap>) -> String {
     let mut b = ammonia::Builder::default();
     b.add_generic_attributes(["style", "width", "height", "align", "valign", "bgcolor", "border", "cellpadding", "cellspacing", "color", "face", "size"])
         .add_tags(["font", "center", "u", "s", "strike", "tt", "big", "small", "caption", "colgroup", "col", "thead", "tbody", "tfoot", "span", "div", "img", "table", "tr", "td", "th", "hr"])
         .link_rel(Some("noopener noreferrer"))
         .url_schemes(["http", "https", "mailto", "cid", "data"].into_iter().collect());
+    let inline = inline.clone();
+    b.attribute_filter(move |element, attribute, value| {
+        let is_cid = value.trim_start().get(..4).is_some_and(|p| p.eq_ignore_ascii_case("cid:"));
+        if element == "img" && attribute == "src" && is_cid {
+            return inline.get(&normalize_cid(value)).map(|uri| Cow::Owned(uri.clone()));
+        }
+        Some(Cow::Borrowed(value))
+    });
     b.clean(html).to_string()
 }
 
 fn text_to_html(text: &str) -> String {
     let escaped = text.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
     format!("<pre style=\"white-space:pre-wrap;font:inherit;margin:0\">{escaped}</pre>")
+}
+
+/// Собирает DTO письма из заголовка, тела и вложений (без сети). Читает файлы кэша и кодирует
+/// картинки, поэтому вызывается из блокирующего потока, не из обработчика IPC.
+pub(crate) fn build_message(store: &Store, h: MessageHead) -> CmdResult<MessageDto> {
+    let body = store.message_body(h.item_pk).map_err(err)?;
+    let wanted = match &body {
+        Some(b) if b.body_type == BodyType::Html => b.unique.as_deref().or(b.full.as_deref()).map(referenced_cids),
+        _ => None,
+    };
+    let (attachments, inline) = prepare_attachments(store, h.item_pk, wanted.as_ref())?;
+    let inline = Arc::new(inline);
+    let (body_html, body_is_text, is_truncated) = match body {
+        Some(b) => {
+            let raw = b.unique.or(b.full);
+            match (raw, b.body_type) {
+                (Some(html), BodyType::Html) => (Some(sanitize_html(&html, &inline)), false, b.is_truncated),
+                (Some(text), BodyType::Text) => (Some(text_to_html(&text)), true, b.is_truncated),
+                (None, _) => (b.text.as_deref().map(text_to_html), true, b.is_truncated),
+            }
+        }
+        None => (None, false, false),
+    };
+    let recipients = store.recipients(h.item_pk).map_err(err)?.into_iter().map(|r| RecipientDto { kind: r.kind, name: r.name, email: r.email }).collect();
+    let attachments = attachments
+        .into_iter()
+        .map(|a| AttachmentDto { attachment_pk: a.attachment_pk, name: a.name, content_type: a.content_type, size: a.size, is_inline: a.is_inline, cached: a.local_path.is_some(), content_id: a.content_id })
+        .collect();
+    Ok(MessageDto {
+        item_pk: h.item_pk,
+        folder_pk: h.folder_pk,
+        folder_name: h.folder_name,
+        subject: h.subject,
+        from_name: h.from_name,
+        from_email: h.from_email,
+        display_to: h.display_to,
+        received_ms: ms(h.received_at),
+        sent_ms: ms(h.sent_at),
+        is_read: h.is_read,
+        is_draft: h.is_draft,
+        has_attachments: h.has_attachments,
+        importance: h.importance,
+        preview: h.preview,
+        body_state: h.body_state,
+        body_html,
+        body_is_text,
+        is_truncated,
+        recipients,
+        attachments,
+    })
 }
 
 #[tauri::command]
@@ -179,55 +359,28 @@ fn conversations(state: State<'_, AppState>, folder_pk: i64, after_ms: Option<i6
         .collect())
 }
 
+/// Письма беседы из локальной базы, без сети: тела, которых нет, приходят с `body_html = null`
+/// и догружаются командой `message_fetch`; инлайновые картинки подставляются только из кэша.
+/// Чтение файлов кэша и base64 идут в блокирующем потоке: синхронная команда выполнялась бы
+/// в потоке окна и замораживала бы его на длинных беседах с картинками.
 #[tauri::command]
-fn conversation(state: State<'_, AppState>, conversation_pk: i64) -> CmdResult<Vec<MessageDto>> {
-    let heads = state.store.conversation_messages(state.account, conversation_pk).map_err(err)?;
-    let mut out = Vec::with_capacity(heads.len());
-    for h in heads {
-        let body = state.store.message_body(h.item_pk).map_err(err)?;
-        let (body_html, body_is_text, is_truncated) = match body {
-            Some(b) => {
-                let raw = b.unique.or(b.full);
-                match (raw, b.body_type) {
-                    (Some(html), BodyType::Html) => (Some(sanitize_html(&html)), false, b.is_truncated),
-                    (Some(text), BodyType::Text) => (Some(text_to_html(&text)), true, b.is_truncated),
-                    (None, _) => (b.text.as_deref().map(text_to_html), true, b.is_truncated),
-                }
-            }
-            None => (None, false, false),
-        };
-        let recipients = state.store.recipients(h.item_pk).map_err(err)?.into_iter().map(|r| RecipientDto { kind: r.kind, name: r.name, email: r.email }).collect();
-        let attachments = state
-            .store
-            .attachments_of_item(h.item_pk)
-            .map_err(err)?
-            .into_iter()
-            .map(|a| AttachmentDto { attachment_pk: a.attachment_pk, name: a.name, content_type: a.content_type, size: a.size, is_inline: a.is_inline, cached: a.local_path.is_some() })
-            .collect();
-        out.push(MessageDto {
-            item_pk: h.item_pk,
-            folder_pk: h.folder_pk,
-            folder_name: h.folder_name,
-            subject: h.subject,
-            from_name: h.from_name,
-            from_email: h.from_email,
-            display_to: h.display_to,
-            received_ms: ms(h.received_at),
-            sent_ms: ms(h.sent_at),
-            is_read: h.is_read,
-            is_draft: h.is_draft,
-            has_attachments: h.has_attachments,
-            importance: h.importance,
-            preview: h.preview,
-            body_state: h.body_state,
-            body_html,
-            body_is_text,
-            is_truncated,
-            recipients,
-            attachments,
-        });
-    }
-    Ok(out)
+async fn conversation(state: State<'_, AppState>, conversation_pk: i64) -> CmdResult<Vec<MessageDto>> {
+    let store = state.store.clone();
+    let account = state.account;
+    tauri::async_runtime::spawn_blocking(move || {
+        let heads = store.conversation_messages(account, conversation_pk).map_err(err)?;
+        heads.into_iter().map(|h| build_message(&store, h)).collect::<CmdResult<Vec<_>>>()
+    })
+    .await
+    .map_err(err)?
+}
+
+/// Дешёвый ключ беседы (один запрос без тел и файлов): окно сравнивает его с открытой беседой
+/// после синхронизации и перечитывает письма только при реальных изменениях.
+#[tauri::command]
+fn conversation_key(state: State<'_, AppState>, conversation_pk: i64) -> CmdResult<Vec<MessageKeyDto>> {
+    let keys = state.store.conversation_keys(state.account, conversation_pk).map_err(err)?;
+    Ok(keys.into_iter().map(|k| MessageKeyDto { item_pk: k.item_pk, body_state: k.body_state, is_read: k.is_read, cached: k.cached }).collect())
 }
 
 #[tauri::command]
@@ -270,7 +423,22 @@ pub fn run() {
     let app = tauri::Builder::default()
         .manage(state)
         .manage(sync_state.clone())
-        .invoke_handler(tauri::generate_handler![account_info, folders, conversations, conversation, search, sync::sync_start, sync::sync_status, sync::sync_cancel])
+        .manage(ondemand::OnDemand::default())
+        .invoke_handler(tauri::generate_handler![
+            account_info,
+            folders,
+            conversations,
+            conversation,
+            conversation_key,
+            search,
+            sync::sync_start,
+            sync::sync_status,
+            sync::sync_cancel,
+            ondemand::message_fetch,
+            ondemand::attachment_open,
+            ondemand::attachment_save_as,
+            ondemand::open_external
+        ])
         .build(tauri::generate_context!())
         .expect("ошибка запуска приложения");
     app.run(move |_app, event| {
@@ -289,12 +457,56 @@ mod tests {
     #[test]
     fn sanitizer_keeps_layout_and_drops_scripts() {
         let html = r##"<div style="color:red"><script>alert(1)</script><a href="javascript:x" onclick="y">ссылка</a><img src="https://t.example/p.gif"><table><tr><td bgcolor="#eee">ячейка</td></tr></table></div>"##;
-        let out = sanitize_html(html);
+        let out = sanitize_html(html, &Arc::new(InlineMap::new()));
         assert!(!out.contains("script"));
         assert!(!out.contains("onclick"));
         assert!(!out.contains("javascript:"));
         assert!(out.contains("style=\"color:red\""));
         assert!(out.contains("bgcolor"));
         assert!(out.contains("<img"));
+    }
+
+    #[test]
+    fn cid_normalization_is_tolerant() {
+        assert_eq!(normalize_cid("image001.jpg@01DD5D86.89427E20"), "image001.jpg@01dd5d86.89427e20");
+        assert_eq!(normalize_cid("cid:Image001.jpg@01DD5D86.89427E20"), "image001.jpg@01dd5d86.89427e20");
+        assert_eq!(normalize_cid("CID:<image001.jpg@01DD5D86.89427E20>"), "image001.jpg@01dd5d86.89427e20");
+        assert_eq!(normalize_cid("cid:%3Cimage001.jpg%4001DD5D86.89427E20%3E"), "image001.jpg@01dd5d86.89427e20");
+        assert_eq!(normalize_cid(" <4b41b9e6-0a9e-427f-a922-e45e31ac31a0> "), "4b41b9e6-0a9e-427f-a922-e45e31ac31a0");
+        assert_eq!(normalize_cid("cid:"), "");
+    }
+
+    #[test]
+    fn sanitizer_inlines_known_cids_and_drops_unknown() {
+        let mut map = InlineMap::new();
+        map.insert("image001.jpg@01dd5d86.89427e20".to_string(), "data:image/jpeg;base64,/9j/".to_string());
+        let html = r#"<p><img src="cid:Image001.jpg@01DD5D86.89427E20" width="10"><img src="CID:%3Cimage001.jpg@01DD5D86.89427E20%3E"><img src="cid:nope@x" alt="нет"><img src="https://t.example/p.gif"></p>"#;
+        let out = sanitize_html(html, &Arc::new(map));
+        assert_eq!(out.matches("src=\"data:image/jpeg;base64,/9j/\"").count(), 2, "{out}");
+        assert!(!out.contains("cid:"), "{out}");
+        assert!(out.contains("alt=\"нет\""), "картинка без источника остаётся, но без src: {out}");
+        assert!(out.contains("https://t.example/p.gif"));
+    }
+
+    #[test]
+    fn referenced_cids_are_collected_from_html() {
+        let html = r#"<p><img src="cid:Image001.jpg@01DD5D86.89427E20"><img src='CID:%3Cimage002.png%3E'><div style="background:url(cid:bg@x)">
+        <img src="https://t.example/p.gif"><img src="cid:"></div>"#;
+        let got = referenced_cids(html);
+        let want: HashSet<String> = ["image001.jpg@01dd5d86.89427e20", "image002.png", "bg@x"].into_iter().map(String::from).collect();
+        assert_eq!(got, want);
+        assert!(referenced_cids("<p>без картинок</p>").is_empty());
+        assert!(referenced_cids("<img src=\"cid:я@кириллица\">").contains("я@кириллица"), "не-ASCII не ломает смещения");
+    }
+
+    #[test]
+    fn image_mime_from_type_or_signature() {
+        assert_eq!(image_mime(Some("image/PNG; charset=binary"), b""), Some("image/png".into()));
+        assert_eq!(image_mime(Some("application/pdf"), b"\x89PNG"), None, "не картинка по типу — не подставляем");
+        assert_eq!(image_mime(None, b"\x89PNG\r\n"), Some("image/png".into()));
+        assert_eq!(image_mime(None, b"\xFF\xD8\xFF\xE0"), Some("image/jpeg".into()));
+        assert_eq!(image_mime(None, b"GIF89a"), Some("image/gif".into()));
+        assert_eq!(image_mime(None, b"RIFF\0\0\0\0WEBPVP8 "), Some("image/webp".into()));
+        assert_eq!(image_mime(None, b"%PDF-1.4"), None);
     }
 }

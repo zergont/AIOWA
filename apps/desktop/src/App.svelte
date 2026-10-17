@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { api, onSyncProgress, type AccountInfo, type Conversation, type Folder, type Message, type SearchHit, type SyncStatus } from "./lib/api";
+  import { api, conversationKeyOf, errorMessage, messagesKey, onSyncProgress, type AccountInfo, type Conversation, type Folder, type Message, type SearchHit, type SyncStatus } from "./lib/api";
   import FolderTree from "./lib/components/FolderTree.svelte";
   import ConversationList from "./lib/components/ConversationList.svelte";
   import ReadingPane from "./lib/components/ReadingPane.svelte";
@@ -64,28 +64,63 @@
     }
   }
 
+  /** Номер последнего запроса беседы: ответ устаревшего запроса не должен ни подменить письма, ни погасить индикатор. */
+  let conversationRequest = 0;
+
   async function openConversation(c: Conversation) {
+    const switching = selected?.conversation_pk !== c.conversation_pk;
     selected = c;
+    // При смене беседы старые письма убираем сразу: панель чтения не должна раскрывать письмо прошлой беседы.
+    if (switching) messages = [];
+    const req = ++conversationRequest;
     loadingMessages = true;
     try {
-      messages = await api.conversation(c.conversation_pk);
+      const fresh = await api.conversation(c.conversation_pk);
+      if (req === conversationRequest) messages = fresh;
     } finally {
-      loadingMessages = false;
+      if (req === conversationRequest) loadingMessages = false;
     }
   }
 
   async function openConversationByPk(pk: number) {
     const existing = conversations.find((c) => c.conversation_pk === pk);
+    const switching = selected?.conversation_pk !== pk;
     selected = existing ?? { conversation_pk: pk, topic: null, participants: [], item_count: 0, unread_count: 0, total_count: 0, last_received_ms: null, has_attachments: false };
+    if (switching) messages = [];
+    const req = ++conversationRequest;
     loadingMessages = true;
     try {
-      messages = await api.conversation(pk);
+      const fresh = await api.conversation(pk);
+      if (req !== conversationRequest) return;
+      messages = fresh;
       if (!existing && messages.length) {
         selected = { ...selected, topic: messages[0].subject, total_count: messages.length };
       }
     } finally {
-      loadingMessages = false;
+      if (req === conversationRequest) loadingMessages = false;
     }
+  }
+
+  // --- догрузка письма с сервера -------------------------------------------
+
+  /** Запросы message_fetch в полёте по item_pk: повторный клик или второй эффект не плодят сетевых вызовов. */
+  const fetching = new Map<number, Promise<Message>>();
+
+  /**
+   * Догружает тело и инлайновые картинки одного письма и подменяет его в открытой беседе точечно,
+   * не трогая остальные карточки. Ошибку пробрасывает вызывающей карточке — она покажет её у себя.
+   */
+  function fetchMessage(itemPk: number): Promise<void> {
+    let p = fetching.get(itemPk);
+    if (!p) {
+      p = api.messageFetch(itemPk).finally(() => fetching.delete(itemPk));
+      fetching.set(itemPk, p);
+    }
+    return p.then((fresh) => {
+      const i = messages.findIndex((m) => m.item_pk === itemPk);
+      // Беседу могли переключить, пока шёл запрос: тогда подменять нечего, тело уже в базе.
+      if (i >= 0) messages[i] = fresh;
+    });
   }
 
   let searchTimer: ReturnType<typeof setTimeout> | undefined;
@@ -101,7 +136,7 @@
       try {
         searchHits = await api.search(q, 100);
       } catch (e) {
-        error = String(e);
+        error = errorMessage(e);
       } finally {
         searching = false;
       }
@@ -122,7 +157,7 @@
     try {
       syncStatus = await api.syncStart();
     } catch (e) {
-      error = String(e);
+      error = errorMessage(e);
     }
   }
 
@@ -130,7 +165,7 @@
     try {
       syncStatus = await api.syncCancel();
     } catch (e) {
-      error = String(e);
+      error = errorMessage(e);
     }
   }
 
@@ -158,13 +193,19 @@
         }
       }
       if (selected && !loadingMessages) {
-        const fresh = await api.conversation(selected.conversation_pk);
-        // Письма перечитываем только при реальных изменениях: иначе сбросится раскрытие карточек.
-        const key = (ms: Message[]) => ms.map((m) => `${m.item_pk}:${m.body_state}:${m.is_read ? 1 : 0}`).join(",");
-        if (key(fresh) !== key(messages)) messages = fresh;
+        // Письма перечитываем только при реальных изменениях (состав, тело, прочитанность, кэш вложений):
+        // иначе перезагрузятся фреймы с текстом и собьётся прокрутка. Сначала дешёвый ключ без тел
+        // и картинок; полная беседа с base64-картинками читается, лишь если ключ разошёлся.
+        const pk = selected.conversation_pk;
+        const keys = await api.conversationKey(pk);
+        if (conversationKeyOf(keys) !== messagesKey(messages)) {
+          const fresh = await api.conversation(pk);
+          // Пока читали, беседу могли переключить.
+          if (selected?.conversation_pk === pk && !loadingMessages) messages = fresh;
+        }
       }
     } catch (e) {
-      error = String(e);
+      error = errorMessage(e);
     }
   }
 
@@ -204,7 +245,7 @@
         // Автозапуск при старте: окно сначала показывает базу, потом тянет новое.
         void startSync();
       } catch (e) {
-        error = String(e);
+        error = errorMessage(e);
       }
     })();
 
@@ -267,7 +308,7 @@
   <div class="splitter" role="separator" aria-orientation="vertical" aria-label="Ширина списка" onpointerdown={startDrag}></div>
 
   <section class="reader" aria-label="Чтение">
-    <ReadingPane conversation={selected} {messages} loading={loadingMessages} />
+    <ReadingPane conversation={selected} {messages} loading={loadingMessages} onfetch={fetchMessage} />
   </section>
 
   <footer class="status" aria-label="Состояние синхронизации">

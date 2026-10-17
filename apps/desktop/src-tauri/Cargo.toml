@@ -29,3 +29,13 @@ ammonia.workspace = true
 keyring.workspace = true
 secrecy.workspace = true
 tokio.workspace = true
+base64.workspace = true
+percent-encoding.workspace = true
+url.workspace = true
+# Открытие файлов и ссылок системным приложением: через ShellExecuteExW, а не через cmd/powershell.
+open = { version = "5", features = ["shellexecute-on-windows"] }
+# Системный диалог «Сохранить как». Без фич по умолчанию (они нужны только Linux: xdg-portal, wayland);
+# на Windows бэкенд IFileDialog работает без фич.
+rfd = { version = "0.17", default-features = false }
+# Папка «Загрузки» пользователя (известная папка Windows) для диалога сохранения.
+dirs = "7"

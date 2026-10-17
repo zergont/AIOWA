@@ -2,7 +2,7 @@
 
 use aiowa_core::*;
 use aiowa_store::Store;
-use aiowa_sync::{Engine, FolderSelection, SyncOptions};
+use aiowa_sync::{BodyFetchOutcome, Engine, FolderSelection, SyncOptions};
 use aiowa_transport::{async_trait, AttachmentContent, FolderCounts, ItemFetchShape, ItemResult, MailTransport, Result as TResult, ServerInfo, TransportError};
 use jiff::Timestamp;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -58,11 +58,13 @@ struct Fake {
     seen_states: Mutex<Vec<Option<String>>>,
     /// Папки, по которым запрашивались элементы.
     seen_folders: Mutex<Vec<String>>,
+    /// Сессия мертва и повторный вход отклонён: каждый `GetItem` и `GetAttachment` падает `AuthFailed`.
+    auth_dead: AtomicBool,
 }
 
 impl Fake {
     fn new() -> Arc<Self> {
-        Arc::new(Self { sync_calls: AtomicUsize::new(0), get_calls: AtomicUsize::new(0), attachment_calls: AtomicUsize::new(0), seen_states: Mutex::new(vec![]), seen_folders: Mutex::new(vec![]) })
+        Arc::new(Self { sync_calls: AtomicUsize::new(0), get_calls: AtomicUsize::new(0), attachment_calls: AtomicUsize::new(0), seen_states: Mutex::new(vec![]), seen_folders: Mutex::new(vec![]), auth_dead: AtomicBool::new(false) })
     }
 }
 
@@ -110,11 +112,16 @@ impl MailTransport for Fake {
 
     async fn get_items(&self, ids: &[ItemId], _shape: ItemFetchShape) -> TResult<Vec<ItemResult>> {
         self.get_calls.fetch_add(1, Ordering::SeqCst);
+        if self.auth_dead.load(Ordering::SeqCst) {
+            return Err(TransportError::AuthFailed("сервер вернул на страницу входа, reason=2".into()));
+        }
         Ok(ids
             .iter()
             .map(|id| {
                 if id.id == "gone" {
                     ItemResult::Failed { id: id.clone(), code: "ErrorItemNotFound".into(), message: "нет".into() }
+                } else if id.id == "broken" {
+                    ItemResult::Failed { id: id.clone(), code: "ErrorInternalServerError".into(), message: "сломалось".into() }
                 } else {
                     // Сервер отдаёт текущее состояние: письмо «a» к этому моменту уже прочитано.
                     let mut m = meta(&id.id, if id.id == "a" { "Запчасти на Колыму" } else { "Старое письмо" }, 1);
@@ -148,6 +155,9 @@ impl MailTransport for Fake {
 
     async fn get_attachment(&self, attachment_id: &str, _max_bytes: u64) -> TResult<AttachmentContent> {
         self.attachment_calls.fetch_add(1, Ordering::SeqCst);
+        if self.auth_dead.load(Ordering::SeqCst) {
+            return Err(TransportError::AuthFailed("сервер вернул на страницу входа, reason=2".into()));
+        }
         match attachment_id {
             "att-ok" => Ok(AttachmentContent { bytes: "Поставка шлёпанцев, 40 пар".as_bytes().to_vec(), content_type: Some("text/plain".into()), file_name: Some("спецификация.txt".into()) }),
             _ => Err(TransportError::Server { code: "ErrorInvalidAttachmentId".into(), message: "нет такого вложения".into() }),
@@ -250,6 +260,95 @@ async fn all_mail_folders_skip_service_ones() {
     assert_eq!(engine.run(&named).await.unwrap().folders_synced, 1);
     let missing = SyncOptions { folders: FolderSelection::Named(vec!["нет такой".into()]), ..SyncOptions::default() };
     assert!(matches!(engine.run(&missing).await, Err(aiowa_sync::SyncError::FolderNotFound(_))));
+}
+
+#[tokio::test]
+async fn fetch_body_on_demand() {
+    let store = test_store("body");
+    let account = store.account("fake", "u").unwrap();
+    let fake = Fake::new();
+    let engine = Engine::new(fake.clone(), store.clone(), account, Arc::new(AtomicBool::new(false)));
+    // Метаданные без тел, как после синхронизации с выключенной загрузкой тел.
+    let opts = SyncOptions { folders: FolderSelection::Named(vec!["inbox".into()]), fetch_bodies: false, fetch_attachments: false, ..SyncOptions::default() };
+    engine.run(&opts).await.unwrap();
+    let (inbox_pk, _) = store.folder_by_distinguished(account, "inbox").unwrap().unwrap();
+    store.apply_item_changes(account, inbox_pk, &[ItemChange::Create(meta("broken", "Сломанное", 1))]).unwrap();
+    let pk_of = |id: &str| store.list_items(account, inbox_pk, 10).unwrap().into_iter().find(|r| r.item_id.id == id).map(|r| r.item_pk);
+    let a_pk = pk_of("a").unwrap();
+    let gone_pk = pk_of("gone").unwrap();
+    let broken_pk = pk_of("broken").unwrap();
+    assert_eq!(store.item_ref(a_pk).unwrap().unwrap().body_state, 0);
+
+    // Успех: тело и вложения сохранены, body_state = 1.
+    let a = store.item_ref(a_pk).unwrap().unwrap();
+    assert_eq!(engine.fetch_body(&a.id, a.folder_pk).await.unwrap(), BodyFetchOutcome::Stored);
+    assert_eq!(store.item_ref(a_pk).unwrap().unwrap().body_state, 1);
+    assert!(store.message_body(a_pk).unwrap().is_some());
+    let atts = store.attachments_of_item(a_pk).unwrap();
+    assert_eq!(atts.iter().find(|x| x.server_id == "att-inline").unwrap().content_id.as_deref(), Some("cid1"));
+
+    // Исчезло на сервере: помечено удалённым.
+    let g = store.item_ref(gone_pk).unwrap().unwrap();
+    assert_eq!(engine.fetch_body(&g.id, g.folder_pk).await.unwrap(), BodyFetchOutcome::Gone);
+    assert!(store.item_ref(gone_pk).unwrap().is_none());
+    assert!(store.list_items(account, inbox_pk, 10).unwrap().iter().all(|r| r.item_id.id != "gone"));
+
+    // Иной отказ: body_state = 2, код и текст сервера в итоге.
+    let b = store.item_ref(broken_pk).unwrap().unwrap();
+    match engine.fetch_body(&b.id, b.folder_pk).await.unwrap() {
+        BodyFetchOutcome::Failed { code, message } => {
+            assert_eq!(code, "ErrorInternalServerError");
+            assert_eq!(message, "сломалось");
+        }
+        other => panic!("ожидался Failed, получено {other:?}"),
+    }
+    assert_eq!(store.item_ref(broken_pk).unwrap().unwrap().body_state, 2);
+    assert_eq!(fake.get_calls.load(Ordering::SeqCst), 3);
+}
+
+/// Отклонённый вход — беда соединения, а не письма: `fetch_body` и этап тел отдают `Err`,
+/// `body_state` остаётся 0, вложения не помечаются, запуск останавливается после первой пачки.
+#[tokio::test]
+async fn auth_failure_is_not_recorded_as_item_failure() {
+    let store = test_store("authdead");
+    let account = store.account("fake", "u").unwrap();
+    let fake = Fake::new();
+    let engine = Engine::new(fake.clone(), store.clone(), account, Arc::new(AtomicBool::new(false)));
+    let meta_only = SyncOptions { folders: FolderSelection::Named(vec!["inbox".into()]), fetch_bodies: false, fetch_attachments: false, ..SyncOptions::default() };
+    engine.run(&meta_only).await.unwrap();
+    let (inbox_pk, _) = store.folder_by_distinguished(account, "inbox").unwrap().unwrap();
+    let a_pk = store.list_items(account, inbox_pk, 10).unwrap().into_iter().find(|r| r.item_id.id == "a").unwrap().item_pk;
+
+    fake.auth_dead.store(true, Ordering::SeqCst);
+    // По требованию: ошибка наверх, в базе ничего не помечено.
+    let a = store.item_ref(a_pk).unwrap().unwrap();
+    let r = engine.fetch_body(&a.id, a.folder_pk).await;
+    assert!(matches!(r, Err(aiowa_sync::SyncError::Transport(TransportError::AuthFailed(_)))), "{r:?}");
+    assert_eq!(store.item_ref(a_pk).unwrap().unwrap().body_state, 0);
+
+    // Этап тел: первая же пачка останавливает запуск, повторных попыток входа пачка за пачкой нет.
+    let calls_before = fake.get_calls.load(Ordering::SeqCst);
+    let with_bodies = SyncOptions { folders: FolderSelection::Named(vec!["inbox".into()]), body_days: Some(30), ..SyncOptions::default() };
+    let r = engine.run(&with_bodies).await;
+    assert!(matches!(r, Err(aiowa_sync::SyncError::Transport(TransportError::AuthFailed(_)))), "{r:?}");
+    assert_eq!(fake.get_calls.load(Ordering::SeqCst), calls_before + 1);
+    assert_eq!(store.count_items_without_bodies(account, inbox_pk, None).unwrap(), 3, "ни одно письмо не помечено отказом");
+
+    // Сессия ожила: то же письмо загружается без следов прошлой ошибки; второе в окне исчезло на сервере.
+    fake.auth_dead.store(false, Ordering::SeqCst);
+    assert_eq!(engine.fetch_body(&a.id, a.folder_pk).await.unwrap(), BodyFetchOutcome::Stored);
+    let gone = store.item_ref(store.list_items(account, inbox_pk, 10).unwrap().into_iter().find(|r| r.item_id.id == "gone").unwrap().item_pk).unwrap().unwrap();
+    assert_eq!(engine.fetch_body(&gone.id, gone.folder_pk).await.unwrap(), BodyFetchOutcome::Gone);
+
+    // Тел в окне больше нет, запуск доходит до вложений: при мёртвой сессии первое же вложение
+    // останавливает запуск, и ни одно не помечено как не скачиваемое.
+    fake.auth_dead.store(true, Ordering::SeqCst);
+    let att_before = fake.attachment_calls.load(Ordering::SeqCst);
+    let r = engine.run(&with_bodies).await;
+    assert!(matches!(r, Err(aiowa_sync::SyncError::Transport(TransportError::AuthFailed(_)))), "{r:?}");
+    assert_eq!(fake.attachment_calls.load(Ordering::SeqCst), att_before + 1);
+    let atts = store.attachments_of_item(a_pk).unwrap();
+    assert!(atts.iter().all(|x| x.text_state != aiowa_store::FETCH_FAILED), "{atts:?}");
 }
 
 #[tokio::test]

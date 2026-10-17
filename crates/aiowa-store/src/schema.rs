@@ -279,11 +279,18 @@ fn scalar_text(ctx: &rusqlite::functions::Context<'_>, f: fn(&str) -> String) ->
 
 /// Регистрирует скалярные функции, которые использует схема (представление индекса,
 /// сравнения без учёта регистра и ё). Вызывать на каждом соединении до миграций.
+/// `zstd_text(blob)` распаковывает сжатое тело письма — для отладочных запросов `aiowa sql`.
 pub fn register_functions(conn: &Connection) -> rusqlite::Result<()> {
     let flags = FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC | FunctionFlags::SQLITE_INNOCUOUS;
     conn.create_scalar_function("fts_norm", 1, flags, |ctx| scalar_text(ctx, text::fts_norm))?;
     conn.create_scalar_function("norm_lower", 1, flags, |ctx| scalar_text(ctx, text::norm_lower))?;
     conn.create_scalar_function("aiowa_topic", 1, flags, |ctx| scalar_text(ctx, text::topic_of))?;
+    conn.create_scalar_function("zstd_text", 1, flags, |ctx| -> rusqlite::Result<Option<String>> {
+        match ctx.get_raw(0) {
+            ValueRef::Blob(b) => Ok(Some(crate::decompress(b).map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?)),
+            _ => Ok(None),
+        }
+    })?;
     Ok(())
 }
 

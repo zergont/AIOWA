@@ -144,10 +144,55 @@ pub struct AttachmentRow {
     pub content_type: Option<String>,
     pub size: Option<i64>,
     pub is_inline: bool,
+    /// `Content-ID` инлайновой картинки, как прислал сервер (без угловых скобок на этом сервере,
+    /// но сопоставлять с `src="cid:…"` надо терпимо к скобкам, регистру и URL-кодированию).
+    pub content_id: Option<String>,
     pub local_path: Option<PathBuf>,
     pub text_state: i64,
     pub text_len: i64,
     pub fetched_at: Option<Timestamp>,
+}
+
+impl AttachmentRow {
+    /// Задание на скачивание этого вложения (для `Engine::fetch_one_attachment`).
+    pub fn todo(&self) -> AttachmentTodo {
+        AttachmentTodo { attachment_pk: self.attachment_pk, item_pk: self.item_pk, server_id: self.server_id.clone(), name: self.name.clone(), content_type: self.content_type.clone(), size: self.size }
+    }
+
+    /// MIME-тип вложения — картинка (`image/*`)?
+    pub fn is_image(&self) -> bool {
+        self.content_type.as_deref().map(|c| c.trim_start().to_ascii_lowercase().starts_with("image/")).unwrap_or(false)
+    }
+}
+
+/// Ссылка на письмо для запроса к серверу: его папка, идентификатор и состояние тела.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ItemRef {
+    pub item_pk: i64,
+    pub folder_pk: i64,
+    pub id: ItemId,
+    /// 0 тела нет, 1 есть, 2 загрузка не удалась.
+    pub body_state: i64,
+}
+
+/// Колонки `attachments` в порядке, который разбирает `attachment_row`.
+const ATTACHMENT_COLUMNS: &str = "attachment_pk, item_pk, server_id, name, content_type, size, is_inline, content_id, local_path, text_state, COALESCE(length(text), 0), fetched_at";
+
+fn attachment_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<AttachmentRow> {
+    Ok(AttachmentRow {
+        attachment_pk: r.get(0)?,
+        item_pk: r.get(1)?,
+        server_id: r.get(2)?,
+        name: r.get(3)?,
+        content_type: r.get(4)?,
+        size: r.get(5)?,
+        is_inline: r.get::<_, i64>(6)? != 0,
+        content_id: r.get(7)?,
+        local_path: r.get::<_, Option<String>>(8)?.map(PathBuf::from),
+        text_state: r.get(9)?,
+        text_len: r.get(10)?,
+        fetched_at: ms_ts(r.get(11)?),
+    })
 }
 
 /// Итог извлечения текста вложения, который записывает синхронизация.
@@ -204,6 +249,23 @@ fn compress(s: &str) -> Result<Vec<u8>> {
 pub fn decompress(b: &[u8]) -> Result<String> {
     let bytes = zstd::decode_all(b).map_err(|e| StoreError::Compression(e.to_string()))?;
     String::from_utf8(bytes).map_err(|e| StoreError::Compression(e.to_string()))
+}
+
+/// Ставит на файл метку «получен из интернета» (поток `Zone.Identifier`, зона 3 — как делают
+/// браузеры и Outlook): SmartScreen предупредит о запуске исполняемого вложения, Office откроет
+/// документ в защищённом просмотре. Только Windows и только NTFS; в остальных случаях — нет операции.
+/// Ошибка не фатальна: файл уже записан, вызывающий лишь пишет предупреждение в журнал.
+pub fn mark_from_internet(path: &Path) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        let stream = format!("{}:Zone.Identifier", path.display());
+        std::fs::write(stream, b"[ZoneTransfer]\r\nZoneId=3\r\n")
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        Ok(())
+    }
 }
 
 /// Имя файла для кэша: без символов, запрещённых в Windows, и не длиннее 120 символов.
@@ -675,6 +737,10 @@ impl Store {
         let name = safe_file_name(todo.name.as_deref().unwrap_or("attachment"));
         let path = self.attachments_dir.join(format!("{}-{}", todo.attachment_pk, name));
         std::fs::write(&path, bytes)?;
+        // Файл пришёл из письма: метка зоны «Интернет», чтобы система предупреждала при открытии.
+        if let Err(e) = mark_from_internet(&path) {
+            warn!(attachment_pk = todo.attachment_pk, error = %e, "не удалось поставить метку Zone.Identifier на файл кэша");
+        }
         let sha: Vec<u8> = Sha256::digest(bytes).to_vec();
         let (text_value, text_state, err) = match text {
             AttachmentText::Extracted(t) => (Some(t), TEXT_OK, None),
@@ -710,26 +776,43 @@ impl Store {
 
     pub fn attachments_of_item(&self, item_pk: i64) -> Result<Vec<AttachmentRow>> {
         self.with_conn(|c| {
-            let mut st = c.prepare_cached(
-                "SELECT attachment_pk, item_pk, server_id, name, content_type, size, is_inline, local_path, text_state, COALESCE(length(text), 0), fetched_at
-                 FROM attachments WHERE item_pk = ?1 ORDER BY attachment_pk",
-            )?;
-            let rows = st.query_map(params![item_pk], |r| {
-                Ok(AttachmentRow {
-                    attachment_pk: r.get(0)?,
-                    item_pk: r.get(1)?,
-                    server_id: r.get(2)?,
-                    name: r.get(3)?,
-                    content_type: r.get(4)?,
-                    size: r.get(5)?,
-                    is_inline: r.get::<_, i64>(6)? != 0,
-                    local_path: r.get::<_, Option<String>>(7)?.map(PathBuf::from),
-                    text_state: r.get(8)?,
-                    text_len: r.get(9)?,
-                    fetched_at: ms_ts(r.get(10)?),
-                })
-            })?;
+            let mut st = c.prepare_cached(&format!("SELECT {ATTACHMENT_COLUMNS} FROM attachments WHERE item_pk = ?1 ORDER BY attachment_pk"))?;
+            let rows = st.query_map(params![item_pk], attachment_row)?;
             Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+        })
+    }
+
+    /// Одно вложение по ключу.
+    pub fn attachment(&self, attachment_pk: i64) -> Result<Option<AttachmentRow>> {
+        self.with_conn(|c| {
+            let mut st = c.prepare_cached(&format!("SELECT {ATTACHMENT_COLUMNS} FROM attachments WHERE attachment_pk = ?1"))?;
+            Ok(st.query_row(params![attachment_pk], attachment_row).optional()?)
+        })
+    }
+
+    /// Отмечает обращение к файлу кэша (для вытеснения по давности).
+    pub fn touch_attachment(&self, attachment_pk: i64) -> Result<()> {
+        self.with_conn(|c| {
+            c.execute("UPDATE attachments SET last_access_at = ?2 WHERE attachment_pk = ?1", params![attachment_pk, now_ms()])?;
+            Ok(())
+        })
+    }
+
+    /// Забывает путь к файлу кэша (файл исчез с диска помимо вытеснения); текст и хэш остаются.
+    pub fn forget_attachment_file(&self, attachment_pk: i64) -> Result<()> {
+        self.with_conn(|c| {
+            c.execute("UPDATE attachments SET local_path = NULL WHERE attachment_pk = ?1", params![attachment_pk])?;
+            Ok(())
+        })
+    }
+
+    /// Ссылка на не удалённое письмо для запроса к серверу.
+    pub fn item_ref(&self, item_pk: i64) -> Result<Option<ItemRef>> {
+        self.with_conn(|c| {
+            Ok(c.query_row("SELECT server_id, change_key, folder_pk, body_state FROM items WHERE item_pk = ?1 AND deleted = 0", params![item_pk], |r| {
+                Ok(ItemRef { item_pk, folder_pk: r.get(2)?, id: ItemId { id: r.get(0)?, change_key: r.get(1)? }, body_state: r.get(3)? })
+            })
+            .optional()?)
         })
     }
 
@@ -1528,6 +1611,85 @@ mod tests {
         s.store_full_messages(acc, fpk, &[msg2]).unwrap();
         assert_eq!(s.attachments_of_item(a1.item_pk).unwrap().len(), 1);
         assert!(s.search(acc, "шлепанц", 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn on_demand_lookups() {
+        let s = tmp_store("ondemand");
+        let acc = s.account("h", "u").unwrap();
+        s.upsert_folders(acc, &[folder("Входящие", Some("inbox"))]).unwrap();
+        let (fpk, _) = s.folder_by_distinguished(acc, "inbox").unwrap().unwrap();
+        s.apply_item_changes(acc, fpk, &[ItemChange::Create(meta("A", "С картинкой")), ItemChange::Create(meta("B", "Без тела"))]).unwrap();
+
+        // Ссылка на письмо: папка, идентификатор, состояние тела; удалённое письмо не видно.
+        let rows = s.list_items(acc, fpk, 10).unwrap();
+        let a_pk = rows.iter().find(|r| r.item_id.id == "A").unwrap().item_pk;
+        let b_pk = rows.iter().find(|r| r.item_id.id == "B").unwrap().item_pk;
+        let r = s.item_ref(a_pk).unwrap().unwrap();
+        assert_eq!((r.item_pk, r.folder_pk, r.id.id.as_str(), r.id.change_key.as_deref(), r.body_state), (a_pk, fpk, "A", Some("c"), 0));
+        assert!(s.item_ref(999_999).unwrap().is_none());
+        s.mark_items_deleted(acc, &[ItemId { id: "B".into(), change_key: None }]).unwrap();
+        assert!(s.item_ref(b_pk).unwrap().is_none(), "удалённое письмо не возвращается");
+        s.mark_body_failed(acc, &[ItemId { id: "A".into(), change_key: None }]).unwrap();
+        assert_eq!(s.item_ref(a_pk).unwrap().unwrap().body_state, 2);
+
+        // Вложения с Content-ID; одно по ключу; задание на скачивание.
+        let inline = AttachmentMeta { id: "img1".into(), name: Some("image001.png".into()), content_type: Some("image/png".into()), size: Some(10), is_inline: true, content_id: Some("image001.png@01DD5D86.89427E20".into()) };
+        let file = AttachmentMeta { id: "f1".into(), name: Some("отчёт.pdf".into()), content_type: Some("application/pdf".into()), size: Some(100), is_inline: false, content_id: None };
+        s.store_full_messages(acc, fpk, &[full(meta("A", "С картинкой"), "<p>см. <img src=\"cid:image001.png@01DD5D86.89427E20\"></p>", vec![inline, file])]).unwrap();
+        assert_eq!(s.item_ref(a_pk).unwrap().unwrap().body_state, 1);
+        let atts = s.attachments_of_item(a_pk).unwrap();
+        let img = atts.iter().find(|a| a.server_id == "img1").unwrap();
+        assert_eq!(img.content_id.as_deref(), Some("image001.png@01DD5D86.89427E20"));
+        assert!(img.is_inline && img.is_image());
+        let pdf = atts.iter().find(|a| a.server_id == "f1").unwrap();
+        assert!(pdf.content_id.is_none() && !pdf.is_image());
+        let one = s.attachment(pdf.attachment_pk).unwrap().unwrap();
+        assert_eq!((one.attachment_pk, one.item_pk, one.server_id.as_str(), one.name.as_deref()), (pdf.attachment_pk, a_pk, "f1", Some("отчёт.pdf")));
+        assert!(s.attachment(999_999).unwrap().is_none());
+        let todo = one.todo();
+        assert_eq!(todo, AttachmentTodo { attachment_pk: pdf.attachment_pk, item_pk: a_pk, server_id: "f1".into(), name: Some("отчёт.pdf".into()), content_type: Some("application/pdf".into()), size: Some(100) });
+
+        // Скачали картинку: путь есть; обращение сдвигает last_access_at; забыть файл — путь пропал, текст и состояние остались.
+        let path = s.save_attachment(&img.todo(), b"\x89PNG", Some("image/png"), AttachmentText::Unsupported).unwrap();
+        let before: i64 = s.debug_query(&format!("SELECT last_access_at FROM attachments WHERE attachment_pk = {}", img.attachment_pk)).unwrap()[1].parse().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(3));
+        s.touch_attachment(img.attachment_pk).unwrap();
+        let after: i64 = s.debug_query(&format!("SELECT last_access_at FROM attachments WHERE attachment_pk = {}", img.attachment_pk)).unwrap()[1].parse().unwrap();
+        assert!(after > before, "{after} > {before}");
+        let cached = s.attachment(img.attachment_pk).unwrap().unwrap();
+        assert_eq!(cached.local_path.as_deref(), Some(path.as_path()));
+        assert_eq!(cached.text_state, TEXT_UNSUPPORTED);
+        s.forget_attachment_file(img.attachment_pk).unwrap();
+        let forgotten = s.attachment(img.attachment_pk).unwrap().unwrap();
+        assert!(forgotten.local_path.is_none() && forgotten.fetched_at.is_some() && forgotten.text_state == TEXT_UNSUPPORTED);
+
+        // Отладочная функция распаковки тела.
+        let lines = s.debug_query(&format!("SELECT instr(zstd_text(unique_body), 'cid:') > 0 FROM bodies WHERE item_pk = {a_pk}")).unwrap();
+        assert_eq!(lines[1], "1");
+
+        // Ключи беседы: только живые письма, порядок как у conversation_messages, cached по базе.
+        let conv_pk = s.list_conversations(acc, fpk, 10).unwrap()[0].conversation_pk;
+        let keys = s.conversation_keys(acc, conv_pk).unwrap();
+        assert_eq!(keys, vec![crate::ui::MessageKey { item_pk: a_pk, body_state: 1, is_read: false, cached: 0 }], "{keys:?}");
+        s.save_attachment(&img.todo(), b"\x89PNG", Some("image/png"), AttachmentText::Unsupported).unwrap();
+        assert_eq!(s.conversation_keys(acc, conv_pk).unwrap()[0].cached, 1);
+        let heads = s.conversation_messages(acc, conv_pk).unwrap();
+        assert_eq!(heads.iter().map(|h| h.item_pk).collect::<Vec<_>>(), vec![a_pk]);
+    }
+
+    #[test]
+    fn attachment_file_gets_internet_zone_mark() {
+        let dir = std::env::temp_dir().join(format!("aiowa-store-test-motw-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("файл.txt");
+        std::fs::write(&path, b"x").unwrap();
+        mark_from_internet(&path).unwrap();
+        // Содержимое файла не меняется; на Windows/NTFS появляется поток Zone.Identifier.
+        assert_eq!(std::fs::read(&path).unwrap(), b"x");
+        #[cfg(windows)]
+        assert!(std::fs::read_to_string(format!("{}:Zone.Identifier", path.display())).unwrap().contains("ZoneId=3"));
     }
 
     #[test]

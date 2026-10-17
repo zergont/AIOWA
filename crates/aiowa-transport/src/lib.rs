@@ -47,9 +47,19 @@ pub enum TransportError {
 
 impl TransportError {
     /// Стоит ли повторить ту же операцию позже без вмешательства человека.
+    /// Ответы шлюза 502/503/504 — временная недоступность, а не отказ по элементу.
     pub fn is_retryable(&self) -> bool {
         matches!(self, Self::Throttled { .. } | Self::Network(_) | Self::SessionLimit)
+            || matches!(self, Self::Protocol { status: 502..=504, .. })
             || matches!(self, Self::Server { code, .. } if code == "ErrorServerBusy" || code == "ErrorTimeoutExpired" || code == "ErrorMailboxStoreUnavailable")
+    }
+
+    /// Отказ сервера по конкретной операции (`ResponseClass: Error` без признака временности):
+    /// именно такие ошибки можно записывать в базу как отказ по письму или вложению. Истёкшая
+    /// сессия, отклонённый вход, сеть и исчерпанные повторы сюда не относятся — они про
+    /// соединение в целом, и помечать по ним элементы нельзя.
+    pub fn is_item_failure(&self) -> bool {
+        matches!(self, Self::Server { .. }) && !self.is_retryable()
     }
 
     /// Нужен ли повторный вход перед следующей попыткой.
@@ -178,6 +188,18 @@ mod tests {
         assert!(TransportError::Server { code: "ErrorInvalidSyncStateData".into(), message: String::new() }.invalidates_sync_state());
         assert!(!TransportError::Cancelled.is_retryable());
         assert!(!TransportError::TooLarge { limit: 1 }.is_retryable());
+        assert!(TransportError::Protocol { op: "GetItem".into(), status: 503, raw: String::new() }.is_retryable());
+        assert!(!TransportError::Protocol { op: "GetItem".into(), status: 500, raw: String::new() }.is_retryable());
+    }
+
+    #[test]
+    fn item_failure_is_only_final_server_error() {
+        assert!(TransportError::Server { code: "ErrorInternalServerError".into(), message: String::new() }.is_item_failure());
+        assert!(!TransportError::Server { code: "ErrorServerBusy".into(), message: String::new() }.is_item_failure(), "временный код сервера — не отказ по элементу");
+        assert!(!TransportError::AuthFailed("x".into()).is_item_failure());
+        assert!(!TransportError::SessionExpired.is_item_failure());
+        assert!(!TransportError::Protocol { op: "GetItem".into(), status: 500, raw: String::new() }.is_item_failure());
+        assert!(!TransportError::Cancelled.is_item_failure());
     }
 
     #[test]

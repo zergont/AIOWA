@@ -7,7 +7,7 @@
 use aiowa_core::AccountId;
 use aiowa_store::Store;
 use aiowa_sync::{Engine, FolderSelection, SyncEvent, SyncOptions, SyncReport, SyncStage};
-use aiowa_transport::{Credentials, MailTransport};
+use aiowa_transport::{Credentials, MailTransport, TransportError};
 use aiowa_transport_owa::{OwaConfig, OwaTransport};
 use secrecy::SecretString;
 use serde::Serialize;
@@ -115,6 +115,11 @@ struct Inner {
 
 pub struct SyncState {
     inner: Mutex<Inner>,
+    /// Фаза входа на сервер: один вход за раз, остальные ждут и берут готовый транспорт.
+    /// Иначе синхронизация и команда «по требованию» войдут одновременно и займут две сессии.
+    connect_lock: tokio::sync::Mutex<()>,
+    /// Приложение закрывается: транспорт отдан на logoff, новых входов не делать.
+    closing: AtomicBool,
     store: Arc<Store>,
     account: AccountId,
     host: String,
@@ -133,11 +138,34 @@ fn load_password(user: &str) -> Result<SecretString, String> {
     Ok(SecretString::from(pw))
 }
 
+/// Почему транспорт процесса не получен. `Display` даёт текст для пользователя.
+#[derive(Debug)]
+pub(crate) enum ConnectError {
+    /// В диспетчере учётных данных нет пароля (подробность уже в журнале).
+    NoPassword,
+    /// Приложение закрывается.
+    Closing,
+    /// Вход на сервер не удался.
+    Connect(TransportError),
+}
+
+impl std::fmt::Display for ConnectError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ConnectError::NoPassword => f.write_str("Нет сохранённого пароля: выполните aiowa set-password"),
+            ConnectError::Closing => f.write_str("Приложение закрывается"),
+            // Текст про отклонённый вход уже начинается со слова «Вход»; остальным нужен контекст.
+            ConnectError::Connect(e @ TransportError::AuthFailed(_)) => f.write_str(&crate::ondemand::describe_transport(e)),
+            ConnectError::Connect(e) => write!(f, "Вход не удался: {}", crate::ondemand::describe_transport(e)),
+        }
+    }
+}
+
 impl SyncState {
     pub fn new(store: Arc<Store>, account: AccountId, host: String, user: String) -> Self {
         let last_ok_ms = store.get_state(account, LAST_OK_KEY).ok().flatten().and_then(|v| v.parse::<i64>().ok());
         let status = SyncStatusDto { last_ok_ms, ..SyncStatusDto::default() };
-        Self { inner: Mutex::new(Inner { status, ..Inner::default() }), store, account, host, user }
+        Self { inner: Mutex::new(Inner { status, ..Inner::default() }), connect_lock: tokio::sync::Mutex::new(()), closing: AtomicBool::new(false), store, account, host, user }
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
@@ -218,23 +246,53 @@ impl SyncState {
         self.status()
     }
 
-    /// Транспорт процесса: вход при первом обращении, дальше та же сессия.
-    async fn transport(&self) -> Result<OwaTransport, String> {
+    /// Транспорт процесса: вход при первом обращении, дальше та же сессия. Вход защищён
+    /// замком: параллельные вызывающие (синхронизация и команды окна) ждут один вход.
+    pub(crate) async fn transport(&self) -> Result<OwaTransport, ConnectError> {
         if let Some(t) = self.lock().transport.clone() {
             return Ok(t);
         }
-        let password = load_password(&self.user)?;
+        let _connecting = self.connect_lock.lock().await;
+        if self.closing.load(Ordering::SeqCst) {
+            return Err(ConnectError::Closing);
+        }
+        // Пока ждали замок, кто-то мог уже войти.
+        if let Some(t) = self.lock().transport.clone() {
+            return Ok(t);
+        }
+        let password = load_password(&self.user).map_err(|detail| {
+            warn!(error = %detail, "пароль не найден");
+            ConnectError::NoPassword
+        })?;
         let creds = Credentials { host: self.host.clone(), user: self.user.clone(), password };
-        let t = OwaTransport::connect(creds, OwaConfig::default()).await.map_err(|e| format!("вход не удался: {e}"))?;
-        let mut g = self.lock();
-        // Параллельный вход невозможен: синхронизация одна, а это единственный вызывающий.
-        g.transport = Some(t.clone());
+        let t = OwaTransport::connect(creds, OwaConfig::default()).await.map_err(ConnectError::Connect)?;
+        // Пока шёл вход, приложение могли начать закрывать: такую сессию не сохраняем, а сразу
+        // завершаем, иначе её никто не разлогинит. (Окно между проверкой и записью закрывает
+        // `shutdown`: он ждёт замок входа и забирает транспорт ещё раз.)
+        if self.closing.load(Ordering::SeqCst) {
+            let _ = tokio::time::timeout(LOGOFF_TIMEOUT, t.logoff()).await;
+            return Err(ConnectError::Closing);
+        }
+        self.lock().transport = Some(t.clone());
         Ok(t)
+    }
+
+    /// Сбрасывает транспорт процесса, если ошибка означает мёртвую сессию: истёкшая сессия, которую
+    /// транспорт не смог восстановить повторным входом, отказ CSRF или отклонённый вход. Следующее
+    /// обращение войдёт заново. Прочие ошибки транспорт не трогают.
+    pub(crate) async fn invalidate_on(&self, e: &TransportError) {
+        if !(e.needs_reauth() || matches!(e, TransportError::AuthFailed(_))) {
+            return;
+        }
+        let old = self.lock().transport.take();
+        if let Some(t) = old {
+            warn!(error = %e, "сессия OWA непригодна, транспорт сброшен");
+            let _ = tokio::time::timeout(LOGOFF_TIMEOUT, t.logoff()).await;
+        }
     }
 
     async fn run(self: Arc<Self>, app: AppHandle, days: Option<u32>, cancel: Arc<AtomicBool>) {
         let outcome = self.run_inner(&app, days, cancel).await;
-        let mut dropped_transport = false;
         match &outcome {
             Ok(report) => {
                 let ms = now_ms();
@@ -244,16 +302,11 @@ impl SyncState {
                 info!(elapsed_s = report.elapsed.as_secs_f32(), created = report.items_created, updated = report.items_updated, bodies = report.bodies_fetched, attachments = report.attachments_fetched, "синхронизация из окна завершена");
             }
             Err(Outcome::Cancelled) => info!("синхронизация остановлена пользователем"),
-            Err(Outcome::Failed { message, drop_transport }) => {
+            Err(Outcome::Failed { message, cause }) => {
                 warn!(error = %message, "синхронизация из окна прервана");
-                dropped_transport = *drop_transport;
-            }
-        }
-        if dropped_transport {
-            // Сессия мертва (вход отклонён, повторный вход не помог): следующий запуск войдёт заново.
-            let old = self.lock().transport.take();
-            if let Some(t) = old {
-                let _ = tokio::time::timeout(LOGOFF_TIMEOUT, t.logoff()).await;
+                if let Some(e) = cause {
+                    self.invalidate_on(e).await;
+                }
             }
         }
         let finished_ms = now_ms();
@@ -280,7 +333,7 @@ impl SyncState {
     }
 
     async fn run_inner(self: &Arc<Self>, app: &AppHandle, days: Option<u32>, cancel: Arc<AtomicBool>) -> Result<SyncReport, Outcome> {
-        let transport = self.transport().await.map_err(|message| Outcome::Failed { message, drop_transport: false })?;
+        let transport = self.transport().await.map_err(|e| Outcome::Failed { message: e.to_string(), cause: None })?;
         if cancel.load(Ordering::Relaxed) {
             return Err(Outcome::Cancelled);
         }
@@ -302,11 +355,8 @@ impl SyncState {
         match engine.run(&opts).await {
             Ok(r) => Ok(r),
             Err(aiowa_sync::SyncError::Cancelled) => Err(Outcome::Cancelled),
-            Err(aiowa_sync::SyncError::Transport(e)) => {
-                let drop_transport = e.needs_reauth() || matches!(e, aiowa_transport::TransportError::AuthFailed(_));
-                Err(Outcome::Failed { message: e.to_string(), drop_transport })
-            }
-            Err(e) => Err(Outcome::Failed { message: e.to_string(), drop_transport: false }),
+            Err(aiowa_sync::SyncError::Transport(e)) => Err(Outcome::Failed { message: e.to_string(), cause: Some(e) }),
+            Err(e) => Err(Outcome::Failed { message: e.to_string(), cause: None }),
         }
     }
 
@@ -360,9 +410,10 @@ impl SyncState {
     /// При выходе: остановить синхронизацию, дождаться конца пачки и выйти из сессии на сервере,
     /// чтобы на нём не копились сессии. Вызывается с главного потока, поэтому блокирует.
     pub fn shutdown(&self) {
-        let (cancel, task, transport) = {
+        self.closing.store(true, Ordering::SeqCst);
+        let (cancel, task) = {
             let mut g = self.lock();
-            (g.cancel.take(), g.task.take(), g.transport.take())
+            (g.cancel.take(), g.task.take())
         };
         if let Some(c) = cancel {
             c.store(true, Ordering::Relaxed);
@@ -373,6 +424,16 @@ impl SyncState {
                     warn!("синхронизация не остановилась за {} с, выхожу из сессии без ожидания", EXIT_GRACE.as_secs());
                 }
             }
+            // Вход, начатый до закрытия (синхронизацией или командой окна), мог ещё идти: ждём замок
+            // входа, чтобы забрать и его сессию. Новых входов не будет — `closing` уже выставлен.
+            let _connecting = match tokio::time::timeout(LOGOFF_TIMEOUT, self.connect_lock.lock()).await {
+                Ok(guard) => Some(guard),
+                Err(_) => {
+                    warn!("вход на сервер не завершился за {} с, выхожу из того, что есть", LOGOFF_TIMEOUT.as_secs());
+                    None
+                }
+            };
+            let transport = self.lock().transport.take();
             if let Some(t) = transport {
                 match tokio::time::timeout(LOGOFF_TIMEOUT, t.logoff()).await {
                     Ok(Ok(())) => info!("выход из сессии OWA выполнен"),
@@ -386,7 +447,8 @@ impl SyncState {
 
 enum Outcome {
     Cancelled,
-    Failed { message: String, drop_transport: bool },
+    /// `cause` — ошибка транспорта, по которой `invalidate_on` решает, сбрасывать ли сессию.
+    Failed { message: String, cause: Option<TransportError> },
 }
 
 // --- команды Tauri -----------------------------------------------------------
