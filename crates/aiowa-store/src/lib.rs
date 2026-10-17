@@ -10,6 +10,7 @@
 pub mod query;
 pub mod schema;
 pub mod text;
+pub mod ui;
 
 use aiowa_core::{AccountId, Folder, FolderChange, FolderId, ItemChange, ItemId, MessageFull, MessageMeta, SyncState};
 use jiff::Timestamp;
@@ -82,6 +83,8 @@ pub struct SearchHit {
     pub snippet: String,
     /// Имя файла, если совпадение найдено в тексте вложения, а не в письме.
     pub attachment_name: Option<String>,
+    /// Беседа письма; нужна интерфейсу, чтобы открыть результат в области чтения.
+    pub conversation_pk: Option<i64>,
 }
 
 /// Сводка по папке для `stats`.
@@ -809,7 +812,7 @@ impl Store {
             sql.push_str(
                 "SELECT i.item_pk, bm25(items_fts, 8.0, 4.0, 2.0, 1.0, 1.0, 0.5) AS rank,
                         i.subject, i.from_name, i.from_email, i.received_at, f.display_name,
-                        snippet(items_fts, 4, ?1, ?2, '…', 14), snippet(items_fts, 5, ?1, ?2, '…', 14)
+                        snippet(items_fts, 4, ?1, ?2, '…', 14), snippet(items_fts, 5, ?1, ?2, '…', 14), i.conversation_pk
                  FROM items_fts JOIN items i ON i.item_pk = items_fts.rowid
                  LEFT JOIN folders f ON f.folder_pk = i.folder_pk
                  WHERE items_fts MATCH ?3 AND i.account_id = ?4 AND i.deleted = 0",
@@ -821,7 +824,7 @@ impl Store {
         } else {
             sql.push_str(
                 "SELECT i.item_pk, 0.0 AS rank, i.subject, i.from_name, i.from_email, i.received_at, f.display_name,
-                        COALESCE(i.preview, ''), ''
+                        COALESCE(i.preview, ''), '', i.conversation_pk
                  FROM items i LEFT JOIN folders f ON f.folder_pk = i.folder_pk
                  WHERE i.account_id = ?1 AND i.deleted = 0",
             );
@@ -863,11 +866,12 @@ impl Store {
                     r.get::<_, Option<String>>(6)?,
                     r.get::<_, String>(7)?,
                     r.get::<_, String>(8)?,
+                    r.get::<_, Option<i64>>(9)?,
                 ))
             })?;
             let raw = rows.collect::<std::result::Result<Vec<_>, _>>()?;
             let mut hits = Vec::with_capacity(raw.len());
-            for (item_pk, rank, subject, from_name, from_email, received_at, folder_name, body_snip, att_snip) in raw {
+            for (item_pk, rank, subject, from_name, from_email, received_at, folder_name, body_snip, att_snip, conversation_pk) in raw {
                 let body_hit = body_snip.contains(MARK_OPEN);
                 let att_hit = att_snip.contains(MARK_OPEN);
                 let (snippet, attachment_name) = if att_hit && !body_hit {
@@ -877,7 +881,7 @@ impl Store {
                     (body_snip, None)
                 };
                 let snippet = snippet.replace(MARK_OPEN, "[").replace(MARK_CLOSE, "]");
-                hits.push(SearchHit { item_pk, rank, subject, from_name, from_email, received_at: ms_ts(received_at), folder_name, snippet, attachment_name });
+                hits.push(SearchHit { item_pk, rank, subject, from_name, from_email, received_at: ms_ts(received_at), folder_name, snippet, attachment_name, conversation_pk });
             }
             Ok(hits)
         })

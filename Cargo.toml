@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/*"]
+members = ["crates/*", "apps/desktop/src-tauri"]
 # Спайк живёт отдельно: у него свой Cargo.lock и свои каталоги сборки.
 exclude = ["spike/owa-probe"]
 
@@ -51,6 +51,11 @@ zip = { version = "9", default-features = false, features = ["deflate"] }
 quick-xml = "0.42"
 encoding_rs = "0.8"
 base64 = "0.23"
+
+# интерфейс
+tauri = { version = "2.12", features = [] }
+tauri-build = { version = "2.7", features = [] }
+ammonia = "4"
 
 # CLI
 clap = { version = "4", features = ["derive", "env"] }

@@ -1,0 +1,145 @@
+/* AIOWA: токены дизайна. Ориентир Fluent 2 под Windows 11: сдержанно, плотно, без лишнего цвета.
+   Цвета только через токены, размеры по сетке 4 px, движение 100–200 мс только на смену состояния. */
+
+:root {
+  color-scheme: light dark;
+
+  /* типографика */
+  --font-ui: "Segoe UI Variable Text", "Segoe UI Variable", "Segoe UI", Inter, "Golos Text", system-ui, sans-serif;
+  --font-display: "Segoe UI Variable Display", "Segoe UI Variable", "Segoe UI", Inter, system-ui, sans-serif;
+  --font-mono: Cascadia Code, Consolas, "JetBrains Mono", monospace;
+  --text-caption: 12px/16px var(--font-ui);
+  --text-body: 14px/20px var(--font-ui);
+  --text-body-strong: 600 14px/20px var(--font-ui);
+  --text-body-large: 18px/24px var(--font-ui);
+  --text-subtitle: 600 20px/28px var(--font-display);
+  --text-title: 600 28px/36px var(--font-display);
+
+  /* сетка и радиусы */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 20px;
+  --space-6: 24px;
+  --radius-control: 4px;
+  --radius-card: 8px;
+  --control-height: 32px;
+  --row-cozy: 56px;
+  --row-compact: 36px;
+  --nav-width: 240px;
+  --list-width: 380px;
+  --list-min: 280px;
+  --list-max: 520px;
+  --read-min: 520px;
+
+  /* движение */
+  --dur-fast: 100ms;
+  --dur-normal: 150ms;
+  --dur-slow: 200ms;
+  --ease-in: cubic-bezier(0.1, 0.9, 0.2, 1);
+  --ease-out: cubic-bezier(0.9, 0.1, 1, 0.2);
+
+  /* светлая тема: поверхности Fluent (Mica-база под навигацией, слой под контентом) */
+  --bg-base: #f3f3f3;
+  --bg-layer: #f9f9f9;
+  --bg-layer-alt: #ffffff;
+  --bg-card: #ffffff;
+  --bg-hover: rgba(0, 0, 0, 0.04);
+  --bg-pressed: rgba(0, 0, 0, 0.07);
+  --bg-selected: rgba(0, 0, 0, 0.06);
+  --bg-reader-paper: #ffffff;
+  --fg-1: #242424;
+  --fg-2: #424242;
+  --fg-3: #616161;
+  --fg-4: #8a8a8a;
+  --fg-disabled: #bdbdbd;
+  --fg-on-accent: #ffffff;
+  --stroke-1: rgba(0, 0, 0, 0.0803);
+  --stroke-2: rgba(0, 0, 0, 0.1622);
+  --stroke-focus: #242424;
+  --accent: #005fb8;
+  --accent-hover: #1a6fc2;
+  --accent-pressed: #004d94;
+  --accent-soft: rgba(0, 95, 184, 0.1);
+  --unread: #005fb8;
+  --danger: #c42b1c;
+  --warning: #9d5d00;
+  --success: #0f7b0f;
+  --shadow-2: 0 1px 2px rgba(0, 0, 0, 0.14), 0 0 2px rgba(0, 0, 0, 0.12);
+  --shadow-8: 0 4px 8px rgba(0, 0, 0, 0.14), 0 0 2px rgba(0, 0, 0, 0.12);
+  --shadow-16: 0 8px 16px rgba(0, 0, 0, 0.14), 0 0 2px rgba(0, 0, 0, 0.12);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg-base: #202020;
+    --bg-layer: #282828;
+    --bg-layer-alt: #2c2c2c;
+    --bg-card: #2b2b2b;
+    --bg-hover: rgba(255, 255, 255, 0.06);
+    --bg-pressed: rgba(255, 255, 255, 0.03);
+    --bg-selected: rgba(255, 255, 255, 0.08);
+    --bg-reader-paper: #ffffff;
+    --fg-1: #ffffff;
+    --fg-2: #d6d6d6;
+    --fg-3: #adadad;
+    --fg-4: #8a8a8a;
+    --fg-disabled: #5c5c5c;
+    --fg-on-accent: #000000;
+    --stroke-1: rgba(255, 255, 255, 0.0837);
+    --stroke-2: rgba(255, 255, 255, 0.1605);
+    --stroke-focus: #ffffff;
+    --accent: #60cdff;
+    --accent-hover: #7bd6ff;
+    --accent-pressed: #4cc2ff;
+    --accent-soft: rgba(96, 205, 255, 0.14);
+    --unread: #60cdff;
+    --danger: #ff99a4;
+    --warning: #fce100;
+    --success: #6ccb5f;
+    --shadow-2: 0 1px 2px rgba(0, 0, 0, 0.5), 0 0 2px rgba(0, 0, 0, 0.3);
+    --shadow-8: 0 4px 8px rgba(0, 0, 0, 0.5), 0 0 2px rgba(0, 0, 0, 0.3);
+    --shadow-16: 0 8px 16px rgba(0, 0, 0, 0.5), 0 0 2px rgba(0, 0, 0, 0.3);
+  }
+}
+
+:root[data-theme="dark"] {
+  --bg-base: #202020;
+  --bg-layer: #282828;
+  --bg-layer-alt: #2c2c2c;
+  --bg-card: #2b2b2b;
+  --bg-hover: rgba(255, 255, 255, 0.06);
+  --bg-pressed: rgba(255, 255, 255, 0.03);
+  --bg-selected: rgba(255, 255, 255, 0.08);
+  --fg-1: #ffffff;
+  --fg-2: #d6d6d6;
+  --fg-3: #adadad;
+  --fg-4: #8a8a8a;
+  --fg-disabled: #5c5c5c;
+  --fg-on-accent: #000000;
+  --stroke-1: rgba(255, 255, 255, 0.0837);
+  --stroke-2: rgba(255, 255, 255, 0.1605);
+  --stroke-focus: #ffffff;
+  --accent: #60cdff;
+  --accent-hover: #7bd6ff;
+  --accent-pressed: #4cc2ff;
+  --accent-soft: rgba(96, 205, 255, 0.14);
+  --unread: #60cdff;
+}
+
+@media (forced-colors: active) {
+  :root {
+    --shadow-2: none;
+    --shadow-8: none;
+    --shadow-16: none;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --dur-fast: 0ms;
+    --dur-normal: 0ms;
+    --dur-slow: 0ms;
+  }
+}
