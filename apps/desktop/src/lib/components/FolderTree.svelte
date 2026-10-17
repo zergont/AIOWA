@@ -109,7 +109,7 @@
 
 <div class="tree" role="tree" aria-label="Папки почты">
   {#if folders.length === 0}
-    <p class="caption empty">Папок ещё нет. Выполни <code>aiowa sync</code>.</p>
+    <p class="caption empty">Папок ещё нет: они появятся после первой синхронизации (кнопка «Обновить» внизу).</p>
   {:else}
     {#each tree as n (n.folder.folder_pk)}
       {@render node(n, 0)}
@@ -200,9 +200,5 @@
   .note {
     padding: var(--space-3) var(--space-2);
     margin: 0;
-  }
-  code {
-    font-family: var(--font-mono);
-    font-size: 12px;
   }
 </style>

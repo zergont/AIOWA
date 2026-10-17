@@ -1,5 +1,5 @@
-//! AIOWA desktop: команды Tauri поверх локальной базы. Только чтение: синхронизацию
-//! делает `aiowa sync`, интерфейс показывает то, что уже лежит в SQLite.
+//! AIOWA desktop: команды Tauri поверх локальной базы. Чтение из SQLite, синхронизация
+//! с сервером по кнопке и по таймеру (`sync.rs`): один транспорт OWA на процесс, logoff при выходе.
 //!
 //! HTML писем очищается ammonia на стороне Rust и показывается во фрейме с sandbox и CSP;
 //! удалённые картинки и внешние ресурсы не загружаются.
@@ -13,6 +13,8 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tauri::State;
+
+mod sync;
 
 struct AppState {
     store: Arc<Store>,
@@ -260,15 +262,24 @@ pub fn run() {
     let host = std::env::var("AIOWA_HOST").unwrap_or_default();
     let user = std::env::var("AIOWA_USER").unwrap_or_default();
     let db_path = std::env::var_os("AIOWA_DB").map(PathBuf::from).unwrap_or_else(|| default_db_path(&host, &user));
-    let store = Store::open(&db_path).expect("не удалось открыть локальную базу");
+    let store = Arc::new(Store::open(&db_path).expect("не удалось открыть локальную базу"));
     let account = store.account(&host, &user).expect("учётная запись");
-    let state = AppState { store: Arc::new(store), account, host, user };
+    let sync_state = Arc::new(sync::SyncState::new(store.clone(), account, host.clone(), user.clone()));
+    let state = AppState { store, account, host, user };
 
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .manage(state)
-        .invoke_handler(tauri::generate_handler![account_info, folders, conversations, conversation, search])
-        .run(tauri::generate_context!())
+        .manage(sync_state.clone())
+        .invoke_handler(tauri::generate_handler![account_info, folders, conversations, conversation, search, sync::sync_start, sync::sync_status, sync::sync_cancel])
+        .build(tauri::generate_context!())
         .expect("ошибка запуска приложения");
+    app.run(move |_app, event| {
+        // Сессия на сервере одна на процесс: при выходе остановить синхронизацию и выйти из неё,
+        // иначе сервер накапливает сессии до MapiExceptionSessionLimit.
+        if let tauri::RunEvent::Exit = event {
+            sync_state.shutdown();
+        }
+    });
 }
 
 #[cfg(test)]

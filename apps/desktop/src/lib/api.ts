@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 
 export interface AccountInfo {
   host: string;
@@ -77,6 +78,39 @@ export interface SearchHit {
   attachment_name: string | null;
 }
 
+/** Этап синхронизации; совпадает с `StageDto` в src-tauri/src/sync.rs. */
+export type SyncStage = "login" | "hierarchy" | "items" | "bodies" | "attachments";
+
+export interface SyncReport {
+  folders_synced: number;
+  items_created: number;
+  items_updated: number;
+  items_deleted: number;
+  bodies_fetched: number;
+  bodies_failed: number;
+  attachments_fetched: number;
+  attachments_failed: number;
+  elapsed_ms: number;
+}
+
+/** Состояние синхронизации: то же приходит событием `sync-progress` и ответом `sync_status`. */
+export interface SyncStatus {
+  running: boolean;
+  cancelling: boolean;
+  stage: SyncStage | null;
+  folder: string | null;
+  done: number;
+  total: number | null;
+  items_processed: number;
+  folders_done: number;
+  started_ms: number | null;
+  last_ok_ms: number | null;
+  last_error: string | null;
+  warnings: string[];
+  warnings_total: number;
+  last_report: SyncReport | null;
+}
+
 export const api = {
   accountInfo: () => invoke<AccountInfo>("account_info"),
   folders: () => invoke<Folder[]>("folders"),
@@ -84,7 +118,16 @@ export const api = {
     invoke<Conversation[]>("conversations", { folderPk, afterMs: after?.ms ?? null, afterPk: after?.pk ?? null, limit }),
   conversation: (conversationPk: number) => invoke<Message[]>("conversation", { conversationPk }),
   search: (query: string, limit = 50) => invoke<SearchHit[]>("search", { query, limit }),
+  /** Запуск инкрементальной синхронизации; если она уже идёт, просто возвращает текущий статус. */
+  syncStart: (days?: number) => invoke<SyncStatus>("sync_start", { days: days ?? null }),
+  syncStatus: () => invoke<SyncStatus>("sync_status"),
+  syncCancel: () => invoke<SyncStatus>("sync_cancel"),
 };
+
+/** Подписка на ход синхронизации. Возвращает функцию отписки. */
+export function onSyncProgress(cb: (status: SyncStatus) => void): Promise<UnlistenFn> {
+  return listen<SyncStatus>("sync-progress", (e) => cb(e.payload));
+}
 
 const dateFull = new Intl.DateTimeFormat("ru-RU", { day: "numeric", month: "short", year: "numeric" });
 const dateShort = new Intl.DateTimeFormat("ru-RU", { day: "numeric", month: "short" });

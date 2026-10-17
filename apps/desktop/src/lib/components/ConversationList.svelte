@@ -29,9 +29,12 @@
     if (hasMore && !loading && scroller.scrollTop + scroller.clientHeight > scroller.scrollHeight - ROW * 10) onmore();
   }
 
+  // Ключ папки, а не объект: после синхронизации объект папки заменяется свежим (новые счётчики),
+  // и список не должен прыгать в начало.
+  const folderPk = $derived(folder?.folder_pk ?? null);
   $effect(() => {
     // При смене папки прокрутка в начало.
-    void folder;
+    void folderPk;
     if (scroller) {
       scroller.scrollTop = 0;
       scrollTop = 0;
@@ -71,7 +74,7 @@
   {#if conversations.length === 0 && !loading}
     <div class="empty">
       <p>В этой папке пока нет бесед.</p>
-      <p class="caption">Если синхронизация ещё не выполнялась, запусти <code>aiowa sync</code>.</p>
+      <p class="caption">Если синхронизация ещё не выполнялась, нажми «Обновить» внизу окна.</p>
     </div>
   {:else}
     <div class="spacer" style="height: {conversations.length * ROW}px">
@@ -226,9 +229,5 @@
   .loading {
     padding: var(--space-3) var(--space-4);
     text-align: center;
-  }
-  code {
-    font-family: var(--font-mono);
-    font-size: 12px;
   }
 </style>

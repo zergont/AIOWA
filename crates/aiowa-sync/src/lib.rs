@@ -119,16 +119,58 @@ pub struct FetchedAttachment {
     pub text_state: i64,
 }
 
+/// Этап синхронизации.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncStage {
+    /// Иерархия папок.
+    Hierarchy,
+    /// Метаданные писем папки (`SyncFolderItems`).
+    Items,
+    /// Тела писем за окно.
+    Bodies,
+    /// Вложения писем за окно.
+    Attachments,
+}
+
+/// Событие хода синхронизации. Отправляется движком через колбэк `Engine::on_progress`;
+/// подходит для строки состояния: папка, сколько сделано, сколько ожидается.
+#[derive(Debug, Clone)]
+pub enum SyncEvent {
+    /// Начался этап; `folder` = `None` для иерархии.
+    Stage { stage: SyncStage, folder: Option<String> },
+    /// Продвижение внутри этапа: `done` элементов обработано; `total` известно не всегда
+    /// (при инкрементальной выгрузке сервер не сообщает, сколько изменений впереди).
+    Progress { stage: SyncStage, folder: Option<String>, done: u64, total: Option<u64> },
+    /// Ошибка, не прервавшая синхронизацию (отвергнутая пачка тел, нескачанное вложение).
+    Warning { stage: SyncStage, folder: Option<String>, message: String },
+}
+
+/// Приёмник событий хода. Вызывается из асинхронного контекста, должен быть быстрым.
+pub type ProgressFn = Arc<dyn Fn(&SyncEvent) + Send + Sync>;
+
 pub struct Engine {
     transport: Arc<dyn MailTransport>,
     store: Arc<Store>,
     account: AccountId,
     cancel: Arc<AtomicBool>,
+    progress: Option<ProgressFn>,
 }
 
 impl Engine {
     pub fn new(transport: Arc<dyn MailTransport>, store: Arc<Store>, account: AccountId, cancel: Arc<AtomicBool>) -> Self {
-        Self { transport, store, account, cancel }
+        Self { transport, store, account, cancel, progress: None }
+    }
+
+    /// Подписка на события хода. Один приёмник; повторный вызов заменяет предыдущий.
+    pub fn on_progress(mut self, f: ProgressFn) -> Self {
+        self.progress = Some(f);
+        self
+    }
+
+    fn emit(&self, event: SyncEvent) {
+        if let Some(p) = &self.progress {
+            p(&event);
+        }
     }
 
     fn check_cancel(&self) -> Result<()> {
@@ -193,6 +235,7 @@ impl Engine {
 
     /// Иерархия папок с сохранённым состоянием; при недействительном состоянии — заново.
     async fn sync_hierarchy(&self) -> Result<usize> {
+        self.emit(SyncEvent::Stage { stage: SyncStage::Hierarchy, folder: None });
         let mut state = self.store.get_state(self.account, "hierarchy")?.map(SyncState);
         let mut reset_once = false;
         let mut total = 0usize;
@@ -226,6 +269,7 @@ impl Engine {
             }
         }
         info!(folders = total, "иерархия папок синхронизирована");
+        self.emit(SyncEvent::Progress { stage: SyncStage::Hierarchy, folder: None, done: total as u64, total: Some(total as u64) });
         Ok(total)
     }
 
@@ -234,6 +278,10 @@ impl Engine {
         let name = folder.name.as_str();
         let folder_ref = FolderRef::Id(FolderId { id: folder.server_id.clone(), change_key: None });
         let mut state = self.store.folder_sync_state(folder_pk)?;
+        // При полной выгрузке ожидаемый объём известен из счётчика папки; при инкрементальной — нет.
+        let expected = if state.is_none() { Some(folder.total_count.max(0) as u64) } else { None };
+        let mut processed = 0u64;
+        self.emit(SyncEvent::Stage { stage: SyncStage::Items, folder: Some(name.to_string()) });
         let mut reset_once = false;
         let mut pages = 0u32;
         let mut empty_streak = 0u32;
@@ -286,6 +334,8 @@ impl Engine {
             report.items_deleted += stats.deleted;
             report.read_flags += stats.read_flags;
             state = Some(changes.state);
+            processed += changes.changes.len() as u64;
+            self.emit(SyncEvent::Progress { stage: SyncStage::Items, folder: Some(name.to_string()), done: processed, total: expected });
             info!(folder = name, page = pages, changes = changes.changes.len(), created = stats.created, updated = stats.updated, deleted = stats.deleted, read_flags = stats.read_flags, elapsed_s = started.elapsed().as_secs(), "пачка применена");
             if pages as usize % opts.checkpoint_every == 0 {
                 self.store.checkpoint()?;
@@ -313,6 +363,7 @@ impl Engine {
             return Ok(());
         }
         info!(folder = name, pending, "загрузка тел");
+        self.emit(SyncEvent::Stage { stage: SyncStage::Bodies, folder: Some(name.to_string()) });
         let mut done = 0i64;
         let mut batches = 0usize;
         loop {
@@ -334,8 +385,11 @@ impl Engine {
                 Ok(r) => r,
                 Err(SyncError::Transport(e)) if !e.is_retryable() && !e.needs_reauth() => {
                     warn!(folder = name, error = %e, count = ids.len(), "пачка тел отвергнута целиком, помечена как ошибка");
+                    self.emit(SyncEvent::Warning { stage: SyncStage::Bodies, folder: Some(name.to_string()), message: format!("пачка тел ({}) отвергнута: {e}", ids.len()) });
                     self.store.mark_body_failed(self.account, &ids)?;
                     report.bodies_failed += ids.len();
+                    done += ids.len() as i64;
+                    self.emit(SyncEvent::Progress { stage: SyncStage::Bodies, folder: Some(name.to_string()), done: done as u64, total: Some(pending as u64) });
                     continue;
                 }
                 Err(e) => return Err(e),
@@ -365,7 +419,8 @@ impl Engine {
                 report.bodies_failed += failed.len();
             }
             report.bodies_fetched += stored;
-            done += stored as i64;
+            done += stored as i64 + gone.len() as i64 + failed.len() as i64;
+            self.emit(SyncEvent::Progress { stage: SyncStage::Bodies, folder: Some(name.to_string()), done: done as u64, total: Some(pending as u64) });
             batches += 1;
             if batches % 10 == 0 {
                 info!(folder = name, done, pending, "тела: прогресс");
@@ -389,7 +444,9 @@ impl Engine {
             return Ok(());
         }
         info!(folder = name, pending, "загрузка вложений");
+        self.emit(SyncEvent::Stage { stage: SyncStage::Attachments, folder: Some(name.to_string()) });
         let mut done = 0i64;
+        let mut handled = 0u64;
         loop {
             self.check_cancel()?;
             let batch = self.store.attachments_to_fetch(self.account, folder_pk, since, max, 8)?;
@@ -409,11 +466,14 @@ impl Engine {
                     }
                     Err(SyncError::Transport(e)) if !e.is_retryable() && !e.needs_reauth() => {
                         warn!(folder = name, attachment = todo.name.as_deref().unwrap_or("?"), error = %e, "вложение не скачано");
+                        self.emit(SyncEvent::Warning { stage: SyncStage::Attachments, folder: Some(name.to_string()), message: format!("вложение «{}» не скачано: {e}", todo.name.as_deref().unwrap_or("?")) });
                         self.store.mark_attachment_failed(todo.attachment_pk, FETCH_FAILED)?;
                         report.attachments_failed += 1;
                     }
                     Err(e) => return Err(e),
                 }
+                handled += 1;
+                self.emit(SyncEvent::Progress { stage: SyncStage::Attachments, folder: Some(name.to_string()), done: handled, total: Some(pending as u64) });
             }
             if done % 40 == 0 {
                 info!(folder = name, done, pending, "вложения: прогресс");

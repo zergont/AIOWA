@@ -1,10 +1,11 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { api, type AccountInfo, type Conversation, type Folder, type Message, type SearchHit } from "./lib/api";
+  import { api, onSyncProgress, type AccountInfo, type Conversation, type Folder, type Message, type SearchHit, type SyncStatus } from "./lib/api";
   import FolderTree from "./lib/components/FolderTree.svelte";
   import ConversationList from "./lib/components/ConversationList.svelte";
   import ReadingPane from "./lib/components/ReadingPane.svelte";
   import SearchResults from "./lib/components/SearchResults.svelte";
+  import StatusBar from "./lib/components/StatusBar.svelte";
 
   let account = $state<AccountInfo | null>(null);
   let folders = $state<Folder[]>([]);
@@ -20,8 +21,11 @@
   let searching = $state(false);
   let error = $state<string | null>(null);
   let listWidth = $state(380);
+  let syncStatus = $state<SyncStatus | null>(null);
 
   const PAGE = 100;
+  /** Период автосинхронизации при видимом окне. */
+  const SYNC_EVERY_MS = 2 * 60_000;
 
   async function loadFolders() {
     folders = await api.folders();
@@ -109,6 +113,61 @@
     searchHits = null;
   }
 
+  // --- синхронизация ---------------------------------------------------------
+
+  let lastSyncAttempt = 0;
+
+  async function startSync() {
+    lastSyncAttempt = Date.now();
+    try {
+      syncStatus = await api.syncStart();
+    } catch (e) {
+      error = String(e);
+    }
+  }
+
+  async function cancelSync() {
+    try {
+      syncStatus = await api.syncCancel();
+    } catch (e) {
+      error = String(e);
+    }
+  }
+
+  /** Раз в 2 минуты при видимом окне; не запускает повторно, пока идёт предыдущая. */
+  function syncTick() {
+    if (document.visibilityState !== "visible") return;
+    if (syncStatus?.running) return;
+    if (Date.now() - lastSyncAttempt < SYNC_EVERY_MS) return;
+    void startSync();
+  }
+
+  /** После синхронизации: перечитать папки, текущий список и открытую беседу, не сбивая выбор. */
+  async function refreshAfterSync() {
+    try {
+      const fresh = await api.folders();
+      folders = fresh;
+      if (selectedFolder) {
+        const same = fresh.find((f) => f.folder_pk === selectedFolder!.folder_pk);
+        if (same) selectedFolder = same;
+        if (searchHits === null && !loadingList) {
+          const limit = Math.min(500, Math.max(PAGE, conversations.length));
+          const rows = await api.conversations(selectedFolder.folder_pk, undefined, limit);
+          conversations = rows;
+          hasMore = rows.length === limit;
+        }
+      }
+      if (selected && !loadingMessages) {
+        const fresh = await api.conversation(selected.conversation_pk);
+        // Письма перечитываем только при реальных изменениях: иначе сбросится раскрытие карточек.
+        const key = (ms: Message[]) => ms.map((m) => `${m.item_pk}:${m.body_state}:${m.is_read ? 1 : 0}`).join(",");
+        if (key(fresh) !== key(messages)) messages = fresh;
+      }
+    } catch (e) {
+      error = String(e);
+    }
+  }
+
   function onKeydown(e: KeyboardEvent) {
     if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "k") {
       e.preventDefault();
@@ -120,13 +179,40 @@
     }
   }
 
-  onMount(async () => {
-    try {
-      account = await api.accountInfo();
-      await loadFolders();
-    } catch (e) {
-      error = String(e);
-    }
+  onMount(() => {
+    let unlisten: (() => void) | undefined;
+    let wasRunning = false;
+    const timer = setInterval(syncTick, 15_000);
+    document.addEventListener("visibilitychange", syncTick);
+
+    (async () => {
+      try {
+        unlisten = await onSyncProgress((s) => {
+          syncStatus = s;
+          if (wasRunning && !s.running) {
+            // Пауза в 2 минуты отсчитывается от конца прогона, а не от его начала:
+            // после долгой первой синхронизации следующая не должна стартовать сразу.
+            lastSyncAttempt = Date.now();
+            void refreshAfterSync();
+          }
+          wasRunning = s.running;
+        });
+        account = await api.accountInfo();
+        await loadFolders();
+        syncStatus = await api.syncStatus();
+        wasRunning = syncStatus.running;
+        // Автозапуск при старте: окно сначала показывает базу, потом тянет новое.
+        void startSync();
+      } catch (e) {
+        error = String(e);
+      }
+    })();
+
+    return () => {
+      clearInterval(timer);
+      document.removeEventListener("visibilitychange", syncTick);
+      unlisten?.();
+    };
   });
 
   // Перетаскивание границы между списком и чтением.
@@ -184,6 +270,10 @@
     <ReadingPane conversation={selected} {messages} loading={loadingMessages} />
   </section>
 
+  <footer class="status" aria-label="Состояние синхронизации">
+    <StatusBar status={syncStatus} onrefresh={startSync} oncancel={cancelSync} />
+  </footer>
+
   {#if error}
     <div class="error-bar" role="alert">
       {error}
@@ -196,10 +286,11 @@
   .shell {
     display: grid;
     grid-template-columns: var(--nav-width) var(--list-width) 1px minmax(var(--read-min), 1fr);
-    grid-template-rows: 48px 1fr;
+    grid-template-rows: 48px 1fr 28px;
     grid-template-areas:
       "top top top top"
-      "nav list split reader";
+      "nav list split reader"
+      "status status status status";
     height: 100%;
     background: var(--bg-base);
   }
@@ -322,10 +413,15 @@
     margin-right: var(--space-2);
   }
 
+  .status {
+    grid-area: status;
+    min-width: 0;
+  }
+
   .error-bar {
     position: fixed;
     left: 50%;
-    bottom: 16px;
+    bottom: 36px;
     transform: translateX(-50%);
     background: var(--bg-card);
     color: var(--danger);
