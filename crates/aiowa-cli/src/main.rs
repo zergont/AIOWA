@@ -1,9 +1,10 @@
-//! `aiowa`: консольная утилита этапа 1. Вход, папки, синхронизация в локальную базу, поиск.
+//! `aiowa`: консольная утилита этапа 1. Вход, папки, синхронизация в локальную базу,
+//! список бесед, поиск с операторами, вложения.
 //! Пароль хранится в диспетчере учётных данных Windows и не передаётся аргументом.
 
-use aiowa_core::{DistinguishedFolder, FolderChange, SyncState};
-use aiowa_store::Store;
-use aiowa_sync::{Engine, SyncOptions};
+use aiowa_core::{FolderChange, SyncState};
+use aiowa_store::{AttachmentTodo, Store};
+use aiowa_sync::{Engine, FolderSelection, SyncOptions};
 use aiowa_transport::{Credentials, MailTransport};
 use aiowa_transport_owa::{OwaConfig, OwaTransport};
 use anyhow::{anyhow, bail, Context, Result};
@@ -20,6 +21,13 @@ fn truncate(s: &str, n: usize) -> String {
         out.push('…');
     }
     out
+}
+
+/// Дополняет строку пробелами до `width` символов (не байт), обрезая длинную.
+fn pad(s: &str, width: usize) -> String {
+    let t = truncate(s, width);
+    let n = t.chars().count();
+    format!("{t}{}", " ".repeat(width.saturating_sub(n)))
 }
 
 const KEYRING_SERVICE: &str = "AIOWA";
@@ -55,24 +63,51 @@ enum Cmd {
     Folders,
     /// Синхронизировать почту в локальную базу
     Sync {
-        /// Глубина в днях для загрузки тел писем (метаданные грузятся за всё время)
+        /// Глубина в днях для загрузки тел и вложений (метаданные грузятся за всё время); 0 = без ограничения
         #[arg(long, default_value_t = 90)]
         days: u32,
-        /// Какие известные папки синхронизировать (через запятую)
-        #[arg(long, default_value = "inbox,sentitems")]
+        /// Какие папки синхронизировать: all (все почтовые кроме служебных) или список через запятую
+        /// известных имён (inbox, sentitems) и отображаемых имён
+        #[arg(long, default_value = "all")]
         folders: String,
-        /// Только метаданные, без тел
+        /// Только метаданные, без тел и вложений
         #[arg(long)]
         no_bodies: bool,
+        /// Не скачивать вложения
+        #[arg(long)]
+        no_attachments: bool,
+        /// Лимит размера одного вложения, МБ
+        #[arg(long, default_value_t = 25)]
+        max_attachment_mb: u64,
+        /// Квота кэша файлов вложений на диске, МБ (текст остаётся в базе и после вытеснения)
+        #[arg(long, default_value_t = 2048)]
+        cache_mb: u64,
         /// Предел пачек SyncFolderItems на папку, 0 = без предела (для проб)
         #[arg(long, default_value_t = 0)]
         pages: u32,
     },
-    /// Полнотекстовый поиск по локальной базе
+    /// Список бесед папки, как в OWA: тема, участники, писем, непрочитанных, дата последнего
+    List {
+        /// Папка: известное имя (inbox, sentitems) или отображаемое
+        #[arg(long, default_value = "inbox")]
+        folder: String,
+        #[arg(long, default_value_t = 30)]
+        limit: usize,
+    },
+    /// Поиск по локальной базе. Операторы: от:/from:, кому:/to:, тема:/subject:,
+    /// вложение:/has:attachment, папка:/in:, после:/до: (даты), остальное ищется по словам
     Search {
         query: String,
         #[arg(long, default_value_t = 20)]
         limit: usize,
+    },
+    /// Скачать вложения одного письма с сервера (проба пути скачивания) и показать извлечённый текст
+    FetchAttachments {
+        /// item_pk письма в локальной базе (см. `search` или `sql`)
+        #[arg(long)]
+        item_pk: i64,
+        #[arg(long, default_value_t = 25)]
+        max_mb: u64,
     },
     /// Размер базы и покрытие по папкам
     Stats,
@@ -103,8 +138,17 @@ async fn connect(cli: &Cli) -> Result<OwaTransport> {
 }
 
 fn init_tracing() {
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,reqwest=warn"));
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,reqwest=warn,pdf_extract=error,lopdf=error"));
     tracing_subscriber::fmt().with_env_filter(filter).with_target(false).without_time().init();
+}
+
+fn folder_selection(spec: &str) -> FolderSelection {
+    let names: Vec<String> = spec.split(',').map(str::trim).filter(|s| !s.is_empty()).map(String::from).collect();
+    if names.is_empty() || (names.len() == 1 && names[0].eq_ignore_ascii_case("all")) { FolderSelection::AllMail } else { FolderSelection::Named(names) }
+}
+
+fn fmt_date(t: Option<jiff::Timestamp>) -> String {
+    t.map(|t| t.to_zoned(jiff::tz::TimeZone::system()).strftime("%Y-%m-%d %H:%M").to_string()).unwrap_or_default()
 }
 
 #[tokio::main]
@@ -147,14 +191,19 @@ async fn main() -> Result<()> {
             print_folder_tree(&changes.changes);
             t.logoff().await.ok();
         }
-        Cmd::Sync { days, folders, no_bodies, pages } => {
+        Cmd::Sync { days, folders, no_bodies, no_attachments, max_attachment_mb, cache_mb, pages } => {
             let store = Arc::new(Store::open(&db_path)?);
             let account = store.account(&cli.host, &cli.user)?;
-            let mut names = Vec::new();
-            for name in folders.split(',').map(str::trim).filter(|s| !s.is_empty()) {
-                names.push(DistinguishedFolder::parse(name).ok_or_else(|| anyhow!("неизвестная папка: {name}"))?);
-            }
-            let opts = SyncOptions { folders: names, body_days: if *days == 0 { None } else { Some(*days) }, fetch_bodies: !no_bodies, max_pages: *pages, ..SyncOptions::default() };
+            let opts = SyncOptions {
+                folders: folder_selection(folders),
+                body_days: if *days == 0 { None } else { Some(*days) },
+                fetch_bodies: !no_bodies,
+                fetch_attachments: !no_bodies && !no_attachments,
+                max_attachment_bytes: max_attachment_mb * 1024 * 1024,
+                attachment_cache_bytes: cache_mb * 1024 * 1024,
+                max_pages: *pages,
+                ..SyncOptions::default()
+            };
             let cancel = Arc::new(AtomicBool::new(false));
             {
                 let cancel = cancel.clone();
@@ -171,7 +220,7 @@ async fn main() -> Result<()> {
             transport.logoff().await.ok();
             let report = result.map_err(|e| anyhow!("синхронизация прервана: {e}"))?;
             println!(
-                "Готово за {:.1} с: папок в иерархии {}, синхронизировано {}, пачек {}, писем создано {} / обновлено {} / удалено {}, флагов {}, тел загружено {} (ошибок {}, исчезло на сервере {}).\nБаза: {}",
+                "Готово за {:.1} с: папок в иерархии {}, синхронизировано {}, пачек {}, писем создано {} / обновлено {} / удалено {}, флагов {}, тел загружено {} (ошибок {}, исчезло на сервере {}), вложений скачано {} ({:.1} МБ, с текстом {}, ошибок {}), из кэша вытеснено {} файлов ({:.1} МБ).\nБаза: {}",
                 report.elapsed.as_secs_f32(),
                 report.folders_in_hierarchy,
                 report.folders_synced,
@@ -183,8 +232,30 @@ async fn main() -> Result<()> {
                 report.bodies_fetched,
                 report.bodies_failed,
                 report.bodies_gone,
+                report.attachments_fetched,
+                report.attachments_bytes as f64 / 1e6,
+                report.attachments_with_text,
+                report.attachments_failed,
+                report.cache_files_evicted,
+                report.cache_bytes_evicted as f64 / 1e6,
                 db_path.display()
             );
+        }
+        Cmd::List { folder, limit } => {
+            let store = Store::open(&db_path)?;
+            let account = store.account(&cli.host, &cli.user)?;
+            let f = store.resolve_folder(account, folder)?.ok_or_else(|| anyhow!("папка «{folder}» не найдена в локальной базе"))?;
+            let started = std::time::Instant::now();
+            let rows = store.list_conversations(account, f.folder_pk, *limit)?;
+            println!("{}: {} бесед за {} мс\n", f.name, rows.len(), started.elapsed().as_millis());
+            println!("{}  {}  {:>5} {:>6}  {}", pad("Дата", 16), pad("Участники", 36), "Писем", "Непроч", "Тема");
+            for c in rows {
+                let who = c.participants.iter().take(4).cloned().collect::<Vec<_>>().join(", ");
+                let marker = if c.unread_count > 0 { "●" } else { " " };
+                let clip = if c.has_attachments { " 📎" } else { "" };
+                let count = if c.total_count != c.item_count { format!("{}/{}", c.item_count, c.total_count) } else { c.item_count.to_string() };
+                println!("{}  {}  {:>5} {:>5}{}  {}{}", pad(&fmt_date(c.last_received_at), 16), pad(&who, 36), count, c.unread_count, marker, truncate(&c.topic.as_deref().unwrap_or("(без темы)").split_whitespace().collect::<Vec<_>>().join(" "), 70), clip);
+            }
         }
         Cmd::Search { query, limit } => {
             let store = Store::open(&db_path)?;
@@ -193,22 +264,70 @@ async fn main() -> Result<()> {
             let hits = store.search(account, query, *limit)?;
             println!("{} результатов за {} мс\n", hits.len(), started.elapsed().as_millis());
             for h in hits {
-                let date = h.received_at.map(|t| t.strftime("%Y-%m-%d %H:%M").to_string()).unwrap_or_default();
                 let from = h.from_name.or(h.from_email).unwrap_or_default();
-                println!("{date}  {}  [{}]\n    {}\n    {}\n", truncate(&from, 28), h.folder_name.unwrap_or_default(), truncate(h.subject.as_deref().unwrap_or("(без темы)"), 90), h.snippet.replace('\n', " "));
+                let snippet = h.snippet.replace('\n', " ");
+                let snippet = match &h.attachment_name {
+                    Some(name) => format!("📎 {name}: {snippet}"),
+                    None => snippet,
+                };
+                println!("{}  {}  [{}]  #{}\n    {}\n    {}\n", fmt_date(h.received_at), pad(&from, 28), h.folder_name.unwrap_or_default(), h.item_pk, truncate(h.subject.as_deref().unwrap_or("(без темы)"), 90), snippet);
             }
+        }
+        Cmd::FetchAttachments { item_pk, max_mb } => {
+            let store = Arc::new(Store::open(&db_path)?);
+            let account = store.account(&cli.host, &cli.user)?;
+            let rows = store.attachments_of_item(*item_pk)?;
+            if rows.is_empty() {
+                bail!("у письма #{item_pk} нет вложений в базе (тело ещё не загружено?)");
+            }
+            let transport = connect(&cli).await?;
+            let engine = Engine::new(Arc::new(transport.clone()), store.clone(), account, Arc::new(AtomicBool::new(false)));
+            let max_bytes = max_mb * 1024 * 1024;
+            for a in rows.iter().filter(|a| !a.is_inline) {
+                store.reset_attachment(a.attachment_pk)?;
+                let todo = AttachmentTodo { attachment_pk: a.attachment_pk, item_pk: a.item_pk, server_id: a.server_id.clone(), name: a.name.clone(), content_type: a.content_type.clone(), size: a.size };
+                let started = std::time::Instant::now();
+                match engine.fetch_one_attachment(&todo, max_bytes, aiowa_extract_limit()).await {
+                    Ok(f) => {
+                        let text = store.attachment_text(a.attachment_pk)?.unwrap_or_default();
+                        println!(
+                            "{}: {} байт за {} мс, текст {} символов (состояние {}), файл {}\n    {}",
+                            a.name.as_deref().unwrap_or("?"),
+                            f.bytes,
+                            started.elapsed().as_millis(),
+                            f.text_chars,
+                            f.text_state,
+                            f.path.display(),
+                            truncate(&text.replace('\n', " "), 300)
+                        );
+                    }
+                    Err(e) => println!("{}: ошибка: {e}", a.name.as_deref().unwrap_or("?")),
+                }
+            }
+            transport.logoff().await.ok();
         }
         Cmd::Stats => {
             let store = Store::open(&db_path)?;
             let account = store.account(&cli.host, &cli.user)?;
             let s = store.stats(account)?;
-            println!("База {} : {:.1} МБ, писем {}, тел {}\n", db_path.display(), s.db_bytes as f64 / 1e6, s.items, s.bodies);
-            println!("{:<34} {:>8} {:>8} {:>8}  {:<10} {:<10} {}", "Папка", "Сервер", "Локально", "Тел", "Старейшее", "Новейшее", "Синхр.");
+            println!(
+                "База {} : {:.1} МБ, писем {}, тел {}, бесед {}, вложений {} (скачано {}, с текстом {}, в кэше {:.1} МБ)\n",
+                db_path.display(),
+                s.db_bytes as f64 / 1e6,
+                s.items,
+                s.bodies,
+                s.conversations,
+                s.attachments,
+                s.attachments_fetched,
+                s.attachments_with_text,
+                s.attachment_cache_bytes as f64 / 1e6
+            );
+            println!("{} {:>8} {:>8} {:>8}  {:<10} {:<10} {}", pad("Папка", 34), "Сервер", "Локально", "Тел", "Старейшее", "Новейшее", "Синхр.");
             for f in s.folders {
                 let fmt = |t: Option<jiff::Timestamp>| t.map(|t| t.strftime("%Y-%m-%d").to_string()).unwrap_or_default();
                 println!(
-                    "{:<34} {:>8} {:>8} {:>8}  {:<10} {:<10} {}",
-                    truncate(&format!("{}{}", f.display_name, f.distinguished.as_deref().map(|d| format!(" ({d})")).unwrap_or_default()), 34),
+                    "{} {:>8} {:>8} {:>8}  {:<10} {:<10} {}",
+                    pad(&format!("{}{}", f.display_name, f.distinguished.as_deref().map(|d| format!(" ({d})")).unwrap_or_default()), 34),
                     f.server_total,
                     f.local_items,
                     f.local_bodies,
@@ -227,6 +346,10 @@ async fn main() -> Result<()> {
         Cmd::SetPassword | Cmd::ForgetPassword => unreachable!(),
     }
     Ok(())
+}
+
+fn aiowa_extract_limit() -> usize {
+    SyncOptions::default().attachment_text_chars
 }
 
 fn print_folder_tree(changes: &[FolderChange]) {

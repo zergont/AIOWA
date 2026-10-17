@@ -133,9 +133,31 @@ X-OWA-UrlPostData: <JSON запроса в URL-кодировке>   — при 
 
 В наблюдении один цикл `PendingNotificationRequest` держался около 5,7 минуты, после чего клиент закрыл его `FinishNotificationRequest` (ответ `{cid, syncFnshRq}`) и открыл следующий. Канарейка в query-параметре нужна, потому что поток читается не через XHR. Для клиента на Rust достаточно `reqwest` со стримингом тела и разбором `<script>` блоков; на первом этапе можно обойтись опросом `FindConversation`/`SyncFolderItems` по таймеру.
 
-## 5. Вложения
+## 5. Вложения (снято клиентом `aiowa` 17.10.2026)
 
-Не снято в этой сессии. Ожидаемые пути по статике OWA: `/owa/service.svc/s/GetFileAttachment?id=...` или `/owa/attachment.ashx`; `GetPersonaPhoto` ходит как `GET /owa/service.svc/s/GetPersonaPhoto?email=...&size=HR96x96`, что подтверждает семейство `service.svc/s/<Op>` для GET-операций с бинарным ответом. Проверяется в спайке.
+Метаданные вложений приходят вместе с письмом в `GetItem` с `ShapeName: ItemPart`: `Attachments[]` с `AttachmentId{Id}`, `Name`, `ContentType`, `Size`, `IsInline`, `ContentId`. `AttachmentId.Id` на этом сервере — строка из 180 символов (base64, включает идентификатор письма), поэтому при перемещении письма идентификаторы его вложений меняются вместе с `ItemId`.
+
+**Скачивание файла** идёт тем же путём, что у браузерной OWA, семейством `service.svc/s/<Op>` для GET-операций с бинарным ответом (как `GetPersonaPhoto`):
+
+```
+GET /owa/service.svc/s/GetFileAttachment?id=<AttachmentId.Id, URL-encoded>&X-OWA-CANARY=<канарейка>
+Cookie: <cookies сессии>
+X-OWA-CANARY: <канарейка>          — дублируется заголовком, как у service.svc
+```
+
+Ответ `200 OK` с телом файла как есть, `Content-Type` файла (`application/pdf`, `application/vnd.openxmlformats-officedocument.spreadsheetml.sheet`, ...) и `Content-Disposition: attachment; filename=%D0%A1%D0%BF...` (имя в процентном кодировании UTF-8 прямо в `filename=`, без `filename*=`). Замеры: 0,4–1,9 с на файл 30–550 КБ при одном запросе за раз; 436 файлов (349 МБ) за один прогон без отказов и троттлинга. Сессионные сигналы те же, что у `service.svc`: 440/401 или редирект на `logon.aspx` = истёкшая сессия, без канарейки — редирект на `errorfe.aspx`. Ответ `text/html` со статусом 200 означает страницу ошибки, а не файл (клиент проверяет тип).
+
+Запасной путь, реализованный в клиенте на случай отказа GET (на этом сервере не понадобился): операция `GetAttachment` по EWS-схеме, `RequestServerVersion: Exchange2013`, тело
+
+```json
+{ "__type": "GetAttachmentRequest:#Exchange",
+  "AttachmentIds": [ { "__type": "AttachmentId:#Exchange", "Id": "…" } ],
+  "AttachmentShape": { "__type": "AttachmentResponseShape:#Exchange", "IncludeMimeContent": false, "BodyType": "Best" } }
+```
+
+с ответом `Body.ResponseMessages.Items[0].Attachments[0]` типа `FileAttachment:#Exchange` и содержимым в `Content` (base64). Для вложений-писем (`ItemAttachment`) поля `Content` нет.
+
+Следствия для клиента: скачивать по одному, с ограничением размера по `Content-Length` и по счётчику прочитанных байт; инлайновые картинки (`IsInline: true`, есть `ContentId`) нужны только рендеру и не качаются индексом; текст извлекается локально (PDF с текстовым слоем, DOCX, XLSX/XLS, TXT/CSV), сканы дают пустой текст, OCR отложен.
 
 ## 5a. TLS сервера
 

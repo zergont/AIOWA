@@ -1,4 +1,5 @@
-//! Текстовые утилиты хранилища: выжимка текста из HTML для индекса и сборка FTS-запроса.
+//! Текстовые утилиты хранилища: выжимка текста из HTML для индекса, нормализация
+//! для поиска (ё→е), тема беседы без префиксов ответов и пересылок.
 //! Это не рендер писем (им займётся интерфейс), а минимально честная очистка для поиска.
 
 /// Убирает теги, скрипты и стили, раскрывает частые сущности, схлопывает пробелы.
@@ -100,16 +101,62 @@ pub fn normalize_ws(s: &str) -> String {
     out
 }
 
-/// Запрос FTS5: каждое слово как префикс в кавычках, слова объединяются по И.
-/// Слова короче двух символов отбрасываются; кавычки внутри экранируются.
-pub fn fts_query(user_query: &str) -> String {
-    user_query
-        .split(|c: char| c.is_whitespace() || matches!(c, ',' | ';' | ':' | '(' | ')' | '[' | ']' | '{' | '}' | '"' | '\'' | '*' | '^'))
-        .map(|w| w.trim_matches(|c: char| !c.is_alphanumeric()))
-        .filter(|w| w.chars().count() >= 2)
-        .map(|w| format!("\"{}\"*", w.replace('"', "\"\"")))
-        .collect::<Vec<_>>()
-        .join(" ")
+/// Нормализация текста для индекса: ё→е, Ё→Е. Регистр не трогаем (его сворачивает
+/// токенизатор), чтобы сниппеты читались как оригинал. Та же функция применяется к
+/// запросу, поэтому «счёт» и «счет» находят друг друга.
+pub fn fts_norm(s: &str) -> String {
+    if !s.contains(['ё', 'Ё']) {
+        return s.to_string();
+    }
+    s.chars().map(|c| match c {
+        'ё' => 'е',
+        'Ё' => 'Е',
+        c => c,
+    })
+    .collect()
+}
+
+/// Нормализация для сравнений: нижний регистр Юникода плюс ё→е.
+pub fn norm_lower(s: &str) -> String {
+    fts_norm(&s.to_lowercase())
+}
+
+/// Тема беседы: тема письма без префиксов ответов и пересылок (`RE:`, `FW:`, `Отв:`, `RE[2]:`).
+pub fn topic_of(subject: &str) -> String {
+    const PREFIXES: &[&str] = &["re:", "fw:", "fwd:", "tr:", "aw:", "wg:", "sv:", "vs:", "отв:", "ответ:", "пер:", "re :", "fw :", "fwd :"];
+    let mut s = subject.trim();
+    loop {
+        let mut stripped = false;
+        for p in PREFIXES {
+            if s.get(..p.len()).map(|h| h.to_lowercase() == *p).unwrap_or(false) {
+                s = s[p.len()..].trim_start();
+                stripped = true;
+                break;
+            }
+        }
+        if !stripped {
+            // Нумерованные: RE[2]:, Re(3):, FW[12]:
+            let lower2: String = s.chars().take(2).collect::<String>().to_lowercase();
+            if matches!(lower2.as_str(), "re" | "fw") {
+                let rest = &s[lower2.len()..];
+                let open = rest.chars().next();
+                if matches!(open, Some('[') | Some('(')) {
+                    let close = if open == Some('[') { ']' } else { ')' };
+                    if let Some(end) = rest.find(close) {
+                        let digits = &rest[1..end];
+                        if !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit()) && rest[end + 1..].starts_with(':') {
+                            s = rest[end + 2..].trim_start();
+                            stripped = true;
+                        }
+                    }
+                }
+            }
+        }
+        if !stripped {
+            break;
+        }
+    }
+    s.trim().to_string()
 }
 
 #[cfg(test)]
@@ -123,9 +170,18 @@ mod tests {
     }
 
     #[test]
-    fn builds_query() {
-        assert_eq!(fts_query("запчасти Колыма"), "\"запчасти\"* \"Колыма\"*");
-        assert_eq!(fts_query("a (b) \"c\""), "");
-        assert_eq!(fts_query("счёт №25"), "\"счёт\"* \"25\"*");
+    fn normalizes_yo() {
+        assert_eq!(fts_norm("Счёт и ЁЛКА"), "Счет и ЕЛКА");
+        assert_eq!(fts_norm("plain"), "plain");
+        assert_eq!(norm_lower("Счёт №25"), "счет №25");
+    }
+
+    #[test]
+    fn topics() {
+        assert_eq!(topic_of("RE: FW: Счет"), "Счет");
+        assert_eq!(topic_of("Отв: тема"), "тема");
+        assert_eq!(topic_of("RE[2]: Re(3): тема"), "тема");
+        assert_eq!(topic_of("Regular"), "Regular");
+        assert_eq!(topic_of("  "), "");
     }
 }

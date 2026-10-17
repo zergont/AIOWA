@@ -145,6 +145,19 @@ pub fn get_item_body(ids: &[ItemId], shape_name: &str, max_body: u64) -> Value {
     })
 }
 
+/// Операция `GetAttachment` (EWS-схема): содержимое файлового вложения приходит в `Content` как base64.
+pub fn get_attachment_body(attachment_id: &str) -> Value {
+    json!({
+        "__type": "GetAttachmentRequest:#Exchange",
+        "AttachmentIds": [ { "__type": "AttachmentId:#Exchange", "Id": attachment_id } ],
+        "AttachmentShape": {
+            "__type": "AttachmentResponseShape:#Exchange",
+            "IncludeMimeContent": false,
+            "BodyType": "Best"
+        }
+    })
+}
+
 pub fn get_folder_body(folders: &[FolderRef]) -> Value {
     json!({
         "__type": "GetFolderRequest:#Exchange",

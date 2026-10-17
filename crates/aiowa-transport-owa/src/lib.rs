@@ -8,14 +8,15 @@
 pub mod protocol;
 
 use aiowa_core::{FolderChanges, FolderRef, ItemChanges, ItemId, SyncState};
-use aiowa_transport::{async_trait, Credentials, FolderCounts, ItemFetchShape, ItemResult, MailTransport, Result, ServerInfo, TransportError};
+use aiowa_transport::{async_trait, AttachmentContent, Credentials, FolderCounts, ItemFetchShape, ItemResult, MailTransport, Result, ServerInfo, TransportError};
+use base64::prelude::*;
 use reqwest::cookie::{CookieStore, Jar};
-use reqwest::header::{HeaderMap, HeaderValue, LOCATION};
+use reqwest::header::{HeaderMap, HeaderValue, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_TYPE, LOCATION};
 use reqwest::redirect::Policy;
 use reqwest::{Client, StatusCode, Url};
 use secrecy::ExposeSecret;
 use serde_json::Value;
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tokio::sync::{Mutex, Semaphore};
@@ -65,7 +66,14 @@ struct Inner {
     generation: AtomicU64,
     relogin: Mutex<()>,
     permits: Semaphore,
+    /// Какой путь скачивания вложений принял сервер: 0 не известно, 1 GET `service.svc/s/GetFileAttachment`,
+    /// 2 операция `GetAttachment` с base64 в JSON.
+    attachment_mode: AtomicU8,
 }
+
+const ATTACHMENT_MODE_UNKNOWN: u8 = 0;
+const ATTACHMENT_MODE_GET: u8 = 1;
+const ATTACHMENT_MODE_JSON: u8 = 2;
 
 /// Транспорт OWA JSON. Дёшево клонируется (Arc внутри).
 #[derive(Clone)]
@@ -128,6 +136,7 @@ impl OwaTransport {
             action_id: AtomicI64::new(-1),
             generation: AtomicU64::new(0),
             relogin: Mutex::new(()),
+            attachment_mode: AtomicU8::new(ATTACHMENT_MODE_UNKNOWN),
         });
         let t = Self { inner };
         t.login().await?;
@@ -287,6 +296,123 @@ impl OwaTransport {
         serde_json::from_str::<Value>(&text).map_err(|e| TransportError::Protocol { op: op.into(), status: status.as_u16(), raw: format!("не JSON ({e}): {}", truncate(&text, 200)) })
     }
 
+    /// Скачивание файлового вложения с одной попыткой повторного входа.
+    async fn get_attachment_with_relogin(&self, id: &str, max_bytes: u64) -> Result<AttachmentContent> {
+        let _permit = self.inner.permits.acquire().await.map_err(|_| TransportError::Cancelled)?;
+        for attempt in 0..2 {
+            let generation = self.inner.generation.load(Ordering::SeqCst);
+            match self.get_attachment_once(id, max_bytes).await {
+                Err(e) if e.needs_reauth() && attempt == 0 => {
+                    self.relogin_once(generation).await?;
+                }
+                other => return other,
+            }
+        }
+        Err(TransportError::SessionExpired)
+    }
+
+    /// Сначала GET `service.svc/s/GetFileAttachment` (так качает браузерная OWA), при отказе
+    /// сервера по форме запроса — операция `GetAttachment` с содержимым в base64. Удачный
+    /// путь запоминается на время сессии.
+    async fn get_attachment_once(&self, id: &str, max_bytes: u64) -> Result<AttachmentContent> {
+        let mode = self.inner.attachment_mode.load(Ordering::Relaxed);
+        if mode != ATTACHMENT_MODE_JSON {
+            match self.get_file_attachment_get(id, max_bytes).await {
+                Ok(c) => {
+                    if mode == ATTACHMENT_MODE_UNKNOWN {
+                        info!(content_type = c.content_type.as_deref().unwrap_or("?"), file_name = c.file_name.as_deref().unwrap_or("?"), bytes = c.bytes.len(), "вложения: сервер принимает GET service.svc/s/GetFileAttachment");
+                    }
+                    self.inner.attachment_mode.store(ATTACHMENT_MODE_GET, Ordering::Relaxed);
+                    return Ok(c);
+                }
+                Err(e) if mode == ATTACHMENT_MODE_UNKNOWN && matches!(e, TransportError::Protocol { .. }) => {
+                    warn!(error = %e, "GET GetFileAttachment отвергнут, пробую операцию GetAttachment");
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        let c = self.get_attachment_json(id, max_bytes).await?;
+        if mode == ATTACHMENT_MODE_UNKNOWN {
+            info!("вложения: сервер принимает операцию GetAttachment (base64 в JSON)");
+        }
+        self.inner.attachment_mode.store(ATTACHMENT_MODE_JSON, Ordering::Relaxed);
+        Ok(c)
+    }
+
+    /// `GET /owa/service.svc/s/GetFileAttachment?id=<AttachmentId>&X-OWA-CANARY=<канарейка>`:
+    /// бинарный ответ с `Content-Type` файла и `Content-Disposition: attachment; filename=...`.
+    async fn get_file_attachment_get(&self, id: &str, max_bytes: u64) -> Result<AttachmentContent> {
+        let inner = &self.inner;
+        let canary = inner.canary.read().expect("canary lock").clone().ok_or(TransportError::SessionExpired)?;
+        let mut url = inner.base.join("owa/service.svc/s/GetFileAttachment").expect("url");
+        url.query_pairs_mut().append_pair("id", id).append_pair("X-OWA-CANARY", &canary);
+        let mut headers = HeaderMap::new();
+        headers.insert("X-OWA-CANARY", HeaderValue::from_str(&canary).map_err(|_| TransportError::CsrfRejected)?);
+        let started = std::time::Instant::now();
+        let mut r = inner.client.get(url).headers(headers).send().await.map_err(net)?;
+        let status = r.status();
+        self.remember_build(r.headers());
+        if status == StatusCode::from_u16(440).unwrap_or(StatusCode::UNAUTHORIZED) || status == StatusCode::UNAUTHORIZED {
+            return Err(TransportError::SessionExpired);
+        }
+        if status.is_redirection() {
+            let loc = r.headers().get(LOCATION).and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+            return Err(classify_redirect(&loc));
+        }
+        let content_type = r.headers().get(CONTENT_TYPE).and_then(|v| v.to_str().ok()).map(|s| s.to_string());
+        if !status.is_success() {
+            let text = r.text().await.unwrap_or_default();
+            return Err(TransportError::Protocol { op: "GetFileAttachment".into(), status: status.as_u16(), raw: truncate(&text, 300) });
+        }
+        if content_type.as_deref().map(|c| c.to_ascii_lowercase().starts_with("text/html")).unwrap_or(false) {
+            let text = r.text().await.unwrap_or_default();
+            return Err(TransportError::Protocol { op: "GetFileAttachment".into(), status: status.as_u16(), raw: format!("сервер вернул страницу вместо файла: {}", truncate(&text, 200)) });
+        }
+        if let Some(len) = r.headers().get(CONTENT_LENGTH).and_then(|v| v.to_str().ok()).and_then(|s| s.parse::<u64>().ok()) {
+            if len > max_bytes {
+                return Err(TransportError::TooLarge { limit: max_bytes });
+            }
+        }
+        let file_name = r.headers().get(CONTENT_DISPOSITION).and_then(|v| v.to_str().ok()).and_then(parse_content_disposition_filename);
+        let mut bytes: Vec<u8> = Vec::new();
+        while let Some(chunk) = r.chunk().await.map_err(net)? {
+            if bytes.len() as u64 + chunk.len() as u64 > max_bytes {
+                return Err(TransportError::TooLarge { limit: max_bytes });
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        debug!(op = "GetFileAttachment", %status, ms = started.elapsed().as_millis(), bytes = bytes.len(), "service.svc/s");
+        Ok(AttachmentContent { bytes, content_type: content_type.map(|c| c.split(';').next().unwrap_or(&c).trim().to_string()), file_name })
+    }
+
+    /// Операция `GetAttachment`: `Body.ResponseMessages.Items[0].Attachments[0].Content` в base64.
+    async fn get_attachment_json(&self, id: &str, max_bytes: u64) -> Result<AttachmentContent> {
+        let v = self.call_unpermitted("GetAttachment", protocol::V_2013, protocol::get_attachment_body(id)).await?;
+        let msg = Self::first_message("GetAttachment", &v)?;
+        let att = msg.pointer("/Attachments/0").ok_or_else(|| TransportError::Protocol { op: "GetAttachment".into(), status: 200, raw: format!("нет Attachments: {}", truncate(&msg.to_string(), 200)) })?;
+        let content = protocol::str_of(att, "Content").ok_or_else(|| TransportError::Protocol {
+            op: "GetAttachment".into(),
+            status: 200,
+            raw: format!("нет Content (тип {}): не файловое вложение?", protocol::str_of(att, "__type").unwrap_or("?")),
+        })?;
+        // base64 длиннее исходных байт на треть: проверяем до декодирования.
+        if (content.len() as u64) / 4 * 3 > max_bytes {
+            return Err(TransportError::TooLarge { limit: max_bytes });
+        }
+        let bytes = BASE64_STANDARD.decode(content).map_err(|e| TransportError::Protocol { op: "GetAttachment".into(), status: 200, raw: format!("base64: {e}") })?;
+        if bytes.len() as u64 > max_bytes {
+            return Err(TransportError::TooLarge { limit: max_bytes });
+        }
+        Ok(AttachmentContent { bytes, content_type: protocol::str_of(att, "ContentType").map(String::from), file_name: protocol::str_of(att, "Name").map(String::from) })
+    }
+
+    /// Как `call`, но без захвата семафора (вызывающий уже держит разрешение) и без повторного входа.
+    async fn call_unpermitted(&self, op: &str, version: &str, body: Value) -> Result<Value> {
+        let env = protocol::envelope(op, version, &self.inner.config.time_zone, body);
+        let payload = serde_json::to_vec(&env).map_err(|e| TransportError::Protocol { op: op.into(), status: 0, raw: e.to_string() })?;
+        self.call_once(op, payload).await
+    }
+
     /// Первое сообщение ответа, с проверкой `ResponseClass`.
     fn first_message(op: &str, v: &Value) -> Result<Value> {
         let msgs = protocol::response_messages(v);
@@ -304,6 +430,31 @@ impl OwaTransport {
         }
         Ok((*first).clone())
     }
+}
+
+/// Имя файла из `Content-Disposition`: сначала `filename*=UTF-8''...`, затем `filename="..."`.
+fn parse_content_disposition_filename(header: &str) -> Option<String> {
+    for part in header.split(';').map(str::trim) {
+        if let Some(v) = part.strip_prefix("filename*=") {
+            let v = v.trim_matches('"');
+            let encoded = v.rsplit("''").next().unwrap_or(v);
+            let decoded = percent_encoding::percent_decode_str(encoded).decode_utf8_lossy().into_owned();
+            if !decoded.is_empty() {
+                return Some(decoded);
+            }
+        }
+    }
+    for part in header.split(';').map(str::trim) {
+        if let Some(v) = part.strip_prefix("filename=") {
+            let v = v.trim_matches('"').trim();
+            if !v.is_empty() {
+                // OWA кодирует имя процентами и в обычном filename= (без filename*=).
+                let decoded = if v.contains('%') { percent_encoding::percent_decode_str(v).decode_utf8_lossy().into_owned() } else { v.to_string() };
+                return Some(decoded);
+            }
+        }
+    }
+    None
 }
 
 fn server_error(code: String, message: String, msg: &Value) -> TransportError {
@@ -415,6 +566,10 @@ impl MailTransport for OwaTransport {
         Ok(out)
     }
 
+    async fn get_attachment(&self, attachment_id: &str, max_bytes: u64) -> Result<AttachmentContent> {
+        self.get_attachment_with_relogin(attachment_id, max_bytes).await
+    }
+
     async fn logoff(&self) -> Result<()> {
         let url = self.inner.base.join("owa/logoff.owa").expect("url");
         let r = self.inner.client.get(url).send().await.map_err(net)?;
@@ -437,6 +592,14 @@ mod tests {
         assert!(matches!(classify_redirect("/owa/auth/logon.aspx?reason=0"), TransportError::SessionExpired));
         assert!(matches!(classify_redirect("/owa/auth/errorFE.aspx?httpCode=500"), TransportError::CsrfRejected));
         assert!(matches!(classify_redirect("/owa/auth/errorfe.aspx?httpCode=500&inex=Microsoft.Mapi.MapiExceptionSessionLimit"), TransportError::SessionLimit));
+    }
+
+    #[test]
+    fn content_disposition_filename() {
+        assert_eq!(parse_content_disposition_filename("attachment; filename=\"a.pdf\""), Some("a.pdf".into()));
+        assert_eq!(parse_content_disposition_filename("attachment; filename=\"a.pdf\"; filename*=UTF-8''%D0%A1%D1%87%D1%91%D1%82.pdf"), Some("Счёт.pdf".into()));
+        assert_eq!(parse_content_disposition_filename("attachment; filename=%d0%a1%d1%87%d1%91%d1%82.pdf"), Some("Счёт.pdf".into()), "OWA кодирует процентами обычный filename");
+        assert_eq!(parse_content_disposition_filename("inline"), None);
     }
 
     #[test]

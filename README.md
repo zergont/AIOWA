@@ -4,7 +4,7 @@
 
 ## Состояние
 
-Этап 1, ядро чтения без интерфейса: синхронизация почты в локальную базу SQLite и полнотекстовый поиск из консоли. Работает на живом сервере Exchange 2019.
+Этап 1, ядро чтения без интерфейса: синхронизация всех почтовых папок в локальную базу SQLite, вложения с извлечением текста, беседы и поиск с операторами из консоли. Работает на живом сервере Exchange 2019.
 
 ## Структура
 
@@ -12,7 +12,8 @@
 crates/aiowa-core           доменные типы
 crates/aiowa-transport      trait транспорта и модель ошибок
 crates/aiowa-transport-owa  реализация поверх OWA JSON (reqwest, системный TLS)
-crates/aiowa-store          SQLite: схема, миграции, FTS5
+crates/aiowa-store          SQLite: схема, миграции, FTS5, беседы, кэш вложений
+crates/aiowa-extract        текст из вложений: PDF, DOCX, XLSX, TXT/CSV
 crates/aiowa-sync           движок синхронизации
 crates/aiowa-cli            бинарник `aiowa`
 spike/owa-probe             спайк протокола, источник форм запросов
@@ -28,11 +29,12 @@ cargo build -p aiowa-cli
 ./target/debug/aiowa --host mail.example.com --user 'user@domain' set-password
 ./target/debug/aiowa --host mail.example.com --user 'user@domain' login
 ./target/debug/aiowa --host mail.example.com --user 'user@domain' sync --days 90
-./target/debug/aiowa --host mail.example.com --user 'user@domain' search "запчасти колыма"
+./target/debug/aiowa --host mail.example.com --user 'user@domain' list --folder inbox --limit 30
+./target/debug/aiowa --host mail.example.com --user 'user@domain' search "запчасти колыма от:петров после:2026-09 вложение:"
 ./target/debug/aiowa --host mail.example.com --user 'user@domain' stats
 ```
 
-`--host` и `--user` можно задать переменными `AIOWA_HOST` и `AIOWA_USER`. База по умолчанию: `%LOCALAPPDATA%\AIOWA\<host>\<user>\mail.db`. Повторный `sync` докачивает только изменения.
+`--host` и `--user` можно задать переменными `AIOWA_HOST` и `AIOWA_USER`. База по умолчанию: `%LOCALAPPDATA%\AIOWA\<host>\<user>\mail.db`, файлы вложений в `attachments` рядом с ней. `sync` берёт все почтовые папки кроме служебных (`--folders inbox,sentitems` для явного выбора), метаданные за всё время, тела и вложения за `--days`; повторный запуск докачивает только изменения. Операторы поиска: `от:`/`from:`, `кому:`/`to:`, `тема:`/`subject:`, `вложение:`/`has:attachment`, `папка:`/`in:`, `после:`/`до:`; ё и е равнозначны.
 
 ## Документы
 

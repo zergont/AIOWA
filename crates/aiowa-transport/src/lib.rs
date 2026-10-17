@@ -40,6 +40,9 @@ pub enum TransportError {
     /// Операция отменена клиентом.
     #[error("отменено")]
     Cancelled,
+    /// Ответ больше допустимого размера (например, вложение сверх лимита).
+    #[error("ответ больше лимита {limit} байт")]
+    TooLarge { limit: u64 },
 }
 
 impl TransportError {
@@ -101,6 +104,22 @@ impl ItemResult {
     }
 }
 
+/// Содержимое вложения, скачанное с сервера.
+#[derive(Clone, PartialEq, Eq)]
+pub struct AttachmentContent {
+    pub bytes: Vec<u8>,
+    /// MIME-тип из ответа сервера, если был.
+    pub content_type: Option<String>,
+    /// Имя файла из ответа сервера (`Content-Disposition`), если было.
+    pub file_name: Option<String>,
+}
+
+impl std::fmt::Debug for AttachmentContent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AttachmentContent").field("bytes", &self.bytes.len()).field("content_type", &self.content_type).field("file_name", &self.file_name).finish()
+    }
+}
+
 /// Счётчики папки.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FolderCounts {
@@ -136,6 +155,10 @@ pub trait MailTransport: Send + Sync {
     /// Счётчики папок.
     async fn get_folder_counts(&self, folders: &[FolderRef]) -> Result<Vec<FolderCounts>>;
 
+    /// Содержимое файлового вложения по `AttachmentId`. Ответ больше `max_bytes`
+    /// обрывается с `TooLarge`; отсутствующее вложение приходит как `Server`/`Protocol`.
+    async fn get_attachment(&self, attachment_id: &str, max_bytes: u64) -> Result<AttachmentContent>;
+
     /// Завершить серверную сессию. После вызова транспорт непригоден.
     async fn logoff(&self) -> Result<()>;
 
@@ -154,6 +177,7 @@ mod tests {
         assert!(TransportError::Throttled { retry_after: None }.is_retryable());
         assert!(TransportError::Server { code: "ErrorInvalidSyncStateData".into(), message: String::new() }.invalidates_sync_state());
         assert!(!TransportError::Cancelled.is_retryable());
+        assert!(!TransportError::TooLarge { limit: 1 }.is_retryable());
     }
 
     #[test]
