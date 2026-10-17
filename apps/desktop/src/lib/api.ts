@@ -140,8 +140,11 @@ export const api = {
   attachmentSaveAs: (attachmentPk: number) => invoke<string | null>("attachment_save_as", { attachmentPk }),
   /** Открыть ссылку (http, https, mailto) во внешнем приложении. */
   openExternal: (url: string) => invoke<void>("open_external", { url }),
-  /** Запуск инкрементальной синхронизации; если она уже идёт, просто возвращает текущий статус. */
-  syncStart: (days?: number) => invoke<SyncStatus>("sync_start", { days: days ?? null }),
+  /**
+   * Запуск инкрементальной синхронизации; если она уже идёт, просто возвращает текущий статус.
+   * `folders` — только эти папки (folder_pk), иначе все почтовые.
+   */
+  syncStart: (days?: number, folders?: number[]) => invoke<SyncStatus>("sync_start", { days: days ?? null, folders: folders ?? null }),
   syncStatus: () => invoke<SyncStatus>("sync_status"),
   syncCancel: () => invoke<SyncStatus>("sync_cancel"),
 };

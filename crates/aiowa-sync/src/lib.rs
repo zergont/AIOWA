@@ -42,6 +42,8 @@ pub enum FolderSelection {
     AllMail,
     /// Явный список: известные имена (`inbox`, `sentitems`) или отображаемые имена.
     Named(Vec<String>),
+    /// Явный список по первичным ключам папок в локальной базе (кнопка на папке в окне).
+    Ids(Vec<i64>),
 }
 
 /// Настройки запуска.
@@ -196,6 +198,16 @@ impl Engine {
                 let mut out: Vec<SyncFolder> = Vec::new();
                 for name in names {
                     let f = self.store.resolve_folder(self.account, name)?.ok_or_else(|| SyncError::FolderNotFound(name.clone()))?;
+                    if !out.iter().any(|x| x.folder_pk == f.folder_pk) {
+                        out.push(f);
+                    }
+                }
+                Ok(out)
+            }
+            FolderSelection::Ids(pks) => {
+                let mut out: Vec<SyncFolder> = Vec::new();
+                for pk in pks {
+                    let f = self.store.folder_by_pk(self.account, *pk)?.ok_or_else(|| SyncError::FolderNotFound(format!("#{pk}")))?;
                     if !out.iter().any(|x| x.folder_pk == f.folder_pk) {
                         out.push(f);
                     }

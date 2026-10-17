@@ -135,12 +135,12 @@ impl Store {
         })
     }
 
-    /// Письма беседы во всех папках, старые первыми (как читается переписка).
+    /// Письма беседы во всех папках, новые первыми (как в OWA: свежий ответ сверху).
     pub fn conversation_messages(&self, account: AccountId, conversation_pk: i64) -> Result<Vec<MessageHead>> {
         self.with_conn(|c| {
             let mut st = c.prepare_cached(&format!(
                 "{HEAD_SELECT} WHERE i.conversation_pk = ?1 AND i.account_id = ?2 AND i.deleted = 0
-                 ORDER BY COALESCE(i.received_at, i.sent_at) ASC, i.item_pk ASC"
+                 ORDER BY COALESCE(i.received_at, i.sent_at) DESC, i.item_pk DESC"
             ))?;
             let rows = st.query_map(params![conversation_pk, account.0], head_row)?;
             Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
@@ -155,7 +155,7 @@ impl Store {
                         (SELECT COUNT(*) FROM attachments a WHERE a.item_pk = i.item_pk AND a.local_path IS NOT NULL)
                  FROM items i
                  WHERE i.conversation_pk = ?1 AND i.account_id = ?2 AND i.deleted = 0
-                 ORDER BY COALESCE(i.received_at, i.sent_at) ASC, i.item_pk ASC",
+                 ORDER BY COALESCE(i.received_at, i.sent_at) DESC, i.item_pk DESC",
             )?;
             let rows = st.query_map(params![conversation_pk, account.0], |r| Ok(MessageKey { item_pk: r.get(0)?, body_state: r.get(1)?, is_read: r.get::<_, i64>(2)? != 0, cached: r.get(3)? }))?;
             Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)

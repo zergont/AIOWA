@@ -5,8 +5,17 @@
     folders: Folder[];
     selected: Folder | null;
     onselect: (f: Folder) => void;
+    /** Синхронизировать только эту папку (кнопка появляется при наведении на строку). */
+    onsync?: (f: Folder) => void;
+    /** Идёт синхронизация: кнопки папок недоступны. */
+    syncing?: boolean;
   }
-  let { folders, selected, onselect }: Props = $props();
+  let { folders, selected, onselect, onsync, syncing = false }: Props = $props();
+
+  function syncFolder(f: Folder, e: Event) {
+    e.stopPropagation();
+    onsync?.(f);
+  }
 
   const PINNED = ["inbox", "drafts", "sentitems", "deleteditems", "junkemail", "archive"];
   const HIDDEN_CLASSES_NOTE = "не почтовые папки скрыты";
@@ -95,6 +104,11 @@
       {/if}
       <svg class="icon" width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path d={icon(f)} fill="none" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round" stroke-linecap="round" /></svg>
       <span class="name" class:unread={f.unread > 0}>{f.name}</span>
+      {#if onsync && f.is_mail}
+        <button class="sync" onclick={(e) => syncFolder(f, e)} onkeydown={(e) => e.stopPropagation()} disabled={syncing} aria-label="Синхронизировать папку «{f.name}»" title={syncing ? "Синхронизация уже идёт" : "Синхронизировать только эту папку"} tabindex="-1">
+          <svg width="12" height="12" viewBox="0 0 16 16" aria-hidden="true"><path d="M13 8a5 5 0 1 1-1.5-3.6M13 2.5v3h-3" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" /></svg>
+        </button>
+      {/if}
       {#if f.unread > 0}
         <span class="count">{f.unread}</span>
       {/if}
@@ -195,6 +209,34 @@
     font-weight: 600;
     min-width: 18px;
     text-align: right;
+  }
+  /* Кнопка синхронизации одной папки: видна при наведении или фокусе внутри строки. */
+  .sync {
+    flex: none;
+    width: 20px;
+    height: 20px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 4px;
+    color: var(--fg-3);
+    opacity: 0;
+    transition:
+      opacity var(--dur-fast) var(--ease-in),
+      background var(--dur-fast) var(--ease-in);
+  }
+  .row:hover .sync,
+  .row:focus-within .sync,
+  .sync:focus-visible {
+    opacity: 1;
+  }
+  .sync:hover:not(:disabled) {
+    background: var(--bg-selected);
+    color: var(--accent);
+  }
+  .sync:disabled {
+    cursor: default;
+    color: var(--fg-4);
   }
   .empty,
   .note {

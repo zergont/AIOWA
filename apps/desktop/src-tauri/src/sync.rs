@@ -190,7 +190,8 @@ impl SyncState {
     }
 
     /// Запускает синхронизацию, если она не идёт. Возвращает статус сразу после запуска.
-    pub fn start(self: &Arc<Self>, app: AppHandle, days: Option<u32>) -> SyncStatusDto {
+    /// `folders` — только эти папки (ключи локальной базы); `None` или пусто — все почтовые.
+    pub fn start(self: &Arc<Self>, app: AppHandle, days: Option<u32>, folders: Option<Vec<i64>>) -> SyncStatusDto {
         let cancel = Arc::new(AtomicBool::new(false));
         {
             let mut g = self.lock();
@@ -218,7 +219,7 @@ impl SyncState {
         let this = self.clone();
         let app_for_task = app.clone();
         let handle = tauri::async_runtime::spawn(async move {
-            this.run(app_for_task, days, cancel).await;
+            this.run(app_for_task, days, folders, cancel).await;
         });
         let mut g = self.lock();
         g.task = Some(handle);
@@ -291,8 +292,8 @@ impl SyncState {
         }
     }
 
-    async fn run(self: Arc<Self>, app: AppHandle, days: Option<u32>, cancel: Arc<AtomicBool>) {
-        let outcome = self.run_inner(&app, days, cancel).await;
+    async fn run(self: Arc<Self>, app: AppHandle, days: Option<u32>, folders: Option<Vec<i64>>, cancel: Arc<AtomicBool>) {
+        let outcome = self.run_inner(&app, days, folders, cancel).await;
         match &outcome {
             Ok(report) => {
                 let ms = now_ms();
@@ -332,13 +333,16 @@ impl SyncState {
         g.cancel = None;
     }
 
-    async fn run_inner(self: &Arc<Self>, app: &AppHandle, days: Option<u32>, cancel: Arc<AtomicBool>) -> Result<SyncReport, Outcome> {
+    async fn run_inner(self: &Arc<Self>, app: &AppHandle, days: Option<u32>, folders: Option<Vec<i64>>, cancel: Arc<AtomicBool>) -> Result<SyncReport, Outcome> {
         let transport = self.transport().await.map_err(|e| Outcome::Failed { message: e.to_string(), cause: None })?;
         if cancel.load(Ordering::Relaxed) {
             return Err(Outcome::Cancelled);
         }
         let opts = SyncOptions {
-            folders: FolderSelection::AllMail,
+            folders: match folders {
+                Some(pks) if !pks.is_empty() => FolderSelection::Ids(pks),
+                _ => FolderSelection::AllMail,
+            },
             body_days: match days {
                 Some(0) => None,
                 Some(d) => Some(d),
@@ -454,8 +458,8 @@ enum Outcome {
 // --- команды Tauri -----------------------------------------------------------
 
 #[tauri::command]
-pub fn sync_start(app: AppHandle, state: tauri::State<'_, Arc<SyncState>>, days: Option<u32>) -> SyncStatusDto {
-    state.inner().start(app, days)
+pub fn sync_start(app: AppHandle, state: tauri::State<'_, Arc<SyncState>>, days: Option<u32>, folders: Option<Vec<i64>>) -> SyncStatusDto {
+    state.inner().start(app, days, folders)
 }
 
 #[tauri::command]

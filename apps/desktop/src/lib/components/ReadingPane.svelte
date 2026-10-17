@@ -12,7 +12,7 @@
   }
   let { conversation, messages, loading, onfetch }: Props = $props();
 
-  // Последнее письмо развёрнуто, остальные свёрнуты до заголовка.
+  // Письма идут от новых к старым; самое свежее развёрнуто, остальные свёрнуты до заголовка.
   // Раскрытие пересчитывается только при смене беседы: точечная замена письма (догрузка тела)
   // и перечитывание после синхронизации не должны сворачивать то, что открыл пользователь.
   let expanded = $state<Set<number>>(new Set());
@@ -20,7 +20,7 @@
   let knownPks = new Set<number>();
   $effect(() => {
     const pk = conversation?.conversation_pk ?? null;
-    const last = messages[messages.length - 1];
+    const newest = messages[0];
     if (pk === null) {
       expandedFor = null;
       knownPks = new Set();
@@ -28,30 +28,31 @@
     }
     if (expandedFor !== pk) {
       // Новая беседа: письма приходят чуть позже выбора, ждём первую непустую выдачу.
-      if (!last) return;
+      if (!newest) return;
       expandedFor = pk;
       knownPks = new Set(messages.map((m) => m.item_pk));
-      expanded = new Set([last.item_pk]);
+      expanded = new Set([newest.item_pk]);
       return;
     }
-    // Та же беседа: пришедшее по синхронизации новое последнее письмо раскрываем, остальное не трогаем.
+    // Та же беседа: пришедшее по синхронизации новое письмо сверху раскрываем, остальное не трогаем.
     const fresh = messages.filter((m) => !knownPks.has(m.item_pk));
     if (!fresh.length) return;
     knownPks = new Set(messages.map((m) => m.item_pk));
-    if (last && fresh.some((m) => m.item_pk === last.item_pk)) {
+    if (newest && fresh.some((m) => m.item_pk === newest.item_pk)) {
       untrack(() => {
-        if (!expanded.has(last.item_pk)) expanded = new Set([...expanded, last.item_pk]);
+        if (!expanded.has(newest.item_pk)) expanded = new Set([...expanded, newest.item_pk]);
       });
     }
   });
+  const allExpanded = $derived(messages.length > 0 && messages.every((m) => expanded.has(m.item_pk)));
   function toggle(pk: number) {
     const next = new Set(expanded);
     if (next.has(pk)) next.delete(pk);
     else next.add(pk);
     expanded = next;
   }
-  function expandAll() {
-    expanded = new Set(messages.map((m) => m.item_pk));
+  function toggleAll() {
+    expanded = allExpanded ? new Set() : new Set(messages.map((m) => m.item_pk));
   }
 </script>
 
@@ -68,7 +69,7 @@
       <div class="meta caption">
         {#if messages.length > 1}
           {messages.length} писем в беседе
-          <button class="link" onclick={expandAll}>развернуть все</button>
+          <button class="link" onclick={toggleAll}>{allExpanded ? "свернуть все" : "развернуть все"}</button>
         {:else if messages.length === 1}
           одно письмо
         {/if}

@@ -152,13 +152,27 @@
 
   let lastSyncAttempt = 0;
 
-  async function startSync() {
+  async function launchSync(folders?: number[]) {
     lastSyncAttempt = Date.now();
     try {
-      syncStatus = await api.syncStart();
+      syncStatus = await api.syncStart(undefined, folders);
     } catch (e) {
       error = errorMessage(e);
     }
+  }
+
+  /** Все почтовые папки (кнопка «Обновить», автозапуск, таймер). */
+  function startSync() {
+    return launchSync();
+  }
+
+  /** Только одна папка — кнопка на строке дерева. Пока идёт другая синхронизация, запуск не делается. */
+  function startFolderSync(f: Folder) {
+    if (syncStatus?.running) {
+      error = "Синхронизация уже идёт, дождись её окончания";
+      return;
+    }
+    void launchSync([f.folder_pk]);
   }
 
   async function cancelSync() {
@@ -294,7 +308,7 @@
   </header>
 
   <nav class="nav" aria-label="Папки">
-    <FolderTree {folders} selected={selectedFolder} onselect={openFolder} />
+    <FolderTree {folders} selected={selectedFolder} onselect={openFolder} onsync={startFolderSync} syncing={syncStatus?.running ?? false} />
   </nav>
 
   <section class="list" aria-label="Список бесед">

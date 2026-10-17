@@ -404,19 +404,34 @@ impl Store {
         })
     }
 
+    /// Папка по первичному ключу (для синхронизации одной папки из окна).
+    pub fn folder_by_pk(&self, account: AccountId, folder_pk: i64) -> Result<Option<SyncFolder>> {
+        self.with_conn(|c| {
+            let mut st = c.prepare_cached(
+                "SELECT folder_pk, server_id, display_name, distinguished, total_count FROM folders
+                 WHERE account_id = ?1 AND folder_pk = ?2 AND deleted = 0",
+            )?;
+            Ok(st.query_row(params![account.0, folder_pk], |r| Ok(SyncFolder { folder_pk: r.get(0)?, server_id: r.get(1)?, name: r.get(2)?, distinguished: r.get(3)?, total_count: r.get(4)? })).optional()?)
+        })
+    }
+
     /// Все почтовые папки для синхронизации: класс `IPF.Note*`, не удалённые, кроме служебных
     /// (нежелательная, удалённые, черновики, исходящие, журнал бесед, ошибки синхронизации) и их
-    /// подпапок. Порядок: входящие, отправленные, затем по убыванию числа писем.
+    /// подпапок. Служебная папка, которую пользователь уже синхронизировал отдельно (есть состояние
+    /// синхронизации), остаётся в наборе: раз попросили, дальше обновляем сами.
+    /// Порядок: входящие, отправленные, затем по убыванию числа писем.
     pub fn folders_for_sync(&self, account: AccountId) -> Result<Vec<SyncFolder>> {
         self.with_conn(|c| {
             let mut st = c.prepare_cached(
-                "SELECT folder_pk, server_id, display_name, distinguished, total_count, parent_server_id, folder_class
+                "SELECT folder_pk, server_id, display_name, distinguished, total_count, parent_server_id, folder_class,
+                        sync_state IS NOT NULL
                  FROM folders WHERE account_id = ?1 AND deleted = 0",
             )?;
             struct Row {
                 f: SyncFolder,
                 parent: Option<String>,
                 class: Option<String>,
+                synced: bool,
             }
             let rows: Vec<Row> = st
                 .query_map(params![account.0], |r| {
@@ -424,6 +439,7 @@ impl Store {
                         f: SyncFolder { folder_pk: r.get(0)?, server_id: r.get(1)?, name: r.get(2)?, distinguished: r.get(3)?, total_count: r.get(4)? },
                         parent: r.get(5)?,
                         class: r.get(6)?,
+                        synced: r.get::<_, i64>(7)? != 0,
                     })
                 })?
                 .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -432,7 +448,14 @@ impl Store {
             let mut out: Vec<SyncFolder> = Vec::new();
             for r in &rows {
                 let class_ok = r.class.as_deref().map(|c| c == "IPF.Note" || c.starts_with("IPF.Note.")).unwrap_or(false);
-                if !class_ok || is_service(r) {
+                if !class_ok {
+                    continue;
+                }
+                if r.synced {
+                    out.push(r.f.clone());
+                    continue;
+                }
+                if is_service(r) {
                     continue;
                 }
                 // Подпапки служебных папок: идём по цепочке родителей (с защитой от цикла).
@@ -930,11 +953,9 @@ impl Store {
             sql.push_str(&format!(" AND (f.distinguished = ?{n} OR norm_lower(f.display_name) = norm_lower(?{n}) OR norm_lower(f.display_name) LIKE norm_lower(?{n}) || '%')"));
         }
         args.push(SqlValue::Integer(limit as i64));
-        if fts.is_some() {
-            sql.push_str(&format!(" ORDER BY rank LIMIT ?{}", args.len()));
-        } else {
-            sql.push_str(&format!(" ORDER BY COALESCE(i.received_at, i.sent_at) DESC LIMIT ?{}", args.len()));
-        }
+        // Как в OWA: результаты от новых к старым; релевантность (bm25) только разводит письма
+        // с одинаковой датой и остаётся в `SearchHit::rank`.
+        sql.push_str(&format!(" ORDER BY COALESCE(i.received_at, i.sent_at) DESC, rank LIMIT ?{}", args.len()));
 
         self.with_conn(|c| {
             let mut st = c.prepare_cached(&sql)?;
