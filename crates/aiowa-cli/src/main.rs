@@ -1,9 +1,9 @@
 //! `aiowa`: консольная утилита этапа 1. Вход, папки, синхронизация в локальную базу,
 //! список бесед, поиск с операторами, вложения, операции записи (прочитано, флаг, перенос, удаление),
-//! отправка письма, подпись из OWA, подсказки адресов.
+//! отправка письма, подпись из OWA, подсказки адресов, календарь (окно событий и одно событие).
 //! Пароль хранится в диспетчере учётных данных Windows и не передаётся аргументом.
 
-use aiowa_core::{ComposeKind, FolderChange, FolderId, FolderRef, Importance, ItemId, OutgoingAttachment, OutgoingMessage, Participant, SyncState};
+use aiowa_core::{CalendarItemType, ComposeKind, FolderChange, FolderId, FolderRef, Importance, ItemId, OutgoingAttachment, OutgoingMessage, Participant, SyncState};
 use aiowa_store::{AttachmentTodo, Store};
 use aiowa_sync::{Engine, FolderSelection, SyncOptions};
 use aiowa_transport::{Credentials, DeleteMode, MailTransport, WriteResult};
@@ -190,6 +190,83 @@ enum Cmd {
         #[arg(long, default_value_t = 10)]
         limit: usize,
     },
+    /// Календарь: события окна с сервера (FindItem с CalendarView) в кэш локальной базы и сводка
+    /// без тем и имён; с --details N — GetItem по N-му событию списка (только чтение)
+    Calendar {
+        /// Начало окна: дата YYYY-MM-DD, местная полночь
+        #[arg(long)]
+        from: String,
+        /// Конец окна (не включая): дата YYYY-MM-DD, местная полночь
+        #[arg(long)]
+        to: String,
+        /// Какое событие списка запросить целиком (GetItem): номер с 1, `recurring` (первый экземпляр
+        /// повторяющейся встречи) или `meeting` (первая встреча); через запятую — пробовать по очереди
+        #[arg(long)]
+        details: Option<String>,
+        /// Не ходить на сервер: показать только кэш локальной базы
+        #[arg(long)]
+        offline: bool,
+        /// Вместе с --details: запросить то же событие формой AllProperties и напечатать форму
+        /// ответа без содержимого (ключи и длины) — для документации протокола
+        #[arg(long)]
+        probe: bool,
+    },
+}
+
+/// Местная полночь даты `YYYY-MM-DD` как момент UTC.
+fn local_midnight(date: &str) -> Result<jiff::Timestamp> {
+    let d: jiff::civil::Date = date.trim().parse().with_context(|| format!("дата «{date}» не в формате YYYY-MM-DD"))?;
+    Ok(d.to_zoned(jiff::tz::TimeZone::system()).map_err(|e| anyhow!("дата «{date}»: {e}"))?.timestamp())
+}
+
+fn fmt_local(ms: i64) -> String {
+    jiff::Timestamp::from_millisecond(ms).map(|t| t.to_zoned(jiff::tz::TimeZone::system()).strftime("%d.%m %a %H:%M").to_string()).unwrap_or_else(|_| ms.to_string())
+}
+
+/// Сводка окна календаря из кэша: только счётчики и флаги, без тем, мест и имён.
+fn print_calendar_rows(rows: &[aiowa_store::CalendarRow]) {
+    let count = |f: &dyn Fn(&aiowa_store::CalendarRow) -> bool| rows.iter().filter(|r| f(r)).count();
+    println!(
+        "Событий {}: весь день {}, повторяющихся {} (экземпляров {}, исключений {}), встреч {}, отменённых {}, с вложениями {}, с подробностями {}",
+        rows.len(),
+        count(&|r| r.is_all_day),
+        count(&|r| CalendarItemType::parse(&r.calendar_type).is_recurring()),
+        count(&|r| r.calendar_type == "Occurrence"),
+        count(&|r| r.calendar_type == "Exception"),
+        count(&|r| r.is_meeting),
+        count(&|r| r.is_cancelled),
+        count(&|r| r.has_attachments),
+        count(&|r| r.has_details),
+    );
+    let mut by_busy: std::collections::BTreeMap<&str, usize> = Default::default();
+    let mut by_response: std::collections::BTreeMap<&str, usize> = Default::default();
+    let mut by_sensitivity: std::collections::BTreeMap<&str, usize> = Default::default();
+    for r in rows {
+        *by_busy.entry(&r.free_busy).or_default() += 1;
+        *by_response.entry(&r.my_response).or_default() += 1;
+        *by_sensitivity.entry(r.sensitivity.as_deref().unwrap_or("(нет)")).or_default() += 1;
+    }
+    println!("Занятость: {by_busy:?}; мой ответ: {by_response:?}; конфиденциальность: {by_sensitivity:?}");
+    println!("{:>3}  {:<16} {:<16} {:>5} {:<15} {:<16} {:<18} {:>6} {:>6} {:>4} {:>5} {:>5}", "#", "Начало (местн.)", "Конец", "Длит", "Тип", "Занятость", "Мой ответ", "Встр.", "Отмен", "Влож", "Тема", "Орг.");
+    for (i, r) in rows.iter().enumerate() {
+        let minutes = (r.end_at - r.start_at) / 60_000;
+        let duration = if r.is_all_day { "день".to_string() } else if minutes % 60 == 0 { format!("{}ч", minutes / 60) } else { format!("{minutes}м") };
+        println!(
+            "{:>3}  {:<16} {:<16} {:>5} {:<15} {:<16} {:<18} {:>6} {:>6} {:>4} {:>5} {:>5}",
+            i + 1,
+            fmt_local(r.start_at),
+            fmt_local(r.end_at),
+            duration,
+            r.calendar_type,
+            r.free_busy,
+            r.my_response,
+            if r.is_meeting { "да" } else { "" },
+            if r.is_cancelled { "да" } else { "" },
+            if r.has_attachments { "да" } else { "" },
+            r.subject.as_ref().map(|s| s.chars().count()).unwrap_or(0),
+            if r.organizer_email.is_some() { "есть" } else { "" },
+        );
+    }
 }
 
 /// Лимиты вложений при отправке, как в композере окна.
@@ -701,6 +778,86 @@ async fn main() -> Result<()> {
             for r in rows {
                 println!("{:>6}  {}  {}", r.weight, pad(r.name.as_deref().unwrap_or(""), 30), r.email);
             }
+        }
+        Cmd::Calendar { from, to, details, offline, probe } => {
+            let start = local_midnight(from)?;
+            let end = local_midnight(to)?;
+            if end <= start {
+                bail!("конец окна должен быть позже начала");
+            }
+            let (start_ms, end_ms) = (start.as_millisecond(), end.as_millisecond());
+            let store = Store::open(&db_path)?;
+            let account = store.account(&cli.host, &cli.user)?;
+            match store.calendar_range_age(account, start_ms, end_ms)? {
+                Some(age) => println!("Окно {from} – {to} (UTC {start} – {end}): в кэше, загружено {} с назад", age / 1000),
+                None => println!("Окно {from} – {to} (UTC {start} – {end}): в кэше не покрыто"),
+            }
+            if *offline {
+                print_calendar_rows(&store.calendar_events(account, start_ms, end_ms)?);
+                return Ok(());
+            }
+            let t = connect(&cli).await?;
+            let started = std::time::Instant::now();
+            let fetched = t.find_calendar_view(start, end).await;
+            let outcome = async {
+                let events = fetched.map_err(|e| anyhow!("FindItem CalendarView: {e}"))?;
+                println!("FindItem CalendarView: {} событий за {} мс", events.len(), started.elapsed().as_millis());
+                let stored = store.replace_calendar_range(account, start_ms, end_ms, &events)?;
+                let rows = store.calendar_events(account, start_ms, end_ms)?;
+                println!("Кэш: записано {stored}, в окне из базы {}, возраст окна {:?} с", rows.len(), store.calendar_range_age(account, start_ms, end_ms)?.map(|a| a / 1000));
+                print_calendar_rows(&rows);
+                if let Some(sel) = details {
+                    let mut index = None;
+                    for s in sel.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                        index = match s {
+                            "recurring" => rows.iter().position(|r| CalendarItemType::parse(&r.calendar_type).is_recurring()),
+                            "meeting" => rows.iter().position(|r| r.is_meeting),
+                            s => Some(s.parse::<usize>().with_context(|| format!("--details: ожидается номер, recurring или meeting, получено «{s}»"))?.wrapping_sub(1)),
+                        };
+                        if index.is_some() {
+                            break;
+                        }
+                    }
+                    let Some(index) = index else {
+                        println!("GetItem: в окне нет события вида «{sel}», подробности не запрошены.");
+                        return Ok(());
+                    };
+                    let n = index + 1;
+                    let row = rows.get(index).ok_or_else(|| anyhow!("события №{n} нет в списке из {}", rows.len()))?;
+                    let started = std::time::Instant::now();
+                    let d = t.get_calendar_item(&row.id).await.map_err(|e| anyhow!("GetItem события: {e}"))?;
+                    let body_len = d.body.as_ref().and_then(|b| b.full_body.as_ref()).map(|s| s.chars().count()).unwrap_or(0);
+                    let mut by_response: std::collections::BTreeMap<&'static str, usize> = Default::default();
+                    for a in &d.attendees {
+                        *by_response.entry(a.response.as_str()).or_default() += 1;
+                    }
+                    println!(
+                        "GetItem №{n}: Ok за {} мс; тело {} символов{}, тип {:?}, участников {} (обязательных {}, по ответам {:?}), напоминание {}, повторение: {}, ChangeKey {}",
+                        started.elapsed().as_millis(),
+                        body_len,
+                        d.body.as_ref().map(|b| if b.is_truncated { " (усечено)" } else { "" }).unwrap_or(" (нет)"),
+                        d.body.as_ref().map(|b| b.body_type),
+                        d.attendees.len(),
+                        d.attendees.iter().filter(|a| a.required).count(),
+                        by_response,
+                        d.reminder_minutes.map(|m| format!("за {m} мин")).unwrap_or_else(|| "нет".into()),
+                        d.recurrence_text.as_deref().unwrap_or("нет"),
+                        describe_change_key(&row.id, &d.event.id)
+                    );
+                    store.store_calendar_details(row.calendar_pk, &d)?;
+                    let (body, attendees, reminder, recurrence) = store.calendar_details(row.calendar_pk)?.ok_or_else(|| anyhow!("подробности не сохранились"))?;
+                    println!("Кэш подробностей: тело {} символов, участников {}, напоминание {:?}, повторение {}", body.map(|b| b.chars().count()).unwrap_or(0), attendees.len(), reminder, if recurrence.is_some() { "есть" } else { "нет" });
+                    if *probe {
+                        let started = std::time::Instant::now();
+                        let shape = t.probe_calendar_item_shape(&row.id).await.map_err(|e| anyhow!("GetItem AllProperties: {e}"))?;
+                        println!("GetItem AllProperties за {} мс, форма элемента (без содержимого):\n{shape}", started.elapsed().as_millis());
+                    }
+                }
+                Ok::<(), anyhow::Error>(())
+            }
+            .await;
+            t.logoff().await.ok();
+            outcome?;
         }
         Cmd::Sql { query } => {
             let store = Store::open(&db_path)?;

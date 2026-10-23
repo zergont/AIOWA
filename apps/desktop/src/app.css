@@ -83,3 +83,34 @@ button {
   box-shadow: var(--shadow-16);
   color: var(--fg-1);
 }
+
+/* Сегментированный переключатель (разделы в верхней панели, вид календаря): ровно одна кнопка «включена». */
+.segmented {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  height: var(--control-height);
+  padding: 2px;
+  border: 1px solid var(--stroke-1);
+  border-radius: var(--radius-control);
+  background: var(--bg-layer-alt);
+}
+.segmented > button {
+  height: 100%;
+  padding: 0 12px;
+  border-radius: 3px;
+  color: var(--fg-2);
+  white-space: nowrap;
+  transition:
+    background var(--dur-fast) var(--ease-in),
+    color var(--dur-fast) var(--ease-in);
+}
+.segmented > button:hover {
+  background: var(--bg-hover);
+  color: var(--fg-1);
+}
+.segmented > button.on {
+  background: var(--bg-selected);
+  color: var(--fg-1);
+  font-weight: 600;
+}

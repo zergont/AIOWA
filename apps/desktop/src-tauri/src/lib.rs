@@ -8,6 +8,9 @@
 //!
 //! Новое письмо, ответ, ответ всем и пересылка — команды композера (`compose.rs`): черновик на
 //! сервере, вложения, отправка через тот же транспорт процесса.
+//!
+//! Календарь (`calendar.rs`): события окна и подробности события из кэша в базе; сервер —
+//! когда кэш не покрывает окно, устарел или окно просит обновить.
 
 use aiowa_core::{AccountId, BodyType};
 use aiowa_store::ui::{ConversationCursor, MessageHead};
@@ -23,6 +26,7 @@ use std::sync::Arc;
 use tauri::{Emitter, Manager, State};
 use tracing::warn;
 
+mod calendar;
 mod compose;
 mod ondemand;
 mod sync;
@@ -469,6 +473,7 @@ pub fn run() {
         .manage(ondemand::OnDemand::default())
         .manage(write::WriteState::default())
         .manage(compose::ComposeState::default())
+        .manage(calendar::CalendarState::default())
         .manage(CloseState::default())
         .on_window_event(|w, ev| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = ev
@@ -508,6 +513,8 @@ pub fn run() {
             compose::signature_set,
             compose::signature_import_owa,
             compose::attachments_pick,
+            calendar::calendar_events,
+            calendar::calendar_event_details,
             window_close_guard,
             window_close_confirmed
         ])

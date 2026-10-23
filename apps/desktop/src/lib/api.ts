@@ -209,6 +209,68 @@ export interface PickedFile {
   size: number;
 }
 
+// --- календарь ------------------------------------------------------------------------------
+// Миллисекунды — UTC; окно само переводит их в местное время. У событий «весь день» границы —
+// полуночи в поясе организатора (сервер их не нормализует), поэтому день показа — местная дата
+// ближайшей полуночи к границе (см. allDayDate в lib/calendar.ts; верно при разнице поясов до 12 ч).
+
+export type FreeBusy = "free" | "tentative" | "busy" | "oof" | "working_elsewhere" | "no_data";
+export type CalendarItemType = "single" | "occurrence" | "exception" | "recurring_master";
+export type ResponseType = "unknown" | "organizer" | "tentative" | "accept" | "decline" | "no_response";
+
+export interface CalendarPerson {
+  name: string | null;
+  email: string | null;
+}
+
+/** Событие в сетке; повторяющиеся приходят уже развёрнутыми в экземпляры. */
+export interface CalendarEvent {
+  calendar_pk: number;
+  subject: string | null;
+  start_ms: number;
+  end_ms: number;
+  is_all_day: boolean;
+  location: string | null;
+  organizer: CalendarPerson | null;
+  free_busy: FreeBusy;
+  calendar_type: CalendarItemType;
+  is_meeting: boolean;
+  is_cancelled: boolean;
+  my_response: ResponseType;
+  sensitivity: string | null;
+  has_attachments: boolean;
+  /** Подробности (тело, участники) уже в кэше. */
+  has_details: boolean;
+}
+
+/** Ответ `calendar_events`: при ошибке сети — кэш (если есть) и текст ошибки по-русски. */
+export interface CalendarRange {
+  events: CalendarEvent[];
+  from_cache: boolean;
+  /** Когда окно последний раз забирали с сервера; null — кэш окно целиком не покрывает. */
+  fetched_ms: number | null;
+  error: string | null;
+}
+
+export interface Attendee {
+  name: string | null;
+  email: string | null;
+  response: ResponseType;
+  required: boolean;
+}
+
+export interface CalendarEventDetails {
+  event: CalendarEvent;
+  /** Тело уже очищено на бэкенде (без cid). */
+  body_html: string | null;
+  attendees: Attendee[];
+  reminder_minutes: number | null;
+  recurrence_text: string | null;
+  from_cache: boolean;
+  /** Обновить с сервера не удалось, показаны подробности из кэша. */
+  error: string | null;
+}
+
 export const api = {
   accountInfo: () => invoke<AccountInfo>("account_info"),
   folders: () => invoke<Folder[]>("folders"),
@@ -264,6 +326,15 @@ export const api = {
   windowCloseGuard: (enabled: boolean) => invoke<void>("window_close_guard", { enabled }),
   /** Пользователь подтвердил закрытие окна. */
   windowCloseConfirmed: () => invoke<void>("window_close_confirmed"),
+
+  // --- календарь ---------------------------------------------------------------------------
+  /**
+   * События окна [startMs, endMs) в UTC. Без `refresh` — только кэш, что есть (fetched_ms говорит,
+   * когда окно забирали, null — не покрыто), о догрузке решает окно; с `refresh` — всегда сервер.
+   */
+  calendarEvents: (startMs: number, endMs: number, refresh: boolean) => invoke<CalendarRange>("calendar_events", { startMs, endMs, refresh }),
+  /** Подробности события: тело, участники, напоминание, текст повторения; с `refresh` — перечитать с сервера. */
+  calendarEventDetails: (calendarPk: number, refresh: boolean) => invoke<CalendarEventDetails>("calendar_event_details", { calendarPk, refresh }),
 };
 
 /** Подписка на запрос закрытия окна (крестик, Alt+F4) при поднятом windowCloseGuard. Возвращает функцию отписки. */

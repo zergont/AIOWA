@@ -3,6 +3,7 @@
 //!
 //! Версия 3 (итерация 2): кэш и текст вложений, беседы с агрегатами по папкам,
 //! колонка `attachment_text` в индексе и нормализация ё→е функцией `fts_norm`.
+//! Версия 4 (этап 4): кэш событий календаря и окна, которые уже забирали с сервера.
 
 use crate::text;
 use rusqlite::functions::FunctionFlags;
@@ -10,7 +11,7 @@ use rusqlite::types::ValueRef;
 use rusqlite::Connection;
 use tracing::info;
 
-pub const CURRENT_VERSION: i64 = 3;
+pub const CURRENT_VERSION: i64 = 4;
 
 /// Состояния текста вложения (`attachments.text_state`).
 pub const TEXT_PENDING: i64 = 0;
@@ -243,6 +244,50 @@ UPDATE items SET fts_indexed = 1 WHERE deleted = 0;
 UPDATE items SET fts_indexed = 0 WHERE deleted = 1;
 "#;
 
+/// Версия 4: кэш календаря. `calendar_items` — экземпляры событий, как их отдаёт `FindItem` с
+/// `CalendarView` (повторяющиеся встречи уже развёрнуты, у каждого экземпляра свой `server_id`);
+/// моменты в миллисекундах UTC; тело и участники появляются после `GetItem` (`details_at`).
+/// `calendar_ranges` — окна, которые уже забирали с сервера, со временем загрузки.
+const V4_TABLES: &str = r#"
+CREATE TABLE IF NOT EXISTS calendar_items (
+  calendar_pk      INTEGER PRIMARY KEY,
+  account_id       INTEGER NOT NULL REFERENCES accounts(account_id),
+  server_id        TEXT NOT NULL,
+  change_key       TEXT,
+  subject          TEXT,
+  start_at         INTEGER NOT NULL,
+  end_at           INTEGER NOT NULL,
+  is_all_day       INTEGER NOT NULL DEFAULT 0,
+  location         TEXT,
+  organizer_name   TEXT,
+  organizer_email  TEXT,
+  free_busy        TEXT NOT NULL DEFAULT 'Busy',
+  calendar_type    TEXT NOT NULL DEFAULT 'Single',
+  is_meeting       INTEGER NOT NULL DEFAULT 0,
+  is_cancelled     INTEGER NOT NULL DEFAULT 0,
+  my_response      TEXT NOT NULL DEFAULT 'Unknown',
+  sensitivity      TEXT,
+  has_attachments  INTEGER NOT NULL DEFAULT 0,
+  last_modified_at INTEGER,
+  body_html        BLOB,
+  attendees_json   TEXT,
+  reminder_minutes INTEGER,
+  recurrence_text  TEXT,
+  fetched_at       INTEGER NOT NULL,
+  details_at       INTEGER,
+  UNIQUE(account_id, server_id)
+);
+CREATE INDEX IF NOT EXISTS calendar_items_range ON calendar_items(account_id, start_at, end_at);
+
+CREATE TABLE IF NOT EXISTS calendar_ranges (
+  account_id  INTEGER NOT NULL REFERENCES accounts(account_id),
+  start_at    INTEGER NOT NULL,
+  end_at      INTEGER NOT NULL,
+  fetched_at  INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS calendar_ranges_account ON calendar_ranges(account_id, start_at);
+"#;
+
 pub const FTS_COLUMNS: &str = "subject, from_name, from_email, recipients, unique_text, attachment_text";
 
 /// Удаляет строку из индекса по текущим значениям источника. Вызывать ДО изменения
@@ -348,6 +393,22 @@ pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
         }
         info!(elapsed_s = started.elapsed().as_secs_f32(), "схема базы обновлена до версии 3: вложения, беседы, индекс пересобран");
     }
+    if version < 4 {
+        conn.execute_batch("BEGIN IMMEDIATE;")?;
+        let result = (|| -> rusqlite::Result<()> {
+            conn.execute_batch(V4_TABLES)?;
+            conn.pragma_update(None, "user_version", 4)?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => conn.execute_batch("COMMIT;")?,
+            Err(e) => {
+                let _ = conn.execute_batch("ROLLBACK;");
+                return Err(e);
+            }
+        }
+        info!("схема базы обновлена до версии 4: кэш календаря");
+    }
     Ok(())
 }
 
@@ -427,5 +488,12 @@ mod tests {
         assert_eq!(ts, TEXT_PENDING);
         let n: i64 = conn.query_row("SELECT COUNT(*) FROM items_fts WHERE items_fts MATCH 'attachment_text: скан'", [], |r| r.get(0)).unwrap();
         assert_eq!(n, 1, "имя вложения проиндексировано при пересборке");
+        // Версия 4 применилась следом: таблицы календаря есть и пусты.
+        let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(v, CURRENT_VERSION);
+        let n: i64 = conn.query_row("SELECT COUNT(*) FROM calendar_items", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 0);
+        let n: i64 = conn.query_row("SELECT COUNT(*) FROM calendar_ranges", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 0);
     }
 }

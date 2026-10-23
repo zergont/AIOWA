@@ -3,8 +3,9 @@
 //! как требует сервер). Ответы разбираются толерантно: неизвестные поля игнорируются.
 
 use aiowa_core::{
-    AttachmentMeta, BodyType, ComposeKind, ConversationId, DistinguishedFolder, FlagStatus, Folder, FolderChange, FolderId, FolderRef, Importance, ItemChange, ItemId,
-    MessageBody, MessageFull, MessageMeta, OutgoingAttachment, OutgoingMessage, Participant, Signature, SyncState,
+    AttachmentMeta, Attendee, BodyType, CalendarEvent, CalendarEventDetails, CalendarItemType, ComposeKind, ConversationId, DistinguishedFolder, FlagStatus, Folder, FolderChange,
+    FolderId, FolderRef, FreeBusy, Importance, ItemChange, ItemId, MessageBody, MessageFull, MessageMeta, OutgoingAttachment, OutgoingMessage, Participant, ResponseType, Signature,
+    SyncState,
 };
 use aiowa_transport::WriteResult;
 use base64::prelude::*;
@@ -361,6 +362,359 @@ pub fn get_user_configuration_body(base: &str) -> Value {
         },
         "UserConfigurationProperties": "All",
     })
+}
+
+// ---------------------------------------------------------------------------
+// Календарь (см. docs/protocol-owa-json.md § 5g)
+
+/// Поля события для списка (`FindItem` с `CalendarView`); у `GetItem` к ним добавляются
+/// `CALENDAR_DETAIL_FIELDS`.
+pub const CALENDAR_FIELDS: &[&str] = &[
+    "item:Subject",
+    "calendar:Start",
+    "calendar:End",
+    "calendar:IsAllDayEvent",
+    "calendar:Location",
+    "calendar:Organizer",
+    "calendar:LegacyFreeBusyStatus",
+    "calendar:CalendarItemType",
+    "calendar:IsMeeting",
+    "calendar:IsCancelled",
+    "calendar:MyResponseType",
+    "item:Sensitivity",
+    "item:HasAttachments",
+    "item:LastModifiedTime",
+    "calendar:AppointmentState",
+];
+
+/// Бит `AppointmentState`: встреча отменена (`IsCancelled` в `FindItem` сервер не отдаёт).
+const APPOINTMENT_STATE_CANCELLED: i64 = 0x4;
+
+/// Поля события для панели: участники с ответами, повторение, тело, напоминание.
+pub const CALENDAR_DETAIL_FIELDS: &[&str] = &["calendar:RequiredAttendees", "calendar:OptionalAttendees", "calendar:Recurrence", "item:Body", "item:ReminderIsSet", "item:ReminderMinutesBeforeStart"];
+
+/// Момент для окна `CalendarView`: `2026-10-20T00:00:00Z` (`with_zone`) или без `Z`
+/// (на случай, если сервер ждёт «наивное» время в поясе контекста, как у `GetCalendarView`).
+pub fn calendar_view_date(t: Timestamp, with_zone: bool) -> String {
+    let s = t.strftime("%Y-%m-%dT%H:%M:%S").to_string();
+    if with_zone { format!("{s}Z") } else { s }
+}
+
+/// `FindItem` по папке `calendar` с `CalendarPageView`: сервер разворачивает повторяющиеся
+/// встречи в экземпляры, окно `[start, end)`. `max_entries` — `MaxEntriesReturned`, если нужен.
+pub fn find_calendar_view_body(start: Timestamp, end: Timestamp, with_zone: bool, max_entries: Option<u32>) -> Value {
+    let mut paging = json!({ "__type": "CalendarPageView:#Exchange", "StartDate": calendar_view_date(start, with_zone), "EndDate": calendar_view_date(end, with_zone) });
+    if let Some(n) = max_entries {
+        paging["MaxEntriesReturned"] = json!(n);
+    }
+    json!({
+        "__type": "FindItemRequest:#Exchange",
+        "ItemShape": {
+            "__type": "ItemResponseShape:#Exchange",
+            "BaseShape": "IdOnly",
+            "AdditionalProperties": CALENDAR_FIELDS.iter().map(|f| property_uri(f)).collect::<Vec<_>>()
+        },
+        "ParentFolderIds": [ folder_ref_json(&FolderRef::Distinguished(DistinguishedFolder::Calendar)) ],
+        "Traversal": "Shallow",
+        "Paging": paging,
+    })
+}
+
+/// Запасной путь: операция OWA `GetCalendarView` (её шлёт браузерная OWA при листании
+/// календаря): `CalendarId` папки, `RangeStart`/`RangeEnd` без зоны в поясе контекста.
+pub fn get_calendar_view_body(start: Timestamp, end: Timestamp) -> Value {
+    json!({
+        "__type": "GetCalendarViewRequest:#Exchange",
+        "CalendarId": target_folder_json(&FolderRef::Distinguished(DistinguishedFolder::Calendar)),
+        "RangeStart": calendar_view_date(start, false),
+        "RangeEnd": calendar_view_date(end, false),
+    })
+}
+
+/// Форма `ItemShape` для `GetItem` события.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CalendarItemShape {
+    /// `IdOnly` + явный список свойств (`CALENDAR_FIELDS` + `CALENDAR_DETAIL_FIELDS`).
+    Explicit,
+    /// `AllProperties`: всё, что сервер знает о событии.
+    AllProperties,
+}
+
+/// `GetItem` одного события: тело HTML, участники, повторение, напоминание.
+pub fn get_calendar_item_body(id: &ItemId, shape: CalendarItemShape, max_body: u64) -> Value {
+    let mut item_shape = json!({
+        "__type": "ItemResponseShape:#Exchange",
+        "BaseShape": match shape { CalendarItemShape::Explicit => "IdOnly", CalendarItemShape::AllProperties => "AllProperties" },
+        "BodyType": "HTML",
+        "FilterHtmlContent": true,
+        "BlockExternalImagesIfSenderUntrusted": true,
+        "MaximumBodySize": max_body,
+        "MaximumRecipientsToReturn": 500
+    });
+    if shape == CalendarItemShape::Explicit {
+        item_shape["AdditionalProperties"] = Value::Array(CALENDAR_FIELDS.iter().chain(CALENDAR_DETAIL_FIELDS).map(|f| property_uri(f)).collect());
+    }
+    json!({
+        "__type": "GetItemRequest:#Exchange",
+        "ItemShape": item_shape,
+        "ItemIds": [ item_id_json(id) ],
+        "ShapeName": null,
+    })
+}
+
+/// `GetItem` повторяющейся встречи по идентификатору её экземпляра (`RecurringMasterItemId`
+/// с `OccurrenceId`): только образец повторения, который у экземпляров отсутствует.
+pub fn get_recurring_master_body(occurrence: &ItemId) -> Value {
+    let mut id = json!({ "__type": "RecurringMasterItemId:#Exchange", "OccurrenceId": occurrence.id });
+    if let Some(ck) = &occurrence.change_key {
+        id["ChangeKey"] = json!(ck);
+    }
+    json!({
+        "__type": "GetItemRequest:#Exchange",
+        "ItemShape": {
+            "__type": "ItemResponseShape:#Exchange",
+            "BaseShape": "IdOnly",
+            "AdditionalProperties": [ property_uri("calendar:Recurrence") ]
+        },
+        "ItemIds": [ id ],
+        "ShapeName": null,
+    })
+}
+
+/// Момент из строки сервера: ISO с зоной (`Z`, `+00:00`), а без зоны — как время в UTC
+/// (контекст запросов — UTC); дата без времени — полночь UTC.
+pub fn parse_calendar_timestamp(s: Option<&str>) -> Option<Timestamp> {
+    let s = s?.trim();
+    if let Ok(t) = s.parse::<Timestamp>() {
+        return Some(t);
+    }
+    if let Ok(dt) = s.parse::<jiff::civil::DateTime>() {
+        return dt.to_zoned(jiff::tz::TimeZone::UTC).ok().map(|z| z.timestamp());
+    }
+    s.parse::<jiff::civil::Date>().ok().and_then(|d| d.to_zoned(jiff::tz::TimeZone::UTC).ok()).map(|z| z.timestamp())
+}
+
+/// Число из поля: JSON-число или строка с числом (EWS-схема описывает их строками).
+pub fn num_of(v: &Value, key: &str) -> Option<i64> {
+    match v.get(key)? {
+        Value::Number(n) => n.as_i64(),
+        Value::String(s) => s.trim().parse().ok(),
+        _ => None,
+    }
+}
+
+/// Место встречи: строка `Location` или объект (`EnhancedLocation`/`Location {DisplayName}`).
+fn location_of(v: &Value) -> Option<String> {
+    let raw = match v.get("Location") {
+        Some(Value::String(s)) => Some(s.as_str()),
+        Some(obj) if obj.is_object() => str_of(obj, "DisplayName"),
+        _ => None,
+    };
+    raw.or_else(|| v.get("EnhancedLocation").and_then(|e| str_of(e, "DisplayName"))).map(str::trim).filter(|s| !s.is_empty()).map(String::from)
+}
+
+/// Событие из элемента `CalendarItem:#Exchange` (`FindItem`, `GetCalendarView`, `GetItem`).
+/// Без `ItemId`, `Start` или `End` события нет. OWA JSON отдаёт занятость как `FreeBusyType`
+/// и свой ответ как `ResponseType` (имена EWS `LegacyFreeBusyStatus`/`MyResponseType` тоже
+/// принимаются); отмена — `IsCancelled` либо бит `AppointmentState`.
+pub fn parse_calendar_event(v: &Value) -> Option<CalendarEvent> {
+    let id = parse_item_id(v.get("ItemId")?)?;
+    let start = parse_calendar_timestamp(str_of(v, "Start"))?;
+    let end = parse_calendar_timestamp(str_of(v, "End")).unwrap_or(start);
+    let appointment_state = num_of(v, "AppointmentState").unwrap_or(0);
+    Some(CalendarEvent {
+        id,
+        subject: str_of(v, "Subject").map(String::from),
+        start,
+        end,
+        is_all_day: bool_of(v, "IsAllDayEvent"),
+        location: location_of(v),
+        organizer: v.get("Organizer").and_then(parse_participant),
+        free_busy: str_of(v, "FreeBusyType").or_else(|| str_of(v, "LegacyFreeBusyStatus")).map(FreeBusy::parse).unwrap_or_default(),
+        calendar_type: str_of(v, "CalendarItemType").map(CalendarItemType::parse).unwrap_or_default(),
+        is_meeting: bool_of(v, "IsMeeting"),
+        is_cancelled: bool_of(v, "IsCancelled") || appointment_state & APPOINTMENT_STATE_CANCELLED != 0,
+        my_response: str_of(v, "ResponseType").or_else(|| str_of(v, "MyResponseType")).map(ResponseType::parse).unwrap_or_default(),
+        sensitivity: str_of(v, "Sensitivity").map(String::from),
+        has_attachments: bool_of(v, "HasAttachments"),
+        last_modified: parse_timestamp(str_of(v, "LastModifiedTime")),
+    })
+}
+
+/// Элементы ответа `FindItem` (`RootFolder.Items[]`) или `GetCalendarView` (`Items[]`) и признак
+/// полной выдачи (`RootFolder.IncludesLastItemInRange`; если его нет — считается полной).
+pub fn parse_calendar_view(msg: &Value) -> (Vec<CalendarEvent>, bool) {
+    let root = msg.get("RootFolder").unwrap_or(msg);
+    let items = root.get("Items").and_then(Value::as_array).map(|a| a.iter().filter_map(parse_calendar_event).collect()).unwrap_or_default();
+    let includes_last = root.get("IncludesLastItemInRange").and_then(Value::as_bool).unwrap_or(true);
+    (items, includes_last)
+}
+
+/// Участник встречи: `{ Mailbox: {...}, ResponseType, LastResponseTime }`.
+fn parse_attendee(v: &Value, required: bool) -> Option<Attendee> {
+    let participant = parse_participant(v)?;
+    Some(Attendee { participant, response: str_of(v, "ResponseType").map(ResponseType::parse).unwrap_or_default(), required })
+}
+
+fn parse_attendees(v: Option<&Value>, required: bool) -> Vec<Attendee> {
+    v.and_then(Value::as_array).map(|a| a.iter().filter_map(|x| parse_attendee(x, required)).collect()).unwrap_or_default()
+}
+
+/// Событие целиком из элемента ответа `GetItem`.
+pub fn parse_calendar_details(v: &Value) -> Option<CalendarEventDetails> {
+    let event = parse_calendar_event(v)?;
+    let body = v.get("Body").or_else(|| v.get("NormalizedBody")).or_else(|| v.get("UniqueBody")).and_then(parse_body).map(|(body_type, value, truncated)| MessageBody {
+        body_type,
+        unique_body: None,
+        full_body: Some(value),
+        is_truncated: truncated,
+    });
+    let mut attendees = parse_attendees(v.get("RequiredAttendees"), true);
+    attendees.extend(parse_attendees(v.get("OptionalAttendees"), false));
+    let reminder_set = v.get("ReminderIsSet").and_then(Value::as_bool).unwrap_or(true);
+    let reminder_minutes = if reminder_set { num_of(v, "ReminderMinutesBeforeStart") } else { None };
+    Some(CalendarEventDetails { event, body, attendees, reminder_minutes, recurrence_text: v.get("Recurrence").and_then(recurrence_text) })
+}
+
+/// Список дней недели из `DaysOfWeek`: строка через пробел (как в EWS) или массив строк.
+fn days_of_week(v: &Value) -> Vec<String> {
+    match v.get("DaysOfWeek") {
+        Some(Value::String(s)) => s.split_whitespace().map(String::from).collect(),
+        Some(Value::Array(a)) => a.iter().filter_map(Value::as_str).map(String::from).collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn day_name_ru(day: &str) -> &str {
+    match day {
+        "Monday" => "пн",
+        "Tuesday" => "вт",
+        "Wednesday" => "ср",
+        "Thursday" => "чт",
+        "Friday" => "пт",
+        "Saturday" => "сб",
+        "Sunday" => "вс",
+        "Day" => "любой день",
+        "Weekday" => "будний день",
+        "WeekendDay" => "выходной",
+        other => other,
+    }
+}
+
+fn index_name_ru(index: &str) -> &str {
+    match index {
+        "First" => "первый",
+        "Second" => "второй",
+        "Third" => "третий",
+        "Fourth" => "четвёртый",
+        "Last" => "последний",
+        other => other,
+    }
+}
+
+fn month_name_ru(month: &str) -> &str {
+    match month {
+        "January" => "января",
+        "February" => "февраля",
+        "March" => "марта",
+        "April" => "апреля",
+        "May" => "мая",
+        "June" => "июня",
+        "July" => "июля",
+        "August" => "августа",
+        "September" => "сентября",
+        "October" => "октября",
+        "November" => "ноября",
+        "December" => "декабря",
+        other => other,
+    }
+}
+
+/// «Каждые N <единиц>» с русским склонением: `forms` — (1, 2–4, 5+), например («день», «дня», «дней»).
+fn every_n(n: i64, forms: (&str, &str, &str), each: &str) -> String {
+    if n <= 1 {
+        return each.to_string();
+    }
+    let last = n % 10;
+    let tens = n % 100;
+    let word = if (11..=14).contains(&tens) {
+        forms.2
+    } else if last == 1 {
+        forms.0
+    } else if (2..=4).contains(&last) {
+        forms.1
+    } else {
+        forms.2
+    };
+    format!("Каждые {n} {word}")
+}
+
+/// Дата `2026-01-05` из `RecurrenceRange` в виде `05.01.2026`.
+fn range_date(v: &Value, key: &str) -> Option<String> {
+    let s = str_of(v, key)?;
+    let d: jiff::civil::Date = s.get(..10)?.parse().ok()?;
+    Some(d.strftime("%d.%m.%Y").to_string())
+}
+
+/// Краткое описание повторения из структуры `Recurrence` (`RecurrencePattern` + `RecurrenceRange`):
+/// «Каждую неделю: пн, ср, с 05.01.2026 по 30.06.2026». Неизвестный образец — `None`.
+pub fn recurrence_text(rec: &Value) -> Option<String> {
+    let pattern = rec.get("RecurrencePattern")?;
+    let ty = str_of(pattern, "__type").unwrap_or("").split(':').next().unwrap_or("");
+    let interval = num_of(pattern, "Interval").unwrap_or(1);
+    let days = days_of_week(pattern).iter().map(|d| day_name_ru(d).to_string()).collect::<Vec<_>>().join(", ");
+    let mut text = match ty {
+        "DailyRecurrence" => every_n(interval, ("день", "дня", "дней"), "Ежедневно"),
+        "WeeklyRecurrence" => {
+            let base = every_n(interval, ("неделю", "недели", "недель"), "Каждую неделю");
+            if days.is_empty() { base } else { format!("{base}: {days}") }
+        }
+        "AbsoluteMonthlyRecurrence" => {
+            let base = every_n(interval, ("месяц", "месяца", "месяцев"), "Ежемесячно");
+            match num_of(pattern, "DayOfMonth") {
+                Some(d) => format!("{base} {d}-го числа"),
+                None => base,
+            }
+        }
+        "RelativeMonthlyRecurrence" => {
+            let base = every_n(interval, ("месяц", "месяца", "месяцев"), "Ежемесячно");
+            let index = str_of(pattern, "DayOfWeekIndex").map(index_name_ru).unwrap_or("");
+            if days.is_empty() { base } else { format!("{base}: {index} {days}").replace(":  ", ": ") }
+        }
+        "AbsoluteYearlyRecurrence" => {
+            let month = str_of(pattern, "Month").map(month_name_ru).unwrap_or("");
+            match num_of(pattern, "DayOfMonth") {
+                Some(d) => format!("Ежегодно {d} {month}").trim_end().to_string(),
+                None => "Ежегодно".to_string(),
+            }
+        }
+        "RelativeYearlyRecurrence" => {
+            let month = str_of(pattern, "Month").map(month_name_ru).unwrap_or("");
+            let index = str_of(pattern, "DayOfWeekIndex").map(index_name_ru).unwrap_or("");
+            format!("Ежегодно: {index} {days} {month}").split_whitespace().collect::<Vec<_>>().join(" ")
+        }
+        _ => return None,
+    };
+    if let Some(range) = rec.get("RecurrenceRange") {
+        let rty = str_of(range, "__type").unwrap_or("").split(':').next().unwrap_or("");
+        if let Some(from) = range_date(range, "StartDate") {
+            text.push_str(&format!(", с {from}"));
+        }
+        match rty {
+            "EndDateRecurrence" => {
+                if let Some(to) = range_date(range, "EndDate") {
+                    text.push_str(&format!(" по {to}"));
+                }
+            }
+            "NumberedRecurrence" => {
+                if let Some(n) = num_of(range, "NumberOfOccurrences") {
+                    text.push_str(&format!(", всего {n} раз"));
+                }
+            }
+            _ => {}
+        }
+    }
+    Some(text)
 }
 
 // ---------------------------------------------------------------------------
@@ -963,6 +1317,132 @@ mod tests {
         let msg: Value = serde_json::from_str(r#"{"UserConfiguration":{"Dictionary":[{"DictionaryKey":{"Value":"AutoAddSignature"},"DictionaryValue":{"Value":"True"}},{"DictionaryKey":{"Value":"SignatureHtml"},"DictionaryValue":{"Value":"  "}}]}}"#).unwrap();
         assert_eq!(parse_user_signature(&msg), None);
         assert_eq!(parse_user_signature(&json!({"UserConfiguration":{}})), None);
+    }
+
+    #[test]
+    fn find_calendar_view_body_exact() {
+        let start: Timestamp = "2026-10-20T00:00:00Z".parse().unwrap();
+        let end: Timestamp = "2026-10-27T00:00:00Z".parse().unwrap();
+        let s = serde_json::to_string(&find_calendar_view_body(start, end, true, None)).unwrap();
+        assert_eq!(
+            s,
+            r#"{"__type":"FindItemRequest:#Exchange","ItemShape":{"__type":"ItemResponseShape:#Exchange","BaseShape":"IdOnly","AdditionalProperties":[{"__type":"PropertyUri:#Exchange","FieldURI":"item:Subject"},{"__type":"PropertyUri:#Exchange","FieldURI":"calendar:Start"},{"__type":"PropertyUri:#Exchange","FieldURI":"calendar:End"},{"__type":"PropertyUri:#Exchange","FieldURI":"calendar:IsAllDayEvent"},{"__type":"PropertyUri:#Exchange","FieldURI":"calendar:Location"},{"__type":"PropertyUri:#Exchange","FieldURI":"calendar:Organizer"},{"__type":"PropertyUri:#Exchange","FieldURI":"calendar:LegacyFreeBusyStatus"},{"__type":"PropertyUri:#Exchange","FieldURI":"calendar:CalendarItemType"},{"__type":"PropertyUri:#Exchange","FieldURI":"calendar:IsMeeting"},{"__type":"PropertyUri:#Exchange","FieldURI":"calendar:IsCancelled"},{"__type":"PropertyUri:#Exchange","FieldURI":"calendar:MyResponseType"},{"__type":"PropertyUri:#Exchange","FieldURI":"item:Sensitivity"},{"__type":"PropertyUri:#Exchange","FieldURI":"item:HasAttachments"},{"__type":"PropertyUri:#Exchange","FieldURI":"item:LastModifiedTime"},{"__type":"PropertyUri:#Exchange","FieldURI":"calendar:AppointmentState"}]},"ParentFolderIds":[{"__type":"DistinguishedFolderId:#Exchange","Id":"calendar"}],"Traversal":"Shallow","Paging":{"__type":"CalendarPageView:#Exchange","StartDate":"2026-10-20T00:00:00Z","EndDate":"2026-10-27T00:00:00Z"}}"#
+        );
+        let s = serde_json::to_string(&find_calendar_view_body(start, end, false, Some(500))).unwrap();
+        assert!(s.ends_with(r#""Paging":{"__type":"CalendarPageView:#Exchange","StartDate":"2026-10-20T00:00:00","EndDate":"2026-10-27T00:00:00","MaxEntriesReturned":500}}"#), "{s}");
+        let env = envelope("FindItem", V_2017, "UTC", find_calendar_view_body(start, end, true, None));
+        assert!(serde_json::to_string(&env).unwrap().starts_with(r#"{"__type":"FindItemJsonRequest:#Exchange","Header":{"__type":"JsonRequestHeaders:#Exchange""#));
+        assert_eq!(
+            serde_json::to_string(&get_calendar_view_body(start, end)).unwrap(),
+            r#"{"__type":"GetCalendarViewRequest:#Exchange","CalendarId":{"__type":"TargetFolderId:#Exchange","BaseFolderId":{"__type":"DistinguishedFolderId:#Exchange","Id":"calendar"}},"RangeStart":"2026-10-20T00:00:00","RangeEnd":"2026-10-27T00:00:00"}"#
+        );
+    }
+
+    #[test]
+    fn get_calendar_item_body_exact() {
+        let id = ItemId { id: "E".into(), change_key: Some("ek".into()) };
+        let s = serde_json::to_string(&get_calendar_item_body(&id, CalendarItemShape::Explicit, 4096)).unwrap();
+        assert!(s.starts_with(r#"{"__type":"GetItemRequest:#Exchange","ItemShape":{"__type":"ItemResponseShape:#Exchange","BaseShape":"IdOnly","BodyType":"HTML","FilterHtmlContent":true,"BlockExternalImagesIfSenderUntrusted":true,"MaximumBodySize":4096,"MaximumRecipientsToReturn":500,"AdditionalProperties":[{"__type":"PropertyUri:#Exchange","FieldURI":"item:Subject"},"#), "{s}");
+        assert!(s.contains(r#"{"__type":"PropertyUri:#Exchange","FieldURI":"calendar:RequiredAttendees"},{"__type":"PropertyUri:#Exchange","FieldURI":"calendar:OptionalAttendees"},{"__type":"PropertyUri:#Exchange","FieldURI":"calendar:Recurrence"},{"__type":"PropertyUri:#Exchange","FieldURI":"item:Body"},{"__type":"PropertyUri:#Exchange","FieldURI":"item:ReminderIsSet"},{"__type":"PropertyUri:#Exchange","FieldURI":"item:ReminderMinutesBeforeStart"}]},"ItemIds":[{"__type":"ItemId:#Exchange","Id":"E","ChangeKey":"ek"}],"ShapeName":null}"#), "{s}");
+        let s = serde_json::to_string(&get_calendar_item_body(&id, CalendarItemShape::AllProperties, 4096)).unwrap();
+        assert_eq!(
+            s,
+            r#"{"__type":"GetItemRequest:#Exchange","ItemShape":{"__type":"ItemResponseShape:#Exchange","BaseShape":"AllProperties","BodyType":"HTML","FilterHtmlContent":true,"BlockExternalImagesIfSenderUntrusted":true,"MaximumBodySize":4096,"MaximumRecipientsToReturn":500},"ItemIds":[{"__type":"ItemId:#Exchange","Id":"E","ChangeKey":"ek"}],"ShapeName":null}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&get_recurring_master_body(&id)).unwrap(),
+            r#"{"__type":"GetItemRequest:#Exchange","ItemShape":{"__type":"ItemResponseShape:#Exchange","BaseShape":"IdOnly","AdditionalProperties":[{"__type":"PropertyUri:#Exchange","FieldURI":"calendar:Recurrence"}]},"ItemIds":[{"__type":"RecurringMasterItemId:#Exchange","OccurrenceId":"E","ChangeKey":"ek"}],"ShapeName":null}"#
+        );
+        assert!(serde_json::to_string(&get_recurring_master_body(&ItemId { id: "E".into(), change_key: None })).unwrap().contains(r#""ItemIds":[{"__type":"RecurringMasterItemId:#Exchange","OccurrenceId":"E"}]"#));
+    }
+
+    #[test]
+    fn parses_calendar_view_and_dates() {
+        let msg: Value = serde_json::from_str(r#"{"__type":"FindItemResponseMessage:#Exchange","ResponseClass":"Success","ResponseCode":"NoError",
+          "RootFolder":{"__type":"FindItemParentType:#Exchange","IncludesLastItemInRange":false,"TotalItemsInView":3,"Items":[
+            {"__type":"CalendarItem:#Exchange","ItemId":{"__type":"ItemId:#Exchange","Id":"A","ChangeKey":"a1"},"Subject":"Планёрка","Start":"2026-10-20T07:00:00Z","End":"2026-10-20T07:30:00Z","IsAllDayEvent":false,"Location":"  Переговорная 3 ","Organizer":{"__type":"SingleRecipientType:#Exchange","Mailbox":{"Name":"Иван","EmailAddress":"i@x.ru","RoutingType":"SMTP"}},"LegacyFreeBusyStatus":"Busy","CalendarItemType":"Occurrence","IsMeeting":true,"IsCancelled":false,"MyResponseType":"Accept","Sensitivity":"Normal","HasAttachments":false,"LastModifiedTime":"2026-10-01T10:00:00+00:00"},
+            {"__type":"CalendarItem:#Exchange","ItemId":{"Id":"B"},"Subject":"Отпуск","Start":"2026-10-21T00:00:00","End":"2026-10-22T00:00:00","IsAllDayEvent":true,"Location":"","LegacyFreeBusyStatus":"OOF","CalendarItemType":"Single","MyResponseType":"Organizer"},
+            {"__type":"CalendarItem:#Exchange","ItemId":{"Id":"C"},"Start":"2026-10-22","IsCancelled":true,"LegacyFreeBusyStatus":"Nonsense"},
+            {"__type":"CalendarItem:#Exchange","ItemId":{"Id":"D"},"Subject":"без начала"},
+            {"__type":"CalendarItem:#Exchange","ItemId":{"Id":"E"},"Start":"2026-10-23T10:00:00Z","End":"2026-10-23T11:00:00Z","FreeBusyType":"Tentative","ResponseType":"Decline","AppointmentState":5,"Location":{"__type":"EnhancedLocation:#Exchange","DisplayName":"Кабинет 7"}}
+          ]}}"#).unwrap();
+        let (items, last) = parse_calendar_view(&msg);
+        assert!(!last);
+        assert_eq!(items.len(), 4, "событие без Start пропущено");
+        // Имена OWA JSON (снято с сервера): FreeBusyType, ResponseType, отмена битом AppointmentState, место объектом.
+        let e = &items[3];
+        assert_eq!((e.free_busy, e.my_response, e.is_cancelled, e.location.as_deref()), (FreeBusy::Tentative, ResponseType::Decline, true, Some("Кабинет 7")));
+        let a = &items[0];
+        assert_eq!((a.id.id.as_str(), a.id.change_key.as_deref()), ("A", Some("a1")));
+        assert_eq!(a.subject.as_deref(), Some("Планёрка"));
+        assert_eq!(a.start, "2026-10-20T07:00:00Z".parse::<Timestamp>().unwrap());
+        assert_eq!(a.end.duration_since(a.start).as_mins(), 30);
+        assert_eq!(a.location.as_deref(), Some("Переговорная 3"));
+        assert_eq!(a.organizer.as_ref().unwrap().email.as_deref(), Some("i@x.ru"));
+        assert_eq!((a.free_busy, a.calendar_type, a.my_response), (FreeBusy::Busy, CalendarItemType::Occurrence, ResponseType::Accept));
+        assert!(a.is_meeting && !a.is_cancelled && !a.is_all_day && a.last_modified.is_some());
+        let b = &items[1];
+        assert!(b.is_all_day && b.location.is_none() && b.organizer.is_none());
+        assert_eq!(b.start, "2026-10-21T00:00:00Z".parse::<Timestamp>().unwrap(), "время без зоны читается как UTC");
+        assert_eq!(b.end.duration_since(b.start).as_hours(), 24);
+        assert_eq!((b.free_busy, b.calendar_type, b.my_response), (FreeBusy::Oof, CalendarItemType::Single, ResponseType::Organizer));
+        let c = &items[2];
+        assert_eq!(c.start, "2026-10-22T00:00:00Z".parse::<Timestamp>().unwrap(), "дата без времени — полночь UTC");
+        assert_eq!(c.end, c.start, "без End конец равен началу");
+        assert!(c.is_cancelled);
+        assert_eq!((c.free_busy, c.my_response), (FreeBusy::NoData, ResponseType::Unknown));
+        // GetCalendarView: элементы прямо в Body без RootFolder, признака полноты нет.
+        let body: Value = serde_json::from_str(r#"{"ResponseClass":"Success","ResponseCode":"NoError","Items":[{"ItemId":{"Id":"X"},"Start":"2026-10-20T07:00:00Z","End":"2026-10-20T08:00:00Z"}]}"#).unwrap();
+        let (items, last) = parse_calendar_view(&body);
+        assert_eq!((items.len(), last), (1, true));
+        assert_eq!(calendar_view_date("2026-10-20T00:00:00Z".parse().unwrap(), true), "2026-10-20T00:00:00Z");
+        assert_eq!(calendar_view_date("2026-10-20T00:00:00+03:00".parse().unwrap(), false), "2026-10-19T21:00:00");
+    }
+
+    #[test]
+    fn parses_calendar_details_and_recurrence() {
+        let v: Value = serde_json::from_str(r#"{"__type":"CalendarItem:#Exchange","ItemId":{"Id":"A","ChangeKey":"a2"},"Subject":"Планёрка","Start":"2026-10-20T07:00:00Z","End":"2026-10-20T07:30:00Z",
+          "Body":{"__type":"BodyContentType:#Exchange","BodyType":"HTML","Value":"<p>Повестка</p>","IsTruncated":false},
+          "RequiredAttendees":[{"__type":"AttendeeType:#Exchange","Mailbox":{"Name":"Иван","EmailAddress":"i@x.ru","RoutingType":"SMTP"},"ResponseType":"Accept","LastResponseTime":"2026-10-01T10:00:00Z"},{"Mailbox":{"Name":"Пётр","EmailAddress":"p@x.ru"},"ResponseType":"NoResponseReceived"}],
+          "OptionalAttendees":[{"Mailbox":{"EmailAddress":"o@x.ru"},"ResponseType":"Decline"},{"Mailbox":{}}],
+          "ReminderIsSet":true,"ReminderMinutesBeforeStart":"15",
+          "Recurrence":{"__type":"RecurrenceType:#Exchange","RecurrencePattern":{"__type":"WeeklyRecurrence:#Exchange","Interval":1,"DaysOfWeek":"Monday Wednesday","FirstDayOfWeek":"Monday"},"RecurrenceRange":{"__type":"EndDateRecurrence:#Exchange","StartDate":"2026-01-05+00:00","EndDate":"2026-06-30+00:00"}}}"#).unwrap();
+        let d = parse_calendar_details(&v).unwrap();
+        assert_eq!(d.event.id.change_key.as_deref(), Some("a2"));
+        let body = d.body.unwrap();
+        assert_eq!((body.body_type, body.full_body.as_deref(), body.unique_body.is_none(), body.is_truncated), (BodyType::Html, Some("<p>Повестка</p>"), true, false));
+        assert_eq!(d.attendees.len(), 3, "участник без имени и адреса пропущен");
+        assert_eq!((d.attendees[0].participant.email.as_deref(), d.attendees[0].response, d.attendees[0].required), (Some("i@x.ru"), ResponseType::Accept, true));
+        assert_eq!((d.attendees[1].response, d.attendees[1].required), (ResponseType::NoResponseReceived, true));
+        assert_eq!((d.attendees[2].participant.email.as_deref(), d.attendees[2].response, d.attendees[2].required), (Some("o@x.ru"), ResponseType::Decline, false));
+        assert_eq!(d.reminder_minutes, Some(15), "число строкой, как в схеме EWS");
+        assert_eq!(d.recurrence_text.as_deref(), Some("Каждую неделю: пн, ср, с 05.01.2026 по 30.06.2026"));
+
+        // Напоминание выключено, тела нет, участников нет, повторения нет.
+        let v: Value = serde_json::from_str(r#"{"ItemId":{"Id":"B"},"Start":"2026-10-20T07:00:00Z","End":"2026-10-20T07:30:00Z","ReminderIsSet":false,"ReminderMinutesBeforeStart":15}"#).unwrap();
+        let d = parse_calendar_details(&v).unwrap();
+        assert!(d.body.is_none() && d.attendees.is_empty() && d.reminder_minutes.is_none() && d.recurrence_text.is_none());
+        let v: Value = serde_json::from_str(r#"{"ItemId":{"Id":"B"},"Start":"2026-10-20T07:00:00Z","End":"2026-10-20T07:30:00Z","ReminderMinutesBeforeStart":30,"UniqueBody":{"BodyType":"Text","Value":"текст"}}"#).unwrap();
+        let d = parse_calendar_details(&v).unwrap();
+        assert_eq!(d.reminder_minutes, Some(30), "без ReminderIsSet минуты считаются включёнными");
+        assert_eq!(d.body.unwrap().body_type, BodyType::Text);
+
+        // Образцы повторения.
+        let text = |pattern: &str, range: &str| recurrence_text(&serde_json::from_str::<Value>(&format!(r#"{{"RecurrencePattern":{pattern},"RecurrenceRange":{range}}}"#)).unwrap());
+        let no_end = r#"{"__type":"NoEndRecurrence:#Exchange","StartDate":"2026-01-05"}"#;
+        assert_eq!(text(r#"{"__type":"DailyRecurrence:#Exchange","Interval":1}"#, no_end).as_deref(), Some("Ежедневно, с 05.01.2026"));
+        assert_eq!(text(r#"{"__type":"DailyRecurrence:#Exchange","Interval":"3"}"#, no_end).as_deref(), Some("Каждые 3 дня, с 05.01.2026"));
+        assert_eq!(text(r#"{"__type":"WeeklyRecurrence:#Exchange","Interval":2,"DaysOfWeek":["Friday"]}"#, r#"{"__type":"NumberedRecurrence:#Exchange","StartDate":"2026-01-09","NumberOfOccurrences":10}"#).as_deref(), Some("Каждые 2 недели: пт, с 09.01.2026, всего 10 раз"));
+        assert_eq!(text(r#"{"__type":"WeeklyRecurrence:#Exchange","Interval":5,"DaysOfWeek":"Monday"}"#, "{}").as_deref(), Some("Каждые 5 недель: пн"));
+        assert_eq!(text(r#"{"__type":"WeeklyRecurrence:#Exchange","Interval":21,"DaysOfWeek":"Monday"}"#, "{}").as_deref(), Some("Каждые 21 неделю: пн"));
+        assert_eq!(text(r#"{"__type":"WeeklyRecurrence:#Exchange","Interval":12,"DaysOfWeek":"Monday"}"#, "{}").as_deref(), Some("Каждые 12 недель: пн"));
+        assert_eq!(text(r#"{"__type":"AbsoluteMonthlyRecurrence:#Exchange","Interval":1,"DayOfMonth":15}"#, "{}").as_deref(), Some("Ежемесячно 15-го числа"));
+        assert_eq!(text(r#"{"__type":"AbsoluteMonthlyRecurrence:#Exchange","Interval":2,"DayOfMonth":15}"#, "{}").as_deref(), Some("Каждые 2 месяца 15-го числа"));
+        assert_eq!(text(r#"{"__type":"RelativeMonthlyRecurrence:#Exchange","Interval":1,"DaysOfWeek":"Monday","DayOfWeekIndex":"First"}"#, "{}").as_deref(), Some("Ежемесячно: первый пн"));
+        assert_eq!(text(r#"{"__type":"AbsoluteYearlyRecurrence:#Exchange","DayOfMonth":8,"Month":"March"}"#, "{}").as_deref(), Some("Ежегодно 8 марта"));
+        assert_eq!(text(r#"{"__type":"RelativeYearlyRecurrence:#Exchange","DaysOfWeek":"Friday","DayOfWeekIndex":"Last","Month":"May"}"#, "{}").as_deref(), Some("Ежегодно: последний пт мая"));
+        assert_eq!(text(r#"{"__type":"WeeklyRegeneration:#Exchange","Interval":1}"#, "{}"), None, "образцы задач не описываются");
+        assert_eq!(recurrence_text(&json!({})), None);
     }
 
     #[test]

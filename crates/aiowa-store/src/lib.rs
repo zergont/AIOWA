@@ -6,7 +6,9 @@
 //! Беседы (`conversations`, `conversation_folders`) пересчитываются в той же транзакции,
 //! что меняет письма. Файлы вложений лежат в каталоге `attachments` рядом с базой и
 //! вытесняются по квоте; извлечённый текст остаётся в базе и после вытеснения.
+//! Календарь кэшируется окнами (`calendar`): окно перечитывается с сервера целиком.
 
+pub mod calendar;
 pub mod query;
 pub mod schema;
 pub mod text;
@@ -24,6 +26,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
+pub use calendar::CalendarRow;
 pub use schema::{FETCH_FAILED, TEXT_FAILED, TEXT_OK, TEXT_PENDING, TEXT_UNSUPPORTED};
 
 #[derive(Debug, thiserror::Error)]

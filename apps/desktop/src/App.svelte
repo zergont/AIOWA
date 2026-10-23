@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount } from "svelte";
+  import { onMount, tick } from "svelte";
   import { api, conversationKeyOf, errorMessage, messagesKey, onCloseRequested, onItemsChanged, onSyncProgress, type AccountInfo, type ComposeContext, type ComposeKind, type Conversation, type Folder, type ItemsChanged, type Message, type SearchHit, type SyncStatus, type WriteReport } from "./lib/api";
   import { ICON, failureText, type ItemAction } from "./lib/actions";
   import { focusBack, type Anchor } from "./lib/popover";
@@ -10,6 +10,9 @@
   import StatusBar from "./lib/components/StatusBar.svelte";
   import Composer from "./lib/components/Composer.svelte";
   import ConfirmPopover from "./lib/components/ConfirmPopover.svelte";
+  import CalendarView from "./lib/components/CalendarView.svelte";
+  import MiniMonth from "./lib/components/MiniMonth.svelte";
+  import { sameDay, startOfDay, viewRange, type CalendarViewKind } from "./lib/calendar";
 
   let account = $state<AccountInfo | null>(null);
   let folders = $state<Folder[]>([]);
@@ -26,6 +29,44 @@
   let error = $state<string | null>(null);
   let listWidth = $state(380);
   let syncStatus = $state<SyncStatus | null>(null);
+
+  // --- разделы: почта и календарь --------------------------------------------------------
+  // Панели обоих разделов при переключении не размонтируются, а прячутся: открытая беседа, композер
+  // с набранным текстом и прокрутка списка — как и выбранное событие с прокруткой сетки — остаются
+  // как были. Календарь создаётся при первом показе (на старте приложения запроса календаря нет);
+  // якорный день и вид живут здесь, потому что их меняет и мини-календарь в колонке навигации.
+
+  type Section = "mail" | "calendar";
+  let section = $state<Section>("mail");
+  /** Календарь уже показывали: дальше он только прячется. */
+  let calendarMounted = $state(false);
+  $effect(() => {
+    if (section === "calendar") calendarMounted = true;
+  });
+  /** Якорный день сетки календаря: меняют мини-календарь, стрелки и «Сегодня». */
+  let calendarAnchor = $state(startOfDay(new Date()));
+  let calendarKind = $state<CalendarViewKind>("week");
+  const calendarRange = $derived(viewRange(calendarKind, calendarAnchor));
+  /**
+   * Какое «сегодня» было при последней смене якоря. Якорь, равный ему, значил «сегодня»: окно может
+   * висеть открытым сутками, и календарь, который ещё не листали, должен открыться на сегодняшнем
+   * дне, а не на дне запуска. Пользователь, ушедший на другой день, своё место не теряет.
+   */
+  let anchorSetOn = startOfDay(new Date());
+  $effect(() => {
+    calendarAnchor; // зависимость: любая смена якоря
+    anchorSetOn = startOfDay(new Date());
+  });
+
+  function showCalendar() {
+    const today = startOfDay(new Date());
+    if (sameDay(calendarAnchor, anchorSetOn) && !sameDay(anchorSetOn, today)) calendarAnchor = today;
+    section = "calendar";
+  }
+
+  function pickCalendarDay(d: Date) {
+    if (d.getTime() !== calendarAnchor.getTime()) calendarAnchor = d;
+  }
 
   const deletedFolderPk = $derived(folders.find((f) => f.distinguished === "deleteditems")?.folder_pk ?? null);
   const sentFolderPk = $derived(folders.find((f) => f.distinguished === "sentitems")?.folder_pk ?? null);
@@ -46,8 +87,8 @@
   let composeReturnTo: HTMLElement | null = null;
   /** Письмо отправлено во время идущей синхронизации: «Отправленные» дотянуть сразу после её конца. */
   let pendingSentSync = false;
-  /** Крестик или Alt+F4 при несохранённом письме: бэкенд не закрыл окно и ждёт подтверждения. */
-  let closeRequested = $state(false);
+  /** Крестик или Alt+F4 при несохранённом письме: бэкенд не закрыл окно и ждёт подтверждения — якорь попапа; null — не запрошено. */
+  let closeRequest = $state<Anchor | null>(null);
   /** Самое верхнее развёрнутое письмо в области чтения (для Ctrl+R и других клавиш). */
   let topExpandedPk = $state<number | null>(null);
   let readerEl = $state<HTMLElement | null>(null);
@@ -74,13 +115,18 @@
    * `conversationPk` — беседа исходного письма (композер ответа стоит над её карточками).
    */
   function openCompose(kind: ComposeKind, itemPk: number | null, conversationPk: number | null) {
+    // Композер живёт в области чтения почты: из календаря сначала возвращаемся туда.
+    section = "mail";
     if (compose && composerBusy) {
       error = busyText();
       return;
     }
     if (compose && composerDirty) {
       composeReturnTo = document.activeElement instanceof HTMLElement ? document.activeElement : null;
-      pendingCompose = { kind, itemPk, conversationPk, anchor: composerAnchor() };
+      // Якорь — после обновления DOM: из календаря область чтения ещё спрятана, её прямоугольник нулевой.
+      void tick().then(() => {
+        pendingCompose = { kind, itemPk, conversationPk, anchor: composerAnchor() };
+      });
       return;
     }
     void loadCompose(kind, itemPk, conversationPk);
@@ -178,11 +224,16 @@
       void confirmClose();
       return;
     }
-    closeRequested = true;
+    // Письмо, которое будет потеряно, должно быть на экране: из календаря сначала показать почту;
+    // якорь попапа — после обновления DOM (спрятанная область чтения даёт нулевой прямоугольник).
+    section = "mail";
+    void tick().then(() => {
+      closeRequest = composerAnchor();
+    });
   }
 
   async function confirmClose() {
-    closeRequested = false;
+    closeRequest = null;
     try {
       await api.windowCloseConfirmed();
     } catch (e) {
@@ -541,9 +592,17 @@
     const ctrl = e.ctrlKey || e.metaKey;
     // По коду клавиши, а не по символу: в русской раскладке e.key даёт кириллицу.
     const is = (code: string, key: string) => e.code === code || e.key.toLowerCase() === key;
+    if (ctrl && e.shiftKey && !e.altKey && (e.code === "Digit1" || e.code === "Digit2")) {
+      e.preventDefault();
+      if (e.code === "Digit1") section = "mail";
+      else showCalendar();
+      return;
+    }
     if (ctrl && !e.shiftKey && !e.altKey && is("KeyK", "k")) {
       e.preventDefault();
-      document.getElementById("search-input")?.focus();
+      // Поле поиска спрятано в календаре: сначала показать почту, фокус — после обновления DOM.
+      section = "mail";
+      void tick().then(() => document.getElementById("search-input")?.focus());
       return;
     }
     if (ctrl && !e.shiftKey && !e.altKey && is("KeyN", "n")) {
@@ -554,12 +613,12 @@
     // Перезагрузку окна (Ctrl+R, F5) гасим везде, даже в редакторе: она бы потеряла набранное письмо.
     if (e.key === "F5" || (ctrl && !e.altKey && is("KeyR", "r"))) {
       e.preventDefault();
-      if (e.key !== "F5" && !inEditable() && topExpandedPk != null) composeFromMessage(topExpandedPk, e.shiftKey ? "reply_all" : "reply");
+      if (e.key !== "F5" && section === "mail" && !inEditable() && topExpandedPk != null) composeFromMessage(topExpandedPk, e.shiftKey ? "reply_all" : "reply");
       return;
     }
     if (ctrl && e.shiftKey && !e.altKey && is("KeyF", "f") && !inEditable()) {
       e.preventDefault();
-      if (topExpandedPk != null) composeFromMessage(topExpandedPk, "forward");
+      if (section === "mail" && topExpandedPk != null) composeFromMessage(topExpandedPk, "forward");
       return;
     }
     if (e.key === "Escape" && document.activeElement?.id === "search-input") {
@@ -650,11 +709,15 @@
       <span class="brand-mark" aria-hidden="true"></span>
       <span class="brand-name">AIOWA</span>
     </div>
+    <div class="segmented sections" role="tablist" aria-label="Разделы">
+      <button role="tab" aria-selected={section === "mail"} class:on={section === "mail"} onclick={() => (section = "mail")} title="Почта (Ctrl+Shift+1)">Почта</button>
+      <button role="tab" aria-selected={section === "calendar"} class:on={section === "calendar"} onclick={showCalendar} title="Календарь (Ctrl+Shift+2)">Календарь</button>
+    </div>
     <button class="new-mail" onclick={() => openCompose("new", null, null)} title="Новое письмо (Ctrl+N)">
       <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path d={ICON.compose} fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" /></svg>
       Новое письмо
     </button>
-    <div class="search" class:active={query.length > 0}>
+    <div class="search" class:active={query.length > 0} class:off={section !== "mail"}>
       <svg class="search-icon" width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><circle cx="7" cy="7" r="4.5" fill="none" stroke="currentColor" stroke-width="1.4" /><path d="M10.5 10.5 14 14" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" /></svg>
       <input id="search-input" type="search" placeholder="Поиск в почте: тема, текст, от:имя, вложение:" bind:value={query} oninput={onQueryInput} autocomplete="off" spellcheck="false" />
       <kbd class="search-kbd">Ctrl K</kbd>
@@ -664,11 +727,16 @@
     </div>
   </header>
 
-  <nav class="nav" aria-label="Папки">
-    <FolderTree {folders} selected={selectedFolder} onselect={openFolder} onsync={startFolderSync} syncing={syncStatus?.running ?? false} />
+  <nav class="nav" aria-label={section === "mail" ? "Папки" : "Мини-календарь"}>
+    <div class="folders" class:off={section !== "mail"}>
+      <FolderTree {folders} selected={selectedFolder} onselect={openFolder} onsync={startFolderSync} syncing={syncStatus?.running ?? false} />
+    </div>
+    {#if section === "calendar"}
+      <MiniMonth selected={calendarAnchor} range={calendarRange} onselect={pickCalendarDay} />
+    {/if}
   </nav>
 
-  <section class="list" aria-label="Список бесед">
+  <section class="list" class:off={section !== "mail"} aria-label="Список бесед">
     {#if searchHits !== null}
       <SearchResults hits={searchHits} {searching} {query} onopen={openConversationByPk} onclear={clearSearch} selectedPk={selected?.conversation_pk ?? null} />
     {:else}
@@ -676,11 +744,17 @@
     {/if}
   </section>
 
-  <div class="splitter" role="separator" aria-orientation="vertical" aria-label="Ширина списка" onpointerdown={startDrag}></div>
+  <div class="splitter" class:off={section !== "mail"} role="separator" aria-orientation="vertical" aria-label="Ширина списка" onpointerdown={startDrag}></div>
 
-  <section class="reader" aria-label="Чтение" bind:this={readerEl}>
+  <section class="reader" class:off={section !== "mail"} aria-label="Чтение" bind:this={readerEl}>
     <ReadingPane conversation={selected} {messages} loading={loadingMessages} onfetch={fetchMessage} {folders} {deletedFolderPk} onaction={onMessageAction} oncompose={composeFromMessage} composer={compose ? composerSnippet : undefined} {composerAlone} bind:topExpandedPk />
   </section>
+
+  {#if calendarMounted}
+    <section class="calendar" class:off={section !== "calendar"} aria-label="Календарь">
+      <CalendarView bind:anchor={calendarAnchor} bind:kind={calendarKind} visible={section === "calendar"} />
+    </section>
+  {/if}
 
   <footer class="status" aria-label="Состояние синхронизации">
     <StatusBar status={syncStatus} {notice} onrefresh={startSync} oncancel={cancelSync} />
@@ -690,8 +764,8 @@
     <ConfirmPopover anchor={pendingCompose.anchor} align="start" title="Отменить текущее письмо?" text="Набранный текст будет потерян, откроется новое." confirmLabel="Отменить письмо" onconfirm={confirmReplace} oncancel={cancelReplace} />
   {/if}
 
-  {#if closeRequested}
-    <ConfirmPopover anchor={composerAnchor()} align="start" title="Закрыть окно?" text={composerBusy ? "Отправка ещё идёт: письмо может не уйти." : "Набранное письмо будет потеряно."} confirmLabel="Закрыть" onconfirm={confirmClose} oncancel={() => (closeRequested = false)} />
+  {#if closeRequest}
+    <ConfirmPopover anchor={closeRequest} align="start" title="Закрыть окно?" text={composerBusy ? "Отправка ещё идёт: письмо может не уйти." : "Набранное письмо будет потеряно."} confirmLabel="Закрыть" onconfirm={confirmClose} oncancel={() => (closeRequest = null)} />
   {/if}
 
   {#if error}
@@ -724,10 +798,13 @@
   .topbar {
     grid-area: top;
     display: grid;
-    grid-template-columns: calc(var(--nav-width) - var(--space-4)) auto 1fr auto;
+    grid-template-columns: calc(var(--nav-width) - var(--space-4)) auto auto 1fr auto;
     align-items: center;
     gap: var(--space-4);
     padding: 0 var(--space-4) 0 var(--space-3);
+  }
+  .sections {
+    justify-self: start;
   }
   .new-mail {
     display: inline-flex;
@@ -850,6 +927,26 @@
     border-radius: 0 var(--radius-card) 0 0;
     overflow: hidden;
     margin-right: var(--space-2);
+  }
+
+  /* Календарь занимает место списка и области чтения; панели другого раздела спрятаны, не размонтированы. */
+  .calendar {
+    grid-row: 2;
+    grid-column: list-start / reader-end;
+    min-width: 0;
+    background: var(--bg-layer);
+    border: 1px solid var(--stroke-1);
+    border-radius: var(--radius-card) var(--radius-card) 0 0;
+    overflow: hidden;
+    margin-right: var(--space-2);
+  }
+  .folders.off,
+  .list.off,
+  .splitter.off,
+  .reader.off,
+  .calendar.off,
+  .search.off {
+    display: none;
   }
 
   .status {

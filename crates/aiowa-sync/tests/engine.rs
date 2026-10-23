@@ -200,6 +200,14 @@ impl MailTransport for Fake {
         Ok(None)
     }
 
+    async fn find_calendar_view(&self, _start: Timestamp, _end: Timestamp) -> TResult<Vec<CalendarEvent>> {
+        Ok(vec![])
+    }
+
+    async fn get_calendar_item(&self, id: &ItemId) -> TResult<CalendarEventDetails> {
+        Err(TransportError::Server { code: "ErrorItemNotFound".into(), message: format!("нет события {}", id.id) })
+    }
+
     async fn logoff(&self) -> TResult<()> {
         Ok(())
     }

@@ -12,6 +12,7 @@ use aiowa_store::{AttachmentRow, Store, FETCH_FAILED};
 use aiowa_sync::{BodyFetchOutcome, Engine, SyncError, SyncOptions};
 use aiowa_transport::TransportError;
 use std::collections::HashMap;
+use std::hash::Hash;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, Weak};
@@ -45,12 +46,18 @@ pub(crate) struct OnDemand {
     attachments: KeyedLocks,
 }
 
-/// Асинхронные замки по ключу; записи живут, пока замком кто-то пользуется.
-#[derive(Default)]
-struct KeyedLocks(Mutex<HashMap<i64, Weak<tokio::sync::Mutex<()>>>>);
+/// Асинхронные замки по ключу; записи живут, пока замком кто-то пользуется. Ключ — число
+/// (письмо, вложение, событие календаря) или кортеж (окно календаря).
+pub(crate) struct KeyedLocks<K = i64>(Mutex<HashMap<K, Weak<tokio::sync::Mutex<()>>>>);
 
-impl KeyedLocks {
-    fn get(&self, key: i64) -> Arc<tokio::sync::Mutex<()>> {
+impl<K> Default for KeyedLocks<K> {
+    fn default() -> Self {
+        Self(Mutex::new(HashMap::new()))
+    }
+}
+
+impl<K: Eq + Hash> KeyedLocks<K> {
+    pub(crate) fn get(&self, key: K) -> Arc<tokio::sync::Mutex<()>> {
         let mut g = self.0.lock().unwrap_or_else(|p| p.into_inner());
         g.retain(|_, w| w.strong_count() > 0);
         if let Some(existing) = g.get(&key).and_then(Weak::upgrade) {

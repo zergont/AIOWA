@@ -5,7 +5,8 @@
 //! сессию, повторный вход и ограничение параллелизма.
 
 use aiowa_core::{FolderChanges, FolderId, FolderRef, ItemChanges, ItemId, MessageFull, SyncState};
-pub use aiowa_core::{ComposeKind, OutgoingAttachment, OutgoingMessage, Signature};
+pub use aiowa_core::{Attendee, CalendarEvent, CalendarEventDetails, CalendarItemType, ComposeKind, FreeBusy, OutgoingAttachment, OutgoingMessage, ResponseType, Signature};
+use jiff::Timestamp;
 use secrecy::SecretString;
 use std::time::Duration;
 
@@ -237,6 +238,15 @@ pub trait MailTransport: Send + Sync {
     /// Подпись пользователя из настроек OWA (`GetUserConfiguration OWA.UserOptions`): `None`,
     /// если подпись не задана.
     async fn user_signature(&self) -> Result<Option<Signature>>;
+
+    /// События календаря в окне `[start, end)` (`FindItem` с `CalendarView` по папке `calendar`):
+    /// повторяющиеся встречи приходят развёрнутыми в экземпляры. Моменты в UTC. Если сервер
+    /// режет выдачу, реализация догружает остаток сама; порядок — по началу.
+    async fn find_calendar_view(&self, start: Timestamp, end: Timestamp) -> Result<Vec<CalendarEvent>>;
+
+    /// Событие целиком (`GetItem`): тело HTML, участники с ответами, напоминание, повторение.
+    /// Отказ сервера по элементу (например, `ErrorItemNotFound`) приходит как `Server`.
+    async fn get_calendar_item(&self, id: &ItemId) -> Result<CalendarEventDetails>;
 
     /// Завершить серверную сессию. После вызова транспорт непригоден.
     async fn logoff(&self) -> Result<()>;

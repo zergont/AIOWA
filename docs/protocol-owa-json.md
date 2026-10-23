@@ -111,8 +111,8 @@ X-OWA-UrlPostData: <JSON запроса в URL-кодировке>   — при 
 | `FindConversation` | список бесед в папке | `ParentFolderId.BaseFolderId` = `DistinguishedFolderId {Id:"sentitems"}` или `FolderId`; `ShapeName` именованный (`ConversationSentItemsListView`, для входящих свой); `Paging`: `IndexedPageView {Offset, MaxEntriesReturned:25}` или `SeekToConditionPageView` по `ConversationInstanceKey` для подгрузки следующих; `SortOrder` по `ConversationLastDeliveryTime`; `ViewFilter:"All"` |
 | `GetConversationItems` | открытие беседы и предзагрузка видимых строк | `Conversations[{ConversationId, SyncState}]`, `ShapeName:"ItemPart"`, `SortOrder:"DateOrderDescending"`, `MaxItemsToReturn:20`, `FoldersToIgnore` (удалённые); `ItemShape` с флагами безопасности (`FilterHtmlContent`, `BlockExternalImagesIfSenderUntrusted`, `MaximumBodySize: 2097152`). Ответ: `Conversation.ConversationNodes[]`, каждый узел `{InternetMessageId, ParentInternetMessageId, HasQuotedText, IsRootNode, Items[]}`. **У элемента есть `UniqueBody {BodyType, Value, IsTruncated}`**, а также `Subject`, `From`, `Sender`, `ToRecipients`, `CcRecipients`, `DateTimeReceived/Sent/Created`, `IsRead`, `ItemClass`, `ItemId{Id,ChangeKey}`, `ParentFolderId`, `Preview`, `Attachments[]` (`AttachmentId`, `Name`, `ContentType`, `Size`, `IsInline`, `ContentId`), `Flag`, `Importance`, `Sensitivity`, `ExtendedProperty[]`. Повторный вызов с `SyncState` из прошлого ответа возвращает только изменения |
 | `GetFolder` | после смены папки | `FolderIds[]`, `FolderShape {BaseShape:"IdOnly", AdditionalProperties:[UnreadCount, TotalCount]}` |
-| `GetItem` | при старте (несколько), открытие одиночных элементов | форма не снята |
-| `FindItem` | при старте, календарь, напоминания | форма не снята |
+| `GetItem` | при старте (несколько), открытие одиночных элементов | формы сняты клиентом: письма § 5b', события календаря § 5g |
+| `FindItem` | при старте, календарь, напоминания | форма с `CalendarPageView` снята клиентом, § 5g |
 | `GetCalendarView` | календарь, листание месяца | `Body {CalendarId: TargetFolderId{BaseFolderId: FolderId{Id, ChangeKey}}, RangeStart, RangeEnd}` (локальное время без зоны, зона в `Header.TimeZoneContext`), `RequestServerVersion: V2017_08_18`; ответ `Body {ResponseClass, ResponseCode, Items[]}` |
 | `GetCalendarFolders`, `GetReminders` | старт, календарь | формы не сняты |
 | `FindPeople` | старт (избранные контакты), автодополнение | форма не снята |
@@ -122,7 +122,7 @@ X-OWA-UrlPostData: <JSON запроса в URL-кодировке>   — при 
 | `GetPresence`, `ResetPresence`, `InstantMessageSignIn` | Lync | клиенту не нужны |
 | `GetFavorites`, `GetAllowedOptions`, `GetUserVoiceData`, `GetUnseenLightningIds` | старт | второстепенны |
 
-Не наблюдалось в этой сессии (проверяется в Rust-спайке напрямую): `SyncFolderItems`, `SyncFolderHierarchy`, `MarkAllItemsAsRead`, `CreateItem`, `UpdateItem`, `GetAttachment`. Позже сняты клиентом: `SyncFolderItems`/`SyncFolderHierarchy`/`GetItem` (§ 5b'), `GetFileAttachment` (§ 5), `UpdateItem` (§ 5e), `CreateItem`/`CreateAttachment`/`SendItem`/`GetUserConfiguration` (§ 5f).
+Не наблюдалось в этой сессии (проверяется в Rust-спайке напрямую): `SyncFolderItems`, `SyncFolderHierarchy`, `MarkAllItemsAsRead`, `CreateItem`, `UpdateItem`, `GetAttachment`. Позже сняты клиентом: `SyncFolderItems`/`SyncFolderHierarchy`/`GetItem` (§ 5b'), `GetFileAttachment` (§ 5), `UpdateItem` (§ 5e), `CreateItem`/`CreateAttachment`/`SendItem`/`GetUserConfiguration` (§ 5f), `FindItem` с `CalendarView` и `GetItem` события (§ 5g).
 
 ## 4. Канал уведомлений
 
@@ -383,6 +383,97 @@ X-OWA-CANARY: <канарейка>          — дублируется заго�
 
 - `Value` у ключа и у значения — всегда **массив** из одного элемента (в схеме EWS элемент `Value` повторяемый); `Type` значения — `String`, `Boolean` и т. д. Клиент разбирает булевы значения и как JSON `true`/`false`, и как строки `"True"`/`"true"` (форма элемента в журнале не фиксировалась). Ключи подписи в **нижнем регистре**: `signaturehtml`, `signaturetext`, `autoaddsignature`, `autoaddsignatureonreply`; остальные ключи в смешанном регистре (`FavoriteFolders`, `FrequentlyUsedFolders`, `themeStorageId`, `timezone`, `NavigationBarWidth`, `IsReplyAllTheDefaultResponse`, `MruEmojis`, …). Клиент сравнивает ключи без учёта регистра и берёт `Value[0]`. На проверенном ящике: подпись 3 800 символов HTML (185 тегов, со `<style>` блоком OWA), `autoaddsignature = true`.
 - `XmlData`/`BinaryData` в ответе нет: все настройки OWA 2019 хранит в словаре.
+
+## 5g. Календарь: `FindItem` с `CalendarView` и `GetItem` события (клиент `aiowa`, 23.10.2026)
+
+Снято запусками `aiowa calendar` (только чтение: `FindItem`, `GetItem`, каждый запуск с `logoff`) на рабочем ящике: неделя 19–26.10.2026 (пусто), год 2026 (30 экземпляров), подробности одной встречи с 35 участниками и одного экземпляра ежегодного события. Все операции — обычный `service.svc`, `__type` первым ключом, `RequestServerVersion: V2017_08_18`, `TimeZoneContext` = `UTC`.
+
+**`FindItem` с `CalendarPageView`** — принят с первого раза; запасные формы клиента (даты без `Z`, операция `GetCalendarView` из § 3.4) не понадобились:
+
+```json
+{ "__type": "FindItemRequest:#Exchange",
+  "ItemShape": { "__type": "ItemResponseShape:#Exchange", "BaseShape": "IdOnly",
+      "AdditionalProperties": [ { "__type": "PropertyUri:#Exchange", "FieldURI": "item:Subject" },
+          "… calendar:Start, calendar:End, calendar:IsAllDayEvent, calendar:Location, calendar:Organizer, calendar:LegacyFreeBusyStatus,",
+          "… calendar:CalendarItemType, calendar:IsMeeting, calendar:IsCancelled, calendar:MyResponseType, item:Sensitivity,",
+          "… item:HasAttachments, item:LastModifiedTime, calendar:AppointmentState" ] },
+  "ParentFolderIds": [ { "__type": "DistinguishedFolderId:#Exchange", "Id": "calendar" } ],
+  "Traversal": "Shallow",
+  "Paging": { "__type": "CalendarPageView:#Exchange", "StartDate": "2025-12-31T21:00:00Z", "EndDate": "2026-12-31T21:00:00Z" } }
+```
+
+Ответ HTTP 200 (год: 30 элементов, 26 КБ, 215–360 мс; пустая неделя: 391 байт, 676 мс первым запросом свежей сессии):
+
+```json
+{ "__type": "FindItemResponseMessage:#Exchange", "ResponseClass": "Success", "ResponseCode": "NoError",
+  "RootFolder": { "IncludesLastItemInRange": true, "TotalItemsInView": 30, "Groups": null,
+    "Items": [ { "__type": "CalendarItem:#Exchange",
+        "ItemId": { "Id": "<152 символа у одиночного, 168 у экземпляра>", "ChangeKey": "<40>" },
+        "Subject": "…", "Sensitivity": "Normal", "HasAttachments": true, "LastModifiedTime": "2026-01-10T08:15:33Z",
+        "Start": "2026-01-15T10:00:00Z", "End": "2026-01-15T11:00:00Z", "IsAllDayEvent": false,
+        "FreeBusyType": "Tentative", "IsMeeting": true, "IsCancelled": false, "CalendarItemType": "Single",
+        "ResponseType": "NoResponseReceived",
+        "Organizer": { "Mailbox": { "Name": "…", "EmailAddress": "…", "RoutingType": "SMTP", "MailboxType": "Mailbox" } },
+        "AppointmentState": 3 } ] } }
+```
+
+Особенности:
+
+- Имена полей в ответе — OWA JSON, а не EWS: занятость приходит как **`FreeBusyType`** (запрошена `calendar:LegacyFreeBusyStatus`), свой ответ на приглашение — как **`ResponseType`** (запрошен `calendar:MyResponseType`). Клиент читает оба имени (`protocol::parse_calendar_event`).
+- **`IsCancelled` в `FindItem` появляется только вместе с `calendar:AppointmentState`** в `AdditionalProperties`: без него поля в ответе нет вовсе (в `GetItem` оно есть всегда). Клиент считает событие отменённым по `IsCancelled` или по биту `0x4` в `AppointmentState` (наблюдались значения 0, 3, 7).
+- `Location` не пришло ни разу — ни в `FindItem`, ни в `GetItem` с `AllProperties`: у проверенных событий места нет, пустые строки сервер, похоже, опускает. Клиент принимает и строку, и объект с `DisplayName` (`EnhancedLocation`).
+- Даты `Start`/`End`/`LastModifiedTime` — ISO с `Z`, 20 символов. Повторяющиеся встречи приходят развёрнутыми в экземпляры (`CalendarItemType: Occurrence`), у каждого свой `ItemId`. `IncludesLastItemInRange: true`, `TotalItemsInView` равен числу элементов; неполная выдача на годовом окне не наблюдалась (клиент на `false` делит окно пополам и перечитывает половины).
+- **События на весь день** приходят как настоящие моменты в UTC, без нормализации к полуночи контекста: событие на 6 мая, созданное в московском поясе, — `Start: 2026-05-05T21:00:00Z`, `End: 2026-05-06T21:00:00Z`; у события из пояса UTC+6 границы в `…T18:00:00Z`. Поэтому день показа всё-день события — **местная дата ближайшей полуночи к `start_ms`**, а не просто местная дата начала: при поясе организатора восточнее местного дата съехала бы на день назад.
+- Наблюдённые значения: `CalendarItemType` — `Single`, `Occurrence`; `FreeBusyType` — `Free`, `Tentative`, `Busy`; `ResponseType` — `Unknown`, `Organizer`, `Tentative`, `Accept`, `NoResponseReceived`; `Sensitivity` — `Normal`. Встречается экземпляр нулевой длины (`Start == End`).
+
+**`GetItem` события** — форма `IdOnly` + явный список свойств принята (запасная `AllProperties` не понадобилась):
+
+```json
+{ "__type": "GetItemRequest:#Exchange",
+  "ItemShape": { "__type": "ItemResponseShape:#Exchange", "BaseShape": "IdOnly", "BodyType": "HTML",
+      "FilterHtmlContent": true, "BlockExternalImagesIfSenderUntrusted": true, "MaximumBodySize": 2097152, "MaximumRecipientsToReturn": 500,
+      "AdditionalProperties": [ "… те же 15 полей, что у FindItem …",
+          "calendar:RequiredAttendees", "calendar:OptionalAttendees", "calendar:Recurrence", "item:Body", "item:ReminderIsSet", "item:ReminderMinutesBeforeStart" ] },
+  "ItemIds": [ { "__type": "ItemId:#Exchange", "Id": "…", "ChangeKey": "…" } ],
+  "ShapeName": null }
+```
+
+Ответ `ItemInfoResponseMessage:#Exchange`, `Items[0]` типа `CalendarItem:#Exchange` (встреча с 35 участниками — 22 КБ, 465 мс; одиночное событие без участников — 1,8 КБ, 160–215 мс):
+
+```json
+{ "__type": "CalendarItem:#Exchange", "ItemId": { "Id": "…", "ChangeKey": "…" }, "Subject": "…", "Sensitivity": "Normal",
+  "Body": { "BodyType": "HTML", "Value": "<html>…</html>", "IsTruncated": false },
+  "ReminderIsSet": true, "ReminderMinutesBeforeStart": 15, "HasAttachments": true, "LastModifiedTime": "…Z",
+  "Start": "…Z", "End": "…Z", "IsAllDayEvent": false, "FreeBusyType": "Busy", "IsMeeting": true, "IsCancelled": false,
+  "CalendarItemType": "Single", "ResponseType": "Accept",
+  "Organizer": { "Mailbox": { "Name": "…", "EmailAddress": "…", "RoutingType": "SMTP", "MailboxType": "Mailbox" } },
+  "RequiredAttendees": [ { "Mailbox": { "Name": "…", "EmailAddress": "…", "RoutingType": "SMTP", "MailboxType": "Mailbox" }, "ResponseType": "Unknown" }, "…" ],
+  "AppointmentState": 3 }
+```
+
+- `ReminderMinutesBeforeStart` — число (а не строка, как в XML EWS); клиент принимает оба вида. `RequiredAttendees`/`OptionalAttendees` отсутствуют, когда пусты. У встречи, где пользователь не организатор, ответы участников все `Unknown`: чужие ответы сервер показывает только организатору.
+- `item:Attachments` в явной форме не запрашивается (в контракте панели события вложений нет). `AllProperties` (проба `aiowa calendar --probe`) отдаёт сверх того `Attachments[]` (с `ContentId`/`IsInline` у картинок тела), `Body`, усечённое до `MaximumBodySize` (`IsTruncated`, `UTF8BodySize`), `IsOrganizer`, `IsRecurring`, `IsOnlineMeeting`, `JoinOnlineMeetingUrl`, `TimeZone`, `StartTimeZoneId`/`EndTimeZoneId` (например, `Russian Standard Time`), `StartWallClock`/`EndWallClock` (со смещением пояса), `UID`, `DateTimeStamp`, `AppointmentSequenceNumber`, `IntendedFreeBusyStatus`, `ResponseObjects`, `EffectiveRights`; у экземпляра — ещё `RecurrenceId`, `OriginalStart`, `IsSeriesCancelled`.
+- **У экземпляра нет `Recurrence`** ни в явной форме, ни в `AllProperties` (как в EWS: образец хранится у «мастера» серии). Клиент достаёт его вторым `GetItem` по `RecurringMasterItemId` — сервер принял:
+
+```json
+{ "__type": "GetItemRequest:#Exchange",
+  "ItemShape": { "__type": "ItemResponseShape:#Exchange", "BaseShape": "IdOnly",
+      "AdditionalProperties": [ { "__type": "PropertyUri:#Exchange", "FieldURI": "calendar:Recurrence" } ] },
+  "ItemIds": [ { "__type": "RecurringMasterItemId:#Exchange", "OccurrenceId": "<ItemId.Id экземпляра>", "ChangeKey": "<его ChangeKey>" } ],
+  "ShapeName": null }
+```
+
+Ответ 773 байта, 178 мс, `Items[0]` =
+
+```json
+{ "__type": "CalendarItem:#Exchange", "ItemId": { "Id": "<мастера>", "ChangeKey": "…" }, "IsAllDayEvent": true,
+  "Recurrence": { "RecurrencePattern": { "__type": "AbsoluteYearlyRecurrence:#Exchange", "DayOfMonth": 6, "Month": "May" },
+                  "RecurrenceRange": { "__type": "NoEndRecurrence:#Exchange", "StartDate": "1977-05-06+00:00" } } }
+```
+
+`DayOfMonth`/`Interval` — числа, `Month`/`DaysOfWeek` — строки (`DaysOfWeek` через пробел, как в EWS; массив клиент тоже принимает), даты диапазона — `YYYY-MM-DD+00:00` (клиент берёт первые десять символов). Текст для панели собирает клиент (`protocol::recurrence_text`): «Ежегодно 6 мая, с 06.05.1977», «Каждую неделю: пн, ср, с 05.01.2026 по 30.06.2026», «Каждые 2 недели: пт, …, всего 10 раз». Еженедельные и ежемесячные образцы на сервере не наблюдались — их формы взяты по схеме EWS и покрыты юнит-тестами. Отказ сервера по этому второму запросу не фатален: подробности отдаются без текста повторения.
+
+Хранилище (схема v4): `calendar_items` — экземпляры с `UNIQUE(account_id, server_id)`, моменты в миллисекундах UTC, тело zstd, `details_at` после `GetItem`; `calendar_ranges` — загруженные окна. Окно заменяется целиком (`Store::replace_calendar_range`): кэшированные экземпляры, пересекающие окно и не пришедшие с сервера, удаляются; подробности сохраняются, пока у экземпляра не сменился `ChangeKey`. CLI: `aiowa calendar --from ГГГГ-ММ-ДД --to ГГГГ-ММ-ДД [--details N|recurring|meeting] [--probe] [--offline]` печатает только счётчики, флаги и даты.
 
 ## 6. Что это значит для клиента
 

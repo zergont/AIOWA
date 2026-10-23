@@ -333,6 +333,191 @@ pub struct Signature {
     pub auto_add: bool,
 }
 
+// ---------------------------------------------------------------------------
+// Календарь
+
+/// Занятость по событию (`calendar:LegacyFreeBusyStatus`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+pub enum FreeBusy {
+    Free,
+    Tentative,
+    #[default]
+    Busy,
+    Oof,
+    WorkingElsewhere,
+    NoData,
+}
+
+impl FreeBusy {
+    /// Разбирает и имя EWS (`Busy`, `OOF`), и ключ интерфейса (`busy`, `oof`); неизвестное — `NoData`.
+    pub fn parse(s: &str) -> Self {
+        match s.to_ascii_lowercase().as_str() {
+            "free" => Self::Free,
+            "tentative" => Self::Tentative,
+            "busy" => Self::Busy,
+            "oof" => Self::Oof,
+            "workingelsewhere" | "working_elsewhere" => Self::WorkingElsewhere,
+            _ => Self::NoData,
+        }
+    }
+    /// Имя значения в схеме EWS (так оно хранится в базе).
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Free => "Free",
+            Self::Tentative => "Tentative",
+            Self::Busy => "Busy",
+            Self::Oof => "OOF",
+            Self::WorkingElsewhere => "WorkingElsewhere",
+            Self::NoData => "NoData",
+        }
+    }
+    /// Ключ для интерфейса: `free`, `tentative`, `busy`, `oof`, `working_elsewhere`, `no_data`.
+    pub const fn key(self) -> &'static str {
+        match self {
+            Self::Free => "free",
+            Self::Tentative => "tentative",
+            Self::Busy => "busy",
+            Self::Oof => "oof",
+            Self::WorkingElsewhere => "working_elsewhere",
+            Self::NoData => "no_data",
+        }
+    }
+}
+
+/// Вид элемента календаря (`calendar:CalendarItemType`): одиночное событие, экземпляр или
+/// исключение повторяющейся встречи, сама повторяющаяся встреча.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+pub enum CalendarItemType {
+    #[default]
+    Single,
+    Occurrence,
+    Exception,
+    RecurringMaster,
+}
+
+impl CalendarItemType {
+    pub fn parse(s: &str) -> Self {
+        match s.to_ascii_lowercase().as_str() {
+            "occurrence" => Self::Occurrence,
+            "exception" => Self::Exception,
+            "recurringmaster" | "recurring_master" => Self::RecurringMaster,
+            _ => Self::Single,
+        }
+    }
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Single => "Single",
+            Self::Occurrence => "Occurrence",
+            Self::Exception => "Exception",
+            Self::RecurringMaster => "RecurringMaster",
+        }
+    }
+    /// Ключ для интерфейса: `single`, `occurrence`, `exception`, `recurring_master`.
+    pub const fn key(self) -> &'static str {
+        match self {
+            Self::Single => "single",
+            Self::Occurrence => "occurrence",
+            Self::Exception => "exception",
+            Self::RecurringMaster => "recurring_master",
+        }
+    }
+    /// Экземпляр, исключение или сама повторяющаяся встреча.
+    pub const fn is_recurring(self) -> bool {
+        !matches!(self, Self::Single)
+    }
+}
+
+/// Ответ на приглашение (`calendar:MyResponseType`, `ResponseType` у участника).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+pub enum ResponseType {
+    #[default]
+    Unknown,
+    Organizer,
+    Tentative,
+    Accept,
+    Decline,
+    NoResponseReceived,
+}
+
+impl ResponseType {
+    pub fn parse(s: &str) -> Self {
+        match s.to_ascii_lowercase().as_str() {
+            "organizer" => Self::Organizer,
+            "tentative" => Self::Tentative,
+            "accept" => Self::Accept,
+            "decline" => Self::Decline,
+            "noresponsereceived" | "no_response" => Self::NoResponseReceived,
+            _ => Self::Unknown,
+        }
+    }
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unknown => "Unknown",
+            Self::Organizer => "Organizer",
+            Self::Tentative => "Tentative",
+            Self::Accept => "Accept",
+            Self::Decline => "Decline",
+            Self::NoResponseReceived => "NoResponseReceived",
+        }
+    }
+    /// Ключ для интерфейса: `unknown`, `organizer`, `tentative`, `accept`, `decline`, `no_response`.
+    pub const fn key(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::Organizer => "organizer",
+            Self::Tentative => "tentative",
+            Self::Accept => "accept",
+            Self::Decline => "decline",
+            Self::NoResponseReceived => "no_response",
+        }
+    }
+}
+
+/// Событие календаря, как его отдаёт `FindItem` с `CalendarView`: повторяющиеся встречи уже
+/// развёрнуты в экземпляры (`Occurrence`/`Exception`), у каждого свой `ItemId`.
+/// `start`/`end` — моменты в UTC; у событий на весь день это границы суток в часовом поясе
+/// контекста запроса.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CalendarEvent {
+    pub id: ItemId,
+    pub subject: Option<String>,
+    pub start: Timestamp,
+    pub end: Timestamp,
+    pub is_all_day: bool,
+    pub location: Option<String>,
+    pub organizer: Option<Participant>,
+    pub free_busy: FreeBusy,
+    pub calendar_type: CalendarItemType,
+    pub is_meeting: bool,
+    pub is_cancelled: bool,
+    pub my_response: ResponseType,
+    /// `Normal`, `Personal`, `Private`, `Confidential`.
+    pub sensitivity: Option<String>,
+    pub has_attachments: bool,
+    pub last_modified: Option<Timestamp>,
+}
+
+/// Участник встречи с его ответом на приглашение.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Attendee {
+    pub participant: Participant,
+    pub response: ResponseType,
+    /// Обязательный (`RequiredAttendees`) или необязательный (`OptionalAttendees`).
+    pub required: bool,
+}
+
+/// Событие целиком (`GetItem`): тело, участники, напоминание, описание повторения.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CalendarEventDetails {
+    pub event: CalendarEvent,
+    pub body: Option<MessageBody>,
+    pub attendees: Vec<Attendee>,
+    /// Минут до начала, если напоминание включено.
+    pub reminder_minutes: Option<i64>,
+    /// Человекочитаемое описание повторения (собирается клиентом из структуры `Recurrence`).
+    pub recurrence_text: Option<String>,
+}
+
 /// Изменение элемента, как его отдаёт `SyncFolderItems`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ItemChange {
@@ -381,6 +566,25 @@ mod tests {
             assert_eq!(DistinguishedFolder::parse(d.as_str()), Some(d));
         }
         assert_eq!(DistinguishedFolder::parse("nope"), None);
+    }
+
+    #[test]
+    fn calendar_enums_roundtrip() {
+        for fb in [FreeBusy::Free, FreeBusy::Tentative, FreeBusy::Busy, FreeBusy::Oof, FreeBusy::WorkingElsewhere, FreeBusy::NoData] {
+            assert_eq!(FreeBusy::parse(fb.as_str()), fb);
+            assert_eq!(FreeBusy::parse(fb.key()), fb);
+        }
+        assert_eq!(FreeBusy::parse("Что-то"), FreeBusy::NoData);
+        for t in [CalendarItemType::Single, CalendarItemType::Occurrence, CalendarItemType::Exception, CalendarItemType::RecurringMaster] {
+            assert_eq!(CalendarItemType::parse(t.as_str()), t);
+            assert_eq!(CalendarItemType::parse(t.key()), t);
+        }
+        assert!(!CalendarItemType::Single.is_recurring() && CalendarItemType::Occurrence.is_recurring());
+        for r in [ResponseType::Unknown, ResponseType::Organizer, ResponseType::Tentative, ResponseType::Accept, ResponseType::Decline, ResponseType::NoResponseReceived] {
+            assert_eq!(ResponseType::parse(r.as_str()), r);
+            assert_eq!(ResponseType::parse(r.key()), r);
+        }
+        assert_eq!(ResponseType::parse(""), ResponseType::Unknown);
     }
 
     #[test]

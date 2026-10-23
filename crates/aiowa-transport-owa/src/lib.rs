@@ -7,9 +7,12 @@
 
 pub mod protocol;
 
-use aiowa_core::{ComposeKind, FolderChanges, FolderRef, ItemChanges, ItemId, OutgoingAttachment, OutgoingMessage, Signature, SyncState};
+use aiowa_core::{CalendarEvent, CalendarEventDetails, ComposeKind, FolderChanges, FolderRef, ItemChanges, ItemId, OutgoingAttachment, OutgoingMessage, Signature, SyncState};
 use aiowa_transport::{async_trait, AttachmentContent, Credentials, DeleteMode, FolderCounts, ItemFetchShape, ItemResult, MailTransport, Result, ServerInfo, TransportError, WriteResult};
 use base64::prelude::*;
+use jiff::Timestamp;
+use protocol::CalendarItemShape;
+use std::collections::HashSet;
 use reqwest::cookie::{CookieStore, Jar};
 use reqwest::header::{HeaderMap, HeaderValue, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_TYPE, LOCATION};
 use reqwest::redirect::Policy;
@@ -77,11 +80,32 @@ struct Inner {
     /// Какой путь скачивания вложений принял сервер: 0 не известно, 1 GET `service.svc/s/GetFileAttachment`,
     /// 2 операция `GetAttachment` с base64 в JSON.
     attachment_mode: AtomicU8,
+    /// Какую форму запроса календаря принял сервер (`CALENDAR_MODE_*`).
+    calendar_mode: AtomicU8,
+    /// Какую форму `ItemShape` для `GetItem` события принял сервер (`CALENDAR_SHAPE_*`).
+    calendar_shape: AtomicU8,
 }
 
 const ATTACHMENT_MODE_UNKNOWN: u8 = 0;
 const ATTACHMENT_MODE_GET: u8 = 1;
 const ATTACHMENT_MODE_JSON: u8 = 2;
+
+/// Формы запроса окна календаря в порядке проб: `FindItem` с `CalendarPageView` и датами `…Z`,
+/// то же без `Z`, операция OWA `GetCalendarView`.
+const CALENDAR_MODE_UNKNOWN: u8 = 0;
+const CALENDAR_MODE_FIND_ITEM_Z: u8 = 1;
+const CALENDAR_MODE_FIND_ITEM_NAIVE: u8 = 2;
+const CALENDAR_MODE_GET_CALENDAR_VIEW: u8 = 3;
+const CALENDAR_MODES: [u8; 3] = [CALENDAR_MODE_FIND_ITEM_Z, CALENDAR_MODE_FIND_ITEM_NAIVE, CALENDAR_MODE_GET_CALENDAR_VIEW];
+
+const CALENDAR_SHAPE_UNKNOWN: u8 = 0;
+const CALENDAR_SHAPE_EXPLICIT: u8 = 1;
+const CALENDAR_SHAPE_ALL: u8 = 2;
+
+/// Самое узкое окно, на которое делится выдача календаря при `IncludesLastItemInRange: false`.
+const CALENDAR_MIN_WINDOW: jiff::SignedDuration = jiff::SignedDuration::from_hours(1);
+/// Предел запросов на одно окно календаря (защита от бесконечного деления).
+const CALENDAR_MAX_REQUESTS: usize = 64;
 
 /// Транспорт OWA JSON. Дёшево клонируется (Arc внутри).
 #[derive(Clone)]
@@ -153,6 +177,8 @@ impl OwaTransport {
             relogin: Mutex::new(()),
             closed: AtomicBool::new(false),
             attachment_mode: AtomicU8::new(ATTACHMENT_MODE_UNKNOWN),
+            calendar_mode: AtomicU8::new(CALENDAR_MODE_UNKNOWN),
+            calendar_shape: AtomicU8::new(CALENDAR_SHAPE_UNKNOWN),
         });
         Ok(Self { inner })
     }
@@ -509,6 +535,104 @@ impl OwaTransport {
         Ok(results)
     }
 
+    /// Одно окно календаря одной формой запроса: события и признак полной выдачи.
+    async fn calendar_window_once(&self, mode: u8, start: Timestamp, end: Timestamp) -> Result<(Vec<CalendarEvent>, bool)> {
+        let (op, body) = match mode {
+            CALENDAR_MODE_FIND_ITEM_Z => ("FindItem", protocol::find_calendar_view_body(start, end, true, None)),
+            CALENDAR_MODE_FIND_ITEM_NAIVE => ("FindItem", protocol::find_calendar_view_body(start, end, false, None)),
+            _ => ("GetCalendarView", protocol::get_calendar_view_body(start, end)),
+        };
+        let v = self.call(op, protocol::V_2017, body).await?;
+        let msg = Self::first_message(op, &v)?;
+        let (events, includes_last) = protocol::parse_calendar_view(&msg);
+        // Форма ответа без содержимого: ключи, формат даты, значения перечислений (не персональные).
+        let root = msg.get("RootFolder").unwrap_or(&msg);
+        let root_keys: Vec<&str> = root.as_object().map(|o| o.keys().map(String::as_str).collect()).unwrap_or_default();
+        let first = root.pointer("/Items/0");
+        let item_keys: Vec<&str> = first.and_then(Value::as_object).map(|o| o.keys().map(String::as_str).collect()).unwrap_or_default();
+        let start_raw = first.and_then(|i| protocol::str_of(i, "Start")).unwrap_or("");
+        let enums: HashSet<String> = root
+            .get("Items")
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .flat_map(|i| {
+                        ["CalendarItemType", "FreeBusyType", "LegacyFreeBusyStatus", "ResponseType", "MyResponseType", "Sensitivity", "AppointmentState", "IsCancelled"]
+                            .into_iter()
+                            .filter_map(move |k| i.get(k).filter(|x| !x.is_object() && !x.is_array()).map(|x| format!("{k}={x}")))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        debug!(op, mode, response_type = protocol::str_of(&msg, "__type").unwrap_or("?"), ?root_keys, ?item_keys, start_raw, items = events.len(), includes_last, total_in_view = ?protocol::i64_of(root, "TotalItemsInView"), ?enums, "форма ответа календаря");
+        Ok((events, includes_last))
+    }
+
+    /// Окно календаря с подбором формы запроса (один раз на сессию) и делением окна пополам,
+    /// пока сервер сообщает неполную выдачу (`IncludesLastItemInRange: false`).
+    async fn calendar_window(&self, start: Timestamp, end: Timestamp) -> Result<Vec<CalendarEvent>> {
+        let mut mode = self.inner.calendar_mode.load(Ordering::Relaxed);
+        let mut out: Vec<CalendarEvent> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut pending: Vec<(Timestamp, Timestamp)> = vec![(start, end)];
+        let mut requests = 0usize;
+        while let Some((s, e)) = pending.pop() {
+            if requests >= CALENDAR_MAX_REQUESTS {
+                warn!(requests, "календарь: предел запросов на окно, остаток окна пропущен");
+                break;
+            }
+            requests += 1;
+            let (events, includes_last) = if mode == CALENDAR_MODE_UNKNOWN {
+                let mut found = None;
+                for candidate in CALENDAR_MODES {
+                    match self.calendar_window_once(candidate, s, e).await {
+                        Ok(r) => {
+                            info!(mode = candidate, "календарь: сервер принял форму запроса ({})", calendar_mode_name(candidate));
+                            self.inner.calendar_mode.store(candidate, Ordering::Relaxed);
+                            mode = candidate;
+                            found = Some(r);
+                            break;
+                        }
+                        Err(e) if matches!(e, TransportError::Protocol { .. } | TransportError::Server { .. }) && !e.is_retryable() && candidate != CALENDAR_MODE_GET_CALENDAR_VIEW => {
+                            warn!(mode = candidate, error = %e, "календарь: форма {} отвергнута, пробую следующую", calendar_mode_name(candidate));
+                        }
+                        Err(e) => return Err(e),
+                    }
+                }
+                found.expect("последняя форма либо принята, либо вернула ошибку")
+            } else {
+                self.calendar_window_once(mode, s, e).await?
+            };
+            for ev in events {
+                if seen.insert(ev.id.id.clone()) {
+                    out.push(ev);
+                }
+            }
+            if !includes_last {
+                let span = e.duration_since(s);
+                if span > CALENDAR_MIN_WINDOW {
+                    let mid = s + span / 2;
+                    debug!(%s, %e, "календарь: выдача неполная, окно делится пополам");
+                    pending.push((mid, e));
+                    pending.push((s, mid));
+                } else {
+                    warn!(%s, %e, "календарь: выдача неполная даже на окне в час, остаток пропущен");
+                }
+            }
+        }
+        out.sort_by(|a, b| a.start.cmp(&b.start).then(a.end.cmp(&b.end)).then(a.id.id.cmp(&b.id.id)));
+        Ok(out)
+    }
+
+    /// Отладка форм протокола: `GetItem` события с `AllProperties`; возвращает форму элемента
+    /// ответа без содержимого (`protocol::json_shape`: ключи, длины строк, длины массивов).
+    pub async fn probe_calendar_item_shape(&self, id: &ItemId) -> Result<String> {
+        let body = protocol::get_calendar_item_body(id, CalendarItemShape::AllProperties, 4096);
+        let v = self.call("GetItem", protocol::V_2017, body).await?;
+        let msg = Self::first_message("GetItem", &v)?;
+        Ok(protocol::json_shape(msg.pointer("/Items/0").unwrap_or(&Value::Null), 3))
+    }
+
     /// Первое сообщение ответа, с проверкой `ResponseClass`.
     fn first_message(op: &str, v: &Value) -> Result<Value> {
         let msgs = protocol::response_messages(v);
@@ -525,6 +649,15 @@ impl OwaTransport {
             return Err(server_error(code, message, first));
         }
         Ok((*first).clone())
+    }
+}
+
+fn calendar_mode_name(mode: u8) -> &'static str {
+    match mode {
+        CALENDAR_MODE_FIND_ITEM_Z => "FindItem CalendarPageView, даты с Z",
+        CALENDAR_MODE_FIND_ITEM_NAIVE => "FindItem CalendarPageView, даты без зоны",
+        CALENDAR_MODE_GET_CALENDAR_VIEW => "GetCalendarView",
+        _ => "не известно",
     }
 }
 
@@ -771,6 +904,85 @@ impl MailTransport for OwaTransport {
             }
         }
         Ok(None)
+    }
+
+    async fn find_calendar_view(&self, start: Timestamp, end: Timestamp) -> Result<Vec<CalendarEvent>> {
+        if end <= start {
+            return Ok(Vec::new());
+        }
+        let started = std::time::Instant::now();
+        let events = self.calendar_window(start, end).await?;
+        debug!(%start, %end, events = events.len(), ms = started.elapsed().as_millis(), "календарь: окно загружено");
+        Ok(events)
+    }
+
+    /// `GetItem` события: сначала `IdOnly` с явным списком свойств, при отказе сервера по форме
+    /// (неизвестное свойство) — `AllProperties`; принятая форма запоминается на сессию.
+    async fn get_calendar_item(&self, id: &ItemId) -> Result<CalendarEventDetails> {
+        let known = self.inner.calendar_shape.load(Ordering::Relaxed);
+        let candidates: &[(u8, CalendarItemShape)] = match known {
+            CALENDAR_SHAPE_ALL => &[(CALENDAR_SHAPE_ALL, CalendarItemShape::AllProperties)],
+            CALENDAR_SHAPE_EXPLICIT => &[(CALENDAR_SHAPE_EXPLICIT, CalendarItemShape::Explicit)],
+            _ => &[(CALENDAR_SHAPE_EXPLICIT, CalendarItemShape::Explicit), (CALENDAR_SHAPE_ALL, CalendarItemShape::AllProperties)],
+        };
+        let mut last_err: Option<TransportError> = None;
+        for (i, (code, shape)) in candidates.iter().enumerate() {
+            let body = protocol::get_calendar_item_body(id, *shape, self.inner.config.max_body_size);
+            let result = self.call("GetItem", protocol::V_2017, body).await.and_then(|v| Self::first_message("GetItem", &v));
+            let msg = match result {
+                Ok(m) => m,
+                // Отказ по форме запроса (HTTP 500 на неизвестное свойство, ErrorInvalidPropertyRequest и т. п.):
+                // пробуем следующую форму. Отказ по элементу (ErrorItemNotFound) и сессия — наверх.
+                Err(e) if i + 1 < candidates.len() && (matches!(&e, TransportError::Protocol { status: 500, .. }) || matches!(&e, TransportError::Server { code, .. } if code.contains("Property") || code.contains("Shape"))) => {
+                    warn!(error = %e, "GetItem события: форма {:?} отвергнута, пробую следующую", shape);
+                    last_err = Some(e);
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
+            Self::log_shape("GetItem", &msg);
+            let Some(item) = msg.pointer("/Items/0") else {
+                return Err(TransportError::Protocol { op: "GetItem".into(), status: 200, raw: format!("нет Items[0]: {}", truncate(&msg.to_string(), 200)) });
+            };
+            let Some(details) = protocol::parse_calendar_details(item) else {
+                let keys: Vec<&str> = item.as_object().map(|o| o.keys().map(String::as_str).collect()).unwrap_or_default();
+                if i + 1 < candidates.len() {
+                    warn!(?keys, "GetItem события: в ответе нет Start/End, пробую AllProperties");
+                    last_err = Some(TransportError::Protocol { op: "GetItem".into(), status: 200, raw: format!("нет Start/End у события, ключи {keys:?}") });
+                    continue;
+                }
+                return Err(TransportError::Protocol { op: "GetItem".into(), status: 200, raw: format!("нет Start/End у события, ключи {keys:?}") });
+            };
+            if known == CALENDAR_SHAPE_UNKNOWN {
+                info!(shape = ?shape, keys = item.as_object().map(|o| o.len()).unwrap_or(0), "GetItem события: сервер принял форму");
+            }
+            self.inner.calendar_shape.store(*code, Ordering::Relaxed);
+            let mut details = details;
+            // У экземпляра повторяющейся встречи образца повторения нет: он у её «мастера»,
+            // который достаётся по идентификатору экземпляра. Отказ сервера здесь не фатален.
+            if details.recurrence_text.is_none() && details.event.calendar_type.is_recurring() {
+                match self.call("GetItem", protocol::V_2017, protocol::get_recurring_master_body(id)).await.and_then(|v| Self::first_message("GetItem", &v)) {
+                    Ok(m) => {
+                        let rec = m.pointer("/Items/0/Recurrence");
+                        details.recurrence_text = rec.and_then(protocol::recurrence_text);
+                        let master_keys: Vec<&str> = m.pointer("/Items/0").and_then(|i| i.as_object()).map(|o| o.keys().map(String::as_str).collect()).unwrap_or_default();
+                        let recurrence_shape = rec.map(|r| protocol::json_shape(r, 3)).unwrap_or_default();
+                        debug!(?master_keys, recurrence_shape, text = details.recurrence_text.is_some(), "GetItem мастера повторяющейся встречи");
+                    }
+                    Err(e) => debug!(error = %e, "GetItem мастера повторяющейся встречи отвергнут, описание повторения не будет показано"),
+                }
+            }
+            debug!(
+                body = details.body.as_ref().and_then(|b| b.full_body.as_ref()).map(|s| s.chars().count()),
+                attendees = details.attendees.len(),
+                reminder = ?details.reminder_minutes,
+                recurrence = details.recurrence_text.is_some(),
+                recurrence_shape = item.get("Recurrence").map(|r| protocol::json_shape(r, 3)).unwrap_or_default(),
+                "GetItem события"
+            );
+            return Ok(details);
+        }
+        Err(last_err.unwrap_or(TransportError::Protocol { op: "GetItem".into(), status: 0, raw: "ни одна форма не принята".into() }))
     }
 
     async fn logoff(&self) -> Result<()> {
