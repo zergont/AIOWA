@@ -5,6 +5,7 @@
 //! сессию, повторный вход и ограничение параллелизма.
 
 use aiowa_core::{FolderChanges, FolderId, FolderRef, ItemChanges, ItemId, MessageFull, SyncState};
+pub use aiowa_core::{ComposeKind, OutgoingAttachment, OutgoingMessage, Signature};
 use secrecy::SecretString;
 use std::time::Duration;
 
@@ -215,6 +216,27 @@ pub trait MailTransport: Send + Sync {
     /// Удалить письма (`DeleteItem`): в «Удалённые» или навсегда. В `Ok` исходный идентификатор
     /// (для `ToDeletedItems` — новый, если сервер его сообщил).
     async fn delete_items(&self, ids: &[ItemId], mode: DeleteMode) -> Result<Vec<WriteResult>>;
+
+    /// Создать черновик в «Черновиках» (`CreateItem` с `MessageDisposition: SaveOnly`).
+    /// Для `Reply`/`ReplyAll`/`Forward` сервер сам добавляет цитируемый оригинал (у пересылки —
+    /// и его вложения); получатели и тема передаются явно. Возвращает идентификатор черновика.
+    async fn create_draft(&self, kind: &ComposeKind, msg: &OutgoingMessage) -> Result<ItemId>;
+
+    /// Приложить файлы к черновику (`CreateAttachment`, по одному запросу на файл). Возвращает
+    /// идентификатор черновика с актуальным `ChangeKey` (`RootItemChangeKey` последнего ответа):
+    /// именно его нужно передавать в `send_draft`.
+    async fn add_attachments(&self, item: &ItemId, files: &[OutgoingAttachment]) -> Result<ItemId>;
+
+    /// Отправить черновик (`SendItem` с копией в «Отправленных»).
+    async fn send_draft(&self, item: &ItemId) -> Result<()>;
+
+    /// Перезаписать тему, тело и получателей черновика (`UpdateItem` с `SaveOnly`). Возвращает
+    /// идентификатор с новым `ChangeKey`.
+    async fn update_draft(&self, item: &ItemId, msg: &OutgoingMessage) -> Result<ItemId>;
+
+    /// Подпись пользователя из настроек OWA (`GetUserConfiguration OWA.UserOptions`): `None`,
+    /// если подпись не задана.
+    async fn user_signature(&self) -> Result<Option<Signature>>;
 
     /// Завершить серверную сессию. После вызова транспорт непригоден.
     async fn logoff(&self) -> Result<()>;

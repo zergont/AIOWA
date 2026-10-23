@@ -7,7 +7,7 @@
 
 pub mod protocol;
 
-use aiowa_core::{FolderChanges, FolderRef, ItemChanges, ItemId, SyncState};
+use aiowa_core::{ComposeKind, FolderChanges, FolderRef, ItemChanges, ItemId, OutgoingAttachment, OutgoingMessage, Signature, SyncState};
 use aiowa_transport::{async_trait, AttachmentContent, Credentials, DeleteMode, FolderCounts, ItemFetchShape, ItemResult, MailTransport, Result, ServerInfo, TransportError, WriteResult};
 use base64::prelude::*;
 use reqwest::cookie::{CookieStore, Jar};
@@ -37,6 +37,9 @@ pub struct OwaConfig {
     pub max_body_size: u64,
     /// Строка User-Agent. Честная, без маскировки под браузер.
     pub user_agent: String,
+    /// Таймаут одного запроса `CreateAttachment`: файл до 25 МиБ в base64 на медленном канале
+    /// не укладывается в общий `timeout`.
+    pub upload_timeout: Duration,
 }
 
 impl Default for OwaConfig {
@@ -49,6 +52,7 @@ impl Default for OwaConfig {
             get_item_batch: 25,
             max_body_size: 2_097_152,
             user_agent: format!("AIOWA/{}", env!("CARGO_PKG_VERSION")),
+            upload_timeout: Duration::from_secs(600),
         }
     }
 }
@@ -257,12 +261,17 @@ impl OwaTransport {
 
     /// Вызов операции `service.svc` с одной попыткой повторного входа.
     pub async fn call(&self, op: &str, version: &str, body: Value) -> Result<Value> {
+        self.call_with_timeout(op, version, body, None).await
+    }
+
+    /// То же с собственным таймаутом запроса вместо общего из настроек (загрузка вложений).
+    pub async fn call_with_timeout(&self, op: &str, version: &str, body: Value, timeout: Option<Duration>) -> Result<Value> {
         let _permit = self.inner.permits.acquire().await.map_err(|_| TransportError::Cancelled)?;
         let env = protocol::envelope(op, version, &self.inner.config.time_zone, body);
         let payload = serde_json::to_vec(&env).map_err(|e| TransportError::Protocol { op: op.into(), status: 0, raw: e.to_string() })?;
         for attempt in 0..2 {
             let generation = self.inner.generation.load(Ordering::SeqCst);
-            match self.call_once(op, payload.clone()).await {
+            match self.call_once(op, payload.clone(), timeout).await {
                 Err(e) if e.needs_reauth() && attempt == 0 => {
                     self.relogin_once(generation).await?;
                 }
@@ -272,7 +281,7 @@ impl OwaTransport {
         Err(TransportError::SessionExpired)
     }
 
-    async fn call_once(&self, op: &str, payload: Vec<u8>) -> Result<Value> {
+    async fn call_once(&self, op: &str, payload: Vec<u8>, timeout: Option<Duration>) -> Result<Value> {
         let inner = &self.inner;
         let id = inner.action_id.fetch_sub(1, Ordering::SeqCst);
         let mut url = inner.base.join("owa/service.svc").expect("url");
@@ -289,7 +298,11 @@ impl OwaTransport {
             }
         }
         let started = std::time::Instant::now();
-        let r = inner.client.post(url).headers(headers).body(payload).send().await.map_err(net)?;
+        let mut req = inner.client.post(url).headers(headers).body(payload);
+        if let Some(t) = timeout {
+            req = req.timeout(t);
+        }
+        let r = req.send().await.map_err(net)?;
         let status = r.status();
         self.remember_build(r.headers());
         if status == StatusCode::from_u16(440).unwrap_or(StatusCode::UNAUTHORIZED) || status == StatusCode::UNAUTHORIZED {
@@ -427,7 +440,22 @@ impl OwaTransport {
     async fn call_unpermitted(&self, op: &str, version: &str, body: Value) -> Result<Value> {
         let env = protocol::envelope(op, version, &self.inner.config.time_zone, body);
         let payload = serde_json::to_vec(&env).map_err(|e| TransportError::Protocol { op: op.into(), status: 0, raw: e.to_string() })?;
-        self.call_once(op, payload).await
+        self.call_once(op, payload, None).await
+    }
+
+    /// Форма сообщения ответа в журнал отладки без содержимого: тип, код, ключи сообщения и
+    /// первого элемента, длины идентификаторов. Нужна для фиксации форм в документе протокола.
+    fn log_shape(op: &str, msg: &Value) {
+        fn keys(v: Option<&Value>) -> Vec<&str> {
+            v.and_then(Value::as_object).map(|o| o.keys().map(String::as_str).collect()).unwrap_or_default()
+        }
+        let msg_keys = keys(Some(msg));
+        let item_keys = keys(msg.pointer("/Items/0"));
+        let att_keys = keys(msg.pointer("/Attachments/0"));
+        let att_id_keys = keys(msg.pointer("/Attachments/0/AttachmentId"));
+        let id_len = msg.pointer("/Items/0/ItemId/Id").and_then(Value::as_str).map(str::len);
+        let ck_len = msg.pointer("/Items/0/ItemId/ChangeKey").and_then(Value::as_str).map(str::len);
+        debug!(op, response_type = protocol::str_of(msg, "__type").unwrap_or("?"), response_code = protocol::str_of(msg, "ResponseCode").unwrap_or("?"), ?msg_keys, ?item_keys, ?att_keys, ?att_id_keys, ?id_len, ?ck_len, "форма ответа");
     }
 
     /// Операция записи по элементам (`UpdateItem`, `MoveItem`, `DeleteItem`): пачками того же
@@ -681,6 +709,68 @@ impl MailTransport for OwaTransport {
             DeleteMode::Hard => "HardDelete",
         };
         self.write_items("DeleteItem", ids, |chunk| protocol::delete_item_body(chunk, delete_type)).await
+    }
+
+    async fn create_draft(&self, kind: &ComposeKind, msg: &OutgoingMessage) -> Result<ItemId> {
+        let v = self.call("CreateItem", protocol::V_2017, protocol::create_item_body(kind, msg)).await?;
+        let m = Self::first_message("CreateItem", &v)?;
+        Self::log_shape("CreateItem", &m);
+        protocol::parse_created_item_id(&m).ok_or_else(|| TransportError::Protocol { op: "CreateItem".into(), status: 200, raw: format!("нет Items[0].ItemId: {}", truncate(&m.to_string(), 200)) })
+    }
+
+    async fn add_attachments(&self, item: &ItemId, files: &[OutgoingAttachment]) -> Result<ItemId> {
+        let mut current = item.clone();
+        for (i, f) in files.iter().enumerate() {
+            let body = protocol::create_attachment_body(&current, f);
+            let v = self.call_with_timeout("CreateAttachment", protocol::V_2017, body, Some(self.inner.config.upload_timeout)).await?;
+            let m = Self::first_message("CreateAttachment", &v)?;
+            Self::log_shape("CreateAttachment", &m);
+            match protocol::parse_attachment_root(&m) {
+                Some(root) => {
+                    debug!(index = i, bytes = f.bytes.len(), root_same = root.id == current.id, ck_len = root.change_key.as_deref().map(str::len), "вложение приложено");
+                    current = root;
+                }
+                None => {
+                    warn!(index = i, "CreateAttachment: в ответе нет RootItemId, ключ черновика не обновлён");
+                }
+            }
+        }
+        Ok(current)
+    }
+
+    async fn send_draft(&self, item: &ItemId) -> Result<()> {
+        let v = self.call("SendItem", protocol::V_2017, protocol::send_item_body(item)).await?;
+        let m = Self::first_message("SendItem", &v)?;
+        Self::log_shape("SendItem", &m);
+        Ok(())
+    }
+
+    async fn update_draft(&self, item: &ItemId, msg: &OutgoingMessage) -> Result<ItemId> {
+        let v = self.call("UpdateItem", protocol::V_2017, protocol::update_draft_body(item, msg)).await?;
+        let m = Self::first_message("UpdateItem", &v)?;
+        Self::log_shape("UpdateItem", &m);
+        Ok(protocol::written_item_id(&m).unwrap_or_else(|| item.clone()))
+    }
+
+    /// Объект `OWA.UserOptions` ищется сначала в корне ящика (`root`, как в EWS Managed API),
+    /// затем в корне почтовых папок (`msgfolderroot`); `ErrorItemNotFound` в обоих — подписи нет.
+    async fn user_signature(&self) -> Result<Option<Signature>> {
+        for base in ["root", "msgfolderroot"] {
+            let v = self.call("GetUserConfiguration", protocol::V_2013, protocol::get_user_configuration_body(base)).await?;
+            match Self::first_message("GetUserConfiguration", &v) {
+                Ok(m) => {
+                    let dict = protocol::user_configuration_dictionary(&m);
+                    let keys: Vec<&str> = dict.iter().map(|(k, _)| k.as_str()).collect();
+                    debug!(base, entries = dict.len(), ?keys, shape = %protocol::json_shape(&m, 5), "GetUserConfiguration: словарь OWA.UserOptions");
+                    return Ok(protocol::parse_user_signature(&m));
+                }
+                Err(TransportError::Server { code, message }) if code == "ErrorItemNotFound" => {
+                    debug!(base, message, "GetUserConfiguration: объекта OWA.UserOptions нет в этой папке");
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(None)
     }
 
     async fn logoff(&self) -> Result<()> {

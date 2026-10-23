@@ -19,7 +19,9 @@ use rusqlite::{params, params_from_iter, Connection, OptionalExtension, Transact
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
 pub use schema::{FETCH_FAILED, TEXT_FAILED, TEXT_OK, TEXT_PENDING, TEXT_UNSUPPORTED};
@@ -43,7 +45,45 @@ pub struct Store {
     path: PathBuf,
     attachments_dir: PathBuf,
     conn: Mutex<Connection>,
+    /// Растёт при каждой записи писем с сервера: по нему кэш подсказок получателей
+    /// понимает, что устарел.
+    write_generation: AtomicU64,
+    recipient_cache: Mutex<Option<RecipientCache>>,
 }
+
+/// Подсказка получателя для автодополнения в композере.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecipientSuggestion {
+    pub name: Option<String>,
+    pub email: String,
+    /// Частота адреса с преимуществом свежих писем: письмо за последние 30 дней даёт 4,
+    /// за год — 2, старше — 1.
+    pub weight: i64,
+}
+
+/// Все известные адреса аккаунта с весами, в порядке убывания веса. Строится одним проходом по
+/// `items` и `recipients` (около 0,3 с на 150 тыс. писем), поэтому кэшируется в памяти и
+/// перестраивается после записей в базу, но не чаще раза в несколько секунд.
+struct RecipientCache {
+    account: AccountId,
+    built_at: Instant,
+    generation: u64,
+    rows: Vec<CachedRecipient>,
+}
+
+struct CachedRecipient {
+    suggestion: RecipientSuggestion,
+    /// Адрес в нижнем регистре.
+    email_norm: String,
+    /// Имя после `norm_lower` (нижний регистр, ё→е).
+    name_norm: String,
+}
+
+/// Кэш подсказок перестраивается после записи не раньше, чем через столько времени после
+/// прошлой сборки (во время синхронизации записи идут каждые несколько секунд).
+const RECIPIENT_CACHE_MIN_AGE: Duration = Duration::from_secs(5);
+/// И в любом случае не реже раза в полчаса: веса зависят от текущей даты.
+const RECIPIENT_CACHE_MAX_AGE: Duration = Duration::from_secs(30 * 60);
 
 /// Статистика применения пачки изменений.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -329,7 +369,7 @@ impl Store {
         schema::register_functions(&conn)?;
         schema::migrate(&conn)?;
         info!(path = %path.display(), "хранилище открыто");
-        Ok(Self { path, attachments_dir, conn: Mutex::new(conn) })
+        Ok(Self { path, attachments_dir, conn: Mutex::new(conn), write_generation: AtomicU64::new(0), recipient_cache: Mutex::new(None) })
     }
 
     pub fn path(&self) -> &Path {
@@ -566,6 +606,7 @@ impl Store {
     /// Применяет пачку изменений `SyncFolderItems` и новое состояние папки одной транзакцией:
     /// состояние никогда не уходит вперёд без изменений и не отстаёт от них.
     pub fn apply_item_batch(&self, account: AccountId, folder_pk: i64, changes: &[ItemChange], state: &SyncState, complete: bool) -> Result<ApplyStats> {
+        self.write_generation.fetch_add(1, Ordering::Relaxed);
         self.with_tx(|tx| {
             let stats = apply_changes_in_tx(tx, account, folder_pk, changes)?;
             tx.execute(
@@ -603,6 +644,7 @@ impl Store {
 
     /// Применяет пачку изменений `SyncFolderItems` одной транзакцией (без состояния).
     pub fn apply_item_changes(&self, account: AccountId, folder_pk: i64, changes: &[ItemChange]) -> Result<ApplyStats> {
+        self.write_generation.fetch_add(1, Ordering::Relaxed);
         self.with_tx(|tx| apply_changes_in_tx(tx, account, folder_pk, changes))
     }
 
@@ -650,6 +692,7 @@ impl Store {
 
     /// Сохраняет письма целиком: метаданные, получатели, тело, вложения, индекс, беседы.
     pub fn store_full_messages(&self, account: AccountId, folder_pk: i64, messages: &[MessageFull]) -> Result<usize> {
+        self.write_generation.fetch_add(1, Ordering::Relaxed);
         let (stored, stale_files) = self.with_tx(|tx| {
             let now = now_ms();
             let mut stored = 0;
@@ -1316,6 +1359,86 @@ impl Store {
         })
     }
 
+    // --- адреса для композера --------------------------------------------------
+
+    /// Подсказки получателей по префиксу адреса или слова имени (без учёта регистра и ё),
+    /// по убыванию веса. Пустой префикс — самые частые адреса. Источник: получатели
+    /// загруженных писем и отправители всех писем аккаунта; адреса без `@` (устаревшие EX)
+    /// не предлагаются, один адрес в разном регистре — одна подсказка.
+    pub fn suggest_recipients(&self, account: AccountId, prefix: &str, limit: usize) -> Result<Vec<RecipientSuggestion>> {
+        let needle = text::norm_lower(prefix.trim());
+        let mut cache = self.recipient_cache.lock().map_err(|_| StoreError::Other("мьютекс кэша адресов отравлен".into()))?;
+        let generation = self.write_generation.load(Ordering::Relaxed);
+        let stale = match &*cache {
+            None => true,
+            Some(c) => c.account != account || c.built_at.elapsed() > RECIPIENT_CACHE_MAX_AGE || (c.generation != generation && c.built_at.elapsed() > RECIPIENT_CACHE_MIN_AGE),
+        };
+        if stale {
+            *cache = Some(self.build_recipient_cache(account, generation)?);
+        }
+        let rows = &cache.as_ref().expect("кэш только что построен").rows;
+        Ok(rows.iter().filter(|r| needle.is_empty() || word_prefix_match(&r.email_norm, &needle) || word_prefix_match(&r.name_norm, &needle)).take(limit).map(|r| r.suggestion.clone()).collect())
+    }
+
+    /// Сбрасывает кэш подсказок получателей: следующий вызов `suggest_recipients` перестроит его.
+    pub fn invalidate_recipient_cache(&self) {
+        if let Ok(mut c) = self.recipient_cache.lock() {
+            *c = None;
+        }
+    }
+
+    fn build_recipient_cache(&self, account: AccountId, generation: u64) -> Result<RecipientCache> {
+        let started = Instant::now();
+        let now = now_ms();
+        let day = 24 * 3600 * 1000i64;
+        // `+account_id` отключает индекс по account_id: с ним планировщик читает строки
+        // вразброс (1,8 с на 150 тыс. писем), последовательный проход по таблице втрое быстрее.
+        // Имя берётся от самого свежего письма, где оно есть: MAX по строке «дата|имя».
+        let rows = self.with_conn(|c| {
+            let mut st = c.prepare(
+                "SELECT lower(email) AS e,
+                        MAX(CASE WHEN name IS NOT NULL AND name != '' THEN printf('%020d', COALESCE(at, 0)) || '|' || name END) AS named,
+                        MAX(COALESCE(at, 0)) AS last_at,
+                        SUM(CASE WHEN at >= ?2 THEN 4 WHEN at >= ?3 THEN 2 ELSE 1 END) AS weight
+                   FROM (SELECT r.email AS email, r.name AS name, COALESCE(i.received_at, i.sent_at) AS at
+                           FROM recipients r JOIN items i ON i.item_pk = r.item_pk
+                          WHERE +i.account_id = ?1 AND i.deleted = 0 AND r.email LIKE '%@%'
+                         UNION ALL
+                         SELECT from_email, from_name, COALESCE(received_at, sent_at)
+                           FROM items WHERE +account_id = ?1 AND deleted = 0 AND from_email LIKE '%@%')
+                  GROUP BY e ORDER BY weight DESC, last_at DESC",
+            )?;
+            let rows = st
+                .query_map(params![account.0, now - 30 * day, now - 365 * day], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?, r.get::<_, i64>(3)?)))?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })?;
+        let rows: Vec<CachedRecipient> = rows
+            .into_iter()
+            .map(|(email, named, weight)| {
+                let name = named.and_then(|n| n.split_once('|').map(|(_, name)| name.to_string())).filter(|n| !n.is_empty());
+                let name_norm = name.as_deref().map(text::norm_lower).unwrap_or_default();
+                CachedRecipient { email_norm: email.clone(), name_norm, suggestion: RecipientSuggestion { name, email, weight } }
+            })
+            .collect();
+        debug!(addresses = rows.len(), ms = started.elapsed().as_millis(), "кэш подсказок получателей построен");
+        Ok(RecipientCache { account, built_at: Instant::now(), generation, rows })
+    }
+
+    /// Собственные адреса пользователя: самые частые адреса отправителя в «Отправленных»
+    /// (до трёх, в нижнем регистре, без повторов). Пусто, если папка или письма не загружены.
+    pub fn own_addresses(&self, account: AccountId) -> Result<Vec<String>> {
+        let Some((sent_pk, _)) = self.folder_by_distinguished(account, "sentitems")? else { return Ok(vec![]) };
+        self.with_conn(|c| {
+            let mut st = c.prepare_cached(
+                "SELECT lower(from_email) AS e, COUNT(*) AS n FROM items
+                  WHERE folder_pk = ?1 AND deleted = 0 AND from_email LIKE '%@%'
+                  GROUP BY e ORDER BY n DESC, e LIMIT 3",
+            )?;
+            Ok(st.query_map(params![sent_pk], |r| r.get::<_, String>(0))?.collect::<std::result::Result<Vec<_>, _>>()?)
+        })
+    }
+
     /// Отладка: выполняет запрос только на чтение и возвращает строки как текст (значения через табуляцию).
     pub fn debug_query(&self, sql: &str) -> Result<Vec<String>> {
         let head = sql.trim_start().to_ascii_lowercase();
@@ -1353,6 +1476,15 @@ impl Store {
             Ok(())
         })
     }
+}
+
+/// Начинается ли строка или любое её слово с `needle` (границы слов — не буквы и не цифры:
+/// пробел, точка, `@`, дефис). Обе строки уже нормализованы.
+fn word_prefix_match(hay: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    hay.match_indices(needle).any(|(i, _)| i == 0 || hay[..i].chars().next_back().map(|c| !c.is_alphanumeric()).unwrap_or(true))
 }
 
 // ---------------------------------------------------------------------------
@@ -1785,6 +1917,94 @@ mod tests {
         assert_eq!(stats.items, 1);
         assert_eq!(stats.bodies, 1);
         assert_eq!(stats.conversations, 1);
+    }
+
+    #[test]
+    fn recipient_suggestions_and_own_addresses() {
+        let s = tmp_store("recipients");
+        let acc = s.account("h", "u").unwrap();
+        s.upsert_folders(acc, &[folder("Входящие", Some("inbox")), folder("Отправленные", Some("sentitems"))]).unwrap();
+        let (inbox, _) = s.folder_by_distinguished(acc, "inbox").unwrap().unwrap();
+        let (sent, _) = s.folder_by_distinguished(acc, "sentitems").unwrap().unwrap();
+        let from = |name: Option<&str>, email: &str| Some(Participant { name: name.map(String::from), email: Some(email.into()), routing_type: None });
+        let recent = Timestamp::now() - jiff::SignedDuration::from_hours(24);
+        let old = Timestamp::now() - jiff::SignedDuration::from_hours(24 * 800);
+        // Входящие: три письма от Петрова (два свежих, одно старое; адрес в разном регистре),
+        // одно старое от Сидоровой и одно от устаревшего адреса EX (без @).
+        let mut items = Vec::new();
+        for (id, name, email, at) in [
+            ("p1", Some("Пётр Петров"), "Petrov@x.ru", recent),
+            ("p2", Some("Пётр Петров"), "petrov@x.ru", recent),
+            ("p3", Some("Петров П."), "PETROV@x.ru", old),
+            ("s1", Some("Анна Сидорова"), "sidorova@y.ru", old),
+            ("ex", Some("Старый"), "/o=Org/ou=Exchange/cn=Recipients/cn=old", recent),
+        ] {
+            let mut m = meta_at(id, "Тема", "2026-10-16T10:00:00Z", Some(id));
+            m.from = from(name, email);
+            m.received_at = Some(at);
+            items.push(ItemChange::Create(m));
+        }
+        s.apply_item_changes(acc, inbox, &items).unwrap();
+        // Отправленные: свои письма — от me@x.ru (3), от Me@X.ru (в другом регистре) и одно от alias@x.ru.
+        let mut sent_items = Vec::new();
+        for (id, email) in [("o1", "me@x.ru"), ("o2", "me@x.ru"), ("o3", "Me@X.ru"), ("o4", "alias@x.ru")] {
+            let mut m = meta_at(id, "Исходящее", "2026-10-16T10:00:00Z", Some(id));
+            m.from = from(Some("Я"), email);
+            m.received_at = Some(recent);
+            sent_items.push(ItemChange::Create(m));
+        }
+        s.apply_item_changes(acc, sent, &sent_items).unwrap();
+        // Получатели исходящего письма: Иванов (Кому) и Сидорова (Копия) — она же отправитель старого входящего.
+        let mut o1 = meta_at("o1", "Исходящее", "2026-10-16T10:00:00Z", Some("o1"));
+        o1.from = from(Some("Я"), "me@x.ru");
+        o1.received_at = Some(recent);
+        let mut f = full(o1, "<p>текст</p>", vec![]);
+        f.to = vec![Participant { name: Some("Иван Иванов".into()), email: Some("ivanov@z.ru".into()), routing_type: None }];
+        f.cc = vec![Participant { name: Some("Анна Сидорова".into()), email: Some("Sidorova@y.ru".into()), routing_type: None }];
+        s.store_full_messages(acc, sent, &[f]).unwrap();
+
+        assert_eq!(s.own_addresses(acc).unwrap(), vec!["me@x.ru".to_string(), "alias@x.ru".to_string()], "самый частый первым, регистр схлопнут, без дублей");
+
+        // Префикс адреса: регистр не важен, три письма Петрова — одна подсказка с суммарным весом.
+        let petrov = s.suggest_recipients(acc, "PET", 10).unwrap();
+        assert_eq!(petrov.len(), 1, "{petrov:?}");
+        assert_eq!(petrov[0].email, "petrov@x.ru");
+        assert_eq!(petrov[0].weight, 4 + 4 + 1, "два свежих письма по 4, старое 1");
+        assert_eq!(petrov[0].name.as_deref(), Some("Пётр Петров"), "имя от самого свежего письма");
+        // Префикс слова имени, без учёта регистра и ё.
+        let by_name = s.suggest_recipients(acc, "петр", 10).unwrap();
+        assert_eq!(by_name.len(), 1, "{by_name:?}");
+        assert_eq!(by_name[0].email, "petrov@x.ru");
+        assert_eq!(s.suggest_recipients(acc, "Сидор", 10).unwrap().len(), 1, "по фамилии (второе слово имени)");
+        let sidorova = &s.suggest_recipients(acc, "sidorova", 10).unwrap()[0];
+        assert_eq!(sidorova.weight, 1 + 4, "старое входящее 1 плюс свежая копия исходящего 4");
+        assert!(s.suggest_recipients(acc, "иван", 10).unwrap().iter().any(|r| r.email == "ivanov@z.ru"), "получатель из таблицы recipients");
+        assert!(s.suggest_recipients(acc, "old", 10).unwrap().is_empty(), "адрес EX без @ не предлагается");
+        assert!(s.suggest_recipients(acc, "etrov", 10).unwrap().is_empty(), "середина слова без границы не совпадает");
+        assert_eq!(s.suggest_recipients(acc, "x.ru", 10).unwrap().len(), 3, "домен после @ — граница слова: petrov, me, alias");
+        // Пустой префикс: все адреса по убыванию веса; лимит соблюдается.
+        let all = s.suggest_recipients(acc, "", 100).unwrap();
+        assert_eq!(all.len(), 5, "{all:?}");
+        assert!(all.windows(2).all(|w| w[0].weight >= w[1].weight));
+        assert_eq!(all[0].email, "me@x.ru");
+        assert_eq!(s.suggest_recipients(acc, "", 2).unwrap().len(), 2);
+        // Новый адрес появляется после сброса кэша.
+        let mut n = meta_at("n1", "Новое", "2026-10-16T10:00:00Z", Some("n1"));
+        n.from = from(Some("Новый Контакт"), "new@q.ru");
+        s.apply_item_changes(acc, inbox, &[ItemChange::Create(n)]).unwrap();
+        s.invalidate_recipient_cache();
+        assert_eq!(s.suggest_recipients(acc, "new", 10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn word_prefix_boundaries() {
+        assert!(word_prefix_match("иван петров", "петр"));
+        assert!(word_prefix_match("иван петров", "иван п"));
+        assert!(!word_prefix_match("иван петров", "ван"));
+        assert!(word_prefix_match("ivan.petrov@x.ru", "petrov"));
+        assert!(word_prefix_match("ivan.petrov@x.ru", "x.ru"));
+        assert!(!word_prefix_match("sidorova@y.ru", "ova"));
+        assert!(word_prefix_match("anything", ""));
     }
 
     #[test]

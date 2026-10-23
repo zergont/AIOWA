@@ -3,10 +3,12 @@
 
   interface Props {
     status: SyncStatus | null;
+    /** Короткое уведомление («Отправлено»); родитель сам убирает его по таймеру. */
+    notice?: string | null;
     onrefresh: () => void;
     oncancel: () => void;
   }
-  let { status, onrefresh, oncancel }: Props = $props();
+  let { status, notice = null, onrefresh, oncancel }: Props = $props();
 
   const STAGES: Record<SyncStage, string> = {
     login: "Вход на сервер",
@@ -86,6 +88,12 @@
   {/if}
 
   <div class="middle">
+    {#if notice}
+      <span class="notice">
+        <svg width="12" height="12" viewBox="0 0 16 16" aria-hidden="true"><path d="m3 8.5 3 3 7-7" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" /></svg>
+        {notice}
+      </span>
+    {/if}
     {#if running}
       <span class="progress-text">{progressText}</span>
       {#if fraction != null}
@@ -164,6 +172,14 @@
     height: 100%;
     background: var(--accent);
     transition: width var(--dur-normal) var(--ease-in);
+  }
+  .notice {
+    flex: none;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    color: var(--success);
+    white-space: nowrap;
   }
   .error {
     color: var(--danger);

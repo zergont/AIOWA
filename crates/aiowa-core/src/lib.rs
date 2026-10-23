@@ -280,6 +280,59 @@ pub struct MessageFull {
     pub attachments: Vec<AttachmentMeta>,
 }
 
+/// Файл, прикладываемый к исходящему письму (содержимое целиком в памяти: лимиты
+/// на размер проверяет вызывающий, транспорт кодирует в base64).
+#[derive(Clone, PartialEq, Eq)]
+pub struct OutgoingAttachment {
+    pub name: String,
+    pub content_type: Option<String>,
+    pub bytes: Vec<u8>,
+}
+
+impl fmt::Debug for OutgoingAttachment {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OutgoingAttachment").field("name", &self.name).field("content_type", &self.content_type).field("bytes", &self.bytes.len()).finish()
+    }
+}
+
+/// Исходящее письмо: получатели, тема, тело HTML, важность. Для ответа и пересылки
+/// это только новая часть: цитату оригинала (и вложения у пересылки) добавляет сервер.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct OutgoingMessage {
+    pub to: Vec<Participant>,
+    pub cc: Vec<Participant>,
+    pub bcc: Vec<Participant>,
+    pub subject: String,
+    pub body_html: String,
+    pub importance: Importance,
+}
+
+/// Вид создаваемого письма. У ответов и пересылки `reference` — письмо-оригинал на сервере.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ComposeKind {
+    New,
+    Reply { reference: ItemId },
+    ReplyAll { reference: ItemId },
+    Forward { reference: ItemId },
+}
+
+impl ComposeKind {
+    /// Письмо-оригинал, если вид его предполагает.
+    pub fn reference(&self) -> Option<&ItemId> {
+        match self {
+            Self::New => None,
+            Self::Reply { reference } | Self::ReplyAll { reference } | Self::Forward { reference } => Some(reference),
+        }
+    }
+}
+
+/// Подпись пользователя: HTML и признак «добавлять автоматически к новым письмам».
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct Signature {
+    pub html: String,
+    pub auto_add: bool,
+}
+
 /// Изменение элемента, как его отдаёт `SyncFolderItems`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ItemChange {

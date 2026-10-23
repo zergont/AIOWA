@@ -180,6 +180,26 @@ impl MailTransport for Fake {
         Ok(ids.iter().map(|id| WriteResult::Ok { id: id.clone() }).collect())
     }
 
+    async fn create_draft(&self, _kind: &ComposeKind, _msg: &OutgoingMessage) -> TResult<ItemId> {
+        Ok(ItemId { id: "draft".into(), change_key: Some("d1".into()) })
+    }
+
+    async fn add_attachments(&self, item: &ItemId, _files: &[OutgoingAttachment]) -> TResult<ItemId> {
+        Ok(ItemId { id: item.id.clone(), change_key: Some("d2".into()) })
+    }
+
+    async fn send_draft(&self, _item: &ItemId) -> TResult<()> {
+        Ok(())
+    }
+
+    async fn update_draft(&self, item: &ItemId, _msg: &OutgoingMessage) -> TResult<ItemId> {
+        Ok(item.clone())
+    }
+
+    async fn user_signature(&self) -> TResult<Option<Signature>> {
+        Ok(None)
+    }
+
     async fn logoff(&self) -> TResult<()> {
         Ok(())
     }

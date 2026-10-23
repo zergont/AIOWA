@@ -1,10 +1,11 @@
 <script lang="ts">
   import { onDestroy, untrack } from "svelte";
-  import { api, errorMessage, formatSize, fullDate, isExternalLink, isInlinePicture, listDate, messageNeedsFetch, personLabel, type Attachment, type Folder, type Message } from "../api";
-  import { ICON, type ItemAction } from "../actions";
+  import { api, errorMessage, formatSize, fullDate, isInlinePicture, listDate, messageNeedsFetch, personLabel, type Attachment, type ComposeKind, type Folder, type Message } from "../api";
+  import { COMPOSE_ACTIONS, ICON, type ItemAction } from "../actions";
   import { focusBack } from "../popover";
   import FolderPicker from "./FolderPicker.svelte";
   import ConfirmPopover from "./ConfirmPopover.svelte";
+  import BodyFrame from "./BodyFrame.svelte";
 
   interface Props {
     message: Message;
@@ -18,8 +19,10 @@
     deletedFolderPk: number | null;
     /** Действие над этим письмом; промис отклоняется текстом ошибки для пользователя. */
     onaction: (action: ItemAction) => Promise<void>;
+    /** Открыть композер: ответ, ответ всем или пересылка этого письма. */
+    oncompose: (kind: ComposeKind) => void;
   }
-  let { message, expanded, ontoggle, onfetch, folders, deletedFolderPk, onaction }: Props = $props();
+  let { message, expanded, ontoggle, onfetch, folders, deletedFolderPk, onaction, oncompose }: Props = $props();
 
   const to = $derived(message.recipients.filter((r) => r.kind === 1).map((r) => personLabel(r.name, r.email)));
   const cc = $derived(message.recipients.filter((r) => r.kind === 2).map((r) => personLabel(r.name, r.email)));
@@ -219,63 +222,6 @@
     for (const t of savedTimers.values()) clearTimeout(t);
   });
 
-  // --- текст письма во фрейме ---------------------------------------------------
-
-  // Письмо живёт в изолированном фрейме: без скриптов, без внешних ресурсов, своя «бумага».
-  // Инлайновые картинки приходят уже как data: (подставляет бэкенд), поэтому cid: в CSP не нужен.
-  const srcdoc = $derived.by(() => {
-    const body = message.body_html ?? "";
-    return `<!doctype html><html lang="ru"><head><meta charset="utf-8">
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src data:; style-src 'unsafe-inline'; font-src 'none'; frame-src 'none'">
-<style>
-  html,body{margin:0;background:#fff;color:#1f1f1f}
-  body{font:14px/1.5 "Segoe UI Variable Text","Segoe UI",Inter,system-ui,sans-serif;padding:16px 20px;word-wrap:break-word;overflow-wrap:anywhere}
-  img{max-width:100%;height:auto}
-  table{max-width:100%}
-  pre{white-space:pre-wrap}
-  blockquote{border-left:3px solid #ddd;margin:8px 0;padding:0 12px;color:#555}
-  a{color:#005fb8}
-</style></head><body>${body}</body></html>`;
-  });
-
-  let frame = $state<HTMLIFrameElement | null>(null);
-  let height = $state(120);
-  let linkNotice = $state<string | null>(null);
-
-  function fit() {
-    const doc = frame?.contentDocument;
-    if (!doc) return;
-    height = Math.min(20000, Math.max(80, doc.documentElement.scrollHeight + 2));
-  }
-  $effect(() => {
-    void srcdoc;
-    // Высота пересчитывается после загрузки и при подгрузке картинок.
-    const id = setTimeout(fit, 50);
-    return () => clearTimeout(id);
-  });
-
-  /** Каждая загрузка srcdoc — новый документ, обработчик вешается заново. */
-  function onFrameLoad() {
-    fit();
-    // Ссылки из письма открываются снаружи: иначе клик увёл бы сам фрейм на чужой сайт.
-    frame?.contentDocument?.addEventListener("click", onFrameClick, true);
-  }
-
-  function onFrameClick(e: MouseEvent) {
-    // Узлы фрейма из другого realm: instanceof Element здесь не работает, идём по nodeType.
-    const node = e.target as Node | null;
-    const el = node == null ? null : node.nodeType === 1 ? (node as Element) : node.parentElement;
-    const link = el?.closest("a[href], area[href]");
-    if (!link) return;
-    e.preventDefault();
-    e.stopPropagation();
-    const href = link.getAttribute("href") ?? "";
-    if (!isExternalLink(href)) return;
-    api.openExternal(href).catch((err) => {
-      linkNotice = errorMessage(err);
-    });
-  }
-
   function initials(name: string | null, email: string | null): string {
     const s = (name || email || "?").trim();
     const parts = s.split(/\s+/).filter(Boolean);
@@ -315,6 +261,12 @@
 
     {#if expanded}
       <div class="actions" role="toolbar" aria-label="Действия с письмом" aria-busy={busy}>
+        {#each COMPOSE_ACTIONS as a (a.kind)}
+          <button class="act" onclick={() => oncompose(a.kind)} aria-label={a.label} title="{a.label} ({a.keys})">
+            <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path d={a.icon} fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round" /></svg>
+          </button>
+        {/each}
+        <span class="act-sep" aria-hidden="true"></span>
         <button class="act" onclick={() => run({ kind: "read", read: !message.is_read })} disabled={busy} aria-label={message.is_read ? "Пометить непрочитанным" : "Пометить прочитанным"} title={message.is_read ? "Пометить непрочитанным" : "Пометить прочитанным"}>
           <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path d={message.is_read ? ICON.unread : ICON.read} fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round" /></svg>
         </button>
@@ -398,15 +350,8 @@
           <button class="btn" onclick={fetchNow}>Повторить</button>
         </div>
       {/if}
-      {#if linkNotice}
-        <div class="note status failed" role="alert">
-          <span class="status-text">{linkNotice}</span>
-          <button class="btn" onclick={() => (linkNotice = null)} aria-label="Скрыть сообщение">Скрыть</button>
-        </div>
-      {/if}
-
       {#if hasBody}
-        <iframe bind:this={frame} title="Текст письма" sandbox="allow-same-origin" {srcdoc} style="height: {height}px" onload={onFrameLoad}></iframe>
+        <BodyFrame html={message.body_html ?? ""} />
         {#if message.is_truncated}<div class="caption note">Письмо обрезано при загрузке.</div>{/if}
       {:else if message.body_state === 2}
         <div class="note status">
@@ -580,6 +525,12 @@
   .act:focus-visible {
     outline-offset: -2px;
   }
+  .act-sep {
+    width: 1px;
+    height: 16px;
+    margin: 0 4px;
+    background: var(--stroke-2);
+  }
   .action-error {
     border-top: 1px solid var(--stroke-1);
   }
@@ -684,13 +635,7 @@
   .body {
     border-top: 1px solid var(--stroke-1);
   }
-  iframe {
-    display: block;
-    width: 100%;
-    border: 0;
-    background: #fff;
-  }
-  .status + iframe {
+  .status + :global(iframe) {
     border-top: 1px solid var(--stroke-1);
   }
   .note {

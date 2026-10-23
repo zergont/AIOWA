@@ -1,6 +1,6 @@
 <script lang="ts">
-  import { untrack } from "svelte";
-  import type { Conversation, Folder, Message } from "../api";
+  import { untrack, type Snippet } from "svelte";
+  import type { ComposeKind, Conversation, Folder, Message } from "../api";
   import type { ItemAction } from "../actions";
   import MessageCard from "./MessageCard.svelte";
 
@@ -16,8 +16,15 @@
     deletedFolderPk: number | null;
     /** Действие над одним письмом; ошибку пробрасывает, карточка покажет её у себя. */
     onaction: (itemPk: number, action: ItemAction) => Promise<void>;
+    /** Ответ, ответ всем или пересылка письма с карточки. */
+    oncompose: (itemPk: number, kind: ComposeKind) => void;
+    /** Композер: над карточками беседы, а при `composerAlone` — вместо неё (новое письмо, чужая беседа). */
+    composer?: Snippet;
+    composerAlone?: boolean;
+    /** Самое верхнее развёрнутое письмо (для клавиш ответа/пересылки); null, если беседа не показана. */
+    topExpandedPk?: number | null;
   }
-  let { conversation, messages, loading, onfetch, folders, deletedFolderPk, onaction }: Props = $props();
+  let { conversation, messages, loading, onfetch, folders, deletedFolderPk, onaction, oncompose, composer, composerAlone = false, topExpandedPk = $bindable(null) }: Props = $props();
 
   // Письма идут от новых к старым; самое свежее развёрнуто, остальные свёрнуты до заголовка.
   // Раскрытие пересчитывается только при смене беседы: точечная замена письма (догрузка тела)
@@ -52,6 +59,9 @@
     }
   });
   const allExpanded = $derived(messages.length > 0 && messages.every((m) => expanded.has(m.item_pk)));
+  $effect(() => {
+    topExpandedPk = composerAlone ? null : (messages.find((m) => expanded.has(m.item_pk))?.item_pk ?? null);
+  });
   function toggle(pk: number) {
     const next = new Set(expanded);
     if (next.has(pk)) next.delete(pk);
@@ -63,7 +73,12 @@
   }
 </script>
 
-{#if !conversation}
+<!--
+  Композер рендерится ровно в одном месте — первым в .messages: смена беседы или папки под открытым
+  ответом меняет только карточки под ним, а не ветку {#if}, иначе экземпляр композера пересоздавался
+  бы и набранный текст, получатели и вложения сбрасывались бы к заготовке.
+-->
+{#if !composer && !conversation}
   <div class="placeholder">
     <svg width="48" height="48" viewBox="0 0 48 48" aria-hidden="true"><rect x="6" y="12" width="36" height="26" rx="3" fill="none" stroke="currentColor" stroke-width="1.5" /><path d="m6 15 18 12 18-12" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" /></svg>
     <p>Выбери беседу, чтобы прочитать её здесь.</p>
@@ -71,24 +86,31 @@
   </div>
 {:else}
   <div class="pane">
-    <header class="head">
-      <h1 class="topic">{conversation.topic || messages[0]?.subject || "(без темы)"}</h1>
-      <div class="meta caption">
-        {#if messages.length > 1}
-          {messages.length} писем в беседе
-          <button class="link" onclick={toggleAll}>{allExpanded ? "свернуть все" : "развернуть все"}</button>
-        {:else if messages.length === 1}
-          одно письмо
-        {/if}
-      </div>
-    </header>
+    {#if conversation && !composerAlone}
+      <header class="head">
+        <h1 class="topic">{conversation.topic || messages[0]?.subject || "(без темы)"}</h1>
+        <div class="meta caption">
+          {#if messages.length > 1}
+            {messages.length} писем в беседе
+            <button class="link" onclick={toggleAll}>{allExpanded ? "свернуть все" : "развернуть все"}</button>
+          {:else if messages.length === 1}
+            одно письмо
+          {/if}
+        </div>
+      </header>
+    {/if}
     <div class="messages">
-      {#if loading && messages.length === 0}
-        <div class="caption loading">Загрузка…</div>
+      {#if composer}
+        {@render composer()}
       {/if}
-      {#each messages as m (m.item_pk)}
-        <MessageCard message={m} expanded={expanded.has(m.item_pk)} ontoggle={() => toggle(m.item_pk)} {onfetch} {folders} {deletedFolderPk} onaction={(a) => onaction(m.item_pk, a)} />
-      {/each}
+      {#if !composerAlone}
+        {#if loading && messages.length === 0}
+          <div class="caption loading">Загрузка…</div>
+        {/if}
+        {#each messages as m (m.item_pk)}
+          <MessageCard message={m} expanded={expanded.has(m.item_pk)} ontoggle={() => toggle(m.item_pk)} {onfetch} {folders} {deletedFolderPk} onaction={(a) => onaction(m.item_pk, a)} oncompose={(kind) => oncompose(m.item_pk, kind)} />
+        {/each}
+      {/if}
     </div>
   </div>
 {/if}

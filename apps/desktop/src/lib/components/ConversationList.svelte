@@ -1,7 +1,7 @@
 <script lang="ts">
   import { SvelteSet } from "svelte/reactivity";
-  import { errorMessage, listDate, type Conversation, type Folder } from "../api";
-  import { ICON, conversationActionLabels, isDeletedFolder, type ItemAction } from "../actions";
+  import { errorMessage, listDate, type ComposeKind, type Conversation, type Folder } from "../api";
+  import { COMPOSE_ACTIONS, ICON, conversationActionLabels, isDeletedFolder, type ItemAction } from "../actions";
   import { focusBack, type Anchor } from "../popover";
   import ContextMenu, { type MenuItem } from "./ContextMenu.svelte";
   import FolderPicker from "./FolderPicker.svelte";
@@ -19,8 +19,10 @@
     folders: Folder[];
     /** Действие над всеми письмами беседы в текущей папке («снять флаг» — во всех папках); промис отклоняется текстом ошибки. */
     onaction: (c: Conversation, action: ItemAction) => Promise<void>;
+    /** Ответ, ответ всем или пересылка самого свежего письма беседы в текущей папке. */
+    oncompose: (c: Conversation, kind: ComposeKind) => void;
   }
-  let { folder, conversations, selected, loading, hasMore, onselect, onmore, folders, onaction }: Props = $props();
+  let { folder, conversations, selected, loading, hasMore, onselect, onmore, folders, onaction, oncompose }: Props = $props();
 
   // Простая виртуализация: рисуем только строки в окне прокрутки плюс запас.
   const ROW = 72;
@@ -77,7 +79,8 @@
     if (!menu) return [];
     const l = conversationActionLabels(menu.c, inDeleted);
     return [
-      { id: "read", label: l.read, icon: menu.c.unread_count > 0 ? ICON.read : ICON.unread },
+      ...COMPOSE_ACTIONS.map((a) => ({ id: a.kind, label: a.label, icon: a.icon })),
+      { id: "read", label: l.read, icon: menu.c.unread_count > 0 ? ICON.read : ICON.unread, separator: true },
       { id: "flag", label: l.flag, icon: ICON.flag },
       { id: "move", label: l.move, icon: ICON.move },
       { id: "delete", label: l.delete, icon: ICON.delete, danger: true, separator: true },
@@ -128,6 +131,12 @@
     if (!m) return;
     const c = m.c;
     switch (id) {
+      case "reply":
+      case "reply_all":
+      case "forward":
+        focusBack(scroller);
+        oncompose(c, id);
+        break;
       case "read":
         focusBack(scroller);
         void run(c, { kind: "read", read: c.unread_count > 0 });

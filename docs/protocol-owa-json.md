@@ -122,7 +122,7 @@ X-OWA-UrlPostData: <JSON запроса в URL-кодировке>   — при 
 | `GetPresence`, `ResetPresence`, `InstantMessageSignIn` | Lync | клиенту не нужны |
 | `GetFavorites`, `GetAllowedOptions`, `GetUserVoiceData`, `GetUnseenLightningIds` | старт | второстепенны |
 
-Не наблюдалось в этой сессии (проверяется в Rust-спайке напрямую): `SyncFolderItems`, `SyncFolderHierarchy`, `MarkAllItemsAsRead`, `CreateItem`, `UpdateItem`, `GetAttachment`. Позже сняты клиентом: `SyncFolderItems`/`SyncFolderHierarchy`/`GetItem` (§ 5b'), `GetFileAttachment` (§ 5), `UpdateItem` (§ 5e).
+Не наблюдалось в этой сессии (проверяется в Rust-спайке напрямую): `SyncFolderItems`, `SyncFolderHierarchy`, `MarkAllItemsAsRead`, `CreateItem`, `UpdateItem`, `GetAttachment`. Позже сняты клиентом: `SyncFolderItems`/`SyncFolderHierarchy`/`GetItem` (§ 5b'), `GetFileAttachment` (§ 5), `UpdateItem` (§ 5e), `CreateItem`/`CreateAttachment`/`SendItem`/`GetUserConfiguration` (§ 5f).
 
 ## 4. Канал уведомлений
 
@@ -290,6 +290,99 @@ X-OWA-CANARY: <канарейка>          — дублируется заго�
 `DeleteType: "HardDelete"` — навсегда. Разбор ответа терпим к форме: новый идентификатор берётся из `Items[0].ItemId`, `MovedItemId` или `MovedItemIds[0]`, если ничего нет — остаётся исходный. **На сервере не проверялось** (та же оговорка, что у `MoveItem`).
 
 Разбор по элементам (`protocol::parse_write_results`): при совпадении числа сообщений и идентификаторов — по позиции; иначе успешные сопоставляются по `ItemId` из ответа, единственное сообщение-ошибка на пачку относится ко всем элементам, элементы без ответа получают отказ `NoResponse`. `ErrorServerBusy` на всю пачку — `Throttled` (отказ вызова), а не отказ по письмам.
+
+## 5f. Создание письма, вложения, отправка, подпись (клиент `aiowa`, 23.10.2026)
+
+Снято на рабочем ящике одним прогоном `aiowa send --to-self --attach … --yes-i-know` (новое письмо самому себе, тема «[AIOWA] проверка отправки», тело из одной строки, одно текстовое вложение 1 621 байт) и тремя вызовами `aiowa signature` (только чтение). Все четыре операции — обычный `service.svc` с `__type` первым ключом; `CreateItem`, `CreateAttachment`, `SendItem` с `RequestServerVersion: V2017_08_18` (как `GetItem`), `GetUserConfiguration` с `Exchange2013`. Ни одна форма из контракта не была отвергнута: `Body` как объект `BodyContentType`, `Items` с `__type`, получатели как `EmailAddress:#Exchange` — всё принято с первого раза. Весь путь черновик → вложение → отправка занял около 0,6 с (219 + 184 + 229 мс).
+
+**`CreateItem`** (черновик в «Черновиках»):
+
+```json
+{ "__type": "CreateItemRequest:#Exchange",
+  "MessageDisposition": "SaveOnly",
+  "SavedItemFolderId": { "__type": "TargetFolderId:#Exchange",
+      "BaseFolderId": { "__type": "DistinguishedFolderId:#Exchange", "Id": "drafts" } },
+  "Items": [ { "__type": "Message:#Exchange",
+      "Subject": "…",
+      "Body": { "__type": "BodyContentType:#Exchange", "BodyType": "HTML", "Value": "<div>…</div>" },
+      "ToRecipients": [ { "__type": "EmailAddress:#Exchange", "Name": "…", "EmailAddress": "…", "RoutingType": "SMTP" } ],
+      "CcRecipients": [ "…" ], "BccRecipients": [ "…" ],
+      "Importance": "Normal", "IsRead": true } ] }
+```
+
+Пустые списки получателей клиент не передаёт; `Name` у получателя необязателен (в проверке его не было). Ответ HTTP 200, 548 байт, `Body.ResponseMessages.Items[0]` =
+
+```json
+{ "__type": "ItemInfoResponseMessage:#Exchange", "ResponseCode": "NoError", "ResponseClass": "Success",
+  "Items": [ { "__type": "Message:#Exchange",
+      "ItemId": { "__type": "ItemId:#Exchange", "Id": "<152 символа>", "ChangeKey": "<40 символов>" } } ] }
+```
+
+`Id` черновика той же длины, что у писем из синхронизации (152), `ChangeKey` здесь полный (40 символов), а не усечённый, как у `UpdateItem` (§ 5e).
+
+Ответ и пересылка — тот же `CreateItem`, но элемент вместо `Message:#Exchange` имеет тип `ReplyToItem:#Exchange`, `ReplyAllToItem:#Exchange` или `ForwardItem:#Exchange` с полями `ReferenceItemId { "__type": "ItemId:#Exchange", Id, ChangeKey }`, `NewBodyContent` (та же форма, что `Body`), `Subject`, `ToRecipients`/`CcRecipients`/`BccRecipients`; `IsRead` не передаётся, `Importance` — только отличная от `Normal`. Сервер сам дописывает к `NewBodyContent` цитируемый оригинал, а у `ForwardItem` переносит и его вложения; тему и получателей клиент считает сам и передаёт явно. В отличие от нового письма, у ответов и пересылки все три списка получателей передаются всегда, пустой — как `[]`: по семантике EWS непереданный список у `ReplyToItem`/`ReplyAllToItem` сервер заполняет из оригинала сам, и письмо ушло бы тем, кого пользователь убрал из «Кому»/«Копии». **На сервере не проверялось**: формы покрыты юнит-тестами сборки тела (`protocol::outgoing_item_json`), первое живое выполнение — за человеком после сборки окна. Проверка без отправки: «Ответить всем» на письмо с «Копией», снять все чипы из «Копии», «Сохранить черновик» (`SaveOnly`), посмотреть `CcRecipients` черновика (OWA или `GetItem`) — должен быть пуст; черновик удалить навсегда. Если сервер проигнорирует `[]`, запасной путь — отдельный `UpdateItem` только по получателям (`SetItemField` для непустых, `DeleteItemField` для пустых) после `CreateItem`, без `item:Body`, чтобы не затереть добавленную сервером цитату.
+
+**`CreateAttachment`** (по одному файлу на запрос; клиент шлёт файлы последовательно, с таймаутом запроса 10 мин вместо общих 90 с — `OwaConfig::upload_timeout`):
+
+```json
+{ "__type": "CreateAttachmentRequest:#Exchange",
+  "ParentItemId": { "__type": "ItemId:#Exchange", "Id": "<Id черновика>", "ChangeKey": "<его ChangeKey>" },
+  "Attachments": [ { "__type": "FileAttachment:#Exchange",
+      "Name": "…", "ContentType": "text/plain", "IsInline": false, "Content": "<base64>" } ] }
+```
+
+Ответ HTTP 200, 847 байт (для файла 1,6 КБ), 184 мс:
+
+```json
+{ "__type": "AttachmentInfoResponseMessage:#Exchange", "ResponseCode": "NoError", "ResponseClass": "Success",
+  "Attachments": [ { "__type": "FileAttachment:#Exchange",
+      "AttachmentId": { "RootItemChangeKey": "<40 символов, новый>", "RootItemId": "<Id черновика, тот же>", "Id": "<AttachmentId>" },
+      "LastModifiedTime": "…" } ] }
+```
+
+`RootItemId` совпадает с `Id` черновика, `RootItemChangeKey` — новый ключ черновика после добавления файла: именно его клиент подставляет в `SendItem` (`add_attachments` возвращает `ItemId` с ключом последнего ответа). Размер тела запроса — размер файла ×4/3 плюс конверт; лимиты клиента 25 МиБ на файл и 35 МиБ на письмо, серверный предел (`MaxMessageSizeInKb` из `sessiondata.ashx`, § 2) на этом файле не проверялся.
+
+**`SendItem`**:
+
+```json
+{ "__type": "SendItemRequest:#Exchange",
+  "ItemIds": [ { "__type": "ItemId:#Exchange", "Id": "<Id черновика>", "ChangeKey": "<RootItemChangeKey>" } ],
+  "SaveItemToFolder": true,
+  "SavedItemFolderId": { "__type": "TargetFolderId:#Exchange",
+      "BaseFolderId": { "__type": "DistinguishedFolderId:#Exchange", "Id": "sentitems" } } }
+```
+
+Ответ HTTP 200, 232 байта, 229 мс; сообщение ответа **без `__type`**: `Body.ResponseMessages.Items[0]` = `{ "ResponseCode": "NoError", "ResponseClass": "Success" }`. Письмо ушло (копия должна появиться в «Отправленных» и прийти во «Входящие» при следующей синхронизации; это проверяет человек). Отказ сервера по письму ожидается тем же сообщением с `ResponseClass: Error` и `ResponseCode` (например, `ErrorItemNotFound`, если `Id`/`ChangeKey` устарели) — в проверке не наблюдался. Клиент при отказе после удачного `CreateItem` не удаляет черновик автоматически в окне (он остаётся в «Черновиках»); CLI `aiowa send` без `--keep-draft` удаляет его `DeleteItem HardDelete`.
+
+**`UpdateItem` черновика** (повторное «сохранить черновик»): тот же `UpdateItemRequest`, что в § 5e (`AlwaysOverwrite`, `SaveOnly`), с `Updates` из `SetItemField` для `item:Subject`, `item:Body` (значение — `Message:#Exchange` с `Body: BodyContentType`), `item:Importance`, `message:ToRecipients`/`CcRecipients`/`BccRecipients` (значение — `Message:#Exchange` со списком) и `DeleteItemField { "__type": "DeleteItemField:#Exchange", "Path": PropertyUri }` для опустевших списков. Ответ ожидается как у § 5e (`Items[0].ItemId` с новым `ChangeKey`). **На сервере не проверялось**, покрыто юнит-тестом точной формы.
+
+**`GetUserConfiguration`** (подпись пользователя из настроек OWA):
+
+```json
+{ "__type": "GetUserConfigurationRequest:#Exchange",
+  "UserConfigurationName": { "__type": "UserConfigurationNameType:#Exchange",
+      "Name": "OWA.UserOptions",
+      "BaseFolderId": { "__type": "DistinguishedFolderId:#Exchange", "Id": "root" } },
+  "UserConfigurationProperties": "All" }
+```
+
+- Объект `OWA.UserOptions` лежит в **корне ящика `root`** (non-IPM subtree, как его читает EWS Managed API), а не в корне почтовых папок: с `msgfolderroot` сервер отвечает `ResponseClass: Error`, `ErrorItemNotFound`, «The specified object was not found in the store., Объект конфигурации не найден. Имя = OWA.UserOptions.» (446 байт). Клиент пробует `root`, затем `msgfolderroot`; `ErrorItemNotFound` в обоих — подписи нет.
+- Ответ с `root`: HTTP 200, 10 530 байт, 177–271 мс:
+
+  ```json
+  { "__type": "GetUserConfigurationResponseMessage:#Exchange", "ResponseCode": "NoError", "ResponseClass": "Success",
+    "UserConfiguration": {
+      "UserConfigurationName": { "BaseFolderId": { "__type": "DistinguishedFolderId:#Exchange", "Id": "root" }, "Name": "OWA.UserOptions" },
+      "ItemId": { "Id": "<152 символа>", "ChangeKey": "<40 символов>" },
+      "Dictionary": [ { "DictionaryKey":   { "Type": "String",  "Value": [ "signaturehtml" ] },
+                        "DictionaryValue": { "Type": "String",  "Value": [ "<div>…</div>" ] } },
+                      { "DictionaryKey":   { "Type": "String",  "Value": [ "autoaddsignature" ] },
+                        "DictionaryValue": { "Type": "Boolean", "Value": [ true ] } },
+                      "… всего 27 записей" ] } }
+  ```
+
+- `Value` у ключа и у значения — всегда **массив** из одного элемента (в схеме EWS элемент `Value` повторяемый); `Type` значения — `String`, `Boolean` и т. д. Клиент разбирает булевы значения и как JSON `true`/`false`, и как строки `"True"`/`"true"` (форма элемента в журнале не фиксировалась). Ключи подписи в **нижнем регистре**: `signaturehtml`, `signaturetext`, `autoaddsignature`, `autoaddsignatureonreply`; остальные ключи в смешанном регистре (`FavoriteFolders`, `FrequentlyUsedFolders`, `themeStorageId`, `timezone`, `NavigationBarWidth`, `IsReplyAllTheDefaultResponse`, `MruEmojis`, …). Клиент сравнивает ключи без учёта регистра и берёт `Value[0]`. На проверенном ящике: подпись 3 800 символов HTML (185 тегов, со `<style>` блоком OWA), `autoaddsignature = true`.
+- `XmlData`/`BinaryData` в ответе нет: все настройки OWA 2019 хранит в словаре.
 
 ## 6. Что это значит для клиента
 

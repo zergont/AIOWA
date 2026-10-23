@@ -1,8 +1,9 @@
 //! `aiowa`: консольная утилита этапа 1. Вход, папки, синхронизация в локальную базу,
-//! список бесед, поиск с операторами, вложения, операции записи (прочитано, флаг, перенос, удаление).
+//! список бесед, поиск с операторами, вложения, операции записи (прочитано, флаг, перенос, удаление),
+//! отправка письма, подпись из OWA, подсказки адресов.
 //! Пароль хранится в диспетчере учётных данных Windows и не передаётся аргументом.
 
-use aiowa_core::{FolderChange, FolderId, FolderRef, SyncState};
+use aiowa_core::{ComposeKind, FolderChange, FolderId, FolderRef, Importance, ItemId, OutgoingAttachment, OutgoingMessage, Participant, SyncState};
 use aiowa_store::{AttachmentTodo, Store};
 use aiowa_sync::{Engine, FolderSelection, SyncOptions};
 use aiowa_transport::{Credentials, DeleteMode, MailTransport, WriteResult};
@@ -152,6 +153,172 @@ enum Cmd {
         #[arg(long)]
         yes_i_know: bool,
     },
+    /// Отправить новое письмо: черновик (CreateItem) → вложения (CreateAttachment) → отправка (SendItem).
+    /// Без --yes-i-know только печатает план
+    Send {
+        /// Получатель; можно повторять флаг или перечислять адреса через запятую
+        #[arg(long)]
+        to: Vec<String>,
+        /// Адресовать самому себе: самый частый адрес отправителя в «Отправленных» локальной базы
+        #[arg(long)]
+        to_self: bool,
+        /// Копия; можно повторять
+        #[arg(long)]
+        cc: Vec<String>,
+        #[arg(long)]
+        subject: String,
+        /// Текст письма (обычный текст, переводы строк сохраняются)
+        #[arg(long)]
+        body: String,
+        /// Файл-вложение; можно повторять. Лимит 25 МиБ на файл и 35 МиБ всего
+        #[arg(long)]
+        attach: Vec<PathBuf>,
+        /// Подтверждение: письмо уйдёт из настоящего ящика
+        #[arg(long)]
+        yes_i_know: bool,
+        /// При отказе отправки оставить черновик на сервере (по умолчанию удаляется навсегда)
+        #[arg(long)]
+        keep_draft: bool,
+    },
+    /// Показать подпись пользователя из настроек OWA (GetUserConfiguration), ничего не сохраняя
+    Signature,
+    /// Подсказки получателей из локальной базы по началу адреса или слова имени
+    Suggest {
+        /// Начало адреса или слова имени; пусто — самые частые адреса
+        #[arg(default_value = "")]
+        prefix: String,
+        #[arg(long, default_value_t = 10)]
+        limit: usize,
+    },
+}
+
+/// Лимиты вложений при отправке, как в композере окна.
+const MAX_ATTACHMENT_BYTES: u64 = 25 * 1024 * 1024;
+const MAX_ATTACHMENTS_TOTAL_BYTES: u64 = 35 * 1024 * 1024;
+
+/// Грубая проверка почтового адреса: одна `@`, непустые части, точка в домене, без пробелов.
+fn looks_like_email(s: &str) -> bool {
+    let Some((local, domain)) = s.split_once('@') else { return false };
+    !local.is_empty() && domain.contains('.') && !domain.starts_with('.') && !domain.ends_with('.') && !s.chars().any(char::is_whitespace) && !domain.contains('@')
+}
+
+/// Адреса из флагов: каждый флаг может содержать несколько адресов через запятую или точку с запятой.
+fn split_addresses(values: &[String]) -> Vec<String> {
+    values.iter().flat_map(|v| v.split([',', ';'])).map(str::trim).filter(|s| !s.is_empty()).map(String::from).collect()
+}
+
+fn participants(addresses: &[String]) -> Vec<Participant> {
+    addresses.iter().map(|a| Participant { name: None, email: Some(a.clone()), routing_type: None }).collect()
+}
+
+/// Обычный текст в HTML: экранирование и `<div>` на строку (пустая строка — `<div><br></div>`, как в OWA).
+fn text_to_html(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + 32);
+    for line in text.lines() {
+        let escaped: String = line.chars().map(|c| match c {
+            '&' => "&amp;".to_string(),
+            '<' => "&lt;".to_string(),
+            '>' => "&gt;".to_string(),
+            c => c.to_string(),
+        }).collect();
+        if escaped.trim().is_empty() {
+            out.push_str("<div><br></div>");
+        } else {
+            out.push_str("<div>");
+            out.push_str(&escaped);
+            out.push_str("</div>");
+        }
+    }
+    out
+}
+
+/// MIME-тип по расширению файла для частых случаев; остальное — `application/octet-stream`.
+fn content_type_for(path: &std::path::Path) -> &'static str {
+    match path.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase()).as_deref() {
+        Some("txt") | Some("log") | Some("md") => "text/plain",
+        Some("csv") => "text/csv",
+        Some("htm") | Some("html") => "text/html",
+        Some("pdf") => "application/pdf",
+        Some("png") => "image/png",
+        Some("jpg") | Some("jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("zip") => "application/zip",
+        Some("doc") => "application/msword",
+        Some("docx") => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        Some("xls") => "application/vnd.ms-excel",
+        Some("xlsx") => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        Some("pptx") => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        _ => "application/octet-stream",
+    }
+}
+
+/// Читает вложения с проверкой лимитов.
+fn load_attachments(paths: &[PathBuf]) -> Result<Vec<OutgoingAttachment>> {
+    let mut out = Vec::with_capacity(paths.len());
+    let mut total = 0u64;
+    for p in paths {
+        let bytes = std::fs::read(p).with_context(|| format!("не удалось прочитать вложение {}", p.display()))?;
+        if bytes.len() as u64 > MAX_ATTACHMENT_BYTES {
+            bail!("вложение {} больше {} МиБ", p.display(), MAX_ATTACHMENT_BYTES / 1024 / 1024);
+        }
+        total += bytes.len() as u64;
+        if total > MAX_ATTACHMENTS_TOTAL_BYTES {
+            bail!("вложения вместе больше {} МиБ", MAX_ATTACHMENTS_TOTAL_BYTES / 1024 / 1024);
+        }
+        let name = p.file_name().and_then(|n| n.to_str()).map(String::from).ok_or_else(|| anyhow!("у вложения {} нет имени файла", p.display()))?;
+        out.push(OutgoingAttachment { name, content_type: Some(content_type_for(p).to_string()), bytes });
+    }
+    Ok(out)
+}
+
+/// Черновик → вложения → отправка. При отказе после создания черновика удаляет его навсегда
+/// (если не `keep_draft`), чтобы в «Черновиках» не копились следы неудачных попыток.
+async fn send_flow(t: &OwaTransport, msg: &OutgoingMessage, files: &[OutgoingAttachment], keep_draft: bool) -> Result<()> {
+    let started = std::time::Instant::now();
+    let draft = t.create_draft(&ComposeKind::New, msg).await.map_err(|e| anyhow!("CreateItem: {e}"))?;
+    println!(
+        "CreateItem: Ok за {} мс; ItemId {} символов, ChangeKey {}",
+        started.elapsed().as_millis(),
+        draft.id.len(),
+        draft.change_key.as_ref().map(|c| format!("{} символов", c.len())).unwrap_or_else(|| "нет".into())
+    );
+    let result = async {
+        let mut current = draft.clone();
+        if !files.is_empty() {
+            let started = std::time::Instant::now();
+            current = t.add_attachments(&draft, files).await.map_err(|e| anyhow!("CreateAttachment: {e}"))?;
+            println!(
+                "CreateAttachment: Ok, файлов {} за {} мс; RootItemId {}, RootItemChangeKey {}",
+                files.len(),
+                started.elapsed().as_millis(),
+                if current.id == draft.id { "тот же" } else { "другой" },
+                describe_change_key(&draft, &current)
+            );
+        }
+        let started = std::time::Instant::now();
+        t.send_draft(&current).await.map_err(|e| anyhow!("SendItem: {e}"))?;
+        println!("SendItem: Ok за {} мс. Письмо отправлено, копия в «Отправленных».", started.elapsed().as_millis());
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+    if let Err(e) = result {
+        println!("Отправка не состоялась: {e}");
+        if keep_draft {
+            println!("Черновик оставлен на сервере в «Черновиках».");
+        } else {
+            let id = ItemId { id: draft.id.clone(), change_key: None };
+            match t.delete_items(std::slice::from_ref(&id), DeleteMode::Hard).await {
+                Ok(r) => match r.first() {
+                    Some(WriteResult::Ok { .. }) => println!("Черновик удалён навсегда (DeleteItem HardDelete)."),
+                    Some(WriteResult::Failed { code, message, .. }) => println!("Черновик не удалён: {code}: {message}"),
+                    None => println!("Черновик не удалён: пустой ответ DeleteItem"),
+                },
+                Err(e2) => println!("Черновик не удалён: DeleteItem: {e2}"),
+            }
+        }
+        return Err(e);
+    }
+    Ok(())
 }
 
 fn keyring_entry(user: &str) -> Result<keyring::Entry> {
@@ -475,6 +642,64 @@ async fn main() -> Result<()> {
                 }
                 Some(WriteResult::Failed { code, message, .. }) => println!("DeleteItem: Failed {code}: {message}"),
                 None => println!("DeleteItem: пустой ответ"),
+            }
+        }
+        Cmd::Send { to, to_self, cc, subject, body, attach, yes_i_know, keep_draft } => {
+            let mut recipients = split_addresses(to);
+            if *to_self {
+                let store = Store::open(&db_path)?;
+                let account = store.account(&cli.host, &cli.user)?;
+                let me = store.own_addresses(account)?.into_iter().next().ok_or_else(|| anyhow!("в локальной базе нет писем в «Отправленных»: собственный адрес неизвестен"))?;
+                recipients.push(me);
+            }
+            let cc = split_addresses(cc);
+            if recipients.is_empty() {
+                bail!("нужен хотя бы один получатель: --to или --to-self");
+            }
+            if let Some(bad) = recipients.iter().chain(&cc).find(|a| !looks_like_email(a)) {
+                bail!("адрес «{bad}» не похож на почтовый");
+            }
+            let files = load_attachments(attach)?;
+            let msg = OutgoingMessage { to: participants(&recipients), cc: participants(&cc), bcc: vec![], subject: subject.clone(), body_html: text_to_html(body), importance: Importance::Normal };
+            println!(
+                "План: Кому {}{}, Копия {}, тема «{}», тело {} символов, вложений {} ({} байт)",
+                recipients.len(),
+                if *to_self { " (в том числе самому себе)" } else { "" },
+                cc.len(),
+                subject,
+                body.chars().count(),
+                files.len(),
+                files.iter().map(|f| f.bytes.len()).sum::<usize>()
+            );
+            if !yes_i_know {
+                println!("Письмо уйдёт из настоящего ящика. Повторите с --yes-i-know, чтобы отправить.");
+                return Ok(());
+            }
+            let t = connect(&cli).await?;
+            let outcome = send_flow(&t, &msg, &files, *keep_draft).await;
+            t.logoff().await.ok();
+            outcome?;
+        }
+        Cmd::Signature => {
+            let t = connect(&cli).await?;
+            let result = t.user_signature().await;
+            t.logoff().await.ok();
+            match result.map_err(|e| anyhow!("GetUserConfiguration: {e}"))? {
+                Some(sig) => {
+                    println!("Подпись в OWA: {} символов HTML, тегов {}, добавлять автоматически: {}", sig.html.chars().count(), sig.html.matches('<').count(), if sig.auto_add { "да" } else { "нет" });
+                    println!("{}", sig.html);
+                }
+                None => println!("Подпись в OWA не задана."),
+            }
+        }
+        Cmd::Suggest { prefix, limit } => {
+            let store = Store::open(&db_path)?;
+            let account = store.account(&cli.host, &cli.user)?;
+            let started = std::time::Instant::now();
+            let rows = store.suggest_recipients(account, prefix, *limit)?;
+            println!("{} подсказок за {} мс", rows.len(), started.elapsed().as_millis());
+            for r in rows {
+                println!("{:>6}  {}  {}", r.weight, pad(r.name.as_deref().unwrap_or(""), 30), r.email);
             }
         }
         Cmd::Sql { query } => {

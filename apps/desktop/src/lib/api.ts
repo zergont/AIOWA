@@ -146,6 +146,69 @@ export interface ItemsChanged {
   folder_pks: number[];
 }
 
+// --- композер: новое письмо, ответ, ответ всем, пересылка ---------------------
+
+export type ComposeKind = "new" | "reply" | "reply_all" | "forward";
+
+/** Получатель исходящего письма (в отличие от `Recipient` входящего — без вида, адрес обязателен). */
+export interface ComposeRecipient {
+  name: string | null;
+  email: string;
+}
+
+export interface SignatureDto {
+  html: string;
+  auto_add: boolean;
+}
+
+/** Заготовка композера от бэкенда: получатели и тема уже подобраны по виду письма. */
+export interface ComposeContext {
+  kind: ComposeKind;
+  reference_item_pk: number | null;
+  to: ComposeRecipient[];
+  cc: ComposeRecipient[];
+  subject: string;
+  /** Исходное письмо для ответа/пересылки; у нового письма null. */
+  original: Message | null;
+  own_addresses: string[];
+  signature: SignatureDto;
+}
+
+export interface ComposeRequest {
+  kind: ComposeKind;
+  reference_item_pk: number | null;
+  to: ComposeRecipient[];
+  cc: ComposeRecipient[];
+  bcc: ComposeRecipient[];
+  subject: string;
+  body_html: string;
+  /** Пути файлов-вложений. */
+  attachments: string[];
+}
+
+/**
+ * Итог отправки: если не ушло, но черновик остался на сервере — draft_saved; message — текст для пользователя.
+ * maybe_sent — ответа на SendItem нет (таймаут, обрыв связи): письмо могло уйти, повтор дал бы дубль адресатам.
+ */
+export interface SendReport {
+  sent: boolean;
+  draft_saved: boolean;
+  maybe_sent: boolean;
+  message: string | null;
+}
+
+export interface RecipientSuggestion {
+  name: string | null;
+  email: string;
+  weight: number;
+}
+
+export interface PickedFile {
+  path: string;
+  name: string;
+  size: number;
+}
+
 export const api = {
   accountInfo: () => invoke<AccountInfo>("account_info"),
   folders: () => invoke<Folder[]>("folders"),
@@ -179,7 +242,34 @@ export const api = {
   itemsDelete: (itemPks: number[], permanent: boolean) => invoke<WriteReport>("items_delete", { itemPks, permanent }),
   /** Письма беседы; с folderPk — только лежащие в этой папке. */
   conversationItemPks: (conversationPk: number, folderPk: number | null) => invoke<number[]>("conversation_item_pks", { conversationPk, folderPk }),
+
+  // --- композер ----------------------------------------------------------------------------
+  /** Заготовка композера: для ответа/пересылки itemPk — исходное письмо. */
+  composeContext: (kind: ComposeKind, itemPk: number | null) => invoke<ComposeContext>("compose_context", { kind, itemPk }),
+  /** Черновик → вложения → отправка; отказ после создания черновика приходит в SendReport (draft_saved). */
+  composeSend: (req: ComposeRequest) => invoke<SendReport>("compose_send", { req }),
+  composeSaveDraft: (req: ComposeRequest) => invoke<SendReport>("compose_save_draft", { req }),
+  /** Подсказки адресатов по началу адреса или слову имени. */
+  recipientsSuggest: (prefix: string, limit?: number) => invoke<RecipientSuggestion[]>("recipients_suggest", { prefix, limit: limit ?? null }),
+  ownAddresses: () => invoke<string[]>("own_addresses"),
+  signatureGet: () => invoke<SignatureDto>("signature_get"),
+  signatureSet: (html: string, autoAdd: boolean) => invoke<void>("signature_set", { html, autoAdd }),
+  /** Подпись из настроек OWA; сохраняется локально; отказ строкой, если подписи нет. */
+  signatureImportOwa: () => invoke<SignatureDto>("signature_import_owa"),
+  /** Системный диалог выбора файлов; отмена — пустой список. */
+  attachmentsPick: () => invoke<PickedFile[]>("attachments_pick"),
+
+  // --- окно --------------------------------------------------------------------------------
+  /** Пока в композере несохранённое письмо: крестик и Alt+F4 не закрывают окно, а шлют событие close-requested. */
+  windowCloseGuard: (enabled: boolean) => invoke<void>("window_close_guard", { enabled }),
+  /** Пользователь подтвердил закрытие окна. */
+  windowCloseConfirmed: () => invoke<void>("window_close_confirmed"),
 };
+
+/** Подписка на запрос закрытия окна (крестик, Alt+F4) при поднятом windowCloseGuard. Возвращает функцию отписки. */
+export function onCloseRequested(cb: () => void): Promise<UnlistenFn> {
+  return listen<void>("close-requested", () => cb());
+}
 
 /** Подписка на ход синхронизации. Возвращает функцию отписки. */
 export function onSyncProgress(cb: (status: SyncStatus) => void): Promise<UnlistenFn> {

@@ -3,10 +3,11 @@
 //! как требует сервер). Ответы разбираются толерантно: неизвестные поля игнорируются.
 
 use aiowa_core::{
-    AttachmentMeta, BodyType, ConversationId, FlagStatus, Folder, FolderChange, FolderId, FolderRef, Importance, ItemChange, ItemId, MessageBody,
-    MessageFull, MessageMeta, Participant, SyncState,
+    AttachmentMeta, BodyType, ComposeKind, ConversationId, DistinguishedFolder, FlagStatus, Folder, FolderChange, FolderId, FolderRef, Importance, ItemChange, ItemId,
+    MessageBody, MessageFull, MessageMeta, OutgoingAttachment, OutgoingMessage, Participant, Signature, SyncState,
 };
 use aiowa_transport::WriteResult;
+use base64::prelude::*;
 use jiff::Timestamp;
 use serde_json::{json, Value};
 
@@ -226,6 +227,139 @@ pub fn delete_item_body(ids: &[ItemId], delete_type: &str) -> Value {
         "DeleteType": delete_type,
         "SuppressReadReceipts": true,
         "ReturnMovedItemIds": true,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Тела операций создания и отправки (см. docs/protocol-owa-json.md § 5f)
+
+/// Получатель письма: `EmailAddress:#Exchange` с `Name`, `EmailAddress`, `RoutingType` (по умолчанию `SMTP`).
+pub fn recipient_json(p: &Participant) -> Value {
+    let mut v = json!({ "__type": "EmailAddress:#Exchange" });
+    if let Some(n) = &p.name {
+        v["Name"] = json!(n);
+    }
+    if let Some(e) = &p.email {
+        v["EmailAddress"] = json!(e);
+    }
+    v["RoutingType"] = json!(p.routing_type.as_deref().unwrap_or("SMTP"));
+    v
+}
+
+/// Тело письма: `BodyContentType:#Exchange` типа HTML.
+pub fn body_content_json(html: &str) -> Value {
+    json!({ "__type": "BodyContentType:#Exchange", "BodyType": "HTML", "Value": html })
+}
+
+/// Элемент для `CreateItem`: `Message:#Exchange` для нового письма; `ReplyToItem`,
+/// `ReplyAllToItem` или `ForwardItem` с `ReferenceItemId` и `NewBodyContent` для ответов и
+/// пересылки. У нового письма пустые списки получателей не передаются (так снято на сервере);
+/// у ответов и пересылки все три списка передаются всегда, пустой — как `[]`: непереданный
+/// список сервер заполняет из оригинала сам, и письмо ушло бы тем, кого пользователь убрал.
+/// У нового письма всегда есть `Importance` и `IsRead: true`, у ответов `Importance` только
+/// отличная от обычной.
+pub fn outgoing_item_json(kind: &ComposeKind, msg: &OutgoingMessage) -> Value {
+    let mut item = match kind {
+        ComposeKind::New => json!({ "__type": "Message:#Exchange", "Subject": msg.subject, "Body": body_content_json(&msg.body_html) }),
+        ComposeKind::Reply { reference } | ComposeKind::ReplyAll { reference } | ComposeKind::Forward { reference } => {
+            let ty = match kind {
+                ComposeKind::Reply { .. } => "ReplyToItem:#Exchange",
+                ComposeKind::ReplyAll { .. } => "ReplyAllToItem:#Exchange",
+                _ => "ForwardItem:#Exchange",
+            };
+            json!({ "__type": ty, "ReferenceItemId": item_id_json(reference), "NewBodyContent": body_content_json(&msg.body_html), "Subject": msg.subject })
+        }
+    };
+    let explicit_empty = !matches!(kind, ComposeKind::New);
+    for (key, list) in [("ToRecipients", &msg.to), ("CcRecipients", &msg.cc), ("BccRecipients", &msg.bcc)] {
+        if explicit_empty || !list.is_empty() {
+            item[key] = Value::Array(list.iter().map(recipient_json).collect());
+        }
+    }
+    if matches!(kind, ComposeKind::New) {
+        item["Importance"] = json!(msg.importance.as_str());
+        item["IsRead"] = json!(true);
+    } else if msg.importance != Importance::Normal {
+        item["Importance"] = json!(msg.importance.as_str());
+    }
+    item
+}
+
+/// `CreateItem` черновика: `MessageDisposition: SaveOnly`, папка «Черновики».
+pub fn create_item_body(kind: &ComposeKind, msg: &OutgoingMessage) -> Value {
+    json!({
+        "__type": "CreateItemRequest:#Exchange",
+        "MessageDisposition": "SaveOnly",
+        "SavedItemFolderId": target_folder_json(&FolderRef::Distinguished(DistinguishedFolder::Drafts)),
+        "Items": [ outgoing_item_json(kind, msg) ],
+    })
+}
+
+/// `CreateAttachment` одного файла к черновику: `FileAttachment:#Exchange`, содержимое в base64.
+/// Один файл на запрос: размер тела запроса ограничен размером одного файла (×4/3).
+pub fn create_attachment_body(parent: &ItemId, file: &OutgoingAttachment) -> Value {
+    json!({
+        "__type": "CreateAttachmentRequest:#Exchange",
+        "ParentItemId": item_id_json(parent),
+        "Attachments": [ {
+            "__type": "FileAttachment:#Exchange",
+            "Name": file.name,
+            "ContentType": file.content_type.as_deref().unwrap_or("application/octet-stream"),
+            "IsInline": false,
+            "Content": BASE64_STANDARD.encode(&file.bytes),
+        } ],
+    })
+}
+
+/// `SendItem` черновика с сохранением копии в «Отправленных».
+pub fn send_item_body(item: &ItemId) -> Value {
+    json!({
+        "__type": "SendItemRequest:#Exchange",
+        "ItemIds": [ item_id_json(item) ],
+        "SaveItemToFolder": true,
+        "SavedItemFolderId": target_folder_json(&FolderRef::Distinguished(DistinguishedFolder::SentItems)),
+    })
+}
+
+/// `UpdateItem` черновика целиком: тема, тело, важность и списки получателей. Пустой список
+/// снимается `DeleteItemField`, иначе сервер оставил бы старых получателей.
+pub fn update_draft_body(item: &ItemId, msg: &OutgoingMessage) -> Value {
+    let set = |field: &str, value: Value| json!({ "__type": "SetItemField:#Exchange", "Path": property_uri(field), "Item": value });
+    let mut updates = vec![
+        set("item:Subject", json!({ "__type": "Message:#Exchange", "Subject": msg.subject })),
+        set("item:Body", json!({ "__type": "Message:#Exchange", "Body": body_content_json(&msg.body_html) })),
+        set("item:Importance", json!({ "__type": "Message:#Exchange", "Importance": msg.importance.as_str() })),
+    ];
+    for (field, key, list) in [("message:ToRecipients", "ToRecipients", &msg.to), ("message:CcRecipients", "CcRecipients", &msg.cc), ("message:BccRecipients", "BccRecipients", &msg.bcc)] {
+        if list.is_empty() {
+            updates.push(json!({ "__type": "DeleteItemField:#Exchange", "Path": property_uri(field) }));
+        } else {
+            let mut m = json!({ "__type": "Message:#Exchange" });
+            m[key] = Value::Array(list.iter().map(recipient_json).collect());
+            updates.push(set(field, m));
+        }
+    }
+    json!({
+        "__type": "UpdateItemRequest:#Exchange",
+        "ConflictResolution": "AlwaysOverwrite",
+        "MessageDisposition": "SaveOnly",
+        "SuppressReadReceipts": true,
+        "ItemChanges": [ { "__type": "ItemChange:#Exchange", "ItemId": item_id_json(item), "Updates": updates } ],
+    })
+}
+
+/// `GetUserConfiguration` настроек OWA (`OWA.UserOptions`): среди прочего `SignatureHtml` и
+/// `AutoAddSignature`. `base` — папка объекта конфигурации: корень ящика `root` (так его читает
+/// EWS Managed API) или корень почтовых папок `msgfolderroot`.
+pub fn get_user_configuration_body(base: &str) -> Value {
+    json!({
+        "__type": "GetUserConfigurationRequest:#Exchange",
+        "UserConfigurationName": {
+            "__type": "UserConfigurationNameType:#Exchange",
+            "Name": "OWA.UserOptions",
+            "BaseFolderId": { "__type": "DistinguishedFolderId:#Exchange", "Id": base }
+        },
+        "UserConfigurationProperties": "All",
     })
 }
 
@@ -475,6 +609,90 @@ pub fn parse_write_results(msgs: &[&Value], ids: &[ItemId]) -> Vec<WriteResult> 
         .collect()
 }
 
+/// Идентификатор созданного элемента из сообщения ответа `CreateItem`: `Items[0].ItemId`.
+pub fn parse_created_item_id(msg: &Value) -> Option<ItemId> {
+    msg.pointer("/Items/0/ItemId").and_then(parse_item_id)
+}
+
+/// Идентификатор письма-родителя после `CreateAttachment`: `Attachments[0].AttachmentId`
+/// содержит `RootItemId` и `RootItemChangeKey` (новый ключ черновика).
+pub fn parse_attachment_root(msg: &Value) -> Option<ItemId> {
+    let att = msg.pointer("/Attachments/0/AttachmentId")?;
+    let id = str_of(att, "RootItemId")?;
+    Some(ItemId { id: id.to_string(), change_key: str_of(att, "RootItemChangeKey").map(String::from) })
+}
+
+/// Идентификатор созданного вложения из ответа `CreateAttachment`: `Attachments[0].AttachmentId.Id`.
+pub fn parse_attachment_id(msg: &Value) -> Option<String> {
+    msg.pointer("/Attachments/0/AttachmentId/Id").and_then(Value::as_str).map(String::from)
+}
+
+/// Скалярное значение объекта словаря (`UserConfigurationDictionaryObject`): `Value` как строка,
+/// число, булево или массив (в схеме EWS `Value` повторяемый, берётся первый элемент), иначе `Values[0]`.
+fn dictionary_object_value(obj: &Value) -> Option<String> {
+    obj.get("Value")
+        .and_then(|v| match v {
+            Value::String(s) => Some(s.clone()),
+            Value::Array(a) => a.first().and_then(|x| match x {
+                Value::String(s) => Some(s.clone()),
+                Value::Bool(b) => Some(b.to_string()),
+                Value::Number(n) => Some(n.to_string()),
+                _ => None,
+            }),
+            Value::Bool(b) => Some(b.to_string()),
+            Value::Number(n) => Some(n.to_string()),
+            _ => None,
+        })
+        .or_else(|| obj.pointer("/Values/0").and_then(Value::as_str).map(String::from))
+}
+
+/// Словарь `UserConfiguration.Dictionary[]` ответа `GetUserConfiguration` как пары ключ → значение
+/// (ключ и значение — `DictionaryKey`/`DictionaryValue`, см. `dictionary_object_value`).
+pub fn user_configuration_dictionary(msg: &Value) -> Vec<(String, String)> {
+    let entries = msg.pointer("/UserConfiguration/Dictionary").and_then(Value::as_array);
+    let mut out = Vec::new();
+    for e in entries.into_iter().flatten() {
+        let Some(key) = e.get("DictionaryKey").and_then(dictionary_object_value) else { continue };
+        if let Some(v) = e.get("DictionaryValue").and_then(dictionary_object_value) {
+            out.push((key, v));
+        }
+    }
+    out
+}
+
+/// Форма JSON без содержимого: строки заменяются на `str(длина)`, массивы показывают длину и
+/// форму первого элемента, объекты — ключи. Для журнала отладки и документации протокола.
+pub fn json_shape(v: &Value, depth: usize) -> String {
+    match v {
+        Value::Null => "null".into(),
+        Value::Bool(_) => "bool".into(),
+        Value::Number(_) => "num".into(),
+        Value::String(s) => format!("str({})", s.chars().count()),
+        Value::Array(a) => match a.first() {
+            None => "[]".into(),
+            Some(first) if depth > 0 => format!("[{}: {}]", a.len(), json_shape(first, depth - 1)),
+            Some(_) => format!("[{}]", a.len()),
+        },
+        Value::Object(o) => {
+            if depth == 0 {
+                return "{…}".into();
+            }
+            let fields: Vec<String> = o.iter().map(|(k, v)| format!("{k}: {}", json_shape(v, depth - 1))).collect();
+            format!("{{{}}}", fields.join(", "))
+        }
+    }
+}
+
+/// Подпись из словаря настроек OWA: `SignatureHtml` и `AutoAddSignature`. Пустая или
+/// отсутствующая подпись — `None`.
+pub fn parse_user_signature(msg: &Value) -> Option<Signature> {
+    let dict = user_configuration_dictionary(msg);
+    let get = |k: &str| dict.iter().find(|(key, _)| key.eq_ignore_ascii_case(k)).map(|(_, v)| v.as_str());
+    let html = get("SignatureHtml").map(str::trim).filter(|h| !h.is_empty())?;
+    let auto_add = get("AutoAddSignature").map(|v| v.eq_ignore_ascii_case("true") || v == "1").unwrap_or(false);
+    Some(Signature { html: html.to_string(), auto_add })
+}
+
 /// Код и текст ошибки сообщения ответа, если `ResponseClass != Success`.
 pub fn message_error(msg: &Value) -> Option<(String, String)> {
     let class = str_of(msg, "ResponseClass").unwrap_or("Success");
@@ -609,6 +827,142 @@ mod tests {
         let v: Value = serde_json::from_str(r#"{"Body":{"ResponseMessages":{"Items":[{"ResponseClass":"Success","ResponseCode":"NoError","MovedItemId":{"Id":"A2","ChangeKey":"k"}}]}}}"#).unwrap();
         let out = parse_write_results(&response_messages(&v), &ids()[..1]);
         assert_eq!(out, vec![WriteResult::Ok { id: ItemId { id: "A2".into(), change_key: Some("k".into()) } }]);
+    }
+
+    fn outgoing() -> OutgoingMessage {
+        OutgoingMessage {
+            to: vec![Participant { name: Some("Иван".into()), email: Some("i@x.ru".into()), routing_type: None }],
+            cc: vec![],
+            bcc: vec![Participant { name: None, email: Some("b@x.ru".into()), routing_type: Some("SMTP".into()) }],
+            subject: "Тема".into(),
+            body_html: "<p>Привет</p>".into(),
+            importance: Importance::Normal,
+        }
+    }
+
+    #[test]
+    fn create_item_new_body_exact() {
+        let s = serde_json::to_string(&create_item_body(&ComposeKind::New, &outgoing())).unwrap();
+        assert_eq!(
+            s,
+            r#"{"__type":"CreateItemRequest:#Exchange","MessageDisposition":"SaveOnly","SavedItemFolderId":{"__type":"TargetFolderId:#Exchange","BaseFolderId":{"__type":"DistinguishedFolderId:#Exchange","Id":"drafts"}},"Items":[{"__type":"Message:#Exchange","Subject":"Тема","Body":{"__type":"BodyContentType:#Exchange","BodyType":"HTML","Value":"<p>Привет</p>"},"ToRecipients":[{"__type":"EmailAddress:#Exchange","Name":"Иван","EmailAddress":"i@x.ru","RoutingType":"SMTP"}],"BccRecipients":[{"__type":"EmailAddress:#Exchange","EmailAddress":"b@x.ru","RoutingType":"SMTP"}],"Importance":"Normal","IsRead":true}]}"#
+        );
+        let env = envelope("CreateItem", V_2017, "UTC", create_item_body(&ComposeKind::New, &outgoing()));
+        assert!(serde_json::to_string(&env).unwrap().starts_with(r#"{"__type":"CreateItemJsonRequest:#Exchange","Header":{"__type":"JsonRequestHeaders:#Exchange""#));
+    }
+
+    #[test]
+    fn create_item_reply_forms_exact() {
+        let reference = ItemId { id: "R".into(), change_key: Some("rk".into()) };
+        let mut msg = outgoing();
+        msg.bcc.clear();
+        msg.cc = vec![Participant { name: Some("Пётр".into()), email: Some("p@x.ru".into()), routing_type: None }];
+        let item = outgoing_item_json(&ComposeKind::ReplyAll { reference: reference.clone() }, &msg);
+        assert_eq!(
+            serde_json::to_string(&item).unwrap(),
+            r#"{"__type":"ReplyAllToItem:#Exchange","ReferenceItemId":{"__type":"ItemId:#Exchange","Id":"R","ChangeKey":"rk"},"NewBodyContent":{"__type":"BodyContentType:#Exchange","BodyType":"HTML","Value":"<p>Привет</p>"},"Subject":"Тема","ToRecipients":[{"__type":"EmailAddress:#Exchange","Name":"Иван","EmailAddress":"i@x.ru","RoutingType":"SMTP"}],"CcRecipients":[{"__type":"EmailAddress:#Exchange","Name":"Пётр","EmailAddress":"p@x.ru","RoutingType":"SMTP"}],"BccRecipients":[]}"#,
+            "у ответа пустой список передаётся явно: иначе сервер заполнит его из оригинала"
+        );
+        let s = serde_json::to_string(&outgoing_item_json(&ComposeKind::Reply { reference: reference.clone() }, &msg)).unwrap();
+        assert!(s.starts_with(r#"{"__type":"ReplyToItem:#Exchange","ReferenceItemId":{"#), "{s}");
+        assert!(!s.contains("IsRead"), "у ответа нет IsRead: {s}");
+        // Убранные пользователем «Кому» и «Копия» у ответа уходят пустыми списками, а не пропуском поля.
+        let mut only_bcc = msg.clone();
+        only_bcc.to.clear();
+        only_bcc.cc.clear();
+        only_bcc.bcc = vec![Participant { name: None, email: Some("b@x.ru".into()), routing_type: None }];
+        let s = serde_json::to_string(&outgoing_item_json(&ComposeKind::ReplyAll { reference: reference.clone() }, &only_bcc)).unwrap();
+        assert!(s.contains(r#""ToRecipients":[],"CcRecipients":[],"BccRecipients":[{"#), "{s}");
+        // У нового письма пустые списки по-прежнему не передаются (форма, снятая на сервере).
+        let s = serde_json::to_string(&outgoing_item_json(&ComposeKind::New, &only_bcc)).unwrap();
+        assert!(!s.contains("ToRecipients") && !s.contains("CcRecipients") && s.contains("BccRecipients"), "{s}");
+        msg.importance = Importance::High;
+        let s = serde_json::to_string(&outgoing_item_json(&ComposeKind::Forward { reference }, &msg)).unwrap();
+        assert!(s.starts_with(r#"{"__type":"ForwardItem:#Exchange","ReferenceItemId":{"#), "{s}");
+        assert!(s.ends_with(r#","Importance":"High"}"#), "важность только отличная от обычной: {s}");
+        let s = serde_json::to_string(&create_item_body(&ComposeKind::Reply { reference: ItemId { id: "R".into(), change_key: None } }, &msg)).unwrap();
+        assert!(s.contains(r#""Items":[{"__type":"ReplyToItem:#Exchange","ReferenceItemId":{"__type":"ItemId:#Exchange","Id":"R"}"#), "{s}");
+    }
+
+    #[test]
+    fn create_attachment_body_exact() {
+        let parent = ItemId { id: "D".into(), change_key: Some("dk".into()) };
+        let file = OutgoingAttachment { name: "счёт.txt".into(), content_type: Some("text/plain".into()), bytes: b"hello".to_vec() };
+        assert_eq!(
+            serde_json::to_string(&create_attachment_body(&parent, &file)).unwrap(),
+            r#"{"__type":"CreateAttachmentRequest:#Exchange","ParentItemId":{"__type":"ItemId:#Exchange","Id":"D","ChangeKey":"dk"},"Attachments":[{"__type":"FileAttachment:#Exchange","Name":"счёт.txt","ContentType":"text/plain","IsInline":false,"Content":"aGVsbG8="}]}"#
+        );
+        let file = OutgoingAttachment { name: "x.bin".into(), content_type: None, bytes: vec![] };
+        assert!(serde_json::to_string(&create_attachment_body(&parent, &file)).unwrap().contains(r#""ContentType":"application/octet-stream","IsInline":false,"Content":"""#));
+    }
+
+    #[test]
+    fn send_item_body_exact() {
+        let s = serde_json::to_string(&send_item_body(&ItemId { id: "D".into(), change_key: Some("dk".into()) })).unwrap();
+        assert_eq!(
+            s,
+            r#"{"__type":"SendItemRequest:#Exchange","ItemIds":[{"__type":"ItemId:#Exchange","Id":"D","ChangeKey":"dk"}],"SaveItemToFolder":true,"SavedItemFolderId":{"__type":"TargetFolderId:#Exchange","BaseFolderId":{"__type":"DistinguishedFolderId:#Exchange","Id":"sentitems"}}}"#
+        );
+    }
+
+    #[test]
+    fn update_draft_body_exact() {
+        let s = serde_json::to_string(&update_draft_body(&ItemId { id: "D".into(), change_key: Some("dk".into()) }, &outgoing())).unwrap();
+        assert_eq!(
+            s,
+            r#"{"__type":"UpdateItemRequest:#Exchange","ConflictResolution":"AlwaysOverwrite","MessageDisposition":"SaveOnly","SuppressReadReceipts":true,"ItemChanges":[{"__type":"ItemChange:#Exchange","ItemId":{"__type":"ItemId:#Exchange","Id":"D","ChangeKey":"dk"},"Updates":[{"__type":"SetItemField:#Exchange","Path":{"__type":"PropertyUri:#Exchange","FieldURI":"item:Subject"},"Item":{"__type":"Message:#Exchange","Subject":"Тема"}},{"__type":"SetItemField:#Exchange","Path":{"__type":"PropertyUri:#Exchange","FieldURI":"item:Body"},"Item":{"__type":"Message:#Exchange","Body":{"__type":"BodyContentType:#Exchange","BodyType":"HTML","Value":"<p>Привет</p>"}}},{"__type":"SetItemField:#Exchange","Path":{"__type":"PropertyUri:#Exchange","FieldURI":"item:Importance"},"Item":{"__type":"Message:#Exchange","Importance":"Normal"}},{"__type":"SetItemField:#Exchange","Path":{"__type":"PropertyUri:#Exchange","FieldURI":"message:ToRecipients"},"Item":{"__type":"Message:#Exchange","ToRecipients":[{"__type":"EmailAddress:#Exchange","Name":"Иван","EmailAddress":"i@x.ru","RoutingType":"SMTP"}]}},{"__type":"DeleteItemField:#Exchange","Path":{"__type":"PropertyUri:#Exchange","FieldURI":"message:CcRecipients"}},{"__type":"SetItemField:#Exchange","Path":{"__type":"PropertyUri:#Exchange","FieldURI":"message:BccRecipients"},"Item":{"__type":"Message:#Exchange","BccRecipients":[{"__type":"EmailAddress:#Exchange","EmailAddress":"b@x.ru","RoutingType":"SMTP"}]}}]}]}"#
+        );
+    }
+
+    #[test]
+    fn get_user_configuration_body_exact() {
+        assert_eq!(
+            serde_json::to_string(&get_user_configuration_body("root")).unwrap(),
+            r#"{"__type":"GetUserConfigurationRequest:#Exchange","UserConfigurationName":{"__type":"UserConfigurationNameType:#Exchange","Name":"OWA.UserOptions","BaseFolderId":{"__type":"DistinguishedFolderId:#Exchange","Id":"root"}},"UserConfigurationProperties":"All"}"#
+        );
+        assert!(serde_json::to_string(&get_user_configuration_body("msgfolderroot")).unwrap().contains(r#""Id":"msgfolderroot"}"#));
+    }
+
+    #[test]
+    fn parses_create_item_and_attachment_responses() {
+        let v: Value = serde_json::from_str(r#"{"Body":{"ResponseMessages":{"Items":[{"__type":"ItemInfoResponseMessage:#Exchange","ResponseClass":"Success","ResponseCode":"NoError","Items":[{"__type":"Message:#Exchange","ItemId":{"__type":"ItemId:#Exchange","Id":"D1","ChangeKey":"k1"}}]}]}}}"#).unwrap();
+        let msgs = response_messages(&v);
+        assert_eq!(parse_created_item_id(msgs[0]), Some(ItemId { id: "D1".into(), change_key: Some("k1".into()) }));
+        assert_eq!(parse_attachment_root(msgs[0]), None);
+        let v: Value = serde_json::from_str(r#"{"Body":{"ResponseMessages":{"Items":[{"__type":"AttachmentInfoResponseMessage:#Exchange","ResponseClass":"Success","ResponseCode":"NoError","Attachments":[{"__type":"FileAttachment:#Exchange","AttachmentId":{"__type":"AttachmentId:#Exchange","Id":"A1","RootItemId":"D1","RootItemChangeKey":"k2"}}]}]}}}"#).unwrap();
+        let msgs = response_messages(&v);
+        assert_eq!(parse_attachment_root(msgs[0]), Some(ItemId { id: "D1".into(), change_key: Some("k2".into()) }));
+        assert_eq!(parse_attachment_id(msgs[0]).as_deref(), Some("A1"));
+        assert_eq!(parse_created_item_id(msgs[0]), None);
+        // SendItem: успех без Items, отказ — ResponseClass Error.
+        let v: Value = serde_json::from_str(r#"{"Body":{"ResponseMessages":{"Items":[{"__type":"SendItemResponseMessage:#Exchange","ResponseClass":"Success","ResponseCode":"NoError"}]}}}"#).unwrap();
+        assert!(message_error(response_messages(&v)[0]).is_none());
+        let v: Value = serde_json::from_str(r#"{"Body":{"ResponseMessages":{"Items":[{"ResponseClass":"Error","ResponseCode":"ErrorItemNotFound","MessageText":"нет"}]}}}"#).unwrap();
+        assert_eq!(message_error(response_messages(&v)[0]), Some(("ErrorItemNotFound".into(), "нет".into())));
+    }
+
+    #[test]
+    fn parses_user_signature_dictionary() {
+        let msg: Value = serde_json::from_str(r#"{"ResponseClass":"Success","ResponseCode":"NoError","UserConfiguration":{"__type":"UserConfiguration:#Exchange","UserConfigurationName":{"Name":"OWA.UserOptions"},"Dictionary":[
+            {"__type":"UserConfigurationDictionaryEntry:#Exchange","DictionaryKey":{"__type":"UserConfigurationDictionaryObject:#Exchange","Type":"String","Value":"SignatureHtml"},"DictionaryValue":{"__type":"UserConfigurationDictionaryObject:#Exchange","Type":"String","Value":"<div>С уважением</div>"}},
+            {"DictionaryKey":{"Type":"String","Value":"AutoAddSignature"},"DictionaryValue":{"Type":"Boolean","Value":"True"}},
+            {"DictionaryKey":{"Type":"String","Value":"Other"},"DictionaryValue":{"Type":"StringArray","Values":["a","b"]}}
+        ]}}"#).unwrap();
+        let dict = user_configuration_dictionary(&msg);
+        assert_eq!(dict.len(), 3);
+        assert_eq!(dict[2], ("Other".to_string(), "a".to_string()));
+        assert_eq!(parse_user_signature(&msg), Some(Signature { html: "<div>С уважением</div>".into(), auto_add: true }));
+        // Ключ и значение массивами (в схеме EWS `Value` повторяемый), булево значение, строковое "false".
+        let msg: Value = serde_json::from_str(r#"{"UserConfiguration":{"Dictionary":[{"DictionaryKey":{"Value":["SignatureHtml"]},"DictionaryValue":{"Value":["<p>x</p>"]}},{"DictionaryKey":{"Value":"AutoAddSignature"},"DictionaryValue":{"Value":"false"}}]}}"#).unwrap();
+        assert_eq!(parse_user_signature(&msg), Some(Signature { html: "<p>x</p>".into(), auto_add: false }));
+        let msg: Value = serde_json::from_str(r#"{"UserConfiguration":{"Dictionary":[{"DictionaryKey":{"Value":["SignatureHtml"]},"DictionaryValue":{"Value":["<p>x</p>"]}},{"DictionaryKey":{"Value":["AutoAddSignature"]},"DictionaryValue":{"Value":[true]}}]}}"#).unwrap();
+        assert_eq!(parse_user_signature(&msg), Some(Signature { html: "<p>x</p>".into(), auto_add: true }));
+        assert_eq!(json_shape(&msg, 5), "{UserConfiguration: {Dictionary: [2: {DictionaryKey: {Value: [1]}, DictionaryValue: {Value: [1]}}]}}");
+        assert_eq!(json_shape(&msg, 4), "{UserConfiguration: {Dictionary: [2: {DictionaryKey: {…}, DictionaryValue: {…}}]}}");
+        // Нет подписи или она пустая.
+        let msg: Value = serde_json::from_str(r#"{"UserConfiguration":{"Dictionary":[{"DictionaryKey":{"Value":"AutoAddSignature"},"DictionaryValue":{"Value":"True"}},{"DictionaryKey":{"Value":"SignatureHtml"},"DictionaryValue":{"Value":"  "}}]}}"#).unwrap();
+        assert_eq!(parse_user_signature(&msg), None);
+        assert_eq!(parse_user_signature(&json!({"UserConfiguration":{}})), None);
     }
 
     #[test]

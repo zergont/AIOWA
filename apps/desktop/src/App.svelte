@@ -1,12 +1,15 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { api, conversationKeyOf, errorMessage, messagesKey, onItemsChanged, onSyncProgress, type AccountInfo, type Conversation, type Folder, type ItemsChanged, type Message, type SearchHit, type SyncStatus, type WriteReport } from "./lib/api";
-  import { failureText, type ItemAction } from "./lib/actions";
+  import { api, conversationKeyOf, errorMessage, messagesKey, onCloseRequested, onItemsChanged, onSyncProgress, type AccountInfo, type ComposeContext, type ComposeKind, type Conversation, type Folder, type ItemsChanged, type Message, type SearchHit, type SyncStatus, type WriteReport } from "./lib/api";
+  import { ICON, failureText, type ItemAction } from "./lib/actions";
+  import { focusBack, type Anchor } from "./lib/popover";
   import FolderTree from "./lib/components/FolderTree.svelte";
   import ConversationList from "./lib/components/ConversationList.svelte";
   import ReadingPane from "./lib/components/ReadingPane.svelte";
   import SearchResults from "./lib/components/SearchResults.svelte";
   import StatusBar from "./lib/components/StatusBar.svelte";
+  import Composer from "./lib/components/Composer.svelte";
+  import ConfirmPopover from "./lib/components/ConfirmPopover.svelte";
 
   let account = $state<AccountInfo | null>(null);
   let folders = $state<Folder[]>([]);
@@ -25,6 +28,173 @@
   let syncStatus = $state<SyncStatus | null>(null);
 
   const deletedFolderPk = $derived(folders.find((f) => f.distinguished === "deleteditems")?.folder_pk ?? null);
+  const sentFolderPk = $derived(folders.find((f) => f.distinguished === "sentitems")?.folder_pk ?? null);
+
+  // --- композер: новое письмо, ответ, ответ всем, пересылка ------------------------------
+
+  /** Открытая заготовка; новая заготовка — новый экземпляр композера ({#key}). */
+  let compose = $state<ComposeContext | null>(null);
+  /** Беседа, над карточками которой стоит композер ответа; у нового письма null. */
+  let composeConversationPk = $state<number | null>(null);
+  let composerDirty = $state(false);
+  /** Композер отправляет или сохраняет черновик: заменять его и закрывать окно сейчас нельзя. */
+  let composerBusy = $state<"send" | "draft" | null>(null);
+  let composeLoading = false;
+  /** Запрошенное письмо, пока пользователь решает, бросить ли текущее. */
+  let pendingCompose = $state<{ kind: ComposeKind; itemPk: number | null; conversationPk: number | null; anchor: Anchor } | null>(null);
+  /** Куда вернуть фокус, когда подтверждение замены закрыто без замены. */
+  let composeReturnTo: HTMLElement | null = null;
+  /** Письмо отправлено во время идущей синхронизации: «Отправленные» дотянуть сразу после её конца. */
+  let pendingSentSync = false;
+  /** Крестик или Alt+F4 при несохранённом письме: бэкенд не закрыл окно и ждёт подтверждения. */
+  let closeRequested = $state(false);
+  /** Самое верхнее развёрнутое письмо в области чтения (для Ctrl+R и других клавиш). */
+  let topExpandedPk = $state<number | null>(null);
+  let readerEl = $state<HTMLElement | null>(null);
+  /** Короткое уведомление в строке состояния («Отправлено»). */
+  let notice = $state<string | null>(null);
+  let noticeTimer: ReturnType<typeof setTimeout> | undefined;
+
+  const composerAlone = $derived(compose !== null && (compose.kind === "new" || composeConversationPk === null || composeConversationPk !== selected?.conversation_pk));
+
+  function showNotice(text: string) {
+    notice = text;
+    clearTimeout(noticeTimer);
+    noticeTimer = setTimeout(() => (notice = null), 5000);
+  }
+
+  /** Якорь подтверждения «отменить текущее письмо?»: верх области чтения, где стоит композер. */
+  function composerAnchor(): Anchor {
+    const r = readerEl?.getBoundingClientRect();
+    return { x: (r?.left ?? 0) + 24, y: (r?.top ?? 0) + 56 };
+  }
+
+  /**
+   * Открыть композер. Один за раз: если текущий с правками — спросить, прежде чем заменить.
+   * `conversationPk` — беседа исходного письма (композер ответа стоит над её карточками).
+   */
+  function openCompose(kind: ComposeKind, itemPk: number | null, conversationPk: number | null) {
+    if (compose && composerBusy) {
+      error = busyText();
+      return;
+    }
+    if (compose && composerDirty) {
+      composeReturnTo = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+      pendingCompose = { kind, itemPk, conversationPk, anchor: composerAnchor() };
+      return;
+    }
+    void loadCompose(kind, itemPk, conversationPk);
+  }
+
+  /** Пока идёт отправка, композер не заменяется: иначе её итог пришёл бы уже в другой композер. */
+  function busyText(): string {
+    return composerBusy === "send" ? "Подожди: письмо отправляется" : "Подожди: черновик сохраняется";
+  }
+
+  async function loadCompose(kind: ComposeKind, itemPk: number | null, conversationPk: number | null) {
+    if (composeLoading || composerBusy) return;
+    composeLoading = true;
+    try {
+      const ctx = await api.composeContext(kind, itemPk);
+      compose = ctx;
+      composeConversationPk = kind === "new" ? null : conversationPk;
+      composerDirty = false;
+    } catch (e) {
+      error = errorMessage(e);
+    } finally {
+      composeLoading = false;
+    }
+  }
+
+  function confirmReplace() {
+    const p = pendingCompose;
+    cancelReplace();
+    if (!p) return;
+    // Отправку могли начать, пока подтверждение было открыто.
+    if (compose && composerBusy) {
+      error = busyText();
+      return;
+    }
+    void loadCompose(p.kind, p.itemPk, p.conversationPk);
+  }
+
+  function cancelReplace() {
+    pendingCompose = null;
+    focusBack(composeReturnTo);
+    composeReturnTo = null;
+  }
+
+  /** Ответ с карточки письма (кнопки и клавиши): беседа — открытая. */
+  function composeFromMessage(itemPk: number, kind: ComposeKind) {
+    openCompose(kind, itemPk, selected?.conversation_pk ?? null);
+  }
+
+  /** Ответ из меню списка: самое свежее письмо беседы в текущей папке. */
+  async function composeFromConversation(c: Conversation, kind: ComposeKind) {
+    if (!selectedFolder) return;
+    try {
+      const pks = await api.conversationItemPks(c.conversation_pk, selectedFolder.folder_pk);
+      if (!pks.length) {
+        error = "В этой папке нет писем беседы";
+        return;
+      }
+      openCompose(kind, pks[0], c.conversation_pk);
+    } catch (e) {
+      error = errorMessage(e);
+    }
+  }
+
+  function closeCompose(reason: "sent" | "draft" | "cancel") {
+    compose = null;
+    composeConversationPk = null;
+    composerDirty = false;
+    composerBusy = null;
+    if (reason === "sent") {
+      showNotice("Отправлено");
+      // Отправленное появится в «Отправленных» после синхронизации этой папки. Идущую синхронизацию
+      // бэкенд не прерывает и запрос не ставит в очередь — тогда папку дотянем после её конца.
+      if (sentFolderPk != null) {
+        if (syncStatus?.running) pendingSentSync = true;
+        else void launchSync([sentFolderPk]);
+      }
+    } else if (reason === "draft") {
+      showNotice("Черновик сохранён в «Черновиках» на сервере");
+    }
+  }
+
+  // --- закрытие окна при несохранённом письме ---------------------------------------------
+  // Внутри приложения замена и отмена письма с правками требуют подтверждения; крестик и Alt+F4
+  // не должны быть лазейкой. Флаг держит бэкенд: при нём CloseRequested превращается в событие.
+
+  const closeGuard = $derived(compose !== null && (composerDirty || composerBusy !== null));
+  $effect(() => {
+    const guarded = closeGuard;
+    api.windowCloseGuard(guarded).catch((e) => console.warn("window_close_guard:", errorMessage(e)));
+  });
+
+  function onCloseRequest() {
+    // Флаг мог ещё не сняться (письмо только что закрыто): тогда нечего спрашивать.
+    if (!closeGuard) {
+      void confirmClose();
+      return;
+    }
+    closeRequested = true;
+  }
+
+  async function confirmClose() {
+    closeRequested = false;
+    try {
+      await api.windowCloseConfirmed();
+    } catch (e) {
+      error = errorMessage(e);
+    }
+  }
+
+  /** Фокус в поле ввода или редакторе: клавиши-буквы с Ctrl там не наши. */
+  function inEditable(): boolean {
+    const el = document.activeElement;
+    return el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement || el instanceof HTMLIFrameElement || (el instanceof HTMLElement && el.isContentEditable);
+  }
 
   const PAGE = 100;
   /** Период автосинхронизации при видимом окне. */
@@ -368,9 +538,29 @@
   }
 
   function onKeydown(e: KeyboardEvent) {
-    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "k") {
+    const ctrl = e.ctrlKey || e.metaKey;
+    // По коду клавиши, а не по символу: в русской раскладке e.key даёт кириллицу.
+    const is = (code: string, key: string) => e.code === code || e.key.toLowerCase() === key;
+    if (ctrl && !e.shiftKey && !e.altKey && is("KeyK", "k")) {
       e.preventDefault();
       document.getElementById("search-input")?.focus();
+      return;
+    }
+    if (ctrl && !e.shiftKey && !e.altKey && is("KeyN", "n")) {
+      e.preventDefault();
+      openCompose("new", null, null);
+      return;
+    }
+    // Перезагрузку окна (Ctrl+R, F5) гасим везде, даже в редакторе: она бы потеряла набранное письмо.
+    if (e.key === "F5" || (ctrl && !e.altKey && is("KeyR", "r"))) {
+      e.preventDefault();
+      if (e.key !== "F5" && !inEditable() && topExpandedPk != null) composeFromMessage(topExpandedPk, e.shiftKey ? "reply_all" : "reply");
+      return;
+    }
+    if (ctrl && e.shiftKey && !e.altKey && is("KeyF", "f") && !inEditable()) {
+      e.preventDefault();
+      if (topExpandedPk != null) composeFromMessage(topExpandedPk, "forward");
+      return;
     }
     if (e.key === "Escape" && document.activeElement?.id === "search-input") {
       clearSearch();
@@ -381,6 +571,7 @@
   onMount(() => {
     let unlisten: (() => void) | undefined;
     let unlistenItems: (() => void) | undefined;
+    let unlistenClose: (() => void) | undefined;
     let wasRunning = false;
     const timer = setInterval(syncTick, 15_000);
     document.addEventListener("visibilitychange", syncTick);
@@ -394,10 +585,15 @@
             // после долгой первой синхронизации следующая не должна стартовать сразу.
             lastSyncAttempt = Date.now();
             void refreshAfterSync();
+            if (pendingSentSync && sentFolderPk != null) {
+              pendingSentSync = false;
+              void launchSync([sentFolderPk]);
+            }
           }
           wasRunning = s.running;
         });
         unlistenItems = await onItemsChanged((ev) => void refreshAfterWrite(ev));
+        unlistenClose = await onCloseRequested(onCloseRequest);
         account = await api.accountInfo();
         await loadFolders();
         syncStatus = await api.syncStatus();
@@ -411,9 +607,11 @@
 
     return () => {
       clearInterval(timer);
+      clearTimeout(noticeTimer);
       document.removeEventListener("visibilitychange", syncTick);
       unlisten?.();
       unlistenItems?.();
+      unlistenClose?.();
     };
   });
 
@@ -438,12 +636,24 @@
 
 <svelte:window onkeydown={onKeydown} />
 
+{#snippet composerSnippet()}
+  {#key compose}
+    {#if compose}
+      <Composer ctx={compose} bind:dirty={composerDirty} bind:busy={composerBusy} onclose={closeCompose} />
+    {/if}
+  {/key}
+{/snippet}
+
 <div class="shell" class:dragging style="--list-width: {listWidth}px">
   <header class="topbar">
     <div class="brand">
       <span class="brand-mark" aria-hidden="true"></span>
       <span class="brand-name">AIOWA</span>
     </div>
+    <button class="new-mail" onclick={() => openCompose("new", null, null)} title="Новое письмо (Ctrl+N)">
+      <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path d={ICON.compose} fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" /></svg>
+      Новое письмо
+    </button>
     <div class="search" class:active={query.length > 0}>
       <svg class="search-icon" width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><circle cx="7" cy="7" r="4.5" fill="none" stroke="currentColor" stroke-width="1.4" /><path d="M10.5 10.5 14 14" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" /></svg>
       <input id="search-input" type="search" placeholder="Поиск в почте: тема, текст, от:имя, вложение:" bind:value={query} oninput={onQueryInput} autocomplete="off" spellcheck="false" />
@@ -462,19 +672,27 @@
     {#if searchHits !== null}
       <SearchResults hits={searchHits} {searching} {query} onopen={openConversationByPk} onclear={clearSearch} selectedPk={selected?.conversation_pk ?? null} />
     {:else}
-      <ConversationList folder={selectedFolder} {conversations} {selected} loading={loadingList} {hasMore} onselect={openConversation} onmore={loadMore} {folders} onaction={onConversationAction} />
+      <ConversationList folder={selectedFolder} {conversations} {selected} loading={loadingList} {hasMore} onselect={openConversation} onmore={loadMore} {folders} onaction={onConversationAction} oncompose={composeFromConversation} />
     {/if}
   </section>
 
   <div class="splitter" role="separator" aria-orientation="vertical" aria-label="Ширина списка" onpointerdown={startDrag}></div>
 
-  <section class="reader" aria-label="Чтение">
-    <ReadingPane conversation={selected} {messages} loading={loadingMessages} onfetch={fetchMessage} {folders} {deletedFolderPk} onaction={onMessageAction} />
+  <section class="reader" aria-label="Чтение" bind:this={readerEl}>
+    <ReadingPane conversation={selected} {messages} loading={loadingMessages} onfetch={fetchMessage} {folders} {deletedFolderPk} onaction={onMessageAction} oncompose={composeFromMessage} composer={compose ? composerSnippet : undefined} {composerAlone} bind:topExpandedPk />
   </section>
 
   <footer class="status" aria-label="Состояние синхронизации">
-    <StatusBar status={syncStatus} onrefresh={startSync} oncancel={cancelSync} />
+    <StatusBar status={syncStatus} {notice} onrefresh={startSync} oncancel={cancelSync} />
   </footer>
+
+  {#if pendingCompose}
+    <ConfirmPopover anchor={pendingCompose.anchor} align="start" title="Отменить текущее письмо?" text="Набранный текст будет потерян, откроется новое." confirmLabel="Отменить письмо" onconfirm={confirmReplace} oncancel={cancelReplace} />
+  {/if}
+
+  {#if closeRequested}
+    <ConfirmPopover anchor={composerAnchor()} align="start" title="Закрыть окно?" text={composerBusy ? "Отправка ещё идёт: письмо может не уйти." : "Набранное письмо будет потеряно."} confirmLabel="Закрыть" onconfirm={confirmClose} oncancel={() => (closeRequested = false)} />
+  {/if}
 
   {#if error}
     <div class="error-bar" role="alert">
@@ -506,10 +724,29 @@
   .topbar {
     grid-area: top;
     display: grid;
-    grid-template-columns: var(--nav-width) 1fr auto;
+    grid-template-columns: calc(var(--nav-width) - var(--space-4)) auto 1fr auto;
     align-items: center;
     gap: var(--space-4);
     padding: 0 var(--space-4) 0 var(--space-3);
+  }
+  .new-mail {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    height: var(--control-height);
+    padding: 0 12px;
+    border: 1px solid var(--accent);
+    border-radius: var(--radius-control);
+    background: var(--accent);
+    color: var(--fg-on-accent);
+    white-space: nowrap;
+    transition: background var(--dur-fast) var(--ease-in);
+  }
+  .new-mail:hover {
+    background: var(--accent-hover);
+  }
+  .new-mail:active {
+    background: var(--accent-pressed);
   }
   .brand {
     display: flex;

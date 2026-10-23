@@ -5,20 +5,25 @@
 //! HTML писем очищается ammonia на стороне Rust и показывается во фрейме с sandbox и CSP;
 //! удалённые картинки и внешние ресурсы не загружаются. Инлайновые картинки (`src="cid:…"`)
 //! подставляются из кэша вложений как `data:`-URI прямо при очистке.
+//!
+//! Новое письмо, ответ, ответ всем и пересылка — команды композера (`compose.rs`): черновик на
+//! сервере, вложения, отправка через тот же транспорт процесса.
 
 use aiowa_core::{AccountId, BodyType};
 use aiowa_store::ui::{ConversationCursor, MessageHead};
 use aiowa_store::{AttachmentRow, Store};
 use base64::Engine as _;
 use jiff::Timestamp;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tauri::State;
+use tauri::{Emitter, Manager, State};
 use tracing::warn;
 
+mod compose;
 mod ondemand;
 mod sync;
 mod write;
@@ -42,6 +47,28 @@ type InlineMap = HashMap<String, String>;
 
 fn err<E: std::fmt::Display>(e: E) -> String {
     e.to_string()
+}
+
+/// Закрытие окна при несохранённом письме. Пока окно держит флаг (`window_close_guard`: в
+/// композере есть правки или идёт отправка), крестик и Alt+F4 окно не закрывают, а шлют событие
+/// `close-requested`; окно спрашивает пользователя и закрывает через `window_close_confirmed`.
+/// Без флага окно закрывается как обычно — если фронтенд не поднялся, окно не «залипает».
+#[derive(Default)]
+struct CloseState {
+    guarded: AtomicBool,
+}
+
+#[tauri::command]
+fn window_close_guard(enabled: bool, st: State<'_, CloseState>) {
+    st.guarded.store(enabled, Ordering::Relaxed);
+}
+
+/// Пользователь подтвердил закрытие: снять флаг и закрыть окно (через обычный `CloseRequested`,
+/// чтобы сработал `RunEvent::Exit` с logoff).
+#[tauri::command]
+fn window_close_confirmed(window: tauri::WebviewWindow, st: State<'_, CloseState>) -> CmdResult<()> {
+    st.guarded.store(false, Ordering::Relaxed);
+    window.close().map_err(err)
 }
 
 fn ms(t: Option<Timestamp>) -> Option<i64> {
@@ -85,6 +112,14 @@ struct RecipientDto {
     kind: i64,
     name: Option<String>,
     email: Option<String>,
+}
+
+/// Получатель исходящего письма (композер): без вида, адрес обязателен. В обе стороны — в
+/// заготовке `compose_context` и в запросе `compose_send`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ComposeRecipientDto {
+    pub(crate) name: Option<String>,
+    pub(crate) email: String,
 }
 
 #[derive(Serialize)]
@@ -433,6 +468,18 @@ pub fn run() {
         .manage(sync_state.clone())
         .manage(ondemand::OnDemand::default())
         .manage(write::WriteState::default())
+        .manage(compose::ComposeState::default())
+        .manage(CloseState::default())
+        .on_window_event(|w, ev| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = ev
+                && w.state::<CloseState>().guarded.load(Ordering::Relaxed)
+            {
+                api.prevent_close();
+                if let Err(e) = w.emit("close-requested", ()) {
+                    warn!(error = %e, "не удалось отправить событие close-requested");
+                }
+            }
+        })
         .invoke_handler(tauri::generate_handler![
             account_info,
             folders,
@@ -451,7 +498,18 @@ pub fn run() {
             write::items_set_flag,
             write::items_move,
             write::items_delete,
-            write::conversation_item_pks
+            write::conversation_item_pks,
+            compose::compose_context,
+            compose::compose_send,
+            compose::compose_save_draft,
+            compose::recipients_suggest,
+            compose::own_addresses,
+            compose::signature_get,
+            compose::signature_set,
+            compose::signature_import_owa,
+            compose::attachments_pick,
+            window_close_guard,
+            window_close_confirmed
         ])
         .build(tauri::generate_context!())
         .expect("ошибка запуска приложения");
