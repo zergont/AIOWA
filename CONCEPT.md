@@ -474,3 +474,7 @@ UI-библиотеки:
 - https://registry.npmjs.org/virtua
 - https://registry.npmjs.org/@fluentui/tokens
 - https://github.com/microsoft/fluentui-system-icons
+
+Похожие проекты:
+- https://github.com/emailops/emailops — EmailOps, клиент на том же стеке (Rust, Tauri 2, SQLite, FTS5, sqlite-vec) с локальным ИИ; разбор и список заимствований в docs/emailops-review.md
+- https://github.com/emailops/emailops/blob/main/docs/DECISIONS.md
