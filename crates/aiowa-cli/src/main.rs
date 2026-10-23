@@ -6,7 +6,7 @@
 use aiowa_core::{CalendarItemType, ComposeKind, FolderChange, FolderId, FolderRef, Importance, ItemId, OutgoingAttachment, OutgoingMessage, Participant, SyncState};
 use aiowa_store::{AttachmentTodo, Store};
 use aiowa_sync::{Engine, FolderSelection, SyncOptions};
-use aiowa_transport::{Credentials, DeleteMode, MailTransport, WriteResult};
+use aiowa_transport::{new_guid, Credentials, DeleteMode, MailTransport, NotificationEvent, NotificationKind, SubscriptionRequest, WriteResult};
 use aiowa_transport_owa::{OwaConfig, OwaTransport};
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand};
@@ -211,6 +211,76 @@ enum Cmd {
         #[arg(long)]
         probe: bool,
     },
+    /// Канал уведомлений: подписаться (SubscribeToNotification), читать поток ev.owa2 заданное
+    /// время и печатать типы событий и счётчики (без содержимого писем), затем завершить поток
+    Notify {
+        /// Сколько секунд читать поток
+        #[arg(long, default_value_t = 90)]
+        seconds: u64,
+        /// Папки для подписки на строки (RowNotification): известные имена (inbox, sentitems) или
+        /// отображаемые, через запятую
+        #[arg(long, default_value = "inbox")]
+        folders: String,
+        /// Только подписки на папки: без NewMail, Hierarchy, Unseen и Calendar
+        #[arg(long)]
+        rows_only: bool,
+    },
+}
+
+/// Событие канала одной строкой без содержимого: вид, папка по имени, длины полей.
+fn describe_event(ev: &NotificationEvent, folder_names: &std::collections::HashMap<String, String>) -> String {
+    let folder_name = |f: &Option<FolderId>| f.as_ref().map(|f| folder_names.get(&f.id).cloned().unwrap_or_else(|| format!("папка {} символов", f.id.len()))).unwrap_or_else(|| "папка не указана".into());
+    match ev {
+        NotificationEvent::FolderRows { folder, event_type, .. } => format!("FolderRows: {}, EventType {}", folder_name(folder), if event_type.is_empty() { "?" } else { event_type }),
+        NotificationEvent::NewMail { item_id, folder, from, subject, preview, is_read, .. } => format!(
+            "NewMail: ItemId {}, {}, отправитель {}, тема {} символов, превью {} символов, is_read {:?}",
+            item_id.as_ref().map(|i| format!("{} символов", i.id.len())).unwrap_or_else(|| "нет".into()),
+            folder_name(folder),
+            match from {
+                Some(p) => format!("{}{}", if p.name.is_some() { "имя" } else { "" }, if p.email.is_some() { "+адрес" } else { "" }),
+                None => "нет".into(),
+            },
+            subject.as_ref().map(|s| s.chars().count()).unwrap_or(0),
+            preview.as_ref().map(|s| s.chars().count()).unwrap_or(0),
+            is_read
+        ),
+        NotificationEvent::Hierarchy { folder, event_type, .. } => format!("Hierarchy: {}, EventType {}", folder_name(folder), if event_type.is_empty() { "?" } else { event_type }),
+        NotificationEvent::Unseen { count, .. } => format!("Unseen: счётчик {:?}", count),
+        NotificationEvent::Calendar { folder, .. } => format!("Calendar: {}", folder_name(folder)),
+        NotificationEvent::KeepAlive => "KeepAlive".into(),
+        NotificationEvent::Reload => "Reload (подписки потеряны)".into(),
+        NotificationEvent::Unknown { raw_kind } => format!("Unknown: {raw_kind}"),
+    }
+}
+
+/// Подписки для `notify`: строки каждой папки и, если не `rows_only`, остальные типы.
+fn notify_subscriptions(folders: &[(FolderId, String)], calendar: Option<&FolderId>, rows_only: bool) -> Vec<SubscriptionRequest> {
+    let mut subs: Vec<SubscriptionRequest> = folders.iter().map(|(f, _)| SubscriptionRequest { id: new_guid(), kind: NotificationKind::FolderRows { folder: f.clone() } }).collect();
+    if !rows_only {
+        subs.push(SubscriptionRequest { id: new_guid(), kind: NotificationKind::NewMail });
+        subs.push(SubscriptionRequest { id: new_guid(), kind: NotificationKind::Hierarchy });
+        subs.push(SubscriptionRequest { id: new_guid(), kind: NotificationKind::Unseen });
+        if let Some(c) = calendar {
+            subs.push(SubscriptionRequest { id: new_guid(), kind: NotificationKind::Calendar { folder: c.clone() } });
+        }
+    }
+    subs
+}
+
+/// Подписаться и напечатать итог по каждой подписке.
+async fn subscribe_and_report(t: &aiowa_transport_owa::OwaTransport, subs: &[SubscriptionRequest], folder_names: &std::collections::HashMap<String, String>) -> Result<usize> {
+    let started = std::time::Instant::now();
+    let results = t.subscribe_notifications(subs).await.map_err(|e| anyhow!("SubscribeToNotification: {e}"))?;
+    let created = results.iter().filter(|r| r.created).count();
+    println!("SubscribeToNotification: {} из {} за {} мс", created, subs.len(), started.elapsed().as_millis());
+    for (s, r) in subs.iter().zip(&results) {
+        let target = match &s.kind {
+            NotificationKind::FolderRows { folder } | NotificationKind::Calendar { folder } => format!(" ({})", folder_names.get(&folder.id).cloned().unwrap_or_else(|| "календарь".into())),
+            _ => String::new(),
+        };
+        println!("  {}{}: {}", s.kind.name(), target, if r.created { "создана".to_string() } else { format!("отказ: {}", r.error.as_deref().unwrap_or("?")) });
+    }
+    Ok(created)
 }
 
 /// Местная полночь даты `YYYY-MM-DD` как момент UTC.
@@ -853,6 +923,102 @@ async fn main() -> Result<()> {
                         println!("GetItem AllProperties за {} мс, форма элемента (без содержимого):\n{shape}", started.elapsed().as_millis());
                     }
                 }
+                Ok::<(), anyhow::Error>(())
+            }
+            .await;
+            t.logoff().await.ok();
+            outcome?;
+        }
+        Cmd::Notify { seconds, folders, rows_only } => {
+            let store = Store::open(&db_path)?;
+            let account = store.account(&cli.host, &cli.user)?;
+            let mut targets: Vec<(FolderId, String)> = Vec::new();
+            for name in folders.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                let f = store.resolve_folder(account, name)?.ok_or_else(|| anyhow!("папка «{name}» не найдена в локальной базе"))?;
+                if !targets.iter().any(|(id, _)| id.id == f.server_id) {
+                    targets.push((FolderId { id: f.server_id.clone(), change_key: None }, f.name.clone()));
+                }
+            }
+            if targets.is_empty() {
+                bail!("нужна хотя бы одна папка: --folders inbox");
+            }
+            let calendar = store.folder_by_distinguished(account, "calendar")?.map(|(_, server_id)| FolderId { id: server_id, change_key: None });
+            if calendar.is_none() && !rows_only {
+                println!("Папка календаря в локальной базе не найдена: подписка CalendarItemNotification пропущена.");
+            }
+            let mut folder_names: std::collections::HashMap<String, String> = targets.iter().map(|(f, n)| (f.id.clone(), n.clone())).collect();
+            if let Some(c) = &calendar {
+                folder_names.insert(c.id.clone(), "Календарь".into());
+            }
+            let subs = notify_subscriptions(&targets, calendar.as_ref(), *rows_only);
+            let t = connect(&cli).await?;
+            let outcome = async {
+                subscribe_and_report(&t, &subs, &folder_names).await?;
+                let cid = new_guid();
+                let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<NotificationEvent>();
+                let sink = move |ev: NotificationEvent| {
+                    let _ = tx.send(ev);
+                };
+                let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(*seconds);
+                let started = std::time::Instant::now();
+                let mut counts: std::collections::BTreeMap<&'static str, usize> = Default::default();
+                let mut cycles = 0usize;
+                println!("Поток PendingNotificationRequest: читаю {seconds} с (cid {} символов)", cid.len());
+                let mut timed_out = false;
+                'outer: loop {
+                    cycles += 1;
+                    // Будущее потока живёт в этом блоке: выход из него по `break 'outer` закрывает GET.
+                    {
+                        let stream = t.notification_stream(&cid, &sink);
+                        tokio::pin!(stream);
+                        loop {
+                            tokio::select! {
+                                r = &mut stream => {
+                                    match r {
+                                        Ok(end) => println!("[{:>6.1} с] цикл {cycles} завершён: событий {}, {:.1} с, закрыт сервером: {}", started.elapsed().as_secs_f32(), end.events, end.elapsed.as_secs_f32(), end.finished_by_server),
+                                        Err(e) => {
+                                            println!("[{:>6.1} с] цикл {cycles} прерван: {e}", started.elapsed().as_secs_f32());
+                                            break 'outer;
+                                        }
+                                    }
+                                    break;
+                                }
+                                Some(ev) = rx.recv() => {
+                                    *counts.entry(ev.kind_name()).or_default() += 1;
+                                    println!("[{:>6.1} с] {}", started.elapsed().as_secs_f32(), describe_event(&ev, &folder_names));
+                                    if matches!(ev, NotificationEvent::Reload) {
+                                        subscribe_and_report(&t, &subs, &folder_names).await?;
+                                    }
+                                }
+                                _ = tokio::time::sleep_until(deadline) => {
+                                    println!("[{:>6.1} с] время вышло, закрываю поток", started.elapsed().as_secs_f32());
+                                    timed_out = true;
+                                    break 'outer;
+                                }
+                            }
+                        }
+                    }
+                    // Между циклами сервер ждёт FinishNotificationRequest.
+                    match t.finish_notification_stream(&cid).await {
+                        Ok(()) => println!("[{:>6.1} с] FinishNotificationRequest: Ok", started.elapsed().as_secs_f32()),
+                        Err(e) => println!("[{:>6.1} с] FinishNotificationRequest: {e}", started.elapsed().as_secs_f32()),
+                    }
+                    if tokio::time::Instant::now() >= deadline {
+                        break;
+                    }
+                }
+                if timed_out {
+                    match t.finish_notification_stream(&cid).await {
+                        Ok(()) => println!("[{:>6.1} с] FinishNotificationRequest: Ok", started.elapsed().as_secs_f32()),
+                        Err(e) => println!("[{:>6.1} с] FinishNotificationRequest: {e}", started.elapsed().as_secs_f32()),
+                    }
+                }
+                // Что успело дойти, пока закрывали.
+                while let Ok(ev) = rx.try_recv() {
+                    *counts.entry(ev.kind_name()).or_default() += 1;
+                    println!("[{:>6.1} с] {}", started.elapsed().as_secs_f32(), describe_event(&ev, &folder_names));
+                }
+                println!("Итого за {:.1} с: циклов {cycles}, событий по видам {counts:?}", started.elapsed().as_secs_f32());
                 Ok::<(), anyhow::Error>(())
             }
             .await;

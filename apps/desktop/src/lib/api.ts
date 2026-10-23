@@ -271,6 +271,42 @@ export interface CalendarEventDetails {
   error: string | null;
 }
 
+// --- канал мгновенных уведомлений OWA ------------------------------------------------------
+// Бэкенд держит открытым поток PendingNotificationRequest и по событиям сервера сам запускает
+// синхронизацию папок. Окно только показывает состояние канала и реагирует на события.
+
+/** Состояние канала; то же приходит событием `notify-status` при каждом изменении и ответом `notify_status`. */
+export interface NotifyStatus {
+  /** Поток открыт: изменения приходят от сервера сразу, таймер синхронизации — лишь страховка. */
+  connected: boolean;
+  /** С какого времени канал держится; null — не подключён. */
+  since_ms: number | null;
+  last_event_ms: number | null;
+  /** Подписок, принятых сервером в текущем цикле. */
+  subscriptions: number;
+  /** Последняя ошибка канала (по-русски); при ней бэкенд переподключается с растущей паузой. */
+  error: string | null;
+  /** Тосты Windows о новых письмах (ключ desktop.notify_toasts; по умолчанию включены). */
+  toasts_enabled: boolean;
+}
+
+/** Отправитель в событии `new-mail`: строка либо участник с именем и адресом. */
+export type NewMailFrom = string | { name: string | null; email: string | null } | null;
+
+/**
+ * Событие `new-mail`: сервер сообщил о новом письме. Приходит до синхронизации папки, поэтому
+ * письма в базе ещё может не быть; item_pk заполнен, только если бэкенд его уже нашёл.
+ */
+export interface NewMail {
+  from: NewMailFrom;
+  subject: string | null;
+  preview: string | null;
+  /** Серверный id письма (строкой или объектом ItemId); null, если сервер его не прислал. */
+  item_id: string | { id: string; change_key?: string | null } | null;
+  item_pk?: number | null;
+  folder_pk: number | null;
+}
+
 export const api = {
   accountInfo: () => invoke<AccountInfo>("account_info"),
   folders: () => invoke<Folder[]>("folders"),
@@ -335,6 +371,11 @@ export const api = {
   calendarEvents: (startMs: number, endMs: number, refresh: boolean) => invoke<CalendarRange>("calendar_events", { startMs, endMs, refresh }),
   /** Подробности события: тело, участники, напоминание, текст повторения; с `refresh` — перечитать с сервера. */
   calendarEventDetails: (calendarPk: number, refresh: boolean) => invoke<CalendarEventDetails>("calendar_event_details", { calendarPk, refresh }),
+
+  // --- канал уведомлений -------------------------------------------------------------------
+  notifyStatus: () => invoke<NotifyStatus>("notify_status"),
+  /** Включить или выключить тосты Windows о новых письмах; новое состояние придёт событием `notify-status`. */
+  notifySetToasts: (enabled: boolean) => invoke<void>("notify_set_toasts", { enabled }),
 };
 
 /** Подписка на запрос закрытия окна (крестик, Alt+F4) при поднятом windowCloseGuard. Возвращает функцию отписки. */
@@ -350,6 +391,27 @@ export function onSyncProgress(cb: (status: SyncStatus) => void): Promise<Unlist
 /** Подписка на изменения писем после команд записи. Возвращает функцию отписки. */
 export function onItemsChanged(cb: (ev: ItemsChanged) => void): Promise<UnlistenFn> {
   return listen<ItemsChanged>("items-changed", (e) => cb(e.payload));
+}
+
+/** Подписка на состояние канала уведомлений. Возвращает функцию отписки. */
+export function onNotifyStatus(cb: (status: NotifyStatus) => void): Promise<UnlistenFn> {
+  return listen<NotifyStatus>("notify-status", (e) => cb(e.payload));
+}
+
+/** Подписка на новые письма по уведомлению сервера. Возвращает функцию отписки. */
+export function onNewMail(cb: (mail: NewMail) => void): Promise<UnlistenFn> {
+  return listen<NewMail>("new-mail", (e) => cb(e.payload));
+}
+
+/** Подписка на изменения в календаре на сервере (без подробностей: окно перечитывает текущий период). */
+export function onCalendarChanged(cb: () => void): Promise<UnlistenFn> {
+  return listen<void>("calendar-changed", () => cb());
+}
+
+/** Отправитель нового письма для строки состояния: имя, иначе адрес, иначе «(без отправителя)». */
+export function newMailSender(m: NewMail): string {
+  if (typeof m.from === "string") return m.from || "(без отправителя)";
+  return personLabel(m.from?.name ?? null, m.from?.email ?? null) || "(без отправителя)";
 }
 
 /** Текст ошибки команды для показа пользователю: команды Tauri отклоняют промис строкой по-русски. */

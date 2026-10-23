@@ -14,7 +14,7 @@ use serde::Serialize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
 use tracing::{info, warn};
 
 const KEYRING_SERVICE: &str = "AIOWA";
@@ -110,7 +110,40 @@ struct Inner {
     status: SyncStatusDto,
     cancel: Option<Arc<AtomicBool>>,
     transport: Option<OwaTransport>,
+    /// Поколение транспорта: растёт с каждым входом. Долгоживущий вызывающий (канал уведомлений)
+    /// сбрасывает транспорт только своего поколения, чтобы не разлогинить сессию, которую другой
+    /// вызывающий уже успел открыть заново.
+    transport_gen: u64,
     task: Option<tauri::async_runtime::JoinHandle<()>>,
+    /// Запрос канала уведомлений, пришедший во время синхронизации: запускается по её концу.
+    pending: Option<PendingSync>,
+}
+
+/// Отложенная синхронизация: все почтовые папки или список ключей папок без повторов.
+#[derive(Debug, Default)]
+struct PendingSync {
+    all: bool,
+    folders: Vec<i64>,
+}
+
+impl PendingSync {
+    fn merge(&mut self, folders: Option<Vec<i64>>) {
+        match folders {
+            None => self.all = true,
+            Some(pks) => {
+                for pk in pks {
+                    if !self.folders.contains(&pk) {
+                        self.folders.push(pk);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Аргумент `folders` для `start`: `None` — все папки.
+    fn into_folders(self) -> Option<Vec<i64>> {
+        if self.all { None } else { Some(self.folders) }
+    }
 }
 
 pub struct SyncState {
@@ -192,10 +225,23 @@ impl SyncState {
     /// Запускает синхронизацию, если она не идёт. Возвращает статус сразу после запуска.
     /// `folders` — только эти папки (ключи локальной базы); `None` или пусто — все почтовые.
     pub fn start(self: &Arc<Self>, app: AppHandle, days: Option<u32>, folders: Option<Vec<i64>>) -> SyncStatusDto {
+        self.launch(app, days, folders, false)
+    }
+
+    /// Запрос от канала уведомлений: как `start`, но если синхронизация уже идёт, папки
+    /// запоминаются и запускаются сразу по её концу (объединяясь с другими такими запросами).
+    pub fn request(self: &Arc<Self>, app: AppHandle, folders: Option<Vec<i64>>) {
+        self.launch(app, None, folders, true);
+    }
+
+    fn launch(self: &Arc<Self>, app: AppHandle, days: Option<u32>, folders: Option<Vec<i64>>, queue_if_busy: bool) -> SyncStatusDto {
         let cancel = Arc::new(AtomicBool::new(false));
         {
             let mut g = self.lock();
-            if g.status.running {
+            if g.status.running || self.closing.load(Ordering::SeqCst) {
+                if queue_if_busy && g.status.running {
+                    g.pending.get_or_insert_with(PendingSync::default).merge(folders);
+                }
                 return g.status.clone();
             }
             g.cancel = Some(cancel.clone());
@@ -247,6 +293,12 @@ impl SyncState {
         self.status()
     }
 
+    /// Транспорт процесса, если вход уже был (без входа и ожидания): для завершения цикла
+    /// канала уведомлений при выходе.
+    pub(crate) fn current_transport(&self) -> Option<OwaTransport> {
+        self.lock().transport.clone()
+    }
+
     /// Транспорт процесса: вход при первом обращении, дальше та же сессия. Вход защищён
     /// замком: параллельные вызывающие (синхронизация и команды окна) ждут один вход.
     pub(crate) async fn transport(&self) -> Result<OwaTransport, ConnectError> {
@@ -274,18 +326,38 @@ impl SyncState {
             let _ = tokio::time::timeout(LOGOFF_TIMEOUT, t.logoff()).await;
             return Err(ConnectError::Closing);
         }
-        self.lock().transport = Some(t.clone());
+        let mut g = self.lock();
+        g.transport = Some(t.clone());
+        g.transport_gen += 1;
         Ok(t)
+    }
+
+    /// Транспорт процесса вместе с его поколением — для `invalidate_on_generation`.
+    pub(crate) async fn transport_with_generation(&self) -> Result<(OwaTransport, u64), ConnectError> {
+        let t = self.transport().await?;
+        let g = self.lock();
+        // Между входом и чтением поколения транспорт могли сбросить: тогда отдаём то, что есть,
+        // а поколение — текущее (сброс по нему никого не заденет).
+        Ok((g.transport.clone().unwrap_or(t), g.transport_gen))
     }
 
     /// Сбрасывает транспорт процесса, если ошибка означает мёртвую сессию: истёкшая сессия, которую
     /// транспорт не смог восстановить повторным входом, отказ CSRF или отклонённый вход. Следующее
     /// обращение войдёт заново. Прочие ошибки транспорт не трогают.
     pub(crate) async fn invalidate_on(&self, e: &TransportError) {
+        self.invalidate_on_generation(e, None).await;
+    }
+
+    /// То же, но только если транспорт процесса всё ещё поколения `generation`: иначе ошибка
+    /// пришла от уже заменённой сессии, и текущую трогать нельзя.
+    pub(crate) async fn invalidate_on_generation(&self, e: &TransportError, generation: Option<u64>) {
         if !(e.needs_reauth() || matches!(e, TransportError::AuthFailed(_))) {
             return;
         }
-        let old = self.lock().transport.take();
+        let old = {
+            let mut g = self.lock();
+            if generation.is_some_and(|wanted| wanted != g.transport_gen) { None } else { g.transport.take() }
+        };
         if let Some(t) = old {
             warn!(error = %e, "сессия OWA непригодна, транспорт сброшен");
             let _ = tokio::time::timeout(LOGOFF_TIMEOUT, t.logoff()).await;
@@ -328,9 +400,27 @@ impl SyncState {
                 Err(Outcome::Failed { message, .. }) => s.last_error = Some(message.clone()),
             }
         });
-        let mut g = self.lock();
-        g.task = None;
-        g.cancel = None;
+        // После удачного прогона: счётчик непрочитанных в заголовке и (один раз) запуск канала
+        // уведомлений — транспорт уже есть, подписки есть на что делать.
+        if outcome.is_ok()
+            && let Some(notify) = app.try_state::<Arc<crate::notify::NotifyState>>()
+        {
+            notify.on_sync_ok(&app);
+        }
+        let pending = {
+            let mut g = self.lock();
+            g.task = None;
+            g.cancel = None;
+            g.pending.take()
+        };
+        // Папки, о которых канал сообщил во время прогона: сразу следующий прогон (не при выходе).
+        if let Some(p) = pending
+            && !self.closing.load(Ordering::SeqCst)
+        {
+            let folders = p.into_folders();
+            info!(folders = folders.as_ref().map(Vec::len), "синхронизация по отложенному запросу канала уведомлений");
+            self.start(app, None, folders);
+        }
     }
 
     async fn run_inner(self: &Arc<Self>, app: &AppHandle, days: Option<u32>, folders: Option<Vec<i64>>, cancel: Arc<AtomicBool>) -> Result<SyncReport, Outcome> {
@@ -423,10 +513,10 @@ impl SyncState {
             c.store(true, Ordering::Relaxed);
         }
         tauri::async_runtime::block_on(async move {
-            if let Some(t) = task {
-                if tokio::time::timeout(EXIT_GRACE, t).await.is_err() {
-                    warn!("синхронизация не остановилась за {} с, выхожу из сессии без ожидания", EXIT_GRACE.as_secs());
-                }
+            if let Some(t) = task
+                && tokio::time::timeout(EXIT_GRACE, t).await.is_err()
+            {
+                warn!("синхронизация не остановилась за {} с, выхожу из сессии без ожидания", EXIT_GRACE.as_secs());
             }
             // Вход, начатый до закрытия (синхронизацией или командой окна), мог ещё идти: ждём замок
             // входа, чтобы забрать и его сессию. Новых входов не будет — `closing` уже выставлен.

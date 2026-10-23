@@ -39,3 +39,7 @@ open = { version = "5", features = ["shellexecute-on-windows"] }
 rfd = { version = "0.17", default-features = false }
 # Папка «Загрузки» пользователя (известная папка Windows) для диалога сохранения.
 dirs = "7"
+# Тосты Windows о новых письмах (канал уведомлений, `notify.rs`); вызывается из Rust, не из окна.
+# В сборке из `target/debug` тост выходит от имени PowerShell (плагин ставит AppUserModelID только
+# установленному приложению).
+tauri-plugin-notification = "2"

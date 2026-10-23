@@ -5,23 +5,28 @@
 //! `__type` первым ключом каждого объекта; системный TLS; одна сессия на процесс и
 //! явный `logoff.owa`; истечение сессии = 440/401/редирект на `logon.aspx`.
 
+pub mod notify;
 pub mod protocol;
 
 use aiowa_core::{CalendarEvent, CalendarEventDetails, ComposeKind, FolderChanges, FolderRef, ItemChanges, ItemId, OutgoingAttachment, OutgoingMessage, Signature, SyncState};
-use aiowa_transport::{async_trait, AttachmentContent, Credentials, DeleteMode, FolderCounts, ItemFetchShape, ItemResult, MailTransport, Result, ServerInfo, TransportError, WriteResult};
+use aiowa_transport::{
+    async_trait, AttachmentContent, Credentials, DeleteMode, FolderCounts, ItemFetchShape, ItemResult, MailTransport, NotificationEvent, NotificationKind, Result, ServerInfo, StreamEnd, SubscriptionRequest,
+    SubscriptionResult, TransportError, WriteResult,
+};
 use base64::prelude::*;
 use jiff::Timestamp;
+use notify::SubscribeForm;
 use protocol::CalendarItemShape;
-use std::collections::HashSet;
 use reqwest::cookie::{CookieStore, Jar};
-use reqwest::header::{HeaderMap, HeaderValue, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_TYPE, LOCATION};
+use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, ACCEPT_ENCODING, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_TYPE, LOCATION};
 use reqwest::redirect::Policy;
 use reqwest::{Client, StatusCode, Url};
 use secrecy::ExposeSecret;
 use serde_json::Value;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, Semaphore};
 use tracing::{debug, info, warn};
 
@@ -84,7 +89,24 @@ struct Inner {
     calendar_mode: AtomicU8,
     /// Какую форму `ItemShape` для `GetItem` события принял сервер (`CALENDAR_SHAPE_*`).
     calendar_shape: AtomicU8,
+    /// Какую форму `SubscribeToNotification` принял сервер (`SubscribeForm::code`, 0 не известно).
+    subscribe_form: AtomicU8,
+    /// Подписки текущей сессии: вид по идентификатору, чтобы разбирать события потока.
+    subscriptions: RwLock<HashMap<String, NotificationKind>>,
+    /// Подписки потеряны при повторном входе, а вызывающий об этом ещё не знает: следующий
+    /// открытый поток первым делом отдаёт `Reload`.
+    subscriptions_stale: AtomicBool,
+    /// Счётчик `n` запросов `PendingNotificationRequest`.
+    pending_counter: AtomicU64,
 }
+
+/// Тишина в потоке уведомлений дольше этого — обрыв (`Network`). Сервер шлёт keep-alive каждые
+/// 40 с (между ними пустые блоки), штатный цикл он закрывает через 320 с: в живом потоке такой
+/// тишины не бывает, а мёртвое соединение после сна или смены сети (FIN не приходит) иначе
+/// висело бы до таймаута, пока окно держит редкий страховочный таймер.
+const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(150);
+/// Общий предел одного цикла потока (сервер закрывает его примерно через 5–6 минут).
+const STREAM_TOTAL_TIMEOUT: Duration = Duration::from_secs(20 * 60);
 
 const ATTACHMENT_MODE_UNKNOWN: u8 = 0;
 const ATTACHMENT_MODE_GET: u8 = 1;
@@ -179,6 +201,10 @@ impl OwaTransport {
             attachment_mode: AtomicU8::new(ATTACHMENT_MODE_UNKNOWN),
             calendar_mode: AtomicU8::new(CALENDAR_MODE_UNKNOWN),
             calendar_shape: AtomicU8::new(CALENDAR_SHAPE_UNKNOWN),
+            subscribe_form: AtomicU8::new(0),
+            subscriptions: RwLock::new(HashMap::new()),
+            subscriptions_stale: AtomicBool::new(false),
+            pending_counter: AtomicU64::new(0),
         });
         Ok(Self { inner })
     }
@@ -264,6 +290,17 @@ impl OwaTransport {
         let canary = self.cookie_value("X-OWA-CANARY").ok_or_else(|| TransportError::AuthFailed("после входа нет cookie X-OWA-CANARY".into()))?;
         *inner.canary.write().expect("canary lock") = Some(canary);
         inner.generation.fetch_add(1, Ordering::SeqCst);
+        // Подписки на уведомления живут в сессии: в новой их нет, и поток должен сказать об этом.
+        let lost = {
+            let mut subs = inner.subscriptions.write().expect("subscriptions lock");
+            let n = subs.len();
+            subs.clear();
+            n
+        };
+        if lost > 0 {
+            inner.subscriptions_stale.store(true, Ordering::SeqCst);
+            warn!(subscriptions = lost, "подписки на уведомления потеряны вместе с сессией");
+        }
         info!(host = %inner.creds.host, "вход в OWA выполнен");
         Ok(())
     }
@@ -292,9 +329,21 @@ impl OwaTransport {
 
     /// То же с собственным таймаутом запроса вместо общего из настроек (загрузка вложений).
     pub async fn call_with_timeout(&self, op: &str, version: &str, body: Value, timeout: Option<Duration>) -> Result<Value> {
-        let _permit = self.inner.permits.acquire().await.map_err(|_| TransportError::Cancelled)?;
         let env = protocol::envelope(op, version, &self.inner.config.time_zone, body);
         let payload = serde_json::to_vec(&env).map_err(|e| TransportError::Protocol { op: op.into(), status: 0, raw: e.to_string() })?;
+        self.call_payload(op, payload, timeout).await
+    }
+
+    /// Операция с OWA-специфичным конвертом (параметры на верхнем уровне рядом с `request`,
+    /// без `Body`): `payload` уходит как есть, ответ — произвольный JSON (у подписок массив).
+    pub async fn call_raw(&self, op: &str, payload: Value) -> Result<Value> {
+        let payload = serde_json::to_vec(&payload).map_err(|e| TransportError::Protocol { op: op.into(), status: 0, raw: e.to_string() })?;
+        self.call_payload(op, payload, None).await
+    }
+
+    /// Готовое тело запроса под разрешением семафора с одной попыткой повторного входа.
+    async fn call_payload(&self, op: &str, payload: Vec<u8>, timeout: Option<Duration>) -> Result<Value> {
+        let _permit = self.inner.permits.acquire().await.map_err(|_| TransportError::Cancelled)?;
         for attempt in 0..2 {
             let generation = self.inner.generation.load(Ordering::SeqCst);
             match self.call_once(op, payload.clone(), timeout).await {
@@ -631,6 +680,125 @@ impl OwaTransport {
         let v = self.call("GetItem", protocol::V_2017, body).await?;
         let msg = Self::first_message("GetItem", &v)?;
         Ok(protocol::json_shape(msg.pointer("/Items/0").unwrap_or(&Value::Null), 3))
+    }
+
+    /// Статус ответа канала уведомлений: 440/401 и редирект на вход — истёкшая сессия,
+    /// прочие неуспешные — `Protocol` с началом тела.
+    async fn check_stream_status(op: &str, r: reqwest::Response) -> Result<reqwest::Response> {
+        let status = r.status();
+        if status == StatusCode::from_u16(440).unwrap_or(StatusCode::UNAUTHORIZED) || status == StatusCode::UNAUTHORIZED {
+            return Err(TransportError::SessionExpired);
+        }
+        if status.is_redirection() {
+            let loc = r.headers().get(LOCATION).and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+            return Err(classify_redirect(&loc));
+        }
+        if !status.is_success() {
+            let text = r.text().await.unwrap_or_default();
+            return Err(TransportError::Protocol { op: op.into(), status: status.as_u16(), raw: truncate(&text, 300) });
+        }
+        Ok(r)
+    }
+
+    /// Открывает поток `PendingNotificationRequest`: GET с канарейкой в query (поток читается не
+    /// через XHR), без сжатия (чтобы блоки не задерживались в буфере gzip), с собственным общим
+    /// таймаутом вместо общего из настроек. Разрешение семафора не берётся.
+    async fn open_notification_stream(&self, cid: &str) -> Result<reqwest::Response> {
+        let inner = &self.inner;
+        let canary = inner.canary.read().expect("canary lock").clone().ok_or(TransportError::SessionExpired)?;
+        let n = inner.pending_counter.fetch_add(1, Ordering::SeqCst) + 1;
+        let mut url = inner.base.join("owa/ev.owa2").expect("url");
+        url.query_pairs_mut()
+            .append_pair("ns", "PendingRequest")
+            .append_pair("ev", "PendingNotificationRequest")
+            .append_pair("UA", "0")
+            .append_pair("cid", cid)
+            .append_pair("brwnm", "chrome")
+            .append_pair("X-OWA-CANARY", &canary)
+            .append_pair("n", &n.to_string());
+        let mut headers = HeaderMap::new();
+        headers.insert("X-OWA-CANARY", HeaderValue::from_str(&canary).map_err(|_| TransportError::CsrfRejected)?);
+        headers.insert(ACCEPT_ENCODING, HeaderValue::from_static("identity"));
+        headers.insert(ACCEPT, HeaderValue::from_static("text/html, */*"));
+        let started = Instant::now();
+        let r = inner.client.get(url).headers(headers).timeout(STREAM_TOTAL_TIMEOUT).send().await.map_err(net)?;
+        self.remember_build(r.headers());
+        let r = Self::check_stream_status("PendingNotificationRequest", r).await?;
+        let content_type = r.headers().get(CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("?").to_string();
+        let encoding = r.headers().get("content-encoding").and_then(|v| v.to_str().ok()).unwrap_or("-").to_string();
+        let chunked = r.headers().get("transfer-encoding").and_then(|v| v.to_str().ok()).unwrap_or("-").to_string();
+        debug!(n, status = %r.status(), content_type, encoding, chunked, ms = started.elapsed().as_millis(), "ev.owa2: поток открыт");
+        Ok(r)
+    }
+
+    /// Читает поток до закрытия сервером: блоки `<script>` собираются из чанков, каждый блок
+    /// разбирается в события для `sink`. Тишина дольше `STREAM_IDLE_TIMEOUT` — `Network`.
+    /// Обрыв соединения после хотя бы одного блока — обычный конец цикла (`finished_by_server:
+    /// false`): следующий цикл откроет поток заново, а настоящая потеря сети проявится на нём.
+    async fn read_notification_stream(&self, mut r: reqwest::Response, sink: &(dyn Fn(NotificationEvent) + Send + Sync), started: Instant) -> Result<StreamEnd> {
+        let mut parser = notify::ScriptBlockParser::new();
+        let mut events = 0usize;
+        let mut blocks = 0usize;
+        let mut bytes_total = 0usize;
+        let mut by_kind: BTreeMap<&'static str, usize> = BTreeMap::new();
+        let finished_by_server = loop {
+            let chunk = match tokio::time::timeout(STREAM_IDLE_TIMEOUT, r.chunk()).await {
+                Err(_) => {
+                    return Err(TransportError::Network(Box::new(std::io::Error::new(std::io::ErrorKind::TimedOut, format!("канал уведомлений молчит дольше {} с", STREAM_IDLE_TIMEOUT.as_secs())))));
+                }
+                Ok(Ok(None)) => break true,
+                Ok(Ok(Some(chunk))) => chunk,
+                Ok(Err(e)) => {
+                    if blocks == 0 {
+                        return Err(net(e));
+                    }
+                    warn!(error = %e, blocks, s = started.elapsed().as_secs(), "ev.owa2: соединение оборвалось после блоков, цикл считается законченным");
+                    break false;
+                }
+            };
+            bytes_total += chunk.len();
+            for block in parser.push(&chunk) {
+                blocks += 1;
+                // Копия списка подписок (он мал), чтобы не держать замок во время обратного вызова.
+                let subs = self.inner.subscriptions.read().expect("subscriptions lock").clone();
+                for ev in notify::parse_block(&block, &subs) {
+                    *by_kind.entry(ev.kind_name()).or_default() += 1;
+                    events += 1;
+                    sink(ev);
+                }
+            }
+        };
+        if blocks == 0 && finished_by_server {
+            return Err(TransportError::Protocol {
+                op: "PendingNotificationRequest".into(),
+                status: 200,
+                raw: format!("поток закрыт сервером без единого блока за {} мс ({} байт, {} в буфере)", started.elapsed().as_millis(), bytes_total, parser.pending()),
+            });
+        }
+        info!(blocks, events, ?by_kind, bytes = bytes_total, s = started.elapsed().as_secs(), finished_by_server, "ev.owa2: цикл потока завершён");
+        Ok(StreamEnd { events, elapsed: started.elapsed(), finished_by_server })
+    }
+
+    /// `FinishNotificationRequest`: POST с канарейкой и пустым телом; ответ `{cid, syncFnshRq}`.
+    async fn finish_once(&self, cid: &str) -> Result<()> {
+        let inner = &self.inner;
+        let canary = inner.canary.read().expect("canary lock").clone().ok_or(TransportError::SessionExpired)?;
+        let mut url = inner.base.join("owa/ev.owa2").expect("url");
+        url.query_pairs_mut().append_pair("ns", "PendingRequest").append_pair("ev", "FinishNotificationRequest").append_pair("UA", "0").append_pair("cid", cid);
+        let mut headers = HeaderMap::new();
+        headers.insert("X-OWA-CANARY", HeaderValue::from_str(&canary).map_err(|_| TransportError::CsrfRejected)?);
+        headers.insert("X-Requested-With", HeaderValue::from_static("XMLHttpRequest"));
+        // Пустое тело без явной длины IIS отвергает (HTTP 411 Length Required).
+        headers.insert(CONTENT_LENGTH, HeaderValue::from_static("0"));
+        let started = Instant::now();
+        let r = inner.client.post(url).headers(headers).body(Vec::new()).send().await.map_err(net)?;
+        self.remember_build(r.headers());
+        let r = Self::check_stream_status("FinishNotificationRequest", r).await?;
+        let status = r.status();
+        let text = r.text().await.map_err(net)?;
+        let shape = serde_json::from_str::<Value>(&text).map(|v| protocol::json_shape(&v, 2)).unwrap_or_else(|_| "не JSON".into());
+        debug!(%status, ms = started.elapsed().as_millis(), bytes = text.len(), shape, "ev.owa2: FinishNotificationRequest");
+        Ok(())
     }
 
     /// Первое сообщение ответа, с проверкой `ResponseClass`.
@@ -983,6 +1151,99 @@ impl MailTransport for OwaTransport {
             return Ok(details);
         }
         Err(last_err.unwrap_or(TransportError::Protocol { op: "GetItem".into(), status: 0, raw: "ни одна форма не принята".into() }))
+    }
+
+    /// `SubscribeToNotification` через `call_raw` с подбором формы (один раз на сессию): форма
+    /// браузерной OWA, при отказе сервера по форме (HTTP 500 или ни одной созданной подписки)
+    /// — запасные. Созданные подписки запоминаются для разбора событий потока.
+    async fn subscribe_notifications(&self, subs: &[SubscriptionRequest]) -> Result<Vec<SubscriptionResult>> {
+        if subs.is_empty() {
+            return Ok(Vec::new());
+        }
+        let known = SubscribeForm::from_code(self.inner.subscribe_form.load(Ordering::Relaxed));
+        let candidates: Vec<SubscribeForm> = match known {
+            Some(f) => vec![f],
+            None => SubscribeForm::ALL.to_vec(),
+        };
+        let mut last: Option<Result<Vec<SubscriptionResult>>> = None;
+        for (i, form) in candidates.iter().enumerate() {
+            let more = i + 1 < candidates.len();
+            let body = notify::subscribe_body(subs, &self.inner.config.time_zone, *form);
+            match self.call_raw("SubscribeToNotification", body).await {
+                Ok(v) => {
+                    let results = notify::parse_subscription_results(&v, subs);
+                    let created = results.iter().filter(|r| r.created).count();
+                    debug!(form = ?form, requested = subs.len(), created, shape = %protocol::json_shape(&v, 3), "SubscribeToNotification: форма ответа");
+                    for (req, res) in subs.iter().zip(&results) {
+                        if res.created {
+                            debug!(kind = req.kind.name(), "подписка создана");
+                        } else {
+                            info!(kind = req.kind.name(), error = res.error.as_deref().unwrap_or("?"), "подписка не создана");
+                        }
+                    }
+                    if created > 0 {
+                        if known.is_none() {
+                            info!(form = form.describe(), "подписки: сервер принял форму запроса");
+                        }
+                        self.inner.subscribe_form.store(form.code(), Ordering::Relaxed);
+                        let mut map = self.inner.subscriptions.write().expect("subscriptions lock");
+                        for (req, res) in subs.iter().zip(&results) {
+                            if res.created {
+                                map.insert(req.id.clone(), req.kind.clone());
+                            }
+                        }
+                        self.inner.subscriptions_stale.store(false, Ordering::SeqCst);
+                        return Ok(results);
+                    }
+                    if more {
+                        warn!(form = form.describe(), "подписки: ни одна не создана, пробую следующую форму");
+                    }
+                    last = Some(Ok(results));
+                }
+                Err(e) if more && matches!(e, TransportError::Protocol { status: 500, .. } | TransportError::Server { .. }) => {
+                    warn!(form = form.describe(), error = %e, "подписки: форма отвергнута, пробую следующую");
+                    last = Some(Err(e));
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        last.unwrap_or_else(|| Err(TransportError::Protocol { op: "SubscribeToNotification".into(), status: 0, raw: "ни одна форма не принята".into() }))
+    }
+
+    /// Один цикл `PendingNotificationRequest` вне семафора. Истёкшая сессия — один повторный
+    /// вход и новая попытка открыть поток; потерянные подписки объявляются `Reload` в `sink`.
+    async fn notification_stream(&self, cid: &str, sink: &(dyn Fn(NotificationEvent) + Send + Sync)) -> Result<StreamEnd> {
+        let started = Instant::now();
+        for attempt in 0..2 {
+            let generation = self.inner.generation.load(Ordering::SeqCst);
+            match self.open_notification_stream(cid).await {
+                Ok(r) => {
+                    if self.inner.subscriptions_stale.swap(false, Ordering::SeqCst) {
+                        sink(NotificationEvent::Reload);
+                    }
+                    return self.read_notification_stream(r, sink, started).await;
+                }
+                Err(e) if e.needs_reauth() && attempt == 0 => {
+                    self.relogin_once(generation).await?;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Err(TransportError::SessionExpired)
+    }
+
+    async fn finish_notification_stream(&self, cid: &str) -> Result<()> {
+        let _permit = self.inner.permits.acquire().await.map_err(|_| TransportError::Cancelled)?;
+        for attempt in 0..2 {
+            let generation = self.inner.generation.load(Ordering::SeqCst);
+            match self.finish_once(cid).await {
+                Err(e) if e.needs_reauth() && attempt == 0 => {
+                    self.relogin_once(generation).await?;
+                }
+                other => return other,
+            }
+        }
+        Err(TransportError::SessionExpired)
     }
 
     async fn logoff(&self) -> Result<()> {

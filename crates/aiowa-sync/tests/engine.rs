@@ -3,7 +3,10 @@
 use aiowa_core::*;
 use aiowa_store::Store;
 use aiowa_sync::{BodyFetchOutcome, Engine, FolderSelection, SyncOptions};
-use aiowa_transport::{async_trait, AttachmentContent, DeleteMode, FolderCounts, ItemFetchShape, ItemResult, MailTransport, Result as TResult, ServerInfo, TransportError, WriteResult};
+use aiowa_transport::{
+    async_trait, AttachmentContent, DeleteMode, FolderCounts, ItemFetchShape, ItemResult, MailTransport, NotificationEvent, Result as TResult, ServerInfo, StreamEnd, SubscriptionRequest, SubscriptionResult,
+    TransportError, WriteResult,
+};
 use jiff::Timestamp;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -206,6 +209,19 @@ impl MailTransport for Fake {
 
     async fn get_calendar_item(&self, id: &ItemId) -> TResult<CalendarEventDetails> {
         Err(TransportError::Server { code: "ErrorItemNotFound".into(), message: format!("нет события {}", id.id) })
+    }
+
+    async fn subscribe_notifications(&self, subs: &[SubscriptionRequest]) -> TResult<Vec<SubscriptionResult>> {
+        Ok(subs.iter().map(|s| SubscriptionResult { id: s.id.clone(), created: true, error: None }).collect())
+    }
+
+    async fn notification_stream(&self, _cid: &str, sink: &(dyn Fn(NotificationEvent) + Send + Sync)) -> TResult<StreamEnd> {
+        sink(NotificationEvent::KeepAlive);
+        Ok(StreamEnd { events: 1, elapsed: std::time::Duration::ZERO, finished_by_server: true })
+    }
+
+    async fn finish_notification_stream(&self, _cid: &str) -> TResult<()> {
+        Ok(())
     }
 
     async fn logoff(&self) -> TResult<()> {

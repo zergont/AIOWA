@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount, untrack } from "svelte";
-  import { api, errorMessage, type CalendarEvent } from "../api";
+  import { api, errorMessage, onCalendarChanged, type CalendarEvent } from "../api";
   import { periodTitle, shiftAnchor, startOfDay, updatedLabel, viewRange, type CalendarViewKind } from "../calendar";
   import WeekGrid from "./WeekGrid.svelte";
   import EventDetails from "./EventDetails.svelte";
@@ -48,6 +48,11 @@
   let request = 0;
   /** Когда последний раз ходили к бэкенду: автообновление отсчитывает от него и от fetched_ms. */
   let lastAttempt = 0;
+  /**
+   * Сервер сообщил об изменении в календаре (событие calendar-changed), а перечитать ещё не удалось:
+   * календарь был спрятан, окно свёрнуто или запрос уже шёл. Снимается ближайшим обновлением.
+   */
+  let serverChanged = false;
 
   async function load(startMs: number, endMs: number, refresh: boolean) {
     const req = ++request;
@@ -85,22 +90,45 @@
     void load(range.start.getTime(), range.end.getTime(), true);
   }
 
-  /** Автообновление раз в 5 минут при видимом окне и показанном календаре; не запускается поверх идущего запроса. */
+  /**
+   * Автообновление при видимом окне и показанном календаре: раз в 5 минут, а после уведомления
+   * сервера об изменении — сразу. Не запускается поверх идущего запроса (тогда отложенное
+   * уведомление дождётся следующего тика).
+   */
   function tick() {
     if (!visible || document.visibilityState !== "visible" || loading) return;
-    const since = Math.max(lastAttempt, fetchedMs ?? 0);
-    if (Date.now() - since < STALE_MS) return;
+    if (!serverChanged) {
+      const since = Math.max(lastAttempt, fetchedMs ?? 0);
+      if (Date.now() - since < STALE_MS) return;
+    }
+    serverChanged = false;
     refresh();
+  }
+
+  /** Событие calendar-changed от канала уведомлений: перечитать текущий период, если календарь на экране. */
+  function onServerChanged() {
+    serverChanged = true;
+    tick();
   }
 
   onMount(() => {
     const clock = setInterval(() => (now = new Date()), 30_000);
     const poll = setInterval(tick, 30_000);
     document.addEventListener("visibilitychange", tick);
+    let disposed = false;
+    let unlistenChanged: (() => void) | undefined;
+    onCalendarChanged(onServerChanged)
+      .then((u) => {
+        if (disposed) u();
+        else unlistenChanged = u;
+      })
+      .catch((e) => console.warn("calendar-changed:", errorMessage(e)));
     return () => {
+      disposed = true;
       clearInterval(clock);
       clearInterval(poll);
       document.removeEventListener("visibilitychange", tick);
+      unlistenChanged?.();
     };
   });
 

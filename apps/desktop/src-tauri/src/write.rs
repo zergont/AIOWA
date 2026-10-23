@@ -23,7 +23,7 @@ use serde::Serialize;
 use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 use tracing::{info, warn};
 
 /// Таймаут одной пачки на сервере.
@@ -393,10 +393,15 @@ async fn run(app: &AppHandle, state: &AppState, sync: &SyncState, ws: &WriteStat
     let _busy = ws.lock.lock().await;
     let mut changed = Changed::default();
     let result = execute(state, sync, item_pks, &action, &mut changed).await;
-    if !changed.is_empty()
-        && let Err(e) = app.emit(ITEMS_CHANGED, changed.into_event())
-    {
-        warn!(error = %e, "не удалось отправить событие items-changed");
+    if !changed.is_empty() {
+        if let Err(e) = app.emit(ITEMS_CHANGED, changed.into_event()) {
+            warn!(error = %e, "не удалось отправить событие items-changed");
+        }
+        // Локальная запись уже поправила счётчики папок в базе: заголовок окна и значок на
+        // панели задач обновляются сразу, не дожидаясь следующей синхронизации.
+        if let Some(notify) = app.try_state::<Arc<crate::notify::NotifyState>>() {
+            notify.refresh_unread(app);
+        }
     }
     result
 }

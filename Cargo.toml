@@ -27,6 +27,8 @@ jiff = { version = "0.2", features = ["serde"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 secrecy = "0.10"
+# идентификаторы клиента для канала уведомлений (cid, SubscriptionId)
+uuid = { version = "1", features = ["v4"] }
 
 # асинхронность и сеть
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal"] }

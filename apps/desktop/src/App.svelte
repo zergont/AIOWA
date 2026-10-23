@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount, tick } from "svelte";
-  import { api, conversationKeyOf, errorMessage, messagesKey, onCloseRequested, onItemsChanged, onSyncProgress, type AccountInfo, type ComposeContext, type ComposeKind, type Conversation, type Folder, type ItemsChanged, type Message, type SearchHit, type SyncStatus, type WriteReport } from "./lib/api";
+  import { api, conversationKeyOf, errorMessage, messagesKey, newMailSender, onCloseRequested, onItemsChanged, onNewMail, onNotifyStatus, onSyncProgress, type AccountInfo, type ComposeContext, type ComposeKind, type Conversation, type Folder, type ItemsChanged, type Message, type NewMail, type NotifyStatus, type SearchHit, type SyncStatus, type WriteReport } from "./lib/api";
   import { ICON, failureText, type ItemAction } from "./lib/actions";
   import { focusBack, type Anchor } from "./lib/popover";
   import FolderTree from "./lib/components/FolderTree.svelte";
@@ -29,6 +29,8 @@
   let error = $state<string | null>(null);
   let listWidth = $state(380);
   let syncStatus = $state<SyncStatus | null>(null);
+  /** Канал мгновенных уведомлений; null — бэкенд о нём ещё не сообщал (или команды нет). */
+  let notify = $state<NotifyStatus | null>(null);
 
   // --- разделы: почта и календарь --------------------------------------------------------
   // Панели обоих разделов при переключении не размонтируются, а прячутся: открытая беседа, композер
@@ -248,8 +250,11 @@
   }
 
   const PAGE = 100;
-  /** Период автосинхронизации при видимом окне. */
+  /** Период автосинхронизации при видимом окне, пока канал уведомлений не подключён. */
   const SYNC_EVERY_MS = 2 * 60_000;
+  /** При открытом канале изменения приходят от сервера сразу; таймер остаётся страховкой. */
+  const SYNC_EVERY_LIVE_MS = 10 * 60_000;
+  const syncEveryMs = $derived(notify?.connected ? SYNC_EVERY_LIVE_MS : SYNC_EVERY_MS);
 
   async function loadFolders() {
     folders = await api.folders();
@@ -557,12 +562,120 @@
     }
   }
 
-  /** Раз в 2 минуты при видимом окне; не запускает повторно, пока идёт предыдущая. */
+  /** Раз в 2 минуты (при открытом канале уведомлений — в 10) при видимом окне; не запускает повторно, пока идёт предыдущая. */
   function syncTick() {
     if (document.visibilityState !== "visible") return;
     if (syncStatus?.running) return;
-    if (Date.now() - lastSyncAttempt < SYNC_EVERY_MS) return;
+    if (Date.now() - lastSyncAttempt < syncEveryMs) return;
     void startSync();
+  }
+
+  // --- канал уведомлений: новое письмо, тосты ---------------------------------------------
+  // Бэкенд по событиям сервера сам синхронизирует затронутые папки; окно показывает строку
+  // «Новое письмо: <отправитель>» на 5 с и по клику ведёт к письму во «Входящих».
+
+  /** Последнее уведомление о новом письме, пока строка на экране. */
+  let newMail = $state<NewMail | null>(null);
+  let newMailTimer: ReturnType<typeof setTimeout> | undefined;
+
+  function showNewMail(m: NewMail) {
+    newMail = m;
+    clearTimeout(newMailTimer);
+    newMailTimer = setTimeout(() => (newMail = null), 5000);
+  }
+
+  /** Тема без префиксов ответа и пересылки, в нижнем регистре: так сравниваются тема письма и тема беседы. */
+  function topicKey(s: string | null): string {
+    return (s ?? "")
+      .replace(/^(\s*(re|fw|fwd|aw|wg|ответ|пересл)\s*:\s*)+/i, "")
+      .trim()
+      .toLowerCase();
+  }
+
+  /**
+   * Беседа нового письма среди верхних строк списка папки: по item_pk, если бэкенд его прислал
+   * (письма беседы в папке — локальный запрос), иначе по теме. null — письма в базе ещё нет
+   * (синхронизация папки по уведомлению только идёт) или оно не в этих строках.
+   */
+  async function findNewMailConversation(m: NewMail, rows: Conversation[], folderPk: number): Promise<Conversation | null> {
+    const itemPk = m.item_pk ?? null;
+    if (itemPk != null) {
+      for (const c of rows) {
+        const pks = await api.conversationItemPks(c.conversation_pk, folderPk);
+        if (pks.includes(itemPk)) return c;
+      }
+      return null;
+    }
+    const key = topicKey(m.subject);
+    if (!key) return null;
+    return rows.find((c) => topicKey(c.topic) === key) ?? null;
+  }
+
+  /**
+   * Письмо из строки «Новое письмо», к которому нужно перейти после конца синхронизации: уведомление
+   * приходит раньше, чем бэкенд дотянет папку (пауза 1,5 с и сам прогон), так что клик в первые секунды
+   * почти всегда застаёт письмо ещё не в базе. `until` — срок, после которого ждать уже нечего.
+   */
+  let pendingNewMail: { mail: NewMail; folderPk: number; until: number } | null = null;
+  const NEW_MAIL_WAIT_MS = 60_000;
+
+  /** Клик по строке «Новое письмо»: во «Входящие» (или папку из события) и, когда письмо в базе, к его беседе. */
+  async function openNewMail() {
+    const m = newMail;
+    if (!m) return;
+    clearTimeout(newMailTimer);
+    newMail = null;
+    section = "mail";
+    const target = folders.find((f) => f.folder_pk === m.folder_pk && f.is_mail) ?? folders.find((f) => f.distinguished === "inbox") ?? null;
+    if (!target) return;
+    try {
+      clearSearch();
+      await openFolder(target);
+      const found = syncStatus?.running ? false : await locateNewMail(m, target.folder_pk);
+      pendingNewMail = found ? null : { mail: m, folderPk: target.folder_pk, until: Date.now() + NEW_MAIL_WAIT_MS };
+    } catch (e) {
+      error = errorMessage(e);
+    }
+  }
+
+  /** Найти беседу нового письма в показанном списке и открыть её; false — письма в списке ещё нет. */
+  async function locateNewMail(m: NewMail, folderPk: number): Promise<boolean> {
+    const c = await findNewMailConversation(m, conversations.slice(0, 20), folderPk);
+    if (!c) return false;
+    // Пока искали, пользователь мог уйти в другую папку или открыть беседу сам: тогда не вмешиваемся.
+    if (selectedFolder?.folder_pk === folderPk && selected === null) await openConversation(c);
+    return true;
+  }
+
+  /** После конца синхронизации (список уже перечитан): довести отложенный переход к новому письму. */
+  async function finishPendingNewMail() {
+    const p = pendingNewMail;
+    if (!p) return;
+    if (Date.now() > p.until || selectedFolder?.folder_pk !== p.folderPk || selected !== null) {
+      pendingNewMail = null;
+      return;
+    }
+    try {
+      if (await locateNewMail(p.mail, p.folderPk)) pendingNewMail = null;
+    } catch (e) {
+      pendingNewMail = null;
+      error = errorMessage(e);
+    }
+  }
+
+  /** Переключатель тостов: окно меняется сразу, итог придёт событием notify-status; при отказе — перечитать состояние. */
+  async function setToasts(enabled: boolean) {
+    if (notify) notify = { ...notify, toasts_enabled: enabled };
+    try {
+      await api.notifySetToasts(enabled);
+    } catch (e) {
+      error = errorMessage(e);
+      try {
+        notify = await api.notifyStatus();
+      } catch {
+        /* команды ещё нет — состояние остаётся как было */
+      }
+    }
   }
 
   /** После синхронизации: перечитать папки, текущий список и открытую беседу, не сбивая выбор. */
@@ -631,19 +744,28 @@
     let unlisten: (() => void) | undefined;
     let unlistenItems: (() => void) | undefined;
     let unlistenClose: (() => void) | undefined;
+    let unlistenNotify: (() => void) | undefined;
+    let unlistenNewMail: (() => void) | undefined;
     let wasRunning = false;
     const timer = setInterval(syncTick, 15_000);
     document.addEventListener("visibilitychange", syncTick);
 
     (async () => {
       try {
+        unlistenNotify = await onNotifyStatus((s) => (notify = s));
+        unlistenNewMail = await onNewMail(showNewMail);
+        // Канал запускается после первой удачной синхронизации; до неё команда отвечает «не подключён».
+        // Если бэкенд собран без неё, окно остаётся в режиме «по таймеру».
+        api.notifyStatus()
+          .then((s) => (notify = s))
+          .catch((e) => console.warn("notify_status:", errorMessage(e)));
         unlisten = await onSyncProgress((s) => {
           syncStatus = s;
           if (wasRunning && !s.running) {
             // Пауза в 2 минуты отсчитывается от конца прогона, а не от его начала:
             // после долгой первой синхронизации следующая не должна стартовать сразу.
             lastSyncAttempt = Date.now();
-            void refreshAfterSync();
+            void refreshAfterSync().then(finishPendingNewMail);
             if (pendingSentSync && sentFolderPk != null) {
               pendingSentSync = false;
               void launchSync([sentFolderPk]);
@@ -667,10 +789,13 @@
     return () => {
       clearInterval(timer);
       clearTimeout(noticeTimer);
+      clearTimeout(newMailTimer);
       document.removeEventListener("visibilitychange", syncTick);
       unlisten?.();
       unlistenItems?.();
       unlistenClose?.();
+      unlistenNotify?.();
+      unlistenNewMail?.();
     };
   });
 
@@ -757,7 +882,7 @@
   {/if}
 
   <footer class="status" aria-label="Состояние синхронизации">
-    <StatusBar status={syncStatus} {notice} onrefresh={startSync} oncancel={cancelSync} />
+    <StatusBar status={syncStatus} {notice} {notify} newMail={newMail ? newMailSender(newMail) : null} onrefresh={startSync} oncancel={cancelSync} ontoasts={setToasts} onnewmail={openNewMail} />
   </footer>
 
   {#if pendingCompose}

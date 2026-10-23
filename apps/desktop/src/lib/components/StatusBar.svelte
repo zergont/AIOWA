@@ -1,14 +1,22 @@
 <script lang="ts">
-  import type { SyncStage, SyncStatus } from "../api";
+  import type { NotifyStatus, SyncStage, SyncStatus } from "../api";
 
   interface Props {
     status: SyncStatus | null;
     /** Короткое уведомление («Отправлено»); родитель сам убирает его по таймеру. */
     notice?: string | null;
+    /** Канал мгновенных уведомлений; null — бэкенд о нём ещё не сообщал. */
+    notify?: NotifyStatus | null;
+    /** Отправитель нового письма по уведомлению сервера; родитель убирает строку по таймеру. */
+    newMail?: string | null;
     onrefresh: () => void;
     oncancel: () => void;
+    /** Переключатель тостов Windows о новых письмах. */
+    ontoasts?: (enabled: boolean) => void;
+    /** Клик по строке «Новое письмо»: открыть его во «Входящих». */
+    onnewmail?: () => void;
   }
-  let { status, notice = null, onrefresh, oncancel }: Props = $props();
+  let { status, notice = null, notify = null, newMail = null, onrefresh, oncancel, ontoasts, onnewmail }: Props = $props();
 
   const STAGES: Record<SyncStage, string> = {
     login: "Вход на сервер",
@@ -72,6 +80,26 @@
   });
 
   const warningsTitle = $derived(status?.warnings.length ? status.warnings.join("\n") : "");
+
+  // --- канал уведомлений -------------------------------------------------------------------
+
+  const live = $derived(notify?.connected ?? false);
+  const toasts = $derived(notify?.toasts_enabled ?? true);
+
+  /** Подсказка индикатора: с какого времени канал открыт, последнее событие, ошибка. */
+  const channelTitle = $derived.by(() => {
+    if (!notify) return "Канал уведомлений ещё не запущен: обновление по таймеру";
+    const lines: string[] = [];
+    if (notify.connected) {
+      lines.push(notify.since_ms != null ? `Канал уведомлений открыт ${when(notify.since_ms)}` : "Канал уведомлений открыт");
+      lines.push(`Подписок: ${notify.subscriptions}`);
+    } else {
+      lines.push("Канал уведомлений не подключён: обновление по таймеру раз в 2 минуты");
+    }
+    if (notify.last_event_ms != null) lines.push(`Последнее событие ${when(notify.last_event_ms)}`);
+    if (notify.error) lines.push(`Ошибка: ${notify.error}`);
+    return lines.join("\n");
+  });
 </script>
 
 <div class="bar" role="status" aria-live="polite">
@@ -94,6 +122,12 @@
         {notice}
       </span>
     {/if}
+    {#if newMail}
+      <button class="new-mail" onclick={onnewmail} title="Открыть во «Входящих»">
+        <svg width="12" height="12" viewBox="0 0 16 16" aria-hidden="true"><path d="M2 4h12v9H2V4Zm0 .5 6 4.5 6-4.5" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" /></svg>
+        <span class="new-mail-text">Новое письмо: {newMail}</span>
+      </button>
+    {/if}
     {#if running}
       <span class="progress-text">{progressText}</span>
       {#if fraction != null}
@@ -109,6 +143,18 @@
       <span class="warn" title={warningsTitle}>{status.warnings_total} {status.warnings_total === 1 ? "предупреждение" : status.warnings_total < 5 ? "предупреждения" : "предупреждений"}</span>
     {/if}
     <span class="summary" title={reportTitle}>{summary}</span>
+    <span class="channel" class:live class:failed={!live && !!notify?.error} title={channelTitle}>
+      <span class="dot" aria-hidden="true"></span>
+      {live ? "мгновенные обновления" : "по таймеру"}
+    </span>
+    <button class="icon-btn" aria-pressed={toasts} aria-label="Уведомления о новых письмах" title={toasts ? "Уведомления о новых письмах включены" : "Уведомления о новых письмах выключены"} onclick={() => ontoasts?.(!toasts)} disabled={!ontoasts}>
+      <svg width="14" height="14" viewBox="0 0 16 16" aria-hidden="true">
+        <path d="M8 2.5a3.6 3.6 0 0 0-3.6 3.6v2.4L3 10.6h10l-1.4-2.1V6.1A3.6 3.6 0 0 0 8 2.5Zm-1.5 10a1.5 1.5 0 0 0 3 0" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" />
+        {#if !toasts}
+          <path d="m3 2.5 10 11" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" />
+        {/if}
+      </svg>
+    </button>
   </div>
 </div>
 
@@ -181,6 +227,29 @@
     color: var(--success);
     white-space: nowrap;
   }
+  .new-mail {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    min-width: 0;
+    max-width: 50%;
+    height: 22px;
+    padding: 0 8px;
+    border-radius: var(--radius-control);
+    color: var(--accent);
+    transition: background var(--dur-fast) var(--ease-in);
+  }
+  .new-mail:hover {
+    background: var(--bg-hover);
+  }
+  .new-mail:active {
+    background: var(--bg-pressed);
+  }
+  .new-mail-text {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
   .error {
     color: var(--danger);
     overflow: hidden;
@@ -199,5 +268,49 @@
   }
   .summary {
     color: var(--fg-3);
+  }
+  .channel {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    color: var(--fg-3);
+  }
+  .dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: var(--fg-4);
+    transition: background var(--dur-normal) var(--ease-in);
+  }
+  .channel.live .dot {
+    background: var(--success);
+  }
+  .channel.failed .dot {
+    background: var(--warning);
+  }
+  .icon-btn {
+    width: 22px;
+    height: 22px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: var(--radius-control);
+    color: var(--fg-3);
+    transition:
+      background var(--dur-fast) var(--ease-in),
+      color var(--dur-fast) var(--ease-in);
+  }
+  .icon-btn:hover:not(:disabled) {
+    background: var(--bg-hover);
+    color: var(--fg-1);
+  }
+  .icon-btn:active:not(:disabled) {
+    background: var(--bg-pressed);
+  }
+  .icon-btn[aria-pressed="false"] {
+    color: var(--fg-4);
+  }
+  .icon-btn:disabled {
+    color: var(--fg-disabled);
   }
 </style>

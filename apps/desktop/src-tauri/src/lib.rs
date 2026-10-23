@@ -11,6 +11,10 @@
 //!
 //! Календарь (`calendar.rs`): события окна и подробности события из кэша в базе; сервер —
 //! когда кэш не покрывает окно, устарел или окно просит обновить.
+//!
+//! Канал мгновенных уведомлений (`notify.rs`): после первой удачной синхронизации фоновая задача
+//! держит поток `PendingNotificationRequest` и по событиям сервера синхронизирует папки, показывает
+//! тосты о новых письмах и ведёт счётчик непрочитанных в заголовке окна.
 
 use aiowa_core::{AccountId, BodyType};
 use aiowa_store::ui::{ConversationCursor, MessageHead};
@@ -28,6 +32,7 @@ use tracing::warn;
 
 mod calendar;
 mod compose;
+mod notify;
 mod ondemand;
 mod sync;
 mod write;
@@ -465,16 +470,29 @@ pub fn run() {
     let store = Arc::new(Store::open(&db_path).expect("не удалось открыть локальную базу"));
     let account = store.account(&host, &user).expect("учётная запись");
     let sync_state = Arc::new(sync::SyncState::new(store.clone(), account, host.clone(), user.clone()));
+    let notify_state = Arc::new(notify::NotifyState::new(store.clone(), account, sync_state.clone()));
     let state = AppState { store, account, host, user };
 
     let app = tauri::Builder::default()
+        // Тосты Windows о новых письмах показывает канал уведомлений из Rust; команд плагина окно не зовёт.
+        .plugin(tauri_plugin_notification::init())
         .manage(state)
         .manage(sync_state.clone())
+        .manage(notify_state.clone())
         .manage(ondemand::OnDemand::default())
         .manage(write::WriteState::default())
         .manage(compose::ComposeState::default())
         .manage(calendar::CalendarState::default())
         .manage(CloseState::default())
+        // Окно из конфигурации к этому моменту уже создано: заголовок «AIOWA (N)» и значок
+        // непрочитанных выставляются по базе сразу, не дожидаясь первой удачной синхронизации.
+        .setup({
+            let notify = notify_state.clone();
+            move |app| {
+                notify.refresh_unread(app.handle());
+                Ok(())
+            }
+        })
         .on_window_event(|w, ev| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = ev
                 && w.state::<CloseState>().guarded.load(Ordering::Relaxed)
@@ -515,15 +533,18 @@ pub fn run() {
             compose::attachments_pick,
             calendar::calendar_events,
             calendar::calendar_event_details,
+            notify::notify_status,
+            notify::notify_set_toasts,
             window_close_guard,
             window_close_confirmed
         ])
         .build(tauri::generate_context!())
         .expect("ошибка запуска приложения");
     app.run(move |_app, event| {
-        // Сессия на сервере одна на процесс: при выходе остановить синхронизацию и выйти из неё,
-        // иначе сервер накапливает сессии до MapiExceptionSessionLimit.
+        // Сессия на сервере одна на процесс: при выходе закрыть канал уведомлений, остановить
+        // синхронизацию и выйти из сессии, иначе сервер накапливает сессии до MapiExceptionSessionLimit.
         if let tauri::RunEvent::Exit = event {
+            notify_state.shutdown();
             sync_state.shutdown();
         }
     });

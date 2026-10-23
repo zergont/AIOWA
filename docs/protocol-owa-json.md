@@ -116,7 +116,7 @@ X-OWA-UrlPostData: <JSON запроса в URL-кодировке>   — при 
 | `GetCalendarView` | календарь, листание месяца | `Body {CalendarId: TargetFolderId{BaseFolderId: FolderId{Id, ChangeKey}}, RangeStart, RangeEnd}` (локальное время без зоны, зона в `Header.TimeZoneContext`), `RequestServerVersion: V2017_08_18`; ответ `Body {ResponseClass, ResponseCode, Items[]}` |
 | `GetCalendarFolders`, `GetReminders` | старт, календарь | формы не сняты |
 | `FindPeople` | старт (избранные контакты), автодополнение | форма не снята |
-| `SubscribeToNotification` | старт и смена папки | `subscriptionData[{SubscriptionId, Parameters{NotificationType:"RowNotification", FolderId}}]`; ответ `[{SubscriptionId, SuccessfullyCreated, SubscriptionExists, ErrorInfo}]`. Типы: `RowNotification` (строки папки), `SuiteNotification` (не поддерживается без Broker), календарные |
+| `SubscribeToNotification` | старт и смена папки | `subscriptionData[{SubscriptionId, Parameters{NotificationType:"RowNotification", FolderId}}]`; ответ `[{SubscriptionId, SuccessfullyCreated, SubscriptionExists, ErrorInfo}]`. Типы: `RowNotification` (строки папки), `SuiteNotification` (не поддерживается без Broker), календарные. Точная форма и проверенные клиентом типы — § 5h, поток событий — § 4 |
 | `UpdateUserConfiguration` | OWA сама пишет настройки (`FrequentlyUsedFolders`) | операция записи, клиенту не нужна |
 | `GetExtensibilityContext` | старт | в ответе `EwsUrl: https://{host}/EWS/Exchange.asmx` и `RestUrl` — EWS доступен как резервный канал |
 | `GetPresence`, `ResetPresence`, `InstantMessageSignIn` | Lync | клиенту не нужны |
@@ -132,6 +132,14 @@ X-OWA-UrlPostData: <JSON запроса в URL-кодировке>   — при 
 - `GET /owa/ev.owa2?ns=PendingRequest&ev=PendingNotificationRequest&UA=0&cid=<guid>&brwnm=chrome&X-OWA-CANARY=<канарейка>&n=<токен>` держится открытым и отдаёт поток `<script>...</script>` блоков: `{id:'pg',data:'alive1',mark:'0'}` как keep-alive, `{id:'pg',data:'noerr'}`, и JSON-массивы событий `[{"EventType":"0","id":"<SubscriptionId>", ...}]` для подписок (RowNotification по папке, InstantMessageNotification и т. д.).
 
 В наблюдении один цикл `PendingNotificationRequest` держался около 5,7 минуты, после чего клиент закрыл его `FinishNotificationRequest` (ответ `{cid, syncFnshRq}`) и открыл следующий. Канарейка в query-параметре нужна, потому что поток читается не через XHR. Для клиента на Rust достаточно `reqwest` со стримингом тела и разбором `<script>` блоков; на первом этапе можно обойтись опросом `FindConversation`/`SyncFolderItems` по таймеру.
+
+Уточнения по итогам клиента `aiowa` (23.10.2026, подробности и форма подписок — § 5h):
+
+- Ответ `GET` потока: `200 OK`, `Content-Type: text/html; charset=UTF-8`, `Transfer-Encoding: chunked`, без сжатия (клиент шлёт `Accept-Encoding: identity`, чтобы блоки не задерживались в буфере gzip). Первый блок приходит через 150 мс после запроса.
+- Служебные блоки — **JS-литералы без обёртки-вызова**, ровно `<script>{id:'pg',data:'alive1',mark:'0'}</script>`: `alive1` сразу после открытия, `{id:'pg',data:'noerr'}` через 40 с, затем `{id:'pg',data:'update'}` каждые 40 с, пока в ящике ничего не происходит; между ними сервер шлёт пустые `<script></script>` (24 за цикл). Все эти блоки клиент считает признаком живого потока (`KeepAlive`, пустые просто сбрасывают таймер); тишина дольше 150 с (больше трёх пропущенных keep-alive) — обрыв: мёртвое соединение после сна или смены сети иначе висело бы до таймаута без единого события.
+- **Цикл закрывает сервер через 320 с** (5,3 мин): присылает `{id:'pg',data:'restart'}`, затем `{id:'pg',data:'alive0'}` и завершает chunked-ответ штатно (клиент видит конец тела без ошибки). Подписки при этом сохраняются: клиент шлёт `FinishNotificationRequest` (148 мс после штатного конца, около 870 мс, если поток оборвал клиент) и открывает следующий `PendingNotificationRequest` с `n` на единицу больше — новый цикл снова начинается с `alive1`.
+- `FinishNotificationRequest` требует явного `Content-Length: 0`: пустой POST без заголовка длины IIS отвергает с `HTTP 411 Length Required`. С заголовком — `200 OK`, тело 61 байт `{"cid":"<guid>","syncFnshRq":<число>}`.
+- `cid` и `SubscriptionId` клиент выбирает сам (guid из 36 символов); браузерная OWA для подписки на строки папки использует `<FolderId>RowNotification` (135 символов), серверу это безразлично.
 
 ## 5. Вложения (снято клиентом `aiowa` 17.10.2026)
 
@@ -474,6 +482,46 @@ X-OWA-CANARY: <канарейка>          — дублируется заго�
 `DayOfMonth`/`Interval` — числа, `Month`/`DaysOfWeek` — строки (`DaysOfWeek` через пробел, как в EWS; массив клиент тоже принимает), даты диапазона — `YYYY-MM-DD+00:00` (клиент берёт первые десять символов). Текст для панели собирает клиент (`protocol::recurrence_text`): «Ежегодно 6 мая, с 06.05.1977», «Каждую неделю: пн, ср, с 05.01.2026 по 30.06.2026», «Каждые 2 недели: пт, …, всего 10 раз». Еженедельные и ежемесячные образцы на сервере не наблюдались — их формы взяты по схеме EWS и покрыты юнит-тестами. Отказ сервера по этому второму запросу не фатален: подробности отдаются без текста повторения.
 
 Хранилище (схема v4): `calendar_items` — экземпляры с `UNIQUE(account_id, server_id)`, моменты в миллисекундах UTC, тело zstd, `details_at` после `GetItem`; `calendar_ranges` — загруженные окна. Окно заменяется целиком (`Store::replace_calendar_range`): кэшированные экземпляры, пересекающие окно и не пришедшие с сервера, удаляются; подробности сохраняются, пока у экземпляра не сменился `ChangeKey`. CLI: `aiowa calendar --from ГГГГ-ММ-ДД --to ГГГГ-ММ-ДД [--details N|recurring|meeting] [--probe] [--offline]` печатает только счётчики, флаги и даты.
+
+## 5h. Подписки на уведомления: `SubscribeToNotification` и поток `ev.owa2` (клиент `aiowa`, 23.10.2026)
+
+Снято тремя запусками `aiowa notify` (только чтение и подписки, каждый запуск с `logoff`): 90 с с подпиской на «Входящие», 150 с на «Входящие» и «Отправленные», 7 минут на «Входящие» для наблюдения конца цикла. Форма запроса взята из захвата браузерной OWA (`fixtures/raw/owa-capture-shapes-2026-10-16.json`, записи с `action=SubscribeToNotification`) и принята сервером с первого раза; запасные формы клиента (`FolderId` объектом, без `__type`) не понадобились. Поток описан в § 4.
+
+**`SubscribeToNotification`** — OWA-специфичный конверт (§ 3.2): без `__type` и `Body` на верхнем уровне, объект `request` несёт только `Header` с `RequestServerVersion: Exchange2013`, параметры рядом с ним. Клиент шлёт его как обычный `service.svc?action=SubscribeToNotification&ID=<n>&AC=1` с теми же заголовками (`Action`, `X-OWA-CANARY`, `Content-Type`), JSON в теле:
+
+```json
+{ "request": { "__type": "NotificationSubscribeJsonRequest:#Exchange",
+      "Header": { "__type": "JsonRequestHeaders:#Exchange", "RequestServerVersion": "Exchange2013",
+                  "TimeZoneContext": { "__type": "TimeZoneContext:#Exchange",
+                                       "TimeZoneDefinition": { "__type": "TimeZoneDefinitionType:#Exchange", "Id": "UTC" } } } },
+  "subscriptionData": [
+    { "__type": "SubscriptionData:#Exchange", "SubscriptionId": "<guid клиента>",
+      "Parameters": { "__type": "SubscriptionParameters:#Exchange", "NotificationType": "RowNotification",
+                      "FolderId": "<FolderId.Id строкой, без ChangeKey>", "subscriptionIdSuffix": "" } },
+    { "__type": "SubscriptionData:#Exchange", "SubscriptionId": "<guid>",
+      "Parameters": { "__type": "SubscriptionParameters:#Exchange", "NotificationType": "NewMailNotification", "subscriptionIdSuffix": "" } } ] }
+```
+
+- `FolderId` в параметрах — **строка**, а не объект `{__type, Id}` (так шлёт браузерная OWA; тип `SubscriptionParameters` на сервере хранит его строкой). Несколько подписок уходят одним запросом.
+- Ответ HTTP 200 (747 байт на пять подписок, 876 на шесть, 290–310 мс) — **массив без конверта `Header`/`Body`**, по элементу на подписку, в порядке запроса:
+
+  ```json
+  [ { "SubscriptionId": "<тот же guid>", "SuccessfullyCreated": true, "SubscriptionExists": false, "ErrorInfo": null }, "…" ]
+  ```
+
+  `SubscriptionExists: true` приходит при повторной подписке с тем же идентификатором (клиент считает её созданной). Отказ по типу — `SuccessfullyCreated: false` с текстом в `ErrorInfo`; HTTP-ошибки на этих формах не наблюдалось.
+
+| `NotificationType` | Результат | Примечание |
+|---|---|---|
+| `RowNotification` (с `FolderId`) | создана | для «Входящих» и «Отправленных»; одна подписка на папку |
+| `NewMailNotification` | создана | без `FolderId` |
+| `HierarchyNotification` | создана | без `FolderId` |
+| `CalendarItemNotification` (с `FolderId` календаря) | создана | идентификатор папки `calendar` из локальной базы |
+| `UnseenItemNotification` | **отказ** | `ErrorInfo: "SubscribeToUnseenCountNotification is only supported through Broker not in OwaMapiNotificationManager."` — как и `SuiteNotification`, требует Broker, которого на этом сервере нет; счётчик непрочитанных клиент берёт из базы после синхронизации |
+
+Подписки живут в серверной сессии: после повторного входа их нет, клиент (`OwaTransport`) очищает список при каждом входе и первым событием следующего открытого потока отдаёт `Reload`, по которому вызывающий подписывается заново. Поток открывается вне семафора транспорта: синхронизация и команды окна идут параллельно с ним. Вид события клиент определяет по `id` (`SubscriptionId`) из своего списка подписок, а для неизвестного идентификатора — по `__type`/`EventType` объекта.
+
+**Поток `PendingNotificationRequest`**: формы блоков и длина цикла в § 4. За 90, 150 и 420 с наблюдения (последний запуск — два цикла: первый закрыт сервером на 320-й секунде, второй открыт клиентом после `FinishNotificationRequest`) в ящике ничего не происходило, поэтому в потоке были только служебные блоки (`alive1`, `noerr`, `update` каждые 40 с, `restart`/`alive0` в конце цикла); **форма массивов событий `[{"EventType": …, "id": "<SubscriptionId>", …}]` на этом сервере пока не снята** (клиент не создаёт и не меняет письма в проверках). Разбор событий в клиенте терпим к форме: `EventType` строкой или числом, `FolderId`/`ItemId` строкой или объектом `{Id, ChangeKey}`, отправитель новой почты строкой или объектом `{Name, EmailAddress}`/`{Mailbox}`, тема `Subject`, превью `PreviewText` или `Preview`; ключи первого реального события попадут в журнал отладки (`канал: событие`, только имена ключей) для дополнения этого раздела.
 
 ## 6. Что это значит для клиента
 

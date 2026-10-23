@@ -4,7 +4,7 @@
 //! Уровень абстракции: операции схемы EWS, а не HTTP. Транспорт сам отвечает за
 //! сессию, повторный вход и ограничение параллелизма.
 
-use aiowa_core::{FolderChanges, FolderId, FolderRef, ItemChanges, ItemId, MessageFull, SyncState};
+use aiowa_core::{FolderChanges, FolderId, FolderRef, ItemChanges, ItemId, MessageFull, Participant, SyncState};
 pub use aiowa_core::{Attendee, CalendarEvent, CalendarEventDetails, CalendarItemType, ComposeKind, FreeBusy, OutgoingAttachment, OutgoingMessage, ResponseType, Signature};
 use jiff::Timestamp;
 use secrecy::SecretString;
@@ -180,6 +180,108 @@ pub struct ServerInfo {
     pub build: Option<String>,
 }
 
+/// Вид подписки на уведомления сервера (`SubscribeToNotification`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NotificationKind {
+    /// Строки папки (`RowNotification`): письмо добавлено, изменено, удалено.
+    FolderRows { folder: FolderId },
+    /// Новая почта ящика (`NewMailNotification`), без привязки к папке.
+    NewMail,
+    /// Дерево папок (`HierarchyNotification`).
+    Hierarchy,
+    /// Счётчик непросмотренных (`UnseenItemNotification`).
+    Unseen,
+    /// События календаря (`CalendarItemNotification`) по папке календаря.
+    Calendar { folder: FolderId },
+}
+
+impl NotificationKind {
+    /// Имя типа уведомления, как его принимает сервер.
+    pub fn name(&self) -> &'static str {
+        match self {
+            NotificationKind::FolderRows { .. } => "RowNotification",
+            NotificationKind::NewMail => "NewMailNotification",
+            NotificationKind::Hierarchy => "HierarchyNotification",
+            NotificationKind::Unseen => "UnseenItemNotification",
+            NotificationKind::Calendar { .. } => "CalendarItemNotification",
+        }
+    }
+}
+
+/// Запрос подписки: идентификатор выбирает клиент (guid), по нему же приходят события.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubscriptionRequest {
+    pub id: String,
+    pub kind: NotificationKind,
+}
+
+/// Ответ сервера по одной подписке: позиция соответствует запросу.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubscriptionResult {
+    pub id: String,
+    /// Подписка создана или уже существовала.
+    pub created: bool,
+    /// Текст отказа сервера (`ErrorInfo`), если подписка не создана.
+    pub error: Option<String>,
+}
+
+/// Событие канала уведомлений. Содержимое писем здесь минимально (отправитель, тема, начало
+/// превью у новой почты) и нужно только для тоста; в журнал пишутся только типы и счётчики.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NotificationEvent {
+    /// Изменились строки папки: нужна синхронизация папки. `event_type` — `RowAdded`,
+    /// `RowModified`, `RowDeleted`, `QueryResultChanged`, `Reload` или как прислал сервер.
+    FolderRows { subscription: String, folder: Option<FolderId>, event_type: String },
+    /// Новое письмо в ящике.
+    NewMail { subscription: String, item_id: Option<ItemId>, folder: Option<FolderId>, from: Option<Participant>, subject: Option<String>, preview: Option<String>, is_read: Option<bool> },
+    /// Изменилось дерево папок. `folder` и `event_type` — как прислал сервер (у браузерной OWA
+    /// `Modified` по папке приходит и при смене её счётчиков, то есть вместе с каждым письмом);
+    /// без папки или при создании, удалении, переносе папки вызывающий обновляет всё дерево.
+    Hierarchy { subscription: String, folder: Option<FolderId>, event_type: String },
+    /// Изменился счётчик непросмотренных.
+    Unseen { subscription: String, count: Option<i64> },
+    /// Изменился календарь.
+    Calendar { subscription: String, folder: Option<FolderId> },
+    /// Сервер подтверждает, что поток жив.
+    KeepAlive,
+    /// Подписки потеряны (новая сессия или просьба сервера): нужно подписаться заново.
+    Reload,
+    /// Блок неизвестного вида; `raw_kind` — только имя типа или ключи, без содержимого.
+    Unknown { raw_kind: String },
+}
+
+impl NotificationEvent {
+    /// Короткое имя варианта для журнала и счётчиков.
+    pub fn kind_name(&self) -> &'static str {
+        match self {
+            NotificationEvent::FolderRows { .. } => "FolderRows",
+            NotificationEvent::NewMail { .. } => "NewMail",
+            NotificationEvent::Hierarchy { .. } => "Hierarchy",
+            NotificationEvent::Unseen { .. } => "Unseen",
+            NotificationEvent::Calendar { .. } => "Calendar",
+            NotificationEvent::KeepAlive => "KeepAlive",
+            NotificationEvent::Reload => "Reload",
+            NotificationEvent::Unknown { .. } => "Unknown",
+        }
+    }
+}
+
+/// Итог одного цикла потока уведомлений.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamEnd {
+    /// Разобранных блоков (включая keep-alive).
+    pub events: usize,
+    pub elapsed: Duration,
+    /// Поток закрыл сервер (обычный конец цикла), а не обрыв соединения.
+    pub finished_by_server: bool,
+}
+
+/// Новый случайный идентификатор в форме guid (строчные шестнадцатеричные цифры с дефисами):
+/// для `cid` канала уведомлений и `SubscriptionId`.
+pub fn new_guid() -> String {
+    uuid::Uuid::new_v4().hyphenated().to_string()
+}
+
 /// Транспорт почты. Все методы потокобезопасны и могут вызываться параллельно;
 /// реализация сама ограничивает число одновременных запросов.
 #[async_trait]
@@ -248,6 +350,25 @@ pub trait MailTransport: Send + Sync {
     /// Отказ сервера по элементу (например, `ErrorItemNotFound`) приходит как `Server`.
     async fn get_calendar_item(&self, id: &ItemId) -> Result<CalendarEventDetails>;
 
+    /// Подписаться на уведомления (`SubscribeToNotification`). Результат той же длины и порядка,
+    /// что `subs`; отказ по одной подписке — `created: false` с текстом, `Err` — отказ вызова.
+    /// Подписки живут в рамках серверной сессии: после повторного входа их нужно создать заново.
+    async fn subscribe_notifications(&self, subs: &[SubscriptionRequest]) -> Result<Vec<SubscriptionResult>>;
+
+    /// Один цикл длинного опроса (`PendingNotificationRequest`): читает поток до закрытия
+    /// сервером (около 5–6 минут) или до ошибки, на каждый разобранный блок зовёт `sink`.
+    /// Истёкшая сессия восстанавливается одним повторным входом, как у остальных вызовов;
+    /// подписки при этом теряются, и в `sink` приходит `Reload`. Тишина дольше двух с половиной
+    /// минут (сервер шлёт keep-alive каждые 40 с) — `Network`: так мёртвое соединение после сна
+    /// или смены сети замечается раньше, чем истёк бы таймер окна. Поток не занимает
+    /// разрешение семафора: синхронизация и команды окна идут
+    /// параллельно с открытым потоком.
+    async fn notification_stream(&self, cid: &str, sink: &(dyn Fn(NotificationEvent) + Send + Sync)) -> Result<StreamEnd>;
+
+    /// Завершить цикл опроса (`FinishNotificationRequest`): вызывается после конца потока и
+    /// перед остановкой канала.
+    async fn finish_notification_stream(&self, cid: &str) -> Result<()>;
+
     /// Завершить серверную сессию. После вызова транспорт непригоден.
     async fn logoff(&self) -> Result<()>;
 
@@ -279,6 +400,17 @@ mod tests {
         assert!(!TransportError::SessionExpired.is_item_failure());
         assert!(!TransportError::Protocol { op: "GetItem".into(), status: 500, raw: String::new() }.is_item_failure());
         assert!(!TransportError::Cancelled.is_item_failure());
+    }
+
+    #[test]
+    fn guid_shape() {
+        let g = new_guid();
+        assert_eq!(g.len(), 36, "{g}");
+        assert_eq!(g.matches('-').count(), 4);
+        assert!(g.chars().all(|c| c.is_ascii_hexdigit() || c == '-'));
+        assert_ne!(g, new_guid());
+        assert_eq!(NotificationKind::NewMail.name(), "NewMailNotification");
+        assert_eq!(NotificationEvent::KeepAlive.kind_name(), "KeepAlive");
     }
 
     #[test]
