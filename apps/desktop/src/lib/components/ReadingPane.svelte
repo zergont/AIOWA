@@ -1,6 +1,7 @@
 <script lang="ts">
   import { untrack } from "svelte";
-  import type { Conversation, Message } from "../api";
+  import type { Conversation, Folder, Message } from "../api";
+  import type { ItemAction } from "../actions";
   import MessageCard from "./MessageCard.svelte";
 
   interface Props {
@@ -9,8 +10,14 @@
     loading: boolean;
     /** Догрузить письмо с сервера; ошибку пробрасывает, карточка покажет её у себя. */
     onfetch: (itemPk: number) => Promise<void>;
+    /** Папки для «Переместить…» на карточке. */
+    folders: Folder[];
+    /** Папка «Удалённые»: письма в ней удаляются только навсегда. */
+    deletedFolderPk: number | null;
+    /** Действие над одним письмом; ошибку пробрасывает, карточка покажет её у себя. */
+    onaction: (itemPk: number, action: ItemAction) => Promise<void>;
   }
-  let { conversation, messages, loading, onfetch }: Props = $props();
+  let { conversation, messages, loading, onfetch, folders, deletedFolderPk, onaction }: Props = $props();
 
   // Письма идут от новых к старым; самое свежее развёрнуто, остальные свёрнуты до заголовка.
   // Раскрытие пересчитывается только при смене беседы: точечная замена письма (догрузка тела)
@@ -80,7 +87,7 @@
         <div class="caption loading">Загрузка…</div>
       {/if}
       {#each messages as m (m.item_pk)}
-        <MessageCard message={m} expanded={expanded.has(m.item_pk)} ontoggle={() => toggle(m.item_pk)} {onfetch} />
+        <MessageCard message={m} expanded={expanded.has(m.item_pk)} ontoggle={() => toggle(m.item_pk)} {onfetch} {folders} {deletedFolderPk} onaction={(a) => onaction(m.item_pk, a)} />
       {/each}
     </div>
   </div>

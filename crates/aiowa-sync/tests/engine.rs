@@ -3,7 +3,7 @@
 use aiowa_core::*;
 use aiowa_store::Store;
 use aiowa_sync::{BodyFetchOutcome, Engine, FolderSelection, SyncOptions};
-use aiowa_transport::{async_trait, AttachmentContent, FolderCounts, ItemFetchShape, ItemResult, MailTransport, Result as TResult, ServerInfo, TransportError};
+use aiowa_transport::{async_trait, AttachmentContent, DeleteMode, FolderCounts, ItemFetchShape, ItemResult, MailTransport, Result as TResult, ServerInfo, TransportError, WriteResult};
 use jiff::Timestamp;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -162,6 +162,22 @@ impl MailTransport for Fake {
             "att-ok" => Ok(AttachmentContent { bytes: "Поставка шлёпанцев, 40 пар".as_bytes().to_vec(), content_type: Some("text/plain".into()), file_name: Some("спецификация.txt".into()) }),
             _ => Err(TransportError::Server { code: "ErrorInvalidAttachmentId".into(), message: "нет такого вложения".into() }),
         }
+    }
+
+    async fn set_read(&self, ids: &[ItemId], _read: bool) -> TResult<Vec<WriteResult>> {
+        Ok(ids.iter().map(|id| WriteResult::Ok { id: id.clone() }).collect())
+    }
+
+    async fn set_flag(&self, ids: &[ItemId], _flagged: bool) -> TResult<Vec<WriteResult>> {
+        Ok(ids.iter().map(|id| WriteResult::Ok { id: id.clone() }).collect())
+    }
+
+    async fn move_items(&self, ids: &[ItemId], _to_folder: &FolderRef) -> TResult<Vec<WriteResult>> {
+        Ok(ids.iter().map(|id| WriteResult::Ok { id: id.clone() }).collect())
+    }
+
+    async fn delete_items(&self, ids: &[ItemId], _mode: DeleteMode) -> TResult<Vec<WriteResult>> {
+        Ok(ids.iter().map(|id| WriteResult::Ok { id: id.clone() }).collect())
     }
 
     async fn logoff(&self) -> TResult<()> {

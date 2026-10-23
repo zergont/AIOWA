@@ -1,11 +1,11 @@
 //! `aiowa`: консольная утилита этапа 1. Вход, папки, синхронизация в локальную базу,
-//! список бесед, поиск с операторами, вложения.
+//! список бесед, поиск с операторами, вложения, операции записи (прочитано, флаг, перенос, удаление).
 //! Пароль хранится в диспетчере учётных данных Windows и не передаётся аргументом.
 
-use aiowa_core::{FolderChange, SyncState};
+use aiowa_core::{FolderChange, FolderId, FolderRef, SyncState};
 use aiowa_store::{AttachmentTodo, Store};
 use aiowa_sync::{Engine, FolderSelection, SyncOptions};
-use aiowa_transport::{Credentials, MailTransport};
+use aiowa_transport::{Credentials, DeleteMode, MailTransport, WriteResult};
 use aiowa_transport_owa::{OwaConfig, OwaTransport};
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand};
@@ -113,6 +113,45 @@ enum Cmd {
     Stats,
     /// Отладка: выполнить SELECT или PRAGMA к локальной базе и напечатать строки
     Sql { query: String },
+    /// Пометить письмо прочитанным или непрочитанным на сервере (UpdateItem) и в базе
+    MarkRead {
+        /// item_pk письма в локальной базе
+        #[arg(long)]
+        item_pk: i64,
+        /// true — прочитано, false — не прочитано
+        #[arg(long, action = clap::ArgAction::Set)]
+        read: bool,
+    },
+    /// Поставить или снять флаг «к исполнению» на сервере (UpdateItem) и в базе
+    Flag {
+        #[arg(long)]
+        item_pk: i64,
+        /// true — поставить, false — снять
+        #[arg(long, action = clap::ArgAction::Set)]
+        flagged: bool,
+    },
+    /// Перенести письмо в папку на сервере (MoveItem) и в базе. Без --yes-i-know только показывает, что сделает
+    Move {
+        #[arg(long)]
+        item_pk: i64,
+        /// Папка назначения: известное имя (inbox, deleteditems) или отображаемое
+        #[arg(long)]
+        to: String,
+        /// Подтверждение: это запись в настоящий ящик
+        #[arg(long)]
+        yes_i_know: bool,
+    },
+    /// Удалить письмо на сервере (DeleteItem): в «Удалённые» или навсегда. Без --yes-i-know только показывает, что сделает
+    Delete {
+        #[arg(long)]
+        item_pk: i64,
+        /// Удалить навсегда (HardDelete) вместо переноса в «Удалённые»
+        #[arg(long)]
+        permanent: bool,
+        /// Подтверждение: это запись в настоящий ящик
+        #[arg(long)]
+        yes_i_know: bool,
+    },
 }
 
 fn keyring_entry(user: &str) -> Result<keyring::Entry> {
@@ -337,6 +376,107 @@ async fn main() -> Result<()> {
                 );
             }
         }
+        Cmd::MarkRead { item_pk, read } => {
+            let store = Store::open(&db_path)?;
+            let r = store.item_ref(*item_pk)?.ok_or_else(|| anyhow!("письмо #{item_pk} не найдено в базе или удалено"))?;
+            println!("#{item_pk}: папка {}, is_read {} → {}, ChangeKey {}", r.folder_pk, r.is_read, read, if r.id.change_key.is_some() { "есть" } else { "нет" });
+            let t = connect(&cli).await?;
+            let result = t.set_read(std::slice::from_ref(&r.id), *read).await;
+            t.logoff().await.ok();
+            let results = result.map_err(|e| anyhow!("UpdateItem: {e}"))?;
+            match results.first() {
+                Some(WriteResult::Ok { id }) => {
+                    let convs = store.set_read_local(&[*item_pk], *read)?;
+                    store.update_item_id(*item_pk, id)?;
+                    println!("UpdateItem: Ok; ItemId в ответе {}, ChangeKey {}; локально is_read = {}, бесед затронуто {}", if id.id == r.id.id { "тот же" } else { "другой" }, describe_change_key(&r.id, id), read, convs.len());
+                }
+                Some(WriteResult::Failed { code, message, .. }) => println!("UpdateItem: Failed {code}: {message}"),
+                None => println!("UpdateItem: пустой ответ"),
+            }
+        }
+        Cmd::Flag { item_pk, flagged } => {
+            let store = Store::open(&db_path)?;
+            let r = store.item_ref(*item_pk)?.ok_or_else(|| anyhow!("письмо #{item_pk} не найдено в базе или удалено"))?;
+            println!("#{item_pk}: папка {}, is_flagged {} → {}", r.folder_pk, r.is_flagged, flagged);
+            let t = connect(&cli).await?;
+            let result = t.set_flag(std::slice::from_ref(&r.id), *flagged).await;
+            t.logoff().await.ok();
+            let results = result.map_err(|e| anyhow!("UpdateItem: {e}"))?;
+            match results.first() {
+                Some(WriteResult::Ok { id }) => {
+                    let convs = store.set_flag_local(&[*item_pk], *flagged)?;
+                    store.update_item_id(*item_pk, id)?;
+                    println!("UpdateItem: Ok; ChangeKey {}; локально флаг = {}, бесед затронуто {}", describe_change_key(&r.id, id), flagged, convs.len());
+                }
+                Some(WriteResult::Failed { code, message, .. }) => println!("UpdateItem: Failed {code}: {message}"),
+                None => println!("UpdateItem: пустой ответ"),
+            }
+        }
+        Cmd::Move { item_pk, to, yes_i_know } => {
+            let store = Store::open(&db_path)?;
+            let account = store.account(&cli.host, &cli.user)?;
+            let r = store.item_ref(*item_pk)?.ok_or_else(|| anyhow!("письмо #{item_pk} не найдено в базе или удалено"))?;
+            let target = store.resolve_folder(account, to)?.ok_or_else(|| anyhow!("папка «{to}» не найдена в локальной базе"))?;
+            if target.folder_pk == r.folder_pk {
+                bail!("письмо #{item_pk} уже лежит в папке «{}»", target.name);
+            }
+            println!("#{item_pk}: из папки {} в «{}» (folder_pk {}) операцией MoveItem", r.folder_pk, target.name, target.folder_pk);
+            if !yes_i_know {
+                println!("Это запись в настоящий ящик. Повторите с --yes-i-know, чтобы выполнить.");
+                return Ok(());
+            }
+            let to_ref = FolderRef::Id(FolderId { id: target.server_id.clone(), change_key: None });
+            let t = connect(&cli).await?;
+            let result = t.move_items(std::slice::from_ref(&r.id), &to_ref).await;
+            t.logoff().await.ok();
+            let results = result.map_err(|e| anyhow!("MoveItem: {e}"))?;
+            match results.first() {
+                Some(WriteResult::Ok { id }) => {
+                    let new_id = (id.id != r.id.id || id.change_key != r.id.change_key).then_some(id);
+                    store.move_local(*item_pk, target.folder_pk, new_id)?;
+                    println!("MoveItem: Ok; новый ItemId в ответе {}; локально письмо в папке {}", if new_id.is_some() { "есть" } else { "нет (остался прежний)" }, target.folder_pk);
+                }
+                Some(WriteResult::Failed { code, message, .. }) => println!("MoveItem: Failed {code}: {message}"),
+                None => println!("MoveItem: пустой ответ"),
+            }
+        }
+        Cmd::Delete { item_pk, permanent, yes_i_know } => {
+            let store = Store::open(&db_path)?;
+            let account = store.account(&cli.host, &cli.user)?;
+            let r = store.item_ref(*item_pk)?.ok_or_else(|| anyhow!("письмо #{item_pk} не найдено в базе или удалено"))?;
+            let deleted_items = store.folder_by_distinguished(account, "deleteditems")?;
+            let in_deleted = deleted_items.as_ref().map(|(pk, _)| *pk == r.folder_pk).unwrap_or(false);
+            let mode = if *permanent { DeleteMode::Hard } else { DeleteMode::ToDeletedItems };
+            if in_deleted && !permanent {
+                bail!("письмо #{item_pk} уже в «Удалённых»: используйте --permanent для удаления навсегда");
+            }
+            println!("#{item_pk}: папка {}, DeleteItem {}", r.folder_pk, if *permanent { "HardDelete (навсегда)" } else { "MoveToDeletedItems (в «Удалённые»)" });
+            if !yes_i_know {
+                println!("Это запись в настоящий ящик. Повторите с --yes-i-know, чтобы выполнить.");
+                return Ok(());
+            }
+            let t = connect(&cli).await?;
+            let result = t.delete_items(std::slice::from_ref(&r.id), mode).await;
+            t.logoff().await.ok();
+            let results = result.map_err(|e| anyhow!("DeleteItem: {e}"))?;
+            match results.first() {
+                Some(WriteResult::Ok { id }) => {
+                    let new_id = (id.id != r.id.id).then_some(id);
+                    match (mode, deleted_items) {
+                        (DeleteMode::Hard, _) | (DeleteMode::ToDeletedItems, None) => {
+                            let convs = store.mark_deleted_local(&[*item_pk])?;
+                            println!("DeleteItem: Ok; локально deleted = 1, бесед затронуто {}", convs.len());
+                        }
+                        (DeleteMode::ToDeletedItems, Some((trash_pk, _))) => {
+                            store.move_local(*item_pk, trash_pk, new_id)?;
+                            println!("DeleteItem: Ok; новый ItemId в ответе {}; локально письмо в «Удалённых» (folder_pk {trash_pk})", if new_id.is_some() { "есть" } else { "нет" });
+                        }
+                    }
+                }
+                Some(WriteResult::Failed { code, message, .. }) => println!("DeleteItem: Failed {code}: {message}"),
+                None => println!("DeleteItem: пустой ответ"),
+            }
+        }
         Cmd::Sql { query } => {
             let store = Store::open(&db_path)?;
             for line in store.debug_query(query)? {
@@ -350,6 +490,15 @@ async fn main() -> Result<()> {
 
 fn aiowa_extract_limit() -> usize {
     SyncOptions::default().attachment_text_chars
+}
+
+/// Как изменился `ChangeKey` после операции записи (сами значения не печатаются).
+fn describe_change_key(before: &aiowa_core::ItemId, after: &aiowa_core::ItemId) -> &'static str {
+    match (&before.change_key, &after.change_key) {
+        (_, None) => "в ответе отсутствует",
+        (Some(b), Some(a)) if b == a => "тот же",
+        _ => "новый",
+    }
 }
 
 fn print_folder_tree(changes: &[FolderChange]) {

@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { api, conversationKeyOf, errorMessage, messagesKey, onSyncProgress, type AccountInfo, type Conversation, type Folder, type Message, type SearchHit, type SyncStatus } from "./lib/api";
+  import { api, conversationKeyOf, errorMessage, messagesKey, onItemsChanged, onSyncProgress, type AccountInfo, type Conversation, type Folder, type ItemsChanged, type Message, type SearchHit, type SyncStatus, type WriteReport } from "./lib/api";
+  import { failureText, type ItemAction } from "./lib/actions";
   import FolderTree from "./lib/components/FolderTree.svelte";
   import ConversationList from "./lib/components/ConversationList.svelte";
   import ReadingPane from "./lib/components/ReadingPane.svelte";
@@ -22,6 +23,8 @@
   let error = $state<string | null>(null);
   let listWidth = $state(380);
   let syncStatus = $state<SyncStatus | null>(null);
+
+  const deletedFolderPk = $derived(folders.find((f) => f.distinguished === "deleteditems")?.folder_pk ?? null);
 
   const PAGE = 100;
   /** Период автосинхронизации при видимом окне. */
@@ -85,7 +88,7 @@
   async function openConversationByPk(pk: number) {
     const existing = conversations.find((c) => c.conversation_pk === pk);
     const switching = selected?.conversation_pk !== pk;
-    selected = existing ?? { conversation_pk: pk, topic: null, participants: [], item_count: 0, unread_count: 0, total_count: 0, last_received_ms: null, has_attachments: false };
+    selected = existing ?? { conversation_pk: pk, topic: null, participants: [], item_count: 0, unread_count: 0, total_count: 0, last_received_ms: null, has_attachments: false, has_flagged: false };
     if (switching) messages = [];
     const req = ++conversationRequest;
     loadingMessages = true;
@@ -121,6 +124,156 @@
       // Беседу могли переключить, пока шёл запрос: тогда подменять нечего, тело уже в базе.
       if (i >= 0) messages[i] = fresh;
     });
+  }
+
+  // --- запись: прочитано, флаг, перенос, удаление ----------------------------------
+
+  function callWrite(itemPks: number[], a: ItemAction): Promise<WriteReport> {
+    switch (a.kind) {
+      case "read":
+        return api.itemsMarkRead(itemPks, a.read);
+      case "flag":
+        return api.itemsSetFlag(itemPks, a.flagged);
+      case "move":
+        return api.itemsMove(itemPks, a.folderPk);
+      case "delete":
+        return api.itemsDelete(itemPks, a.permanent);
+    }
+  }
+
+  /**
+   * Оптимистичная правка открытой беседы: окно меняется сразу, не дожидаясь сервера.
+   * Событие items-changed потом сверит всё с базой (и откатит отказавшее).
+   */
+  function applyToMessages(itemPks: number[], a: ItemAction) {
+    const set = new Set(itemPks);
+    const nameOf = (pk: number) => folders.find((f) => f.folder_pk === pk)?.name ?? null;
+    if (a.kind === "delete" && a.permanent) {
+      messages = messages.filter((m) => !set.has(m.item_pk));
+      return;
+    }
+    for (const m of messages) {
+      if (!set.has(m.item_pk)) continue;
+      if (a.kind === "read") m.is_read = a.read;
+      else if (a.kind === "flag") m.is_flagged = a.flagged;
+      else if (a.kind === "move") {
+        m.folder_pk = a.folderPk;
+        m.folder_name = nameOf(a.folderPk) ?? m.folder_name;
+      } else if (deletedFolderPk != null) {
+        m.folder_pk = deletedFolderPk;
+        m.folder_name = nameOf(deletedFolderPk) ?? m.folder_name;
+      }
+    }
+  }
+
+  /** Оптимистичная правка строки списка для действия над всей беседой в текущей папке. */
+  function applyToRow(c: Conversation, a: ItemAction) {
+    const row = conversations.find((x) => x.conversation_pk === c.conversation_pk);
+    if (!row) return;
+    if (a.kind === "read") row.unread_count = a.read ? 0 : row.item_count;
+    else if (a.kind === "flag") row.has_flagged = a.flagged;
+    else dropRow(c.conversation_pk);
+  }
+
+  /** Беседа ушла из текущей папки: убрать строку; если она была открыта — перейти к соседней или снять выбор. */
+  function dropRow(pk: number) {
+    const idx = conversations.findIndex((c) => c.conversation_pk === pk);
+    if (idx < 0) return;
+    const rows = conversations.filter((c) => c.conversation_pk !== pk);
+    conversations = rows;
+    if (selected?.conversation_pk === pk) selectNeighbour(rows, idx);
+  }
+
+  function selectNeighbour(rows: Conversation[], idx: number) {
+    const next = rows[Math.min(idx, rows.length - 1)];
+    if (next) void openConversation(next).catch((e) => (error = errorMessage(e)));
+    else {
+      selected = null;
+      messages = [];
+    }
+  }
+
+  /**
+   * Выполнить действие над письмами: сразу поправить окно, затем команда (локально → сервер).
+   * Отказ — исключение с текстом для пользователя; окно вернётся к серверному состоянию по items-changed,
+   * а при отказе всего вызова — немедленным перечитыванием.
+   */
+  async function runWrite(itemPks: number[], a: ItemAction): Promise<void> {
+    if (!itemPks.length) return;
+    applyToMessages(itemPks, a);
+    let report: WriteReport;
+    try {
+      report = await callWrite(itemPks, a);
+    } catch (e) {
+      await refreshAfterWrite({ conversation_pks: selected ? [selected.conversation_pk] : [], folder_pks: [] });
+      throw errorMessage(e);
+    }
+    const failed = failureText(report);
+    if (failed) throw failed;
+  }
+
+  /** Действие над одним письмом с карточки. */
+  function onMessageAction(itemPk: number, a: ItemAction): Promise<void> {
+    return runWrite([itemPk], a);
+  }
+
+  /**
+   * Действие над всеми письмами беседы в текущей папке (меню списка, клавиша Delete).
+   * Исключение — «Снять флаг»: признак has_flagged в строке считается по всей беседе, поэтому и
+   * снимается флаг со всех её писем, где бы они ни лежали; иначе флаг на письме из другой папки
+   * оставался бы, а пункт меню ничего не делал.
+   */
+  async function onConversationAction(c: Conversation, a: ItemAction): Promise<void> {
+    if (!selectedFolder) return;
+    const folderPk = a.kind === "flag" && !a.flagged ? null : selectedFolder.folder_pk;
+    const itemPks = await api.conversationItemPks(c.conversation_pk, folderPk);
+    if (!itemPks.length) return;
+    applyToRow(c, a);
+    await runWrite(itemPks, a);
+  }
+
+  /** Перечитать папки, не сбивая выбранную (объект заменяется свежим со счётчиками). */
+  async function reloadFolders() {
+    const fresh = await api.folders();
+    folders = fresh;
+    if (selectedFolder) {
+      const same = fresh.find((f) => f.folder_pk === selectedFolder!.folder_pk);
+      if (same) selectedFolder = same;
+    }
+  }
+
+  /** Перечитать список текущей папки тем же объёмом, что показан (прокрутка остаётся). null — сейчас нельзя. */
+  async function reloadList(): Promise<Conversation[] | null> {
+    if (!selectedFolder || searchHits !== null || loadingList) return null;
+    const limit = Math.min(500, Math.max(PAGE, conversations.length));
+    const rows = await api.conversations(selectedFolder.folder_pk, undefined, limit);
+    conversations = rows;
+    hasMore = rows.length === limit;
+    return rows;
+  }
+
+  /**
+   * После команды записи (событие items-changed): папки и список текущей папки перечитываются,
+   * открытая беседа — если затронута. Если беседы в папке больше нет, выбор переходит к соседней строке.
+   */
+  async function refreshAfterWrite(ev: ItemsChanged) {
+    try {
+      await reloadFolders();
+      if (selected && ev.conversation_pks.includes(selected.conversation_pk) && !loadingMessages) {
+        const pk = selected.conversation_pk;
+        const fresh = await api.conversation(pk);
+        if (selected?.conversation_pk === pk && !loadingMessages) messages = fresh;
+      }
+      const before = selected ? conversations.findIndex((c) => c.conversation_pk === selected!.conversation_pk) : -1;
+      const rows = await reloadList();
+      if (rows && selected) {
+        const same = rows.find((c) => c.conversation_pk === selected!.conversation_pk);
+        if (same) selected = same;
+        else if (before >= 0) selectNeighbour(rows, before);
+      }
+    } catch (e) {
+      error = errorMessage(e);
+    }
   }
 
   let searchTimer: ReturnType<typeof setTimeout> | undefined;
@@ -194,25 +347,16 @@
   /** После синхронизации: перечитать папки, текущий список и открытую беседу, не сбивая выбор. */
   async function refreshAfterSync() {
     try {
-      const fresh = await api.folders();
-      folders = fresh;
-      if (selectedFolder) {
-        const same = fresh.find((f) => f.folder_pk === selectedFolder!.folder_pk);
-        if (same) selectedFolder = same;
-        if (searchHits === null && !loadingList) {
-          const limit = Math.min(500, Math.max(PAGE, conversations.length));
-          const rows = await api.conversations(selectedFolder.folder_pk, undefined, limit);
-          conversations = rows;
-          hasMore = rows.length === limit;
-        }
-      }
+      await reloadFolders();
+      await reloadList();
       if (selected && !loadingMessages) {
         // Письма перечитываем только при реальных изменениях (состав, тело, прочитанность, кэш вложений):
         // иначе перезагрузятся фреймы с текстом и собьётся прокрутка. Сначала дешёвый ключ без тел
         // и картинок; полная беседа с base64-картинками читается, лишь если ключ разошёлся.
         const pk = selected.conversation_pk;
         const keys = await api.conversationKey(pk);
-        if (conversationKeyOf(keys) !== messagesKey(messages)) {
+        const withFlag = keys.every((k) => k.is_flagged !== undefined);
+        if (conversationKeyOf(keys, withFlag) !== messagesKey(messages, withFlag)) {
           const fresh = await api.conversation(pk);
           // Пока читали, беседу могли переключить.
           if (selected?.conversation_pk === pk && !loadingMessages) messages = fresh;
@@ -236,6 +380,7 @@
 
   onMount(() => {
     let unlisten: (() => void) | undefined;
+    let unlistenItems: (() => void) | undefined;
     let wasRunning = false;
     const timer = setInterval(syncTick, 15_000);
     document.addEventListener("visibilitychange", syncTick);
@@ -252,6 +397,7 @@
           }
           wasRunning = s.running;
         });
+        unlistenItems = await onItemsChanged((ev) => void refreshAfterWrite(ev));
         account = await api.accountInfo();
         await loadFolders();
         syncStatus = await api.syncStatus();
@@ -267,6 +413,7 @@
       clearInterval(timer);
       document.removeEventListener("visibilitychange", syncTick);
       unlisten?.();
+      unlistenItems?.();
     };
   });
 
@@ -315,14 +462,14 @@
     {#if searchHits !== null}
       <SearchResults hits={searchHits} {searching} {query} onopen={openConversationByPk} onclear={clearSearch} selectedPk={selected?.conversation_pk ?? null} />
     {:else}
-      <ConversationList folder={selectedFolder} {conversations} {selected} loading={loadingList} {hasMore} onselect={openConversation} onmore={loadMore} />
+      <ConversationList folder={selectedFolder} {conversations} {selected} loading={loadingList} {hasMore} onselect={openConversation} onmore={loadMore} {folders} onaction={onConversationAction} />
     {/if}
   </section>
 
   <div class="splitter" role="separator" aria-orientation="vertical" aria-label="Ширина списка" onpointerdown={startDrag}></div>
 
   <section class="reader" aria-label="Чтение">
-    <ReadingPane conversation={selected} {messages} loading={loadingMessages} onfetch={fetchMessage} />
+    <ReadingPane conversation={selected} {messages} loading={loadingMessages} onfetch={fetchMessage} {folders} {deletedFolderPk} onaction={onMessageAction} />
   </section>
 
   <footer class="status" aria-label="Состояние синхронизации">

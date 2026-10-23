@@ -122,7 +122,7 @@ X-OWA-UrlPostData: <JSON запроса в URL-кодировке>   — при 
 | `GetPresence`, `ResetPresence`, `InstantMessageSignIn` | Lync | клиенту не нужны |
 | `GetFavorites`, `GetAllowedOptions`, `GetUserVoiceData`, `GetUnseenLightningIds` | старт | второстепенны |
 
-Не наблюдалось в этой сессии (проверяется в Rust-спайке напрямую): `SyncFolderItems`, `SyncFolderHierarchy`, `MarkAllItemsAsRead`, `CreateItem`, `UpdateItem`, `GetAttachment`.
+Не наблюдалось в этой сессии (проверяется в Rust-спайке напрямую): `SyncFolderItems`, `SyncFolderHierarchy`, `MarkAllItemsAsRead`, `CreateItem`, `UpdateItem`, `GetAttachment`. Позже сняты клиентом: `SyncFolderItems`/`SyncFolderHierarchy`/`GetItem` (§ 5b'), `GetFileAttachment` (§ 5), `UpdateItem` (§ 5e).
 
 ## 4. Канал уведомлений
 
@@ -238,6 +238,58 @@ X-OWA-CANARY: <канарейка>          — дублируется заго�
 Вывод: при входе с `flags=4` («частный компьютер») сессия переживает как минимум два часа без единого запроса; таймаут бездействия, если он есть, больше двух часов. Фоновая синхронизация раз в час может жить на одной сессии без повторных входов; сигнал к повторному входу только 440/401/редирект на `logon.aspx`. Первый запрос после долгой паузы стабильно занимает около секунды против 130–160 мс в активной сессии.
 
 Вход под давлением лишних сессий (перед срабатыванием лимита) занимал около 8 с вместо 2–3 с.
+
+## 5e. Операции записи (клиент `aiowa`, 23.10.2026)
+
+Все три операции идут через тот же `service.svc` с `RequestServerVersion: V2017_08_18` (как `GetItem`), `__type` первым ключом, пачками по 25 идентификаторов. Ответ по каждому элементу — отдельное сообщение `Body.ResponseMessages.Items[i]` в порядке запроса; `ResponseClass: Error` у одного сообщения — отказ по этому письму, а не по всему вызову.
+
+**`UpdateItem`** (прочитано/непрочитано, флаг):
+
+```json
+{ "__type": "UpdateItemRequest:#Exchange",
+  "ConflictResolution": "AlwaysOverwrite", "MessageDisposition": "SaveOnly", "SuppressReadReceipts": true,
+  "ItemChanges": [ { "__type": "ItemChange:#Exchange",
+      "ItemId": { "__type": "ItemId:#Exchange", "Id": "…", "ChangeKey": "…" },
+      "Updates": [ { "__type": "SetItemField:#Exchange",
+          "Path": { "__type": "PropertyUri:#Exchange", "FieldURI": "message:IsRead" },
+          "Item": { "__type": "Message:#Exchange", "IsRead": true } } ] } ] }
+```
+
+- Флаг: `FieldURI: "item:Flag"`, `Item: { "__type": "Message:#Exchange", "Flag": { "__type": "FlagType:#Exchange", "FlagStatus": "Flagged" } }`; снятие — `"NotFlagged"`.
+- `AlwaysOverwrite` нужен потому, что локальный `ChangeKey` может отстать от сервера после чужих правок; `SaveOnly` обязателен для писем (иначе сервер требует `MessageDisposition`).
+- **Снято с сервера 23.10.2026** (`aiowa mark-read` на одном старом письме входящих: `IsRead` false, затем обратно true; оба вызова по 480–500 мс, ответ 546 байт): HTTP 200, `Body.ResponseMessages.Items[0]` =
+
+  ```json
+  { "__type": "UpdateItemResponseMessage:#Exchange", "ResponseCode": "NoError", "ResponseClass": "Success",
+    "Items": [ { "__type": "Message:#Exchange", "ItemId": { "__type": "ItemId:#Exchange", "Id": "<тот же Id>", "ChangeKey": "<новый>" } } ],
+    "ConflictResults": { "...": "счётчик конфликтов, клиенту не нужен" } }
+  ```
+
+  `Id` письма не меняется (152 символа, как в базе). `ChangeKey` в ответе **короткий, 8 символов**, тогда как `SyncFolderItems`/`GetItem` отдают ключи по 40 символов: OWA JSON кладёт в ответ `UpdateItem` усечённую форму ключа. Второй вызов, отправленный с этим 8-символьным ключом, прошёл и вернул тот же 8-символьный ключ; ключ недельной давности из синхронизации с `AlwaysOverwrite` сервер тоже принял. Клиент записывает ключ из ответа в базу (`update_item_id`); полноценный ключ вернётся со следующим `SyncFolderItems` (`Update`). Для `MoveItem` и `DeleteItem` ключ не нужен. Отказ по элементу приходит тем же сообщением с `ResponseClass: Error` и `ResponseCode` (например, `ErrorItemNotFound`) — в этой проверке не наблюдался.
+
+**`MoveItem`**:
+
+```json
+{ "__type": "MoveItemRequest:#Exchange",
+  "ToFolderId": { "__type": "TargetFolderId:#Exchange",
+      "BaseFolderId": { "__type": "FolderId:#Exchange", "Id": "…" } },
+  "ItemIds": [ { "__type": "ItemId:#Exchange", "Id": "…", "ChangeKey": "…" } ],
+  "ReturnNewItemIds": true }
+```
+
+`BaseFolderId` может быть и `{ "__type": "DistinguishedFolderId:#Exchange", "Id": "deleteditems" }`. В ответе ожидается `Items[0].ItemId` с новым идентификатором письма в целевой папке (идентификаторы вложений тоже меняются, см. § 5). **На сервере не проверялось**: реализовано по схеме EWS и покрыто юнит-тестами сборки тела и разбора ответа; первое живое выполнение — за человеком после сборки.
+
+**`DeleteItem`**:
+
+```json
+{ "__type": "DeleteItemRequest:#Exchange",
+  "ItemIds": [ { "__type": "ItemId:#Exchange", "Id": "…", "ChangeKey": "…" } ],
+  "DeleteType": "MoveToDeletedItems", "SuppressReadReceipts": true, "ReturnMovedItemIds": true }
+```
+
+`DeleteType: "HardDelete"` — навсегда. Разбор ответа терпим к форме: новый идентификатор берётся из `Items[0].ItemId`, `MovedItemId` или `MovedItemIds[0]`, если ничего нет — остаётся исходный. **На сервере не проверялось** (та же оговорка, что у `MoveItem`).
+
+Разбор по элементам (`protocol::parse_write_results`): при совпадении числа сообщений и идентификаторов — по позиции; иначе успешные сопоставляются по `ItemId` из ответа, единственное сообщение-ошибка на пачку относится ко всем элементам, элементы без ответа получают отказ `NoResponse`. `ErrorServerBusy` на всю пачку — `Throttled` (отказ вызова), а не отказ по письмам.
 
 ## 6. Что это значит для клиента
 

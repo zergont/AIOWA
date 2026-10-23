@@ -72,3 +72,14 @@ button {
   font: var(--text-caption);
   color: var(--fg-3);
 }
+
+/* Всплывающие окна (меню, выбор папки, подтверждение): поверх всего, положение задаёт компонент. */
+.popup {
+  position: fixed;
+  z-index: 100;
+  background: var(--bg-card);
+  border: 1px solid var(--stroke-2);
+  border-radius: var(--radius-card);
+  box-shadow: var(--shadow-16);
+  color: var(--fg-1);
+}

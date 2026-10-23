@@ -114,6 +114,38 @@ impl ItemResult {
     }
 }
 
+/// Режим удаления письма на сервере.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeleteMode {
+    /// Перенести в «Удалённые» (`MoveToDeletedItems`): письмо получает новый идентификатор.
+    ToDeletedItems,
+    /// Удалить навсегда (`HardDelete`).
+    Hard,
+}
+
+/// Результат операции записи по одному элементу: позиция соответствует запрошенному id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WriteResult {
+    /// Успех. `id` — идентификатор после операции: новый `ChangeKey` после `UpdateItem`,
+    /// новый идентификатор в целевой папке после `MoveItem`, для удаления — исходный.
+    Ok { id: ItemId },
+    /// Сервер отказал по этому элементу (`ResponseClass: Error`).
+    Failed { id: ItemId, code: String, message: String },
+}
+
+impl WriteResult {
+    pub fn is_ok(&self) -> bool {
+        matches!(self, WriteResult::Ok { .. })
+    }
+
+    /// Идентификатор из результата (новый при успехе, исходный при отказе).
+    pub fn id(&self) -> &ItemId {
+        match self {
+            WriteResult::Ok { id } | WriteResult::Failed { id, .. } => id,
+        }
+    }
+}
+
 /// Содержимое вложения, скачанное с сервера.
 #[derive(Clone, PartialEq, Eq)]
 pub struct AttachmentContent {
@@ -168,6 +200,21 @@ pub trait MailTransport: Send + Sync {
     /// Содержимое файлового вложения по `AttachmentId`. Ответ больше `max_bytes`
     /// обрывается с `TooLarge`; отсутствующее вложение приходит как `Server`/`Protocol`.
     async fn get_attachment(&self, attachment_id: &str, max_bytes: u64) -> Result<AttachmentContent>;
+
+    /// Пометить письма прочитанными или непрочитанными (`UpdateItem` поля `message:IsRead`).
+    /// Результат той же длины и порядка, что `ids`; отказ по одному элементу — `Failed`,
+    /// `Err` — отказ всего вызова (сессия, сеть). В `Ok` — идентификатор с новым `ChangeKey`.
+    async fn set_read(&self, ids: &[ItemId], read: bool) -> Result<Vec<WriteResult>>;
+
+    /// Поставить или снять флаг «к исполнению» (`UpdateItem` поля `item:Flag`).
+    async fn set_flag(&self, ids: &[ItemId], flagged: bool) -> Result<Vec<WriteResult>>;
+
+    /// Перенести письма в папку (`MoveItem`); в `Ok` новый идентификатор в целевой папке.
+    async fn move_items(&self, ids: &[ItemId], to_folder: &FolderRef) -> Result<Vec<WriteResult>>;
+
+    /// Удалить письма (`DeleteItem`): в «Удалённые» или навсегда. В `Ok` исходный идентификатор
+    /// (для `ToDeletedItems` — новый, если сервер его сообщил).
+    async fn delete_items(&self, ids: &[ItemId], mode: DeleteMode) -> Result<Vec<WriteResult>>;
 
     /// Завершить серверную сессию. После вызова транспорт непригоден.
     async fn logoff(&self) -> Result<()>;

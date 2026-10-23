@@ -26,6 +26,8 @@ export interface Conversation {
   total_count: number;
   last_received_ms: number | null;
   has_attachments: boolean;
+  /** В беседе есть письмо с флагом (в любой папке). */
+  has_flagged: boolean;
 }
 
 export interface Recipient {
@@ -57,6 +59,7 @@ export interface Message {
   received_ms: number | null;
   sent_ms: number | null;
   is_read: boolean;
+  is_flagged: boolean;
   is_draft: boolean;
   has_attachments: boolean;
   importance: string | null;
@@ -76,6 +79,8 @@ export interface MessageKey {
   is_read: boolean;
   /** Вложений с файлом в кэше по базе. */
   cached: number;
+  /** Флаг; поле может отсутствовать в старом ответе — тогда в ключе не участвует. */
+  is_flagged?: boolean;
 }
 
 export interface SearchHit {
@@ -123,6 +128,24 @@ export interface SyncStatus {
   last_report: SyncReport | null;
 }
 
+/** Отказ по одному письму в команде записи; текст уже по-русски для показа пользователю. */
+export interface WriteFailure {
+  item_pk: number;
+  message: string;
+}
+
+/** Итог команды записи: сколько писем обработано и какие отказали (по ним локальное изменение уже откачено). */
+export interface WriteReport {
+  done: number;
+  failed: WriteFailure[];
+}
+
+/** Событие `items-changed`: какие беседы и папки затронуты записью (локально и на сервере). */
+export interface ItemsChanged {
+  conversation_pks: number[];
+  folder_pks: number[];
+}
+
 export const api = {
   accountInfo: () => invoke<AccountInfo>("account_info"),
   folders: () => invoke<Folder[]>("folders"),
@@ -147,11 +170,25 @@ export const api = {
   syncStart: (days?: number, folders?: number[]) => invoke<SyncStatus>("sync_start", { days: days ?? null, folders: folders ?? null }),
   syncStatus: () => invoke<SyncStatus>("sync_status"),
   syncCancel: () => invoke<SyncStatus>("sync_cancel"),
+
+  // --- запись: сначала локально, затем на сервер; отказ по письму приходит в failed -------------
+  itemsMarkRead: (itemPks: number[], read: boolean) => invoke<WriteReport>("items_mark_read", { itemPks, read }),
+  itemsSetFlag: (itemPks: number[], flagged: boolean) => invoke<WriteReport>("items_set_flag", { itemPks, flagged }),
+  itemsMove: (itemPks: number[], folderPk: number) => invoke<WriteReport>("items_move", { itemPks, folderPk }),
+  /** permanent=false — в «Удалённые» (из самих «Удалённых» откажет), permanent=true — навсегда. */
+  itemsDelete: (itemPks: number[], permanent: boolean) => invoke<WriteReport>("items_delete", { itemPks, permanent }),
+  /** Письма беседы; с folderPk — только лежащие в этой папке. */
+  conversationItemPks: (conversationPk: number, folderPk: number | null) => invoke<number[]>("conversation_item_pks", { conversationPk, folderPk }),
 };
 
 /** Подписка на ход синхронизации. Возвращает функцию отписки. */
 export function onSyncProgress(cb: (status: SyncStatus) => void): Promise<UnlistenFn> {
   return listen<SyncStatus>("sync-progress", (e) => cb(e.payload));
+}
+
+/** Подписка на изменения писем после команд записи. Возвращает функцию отписки. */
+export function onItemsChanged(cb: (ev: ItemsChanged) => void): Promise<UnlistenFn> {
+  return listen<ItemsChanged>("items-changed", (e) => cb(e.payload));
 }
 
 /** Текст ошибки команды для показа пользователю: команды Tauri отклоняют промис строкой по-русски. */
@@ -176,14 +213,21 @@ export function needsInlineFetch(a: Attachment): boolean {
   return a.is_inline && a.content_id != null && !a.cached && (a.content_type == null || isImageType(a.content_type));
 }
 
-/** Строка-ключ состояния писем беседы: состав, тела, прочитанность, число вложений в кэше. */
-export function conversationKeyOf(keys: Pick<MessageKey, "item_pk" | "body_state" | "is_read" | "cached">[]): string {
-  return keys.map((k) => `${k.item_pk}:${k.body_state}:${k.is_read ? 1 : 0}:${k.cached}`).join(",");
+/**
+ * Строка-ключ состояния писем беседы: состав, тела, прочитанность, число вложений в кэше и флаг.
+ * Флаг входит в ключ, только если он известен у всех писем (`withFlag`): так ключ сервера и ключ окна сравнимы
+ * и когда бэкенд ещё не отдаёт `is_flagged` в `conversation_key`.
+ */
+export function conversationKeyOf(keys: Pick<MessageKey, "item_pk" | "body_state" | "is_read" | "cached" | "is_flagged">[], withFlag = keys.every((k) => k.is_flagged !== undefined)): string {
+  return keys.map((k) => `${k.item_pk}:${k.body_state}:${k.is_read ? 1 : 0}:${k.cached}${withFlag ? (k.is_flagged ? ":f" : ":-") : ""}`).join(",");
 }
 
 /** Ключ открытой беседы по уже загруженным письмам (в тех же терминах, что `conversationKey`). */
-export function messagesKey(ms: Message[]): string {
-  return conversationKeyOf(ms.map((m) => ({ item_pk: m.item_pk, body_state: m.body_state, is_read: m.is_read, cached: m.attachments.filter((a) => a.cached).length })));
+export function messagesKey(ms: Message[], withFlag = true): string {
+  return conversationKeyOf(
+    ms.map((m) => ({ item_pk: m.item_pk, body_state: m.body_state, is_read: m.is_read, cached: m.attachments.filter((a) => a.cached).length, is_flagged: m.is_flagged })),
+    withFlag,
+  );
 }
 
 /** Письму нужна догрузка с сервера: нет тела (и сервер ещё не отказывал) или не хватает инлайновых картинок. */

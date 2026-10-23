@@ -166,6 +166,7 @@ impl AttachmentRow {
 }
 
 /// Ссылка на письмо для запроса к серверу: его папка, идентификатор и состояние тела.
+/// `is_read` и `is_flagged` — состояние до операции записи, чтобы откатить её при отказе сервера.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ItemRef {
     pub item_pk: i64,
@@ -173,7 +174,31 @@ pub struct ItemRef {
     pub id: ItemId,
     /// 0 тела нет, 1 есть, 2 загрузка не удалась.
     pub body_state: i64,
+    pub is_read: bool,
+    pub is_flagged: bool,
+    /// Беседа письма (для события окну после операции записи).
+    pub conversation_pk: Option<i64>,
 }
+
+/// Колонки `items` в порядке, который разбирает `item_ref_row`.
+const ITEM_REF_COLUMNS: &str = "server_id, change_key, folder_pk, body_state, is_read, flag_status, conversation_pk";
+
+fn item_ref_row(item_pk: i64, r: &rusqlite::Row<'_>) -> rusqlite::Result<ItemRef> {
+    Ok(ItemRef {
+        item_pk,
+        folder_pk: r.get(2)?,
+        id: ItemId { id: r.get(0)?, change_key: r.get(1)? },
+        body_state: r.get(3)?,
+        is_read: r.get::<_, i64>(4)? != 0,
+        is_flagged: r.get::<_, Option<String>>(5)?.as_deref() == Some(FLAGGED),
+        conversation_pk: r.get(6)?,
+    })
+}
+
+/// Значение `items.flag_status` для поставленного флага (как присылает сервер).
+const FLAGGED: &str = "Flagged";
+/// Значение `items.flag_status` без флага.
+const NOT_FLAGGED: &str = "NotFlagged";
 
 /// Колонки `attachments` в порядке, который разбирает `attachment_row`.
 const ATTACHMENT_COLUMNS: &str = "attachment_pk, item_pk, server_id, name, content_type, size, is_inline, content_id, local_path, text_state, COALESCE(length(text), 0), fetched_at";
@@ -217,7 +242,12 @@ pub struct ConversationRow {
     pub total_count: i64,
     pub last_received_at: Option<Timestamp>,
     pub has_attachments: bool,
+    /// Есть ли в беседе (во всех папках) письмо с флагом «к исполнению».
+    pub has_flagged: bool,
 }
+
+/// Подзапрос «в беседе есть письмо с флагом» для списков бесед (`c` — `conversations`).
+const HAS_FLAGGED_SQL: &str = "EXISTS(SELECT 1 FROM items fi WHERE fi.conversation_pk = c.conversation_pk AND fi.deleted = 0 AND fi.flag_status = 'Flagged')";
 
 /// Итог вытеснения кэша вложений.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -831,11 +861,195 @@ impl Store {
 
     /// Ссылка на не удалённое письмо для запроса к серверу.
     pub fn item_ref(&self, item_pk: i64) -> Result<Option<ItemRef>> {
+        self.with_conn(|c| Ok(c.query_row(&format!("SELECT {ITEM_REF_COLUMNS} FROM items WHERE item_pk = ?1 AND deleted = 0"), params![item_pk], |r| item_ref_row(item_pk, r)).optional()?))
+    }
+
+    /// Ссылки на не удалённые письма пакетно, в порядке `item_pks`; неизвестные и удалённые
+    /// пропускаются (вызывающий сверяет длину, если это важно).
+    pub fn item_refs(&self, item_pks: &[i64]) -> Result<Vec<ItemRef>> {
         self.with_conn(|c| {
-            Ok(c.query_row("SELECT server_id, change_key, folder_pk, body_state FROM items WHERE item_pk = ?1 AND deleted = 0", params![item_pk], |r| {
-                Ok(ItemRef { item_pk, folder_pk: r.get(2)?, id: ItemId { id: r.get(0)?, change_key: r.get(1)? }, body_state: r.get(3)? })
-            })
-            .optional()?)
+            let mut st = c.prepare_cached(&format!("SELECT {ITEM_REF_COLUMNS} FROM items WHERE item_pk = ?1 AND deleted = 0"))?;
+            let mut out = Vec::with_capacity(item_pks.len());
+            for &pk in item_pks {
+                if let Some(r) = st.query_row(params![pk], |r| item_ref_row(pk, r)).optional()? {
+                    out.push(r);
+                }
+            }
+            Ok(out)
+        })
+    }
+
+    /// Письма беседы (не удалённые), при `folder_pk` — только лежащие в этой папке;
+    /// порядок как в области чтения: новые первыми.
+    pub fn conversation_item_pks(&self, account: AccountId, conversation_pk: i64, folder_pk: Option<i64>) -> Result<Vec<i64>> {
+        self.with_conn(|c| {
+            let mut st = c.prepare_cached(
+                "SELECT item_pk FROM items WHERE conversation_pk = ?1 AND account_id = ?2 AND deleted = 0 AND (?3 IS NULL OR folder_pk = ?3)
+                 ORDER BY COALESCE(received_at, sent_at) DESC, item_pk DESC",
+            )?;
+            Ok(st.query_map(params![conversation_pk, account.0, folder_pk], |r| r.get::<_, i64>(0))?.collect::<std::result::Result<Vec<_>, _>>()?)
+        })
+    }
+
+    // --- локальное применение операций записи -------------------------------
+    //
+    // Окно меняет базу сразу (оптимистично), затем идёт на сервер и при отказе откатывает
+    // обратным вызовом той же функции. Агрегаты бесед и папок пересчитываются здесь же,
+    // в той же транзакции, как в `apply_item_batch`; индекс трогает только удаление.
+
+    /// Помечает письма прочитанными или непрочитанными; уже находящиеся в нужном состоянии не
+    /// меняются. Возвращает беседы затронутых писем (без повторов).
+    pub fn set_read_local(&self, item_pks: &[i64], read: bool) -> Result<Vec<i64>> {
+        self.with_tx(|tx| {
+            let now = now_ms();
+            let mut touched = Touched::default();
+            let mut convs: BTreeSet<i64> = BTreeSet::new();
+            let mut folder_unread: HashMap<i64, i64> = HashMap::new();
+            for &pk in item_pks {
+                let Some(st) = item_pos(tx, pk)? else { continue };
+                if st.deleted {
+                    continue;
+                }
+                if st.is_read != read {
+                    tx.prepare_cached("UPDATE items SET is_read = ?2, updated_at = ?3 WHERE item_pk = ?1")?.execute(params![pk, read as i64, now])?;
+                    *folder_unread.entry(st.folder_pk).or_default() += if read { -1 } else { 1 };
+                    touched.add(st.conversation_pk, st.folder_pk);
+                }
+                convs.extend(st.conversation_pk);
+            }
+            touched.recompute(tx)?;
+            for (f, d) in folder_unread {
+                adjust_folder_counts(tx, f, 0, d, now)?;
+            }
+            Ok(convs.into_iter().collect())
+        })
+    }
+
+    /// Ставит или снимает флаг «к исполнению». Флаг в агрегаты и индекс не входит.
+    /// Возвращает беседы затронутых писем.
+    pub fn set_flag_local(&self, item_pks: &[i64], flagged: bool) -> Result<Vec<i64>> {
+        self.with_tx(|tx| {
+            let now = now_ms();
+            let status = if flagged { FLAGGED } else { NOT_FLAGGED };
+            let mut convs: BTreeSet<i64> = BTreeSet::new();
+            for &pk in item_pks {
+                let Some(st) = item_pos(tx, pk)? else { continue };
+                if st.deleted {
+                    continue;
+                }
+                tx.prepare_cached("UPDATE items SET flag_status = ?2, updated_at = ?3 WHERE item_pk = ?1")?.execute(params![pk, status, now])?;
+                convs.extend(st.conversation_pk);
+            }
+            Ok(convs.into_iter().collect())
+        })
+    }
+
+    /// Переносит письмо в папку `folder_pk` и, если сервер уже выдал новый идентификатор,
+    /// записывает его. Пересчитывает агрегаты беседы в обеих папках и счётчики папок.
+    /// Если строка с новым идентификатором уже есть (параллельная синхронизация успела создать
+    /// письмо в целевой папке), текущая строка помечается удалённой, а та получает папку.
+    pub fn move_local(&self, item_pk: i64, folder_pk: i64, new_id: Option<&ItemId>) -> Result<()> {
+        self.with_tx(|tx| {
+            let Some(st) = item_pos(tx, item_pk)? else { return Err(StoreError::Other(format!("письмо #{item_pk} не найдено"))) };
+            if st.deleted {
+                return Err(StoreError::Other(format!("письмо #{item_pk} удалено")));
+            }
+            let now = now_ms();
+            let mut touched = Touched::default();
+            touched.add(st.conversation_pk, st.folder_pk);
+            touched.add(st.conversation_pk, folder_pk);
+            let twin: Option<i64> = match new_id {
+                Some(id) if id.id != st.server_id => tx
+                    .prepare_cached("SELECT item_pk FROM items WHERE account_id = ?1 AND server_id = ?2 AND item_pk <> ?3")?
+                    .query_row(params![st.account_id, id.id, item_pk], |r| r.get(0))
+                    .optional()?,
+                _ => None,
+            };
+            match (new_id, twin) {
+                (Some(id), Some(twin_pk)) => {
+                    fts_delete(tx, item_pk)?;
+                    tx.prepare_cached("UPDATE items SET deleted = 1, updated_at = ?2 WHERE item_pk = ?1")?.execute(params![item_pk, now])?;
+                    let twin_pos = item_pos(tx, twin_pk)?;
+                    tx.prepare_cached("UPDATE items SET folder_pk = ?2, change_key = ?3, deleted = 0, updated_at = ?4 WHERE item_pk = ?1")?.execute(params![twin_pk, folder_pk, id.change_key, now])?;
+                    if let Some(tp) = twin_pos {
+                        touched.add(tp.conversation_pk, tp.folder_pk);
+                        if tp.deleted {
+                            fts_insert(tx, twin_pk)?;
+                        }
+                    }
+                }
+                (Some(id), None) => {
+                    tx.prepare_cached("UPDATE items SET folder_pk = ?2, server_id = ?3, change_key = ?4, updated_at = ?5 WHERE item_pk = ?1")?.execute(params![item_pk, folder_pk, id.id, id.change_key, now])?;
+                }
+                (None, _) => {
+                    tx.prepare_cached("UPDATE items SET folder_pk = ?2, updated_at = ?3 WHERE item_pk = ?1")?.execute(params![item_pk, folder_pk, now])?;
+                }
+            }
+            touched.recompute(tx)?;
+            if st.folder_pk != folder_pk {
+                let unread = if st.is_read { 0 } else { 1 };
+                adjust_folder_counts(tx, st.folder_pk, -1, -unread, now)?;
+                adjust_folder_counts(tx, folder_pk, 1, unread, now)?;
+            }
+            Ok(())
+        })
+    }
+
+    /// Помечает письма удалёнными (жёсткое удаление или письмо уже лежало в «Удалённых»):
+    /// снимает с индекса, пересчитывает агрегаты и счётчики папок. Возвращает беседы.
+    pub fn mark_deleted_local(&self, item_pks: &[i64]) -> Result<Vec<i64>> {
+        self.set_deleted_local(item_pks, true)
+    }
+
+    /// Обратная операция к `mark_deleted_local` для отката при отказе сервера: возвращает письма
+    /// в список и индекс. Возвращает беседы.
+    pub fn restore_deleted_local(&self, item_pks: &[i64]) -> Result<Vec<i64>> {
+        self.set_deleted_local(item_pks, false)
+    }
+
+    fn set_deleted_local(&self, item_pks: &[i64], deleted: bool) -> Result<Vec<i64>> {
+        self.with_tx(|tx| {
+            let now = now_ms();
+            let mut touched = Touched::default();
+            let mut convs: BTreeSet<i64> = BTreeSet::new();
+            let mut folder_delta: HashMap<i64, (i64, i64)> = HashMap::new();
+            for &pk in item_pks {
+                let Some(st) = item_pos(tx, pk)? else { continue };
+                if st.deleted == deleted {
+                    convs.extend(st.conversation_pk);
+                    continue;
+                }
+                if deleted {
+                    fts_delete(tx, pk)?;
+                }
+                tx.prepare_cached("UPDATE items SET deleted = ?2, updated_at = ?3 WHERE item_pk = ?1")?.execute(params![pk, deleted as i64, now])?;
+                if !deleted {
+                    fts_insert(tx, pk)?;
+                }
+                let sign = if deleted { -1 } else { 1 };
+                let d = folder_delta.entry(st.folder_pk).or_default();
+                d.0 += sign;
+                d.1 += if st.is_read { 0 } else { sign };
+                touched.add(st.conversation_pk, st.folder_pk);
+                convs.extend(st.conversation_pk);
+            }
+            touched.recompute(tx)?;
+            for (f, (dt, du)) in folder_delta {
+                adjust_folder_counts(tx, f, dt, du, now)?;
+            }
+            Ok(convs.into_iter().collect())
+        })
+    }
+
+    /// Записывает идентификатор письма после операции на сервере (новый `ChangeKey` после
+    /// `UpdateItem`). Удалённые строки тоже обновляются: это нужно откату.
+    pub fn update_item_id(&self, item_pk: i64, id: &ItemId) -> Result<()> {
+        self.with_conn(|c| {
+            let n = c.execute("UPDATE items SET server_id = ?2, change_key = ?3, updated_at = ?4 WHERE item_pk = ?1", params![item_pk, id.id, id.change_key, now_ms()])?;
+            if n == 0 {
+                return Err(StoreError::Other(format!("письмо #{item_pk} не найдено")));
+            }
+            Ok(())
         })
     }
 
@@ -1020,12 +1234,12 @@ impl Store {
     /// Беседы папки, как в списке OWA: свежие первыми, с участниками и счётчиками.
     pub fn list_conversations(&self, account: AccountId, folder_pk: i64, limit: usize) -> Result<Vec<ConversationRow>> {
         self.with_conn(|c| {
-            let mut st = c.prepare_cached(
-                "SELECT c.conversation_pk, c.topic, cf.item_count, cf.unread_count, c.item_count, cf.last_received_at, c.has_attachments
+            let mut st = c.prepare_cached(&format!(
+                "SELECT c.conversation_pk, c.topic, cf.item_count, cf.unread_count, c.item_count, cf.last_received_at, c.has_attachments, {HAS_FLAGGED_SQL}
                  FROM conversation_folders cf JOIN conversations c ON c.conversation_pk = cf.conversation_pk
                  WHERE cf.folder_pk = ?1 AND c.account_id = ?2
-                 ORDER BY cf.last_received_at DESC, c.conversation_pk DESC LIMIT ?3",
-            )?;
+                 ORDER BY cf.last_received_at DESC, c.conversation_pk DESC LIMIT ?3"
+            ))?;
             let rows: Vec<ConversationRow> = st
                 .query_map(params![folder_pk, account.0, limit as i64], |r| {
                     Ok(ConversationRow {
@@ -1037,6 +1251,7 @@ impl Store {
                         total_count: r.get(4)?,
                         last_received_at: ms_ts(r.get::<_, Option<i64>>(5)?),
                         has_attachments: r.get::<_, i64>(6)? != 0,
+                        has_flagged: r.get::<_, i64>(7)? != 0,
                     })
                 })?
                 .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -1180,6 +1395,36 @@ struct ItemState {
 fn item_state(tx: &Transaction, account: AccountId, server_id: &str) -> Result<Option<ItemState>> {
     let mut st = tx.prepare_cached("SELECT item_pk, conversation_pk, folder_pk FROM items WHERE account_id = ?1 AND server_id = ?2")?;
     Ok(st.query_row(params![account.0, server_id], |r| Ok(ItemState { item_pk: r.get(0)?, conversation_pk: r.get(1)?, folder_pk: r.get(2)? })).optional()?)
+}
+
+/// Положение и состояние письма по первичному ключу (для локальных операций записи).
+struct ItemPos {
+    account_id: i64,
+    server_id: String,
+    conversation_pk: Option<i64>,
+    folder_pk: i64,
+    is_read: bool,
+    deleted: bool,
+}
+
+fn item_pos(tx: &Transaction, item_pk: i64) -> Result<Option<ItemPos>> {
+    let mut st = tx.prepare_cached("SELECT account_id, server_id, conversation_pk, folder_pk, is_read, deleted FROM items WHERE item_pk = ?1")?;
+    Ok(st
+        .query_row(params![item_pk], |r| {
+            Ok(ItemPos { account_id: r.get(0)?, server_id: r.get(1)?, conversation_pk: r.get(2)?, folder_pk: r.get(3)?, is_read: r.get::<_, i64>(4)? != 0, deleted: r.get::<_, i64>(5)? != 0 })
+        })
+        .optional()?)
+}
+
+/// Сдвигает локальные счётчики папки (`total_count`, `unread_count`) между синхронизациями
+/// иерархии; ниже нуля не опускает. Следующая синхронизация перепишет их серверными.
+fn adjust_folder_counts(tx: &Transaction, folder_pk: i64, d_total: i64, d_unread: i64, now: i64) -> Result<()> {
+    if d_total == 0 && d_unread == 0 {
+        return Ok(());
+    }
+    tx.prepare_cached("UPDATE folders SET total_count = MAX(0, total_count + ?2), unread_count = MAX(0, unread_count + ?3), updated_at = ?4 WHERE folder_pk = ?1")?
+        .execute(params![folder_pk, d_total, d_unread, now])?;
+    Ok(())
 }
 
 /// Пары (беседа, папка), чьи агрегаты надо пересчитать в конце транзакции.
@@ -1692,7 +1937,7 @@ mod tests {
         // Ключи беседы: только живые письма, порядок как у conversation_messages, cached по базе.
         let conv_pk = s.list_conversations(acc, fpk, 10).unwrap()[0].conversation_pk;
         let keys = s.conversation_keys(acc, conv_pk).unwrap();
-        assert_eq!(keys, vec![crate::ui::MessageKey { item_pk: a_pk, body_state: 1, is_read: false, cached: 0 }], "{keys:?}");
+        assert_eq!(keys, vec![crate::ui::MessageKey { item_pk: a_pk, body_state: 1, is_read: false, cached: 0, is_flagged: false }], "{keys:?}");
         s.save_attachment(&img.todo(), b"\x89PNG", Some("image/png"), AttachmentText::Unsupported).unwrap();
         assert_eq!(s.conversation_keys(acc, conv_pk).unwrap()[0].cached, 1);
         let heads = s.conversation_messages(acc, conv_pk).unwrap();
@@ -1754,6 +1999,122 @@ mod tests {
         assert_eq!(arch.len(), 1);
         assert_eq!((arch[0].item_count, arch[0].total_count), (1, 2));
         assert_eq!(s.stats(acc).unwrap().items, 3);
+    }
+
+    #[test]
+    fn local_write_operations() {
+        let s = tmp_store("write");
+        let acc = s.account("h", "u").unwrap();
+        s.upsert_folders(acc, &[folder("Входящие", Some("inbox")), folder("Отправленные", Some("sentitems")), folder("Архив", None), folder("Удаленные", Some("deleteditems"))]).unwrap();
+        let (inbox, _) = s.folder_by_distinguished(acc, "inbox").unwrap().unwrap();
+        let (sent, _) = s.folder_by_distinguished(acc, "sentitems").unwrap().unwrap();
+        let archive = s.resolve_folder(acc, "архив").unwrap().unwrap().folder_pk;
+        s.apply_item_changes(
+            acc,
+            inbox,
+            &[
+                ItemChange::Create(meta_at("A", "Договор", "2026-10-01T10:00:00Z", Some("c1"))),
+                ItemChange::Create(meta_at("B", "RE: Договор", "2026-10-02T10:00:00Z", Some("c1"))),
+                ItemChange::Create(meta_at("X", "Другое", "2026-09-01T10:00:00Z", None)),
+            ],
+        )
+        .unwrap();
+        s.apply_item_changes(acc, sent, &[ItemChange::Create(meta_at("S", "RE: Договор", "2026-10-03T10:00:00Z", Some("c1")))]).unwrap();
+        let pk = |id: &str| -> i64 { s.debug_query(&format!("SELECT item_pk FROM items WHERE server_id = '{id}'")).unwrap()[1].parse().unwrap() };
+        let (a, b, x, sp) = (pk("A"), pk("B"), pk("X"), pk("S"));
+        let folder_counts = |fpk: i64| -> (i64, i64) {
+            let line = &s.debug_query(&format!("SELECT total_count || ',' || unread_count FROM folders WHERE folder_pk = {fpk}")).unwrap()[1];
+            let (t, u) = line.split_once(',').unwrap();
+            (t.parse().unwrap(), u.parse().unwrap())
+        };
+        let conv_in = |fpk: i64| -> ConversationRow { s.list_conversations(acc, fpk, 10).unwrap().into_iter().find(|c| c.topic.as_deref() == Some("Договор")).expect("беседа «Договор»") };
+        let c1 = conv_in(inbox).conversation_pk;
+        assert_eq!(folder_counts(inbox), (10, 1), "счётчики папки из иерархии до операций");
+
+        // item_refs: пакетно, в порядке запроса, неизвестные пропущены, состояние до операции.
+        let refs = s.item_refs(&[b, a, 9999]).unwrap();
+        assert_eq!(refs.iter().map(|r| r.item_pk).collect::<Vec<_>>(), vec![b, a]);
+        assert_eq!((refs[0].folder_pk, refs[0].id.id.as_str(), refs[0].is_read, refs[0].is_flagged), (inbox, "B", false, false));
+
+        // conversation_item_pks: вся беседа и только папка, новые первыми.
+        assert_eq!(s.conversation_item_pks(acc, c1, None).unwrap(), vec![sp, b, a]);
+        assert_eq!(s.conversation_item_pks(acc, c1, Some(inbox)).unwrap(), vec![b, a]);
+        assert_eq!(s.conversation_item_pks(acc, c1, Some(archive)).unwrap(), Vec::<i64>::new());
+
+        // set_read_local: is_read, агрегаты беседы (в папке и всей), непрочитанные папки.
+        assert_eq!(s.set_read_local(&[a, x], true).unwrap().len(), 2, "две беседы затронуты");
+        assert!(s.item_ref(a).unwrap().unwrap().is_read);
+        let c = conv_in(inbox);
+        assert_eq!((c.item_count, c.unread_count, c.total_count), (2, 1, 3));
+        assert_eq!(s.debug_query(&format!("SELECT unread_count FROM conversations WHERE conversation_pk = {c1}")).unwrap()[1], "2", "непрочитанных во всей беседе: B и S");
+        assert_eq!(folder_counts(inbox), (10, 0), "два письма прочитаны, ниже нуля не уходит");
+        assert_eq!(s.set_read_local(&[a], true).unwrap(), vec![c1], "повтор не меняет состояние, но беседу возвращает");
+        s.set_read_local(&[a], false).unwrap();
+        assert_eq!(folder_counts(inbox), (10, 1));
+        assert_eq!(conv_in(inbox).unread_count, 2);
+        s.set_read_local(&[a], true).unwrap();
+
+        // set_flag_local: флаг на письме, в ключах беседы и признак беседы в списках.
+        assert_eq!(s.set_flag_local(&[b], true).unwrap(), vec![c1]);
+        assert!(s.item_ref(b).unwrap().unwrap().is_flagged);
+        assert!(s.message_head(b).unwrap().unwrap().is_flagged);
+        assert!(s.conversation_keys(acc, c1).unwrap().iter().any(|k| k.item_pk == b && k.is_flagged));
+        assert!(conv_in(inbox).has_flagged);
+        assert!(s.conversations_page(acc, sent, None, 10).unwrap()[0].has_flagged, "признак общий для беседы во всех папках");
+        assert!(!s.list_conversations(acc, inbox, 10).unwrap().iter().find(|c| c.topic.as_deref() == Some("Другое")).unwrap().has_flagged);
+        s.set_flag_local(&[b], false).unwrap();
+        assert!(!conv_in(inbox).has_flagged);
+        assert!(!s.message_head(b).unwrap().unwrap().is_flagged);
+
+        // move_local с новым идентификатором: папка, id, агрегаты обеих папок, счётчики папок.
+        s.move_local(a, archive, Some(&ItemId { id: "A2".into(), change_key: Some("k2".into()) })).unwrap();
+        let r = s.item_ref(a).unwrap().unwrap();
+        assert_eq!((r.folder_pk, r.id.id.as_str(), r.id.change_key.as_deref()), (archive, "A2", Some("k2")));
+        let c = conv_in(inbox);
+        assert_eq!((c.item_count, c.unread_count, c.total_count), (1, 1, 3), "осталось непрочитанное B");
+        let c = conv_in(archive);
+        assert_eq!((c.item_count, c.unread_count, c.total_count), (1, 0, 3));
+        assert_eq!(folder_counts(inbox), (9, 0), "перенесено прочитанное: непрочитанных не убавилось (ранее ушло в ноль)");
+        assert_eq!(folder_counts(archive), (11, 1));
+        assert_eq!(s.conversation_item_pks(acc, c1, Some(archive)).unwrap(), vec![a]);
+        // Откат без идентификатора: папка возвращается, id остаётся новым.
+        s.move_local(a, inbox, None).unwrap();
+        assert_eq!(s.item_ref(a).unwrap().unwrap().folder_pk, inbox);
+        assert_eq!(conv_in(inbox).item_count, 2);
+        assert!(s.list_conversations(acc, archive, 10).unwrap().is_empty());
+        assert_eq!(folder_counts(archive), (10, 1));
+
+        // update_item_id: новый ChangeKey после UpdateItem.
+        s.update_item_id(a, &ItemId { id: "A2".into(), change_key: Some("k3".into()) }).unwrap();
+        assert_eq!(s.item_ref(a).unwrap().unwrap().id.change_key.as_deref(), Some("k3"));
+        assert!(s.update_item_id(9999, &ItemId { id: "n".into(), change_key: None }).is_err());
+
+        // mark_deleted_local и восстановление: агрегаты, индекс, счётчики папки.
+        assert_eq!(s.search(acc, "тема:договор", 10).unwrap().len(), 3);
+        assert_eq!(s.mark_deleted_local(&[b]).unwrap(), vec![c1]);
+        assert!(s.item_ref(b).unwrap().is_none());
+        let c = conv_in(inbox);
+        assert_eq!((c.item_count, c.unread_count, c.total_count), (1, 0, 2));
+        assert_eq!(s.search(acc, "тема:договор", 10).unwrap().len(), 2, "удалённое письмо снято с индекса");
+        assert_eq!(folder_counts(inbox), (9, 0));
+        assert_eq!(s.restore_deleted_local(&[b]).unwrap(), vec![c1]);
+        let c = conv_in(inbox);
+        assert_eq!((c.item_count, c.unread_count, c.total_count), (2, 1, 3));
+        assert_eq!(s.search(acc, "тема:договор", 10).unwrap().len(), 3, "восстановленное письмо снова в индексе");
+        assert_eq!(folder_counts(inbox), (10, 1));
+        assert!(!s.item_refs(&[b]).unwrap()[0].is_read);
+
+        // move_local, когда синхронизация уже создала письмо с новым id в целевой папке:
+        // текущая строка гасится, двойник получает папку, беседа в источнике редеет.
+        s.apply_item_changes(acc, archive, &[ItemChange::Create(meta_at("B2", "RE: Договор", "2026-10-02T10:00:00Z", Some("c1")))]).unwrap();
+        let b2 = pk("B2");
+        s.move_local(b, archive, Some(&ItemId { id: "B2".into(), change_key: Some("z".into()) })).unwrap();
+        assert!(s.item_ref(b).unwrap().is_none(), "старая строка помечена удалённой");
+        let r = s.item_ref(b2).unwrap().unwrap();
+        assert_eq!((r.folder_pk, r.id.change_key.as_deref()), (archive, Some("z")));
+        assert_eq!(conv_in(inbox).item_count, 1);
+        assert_eq!(conv_in(archive).item_count, 1);
+        assert_eq!(s.stats(acc).unwrap().items, 4, "A, X, S и B2");
     }
 
     #[test]

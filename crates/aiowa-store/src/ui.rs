@@ -1,7 +1,7 @@
 //! Запросы только на чтение для интерфейса: страницы бесед, письма беседы, тело, получатели.
 //! Пагинация keyset: `(last_received_at, conversation_pk)` строго убывают, OFFSET не используется.
 
-use crate::{decompress, ms_ts, ConversationRow, Result, Store};
+use crate::{decompress, ms_ts, ConversationRow, Result, Store, HAS_FLAGGED_SQL};
 use aiowa_core::{AccountId, BodyType};
 use jiff::Timestamp;
 use rusqlite::{params, OptionalExtension};
@@ -25,6 +25,8 @@ pub struct MessageHead {
     pub preview: Option<String>,
     /// 0 тела нет, 1 есть, 2 загрузка не удалась.
     pub body_state: i64,
+    /// Флаг «к исполнению» поставлен (`FlagStatus = Flagged`).
+    pub is_flagged: bool,
 }
 
 /// Тело письма для показа.
@@ -63,11 +65,12 @@ pub struct MessageKey {
     pub is_read: bool,
     /// Вложений с файлом в кэше (по базе, без проверки диска).
     pub cached: i64,
+    pub is_flagged: bool,
 }
 
 /// Выборка заголовка письма в порядке, который разбирает `head_row`.
 const HEAD_SELECT: &str = "SELECT i.item_pk, i.folder_pk, f.display_name, i.subject, i.from_name, i.from_email, i.display_to, i.received_at, i.sent_at,
-        i.is_read, i.is_draft, i.has_attachments, i.importance, i.preview, i.body_state
+        i.is_read, i.is_draft, i.has_attachments, i.importance, i.preview, i.body_state, i.flag_status = 'Flagged'
  FROM items i LEFT JOIN folders f ON f.folder_pk = i.folder_pk";
 
 fn head_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<MessageHead> {
@@ -87,6 +90,7 @@ fn head_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<MessageHead> {
         importance: r.get(12)?,
         preview: r.get(13)?,
         body_state: r.get(14)?,
+        is_flagged: r.get::<_, Option<i64>>(15)?.unwrap_or(0) != 0,
     })
 }
 
@@ -94,13 +98,13 @@ impl Store {
     /// Страница бесед папки, свежие первыми; `after` — курсор предыдущей страницы.
     pub fn conversations_page(&self, account: AccountId, folder_pk: i64, after: Option<ConversationCursor>, limit: usize) -> Result<Vec<ConversationRow>> {
         self.with_conn(|c| {
-            let mut st = c.prepare_cached(
-                "SELECT c.conversation_pk, c.topic, cf.item_count, cf.unread_count, c.item_count, cf.last_received_at, c.has_attachments
+            let mut st = c.prepare_cached(&format!(
+                "SELECT c.conversation_pk, c.topic, cf.item_count, cf.unread_count, c.item_count, cf.last_received_at, c.has_attachments, {HAS_FLAGGED_SQL}
                  FROM conversation_folders cf JOIN conversations c ON c.conversation_pk = cf.conversation_pk
                  WHERE cf.folder_pk = ?1 AND c.account_id = ?2
                    AND (?3 IS NULL OR cf.last_received_at < ?3 OR (cf.last_received_at = ?3 AND cf.conversation_pk < ?4))
-                 ORDER BY cf.last_received_at DESC, cf.conversation_pk DESC LIMIT ?5",
-            )?;
+                 ORDER BY cf.last_received_at DESC, cf.conversation_pk DESC LIMIT ?5"
+            ))?;
             let rows: Vec<ConversationRow> = st
                 .query_map(params![folder_pk, account.0, after.map(|a| a.last_received_at), after.map(|a| a.conversation_pk).unwrap_or(i64::MAX), limit as i64], |r| {
                     Ok(ConversationRow {
@@ -112,6 +116,7 @@ impl Store {
                         total_count: r.get(4)?,
                         last_received_at: ms_ts(r.get::<_, Option<i64>>(5)?),
                         has_attachments: r.get::<_, i64>(6)? != 0,
+                        has_flagged: r.get::<_, i64>(7)? != 0,
                     })
                 })?
                 .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -152,12 +157,15 @@ impl Store {
         self.with_conn(|c| {
             let mut st = c.prepare_cached(
                 "SELECT i.item_pk, i.body_state, i.is_read,
-                        (SELECT COUNT(*) FROM attachments a WHERE a.item_pk = i.item_pk AND a.local_path IS NOT NULL)
+                        (SELECT COUNT(*) FROM attachments a WHERE a.item_pk = i.item_pk AND a.local_path IS NOT NULL),
+                        i.flag_status = 'Flagged'
                  FROM items i
                  WHERE i.conversation_pk = ?1 AND i.account_id = ?2 AND i.deleted = 0
                  ORDER BY COALESCE(i.received_at, i.sent_at) DESC, i.item_pk DESC",
             )?;
-            let rows = st.query_map(params![conversation_pk, account.0], |r| Ok(MessageKey { item_pk: r.get(0)?, body_state: r.get(1)?, is_read: r.get::<_, i64>(2)? != 0, cached: r.get(3)? }))?;
+            let rows = st.query_map(params![conversation_pk, account.0], |r| {
+                Ok(MessageKey { item_pk: r.get(0)?, body_state: r.get(1)?, is_read: r.get::<_, i64>(2)? != 0, cached: r.get(3)?, is_flagged: r.get::<_, Option<i64>>(4)?.unwrap_or(0) != 0 })
+            })?;
             Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
         })
     }

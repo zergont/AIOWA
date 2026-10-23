@@ -183,7 +183,7 @@ CREATE VIRTUAL TABLE items_fts USING fts5(
 
 ## 7. CLI
 
-`aiowa --host H --user U <cmd>`: `login` (проверка + logoff), `folders`, `sync [--days 90] [--folders inbox,sentitems] [--no-bodies]`, `search <запрос> [--limit 20]` (FTS5 с подсветкой сниппетов; порядок от новых к старым, как в OWA, bm25 только разводит одинаковые даты), `stats` (размер базы, покрытие по папкам и датам). Пароль через `keyring`, как в спайке.
+`aiowa --host H --user U <cmd>`: `login` (проверка + logoff), `folders`, `sync [--days 90] [--folders inbox,sentitems] [--no-bodies]`, `search <запрос> [--limit 20]` (FTS5 с подсветкой сниппетов; порядок от новых к старым, как в OWA, bm25 только разводит одинаковые даты), операции записи `mark-read`, `flag`, `move`, `delete` по `--item-pk` (перенос и удаление только с `--yes-i-know`), `stats` (размер базы, покрытие по папкам и датам). Пароль через `keyring`, как в спайке.
 
 ## 8. Что проверить до написания кода
 

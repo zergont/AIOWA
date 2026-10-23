@@ -8,7 +8,7 @@
 pub mod protocol;
 
 use aiowa_core::{FolderChanges, FolderRef, ItemChanges, ItemId, SyncState};
-use aiowa_transport::{async_trait, AttachmentContent, Credentials, FolderCounts, ItemFetchShape, ItemResult, MailTransport, Result, ServerInfo, TransportError};
+use aiowa_transport::{async_trait, AttachmentContent, Credentials, DeleteMode, FolderCounts, ItemFetchShape, ItemResult, MailTransport, Result, ServerInfo, TransportError, WriteResult};
 use base64::prelude::*;
 use reqwest::cookie::{CookieStore, Jar};
 use reqwest::header::{HeaderMap, HeaderValue, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_TYPE, LOCATION};
@@ -430,6 +430,57 @@ impl OwaTransport {
         self.call_once(op, payload).await
     }
 
+    /// Операция записи по элементам (`UpdateItem`, `MoveItem`, `DeleteItem`): пачками того же
+    /// размера, что `GetItem`, через `call` с повторным входом; результат по позициям `ids`.
+    /// Если сервер отверг всю пачку из-за занятости (`ErrorServerBusy`), это отказ вызова
+    /// `Throttled`, а не отказ по элементам.
+    ///
+    /// `Err` — только если сервер не ответил ни на одну пачку. Отказ следующей пачки после
+    /// подтверждённых не теряет их результаты (сервер те письма уже изменил, и вызывающий
+    /// не должен откатывать их локально): оставшиеся элементы получают `Failed` с видом ошибки.
+    async fn write_items(&self, op: &str, ids: &[ItemId], build: impl Fn(&[ItemId]) -> Value + Send + Sync) -> Result<Vec<WriteResult>> {
+        let mut out: Vec<WriteResult> = Vec::with_capacity(ids.len());
+        for chunk in ids.chunks(self.inner.config.get_item_batch.max(1)) {
+            match self.write_chunk(op, chunk, &build).await {
+                Ok(results) => out.extend(results),
+                Err(e) if out.is_empty() => return Err(e),
+                Err(e) => {
+                    warn!(op, confirmed = out.len(), rest = ids.len() - out.len(), error = %e, "отказ пачки после подтверждённых: оставшиеся элементы отклонены");
+                    fail_rest(&mut out, ids, &e);
+                    break;
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Одна пачка операции записи: один запрос к серверу, результат той же длины, что `chunk`.
+    async fn write_chunk(&self, op: &str, chunk: &[ItemId], build: &(impl Fn(&[ItemId]) -> Value + Send + Sync)) -> Result<Vec<WriteResult>> {
+        let v = self.call(op, protocol::V_2017, build(chunk)).await?;
+        let msgs = protocol::response_messages(&v);
+        if msgs.is_empty() {
+            if let Some(code) = v.pointer("/Body/ResponseCode").and_then(Value::as_str).filter(|c| *c != "NoError") {
+                return Err(TransportError::Server { code: code.to_string(), message: v.pointer("/Body/MessageText").and_then(Value::as_str).unwrap_or("").to_string() });
+            }
+            return Err(TransportError::Protocol { op: op.into(), status: 200, raw: format!("нет ResponseMessages: {}", truncate(&v.to_string(), 200)) });
+        }
+        let results = protocol::parse_write_results(&msgs, chunk);
+        if results.iter().all(|r| !r.is_ok())
+            && let Some(busy) = msgs.iter().find(|m| protocol::message_error(m).map(|(code, _)| code == "ErrorServerBusy").unwrap_or(false))
+        {
+            let (code, message) = protocol::message_error(busy).expect("проверено выше");
+            return Err(server_error(code, message, busy));
+        }
+        // Форма ответа без содержимого: тип сообщения, код, какие ключи есть у элемента.
+        if let Some(first) = msgs.first() {
+            let item_keys: Vec<&str> = first.pointer("/Items/0").and_then(Value::as_object).map(|o| o.keys().map(String::as_str).collect()).unwrap_or_default();
+            let msg_keys: Vec<&str> = first.as_object().map(|o| o.keys().map(String::as_str).collect()).unwrap_or_default();
+            debug!(op, response_type = protocol::str_of(first, "__type").unwrap_or("?"), response_code = protocol::str_of(first, "ResponseCode").unwrap_or("?"), ?msg_keys, ?item_keys, "форма ответа");
+        }
+        debug!(op, requested = chunk.len(), ok = results.iter().filter(|r| r.is_ok()).count(), "операция записи");
+        Ok(results)
+    }
+
     /// Первое сообщение ответа, с проверкой `ResponseClass`.
     fn first_message(op: &str, v: &Value) -> Result<Value> {
         let msgs = protocol::response_messages(v);
@@ -472,6 +523,31 @@ fn parse_content_disposition_filename(header: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Вид ошибки транспорта как код для `WriteResult::Failed` (имя варианта, без подробностей).
+fn error_kind(e: &TransportError) -> &'static str {
+    match e {
+        TransportError::SessionExpired => "SessionExpired",
+        TransportError::CsrfRejected => "CsrfRejected",
+        TransportError::SessionLimit => "SessionLimit",
+        TransportError::AuthFailed(_) => "AuthFailed",
+        TransportError::Throttled { .. } => "Throttled",
+        TransportError::Network(_) => "Network",
+        TransportError::Protocol { .. } => "Protocol",
+        TransportError::Server { .. } => "Server",
+        TransportError::Cancelled => "Cancelled",
+        TransportError::TooLarge { .. } => "TooLarge",
+    }
+}
+
+/// Дописывает в `out` отказ `Failed` по всем элементам `ids`, на которые ответа ещё нет
+/// (`out` содержит результаты первых `out.len()` элементов), так что `out.len() == ids.len()`.
+fn fail_rest(out: &mut Vec<WriteResult>, ids: &[ItemId], e: &TransportError) {
+    let code = error_kind(e);
+    let message = e.to_string();
+    let rest = &ids[out.len().min(ids.len())..];
+    out.extend(rest.iter().map(|id| WriteResult::Failed { id: id.clone(), code: code.into(), message: message.clone() }));
 }
 
 fn server_error(code: String, message: String, msg: &Value) -> TransportError {
@@ -587,6 +663,26 @@ impl MailTransport for OwaTransport {
         self.get_attachment_with_relogin(attachment_id, max_bytes).await
     }
 
+    async fn set_read(&self, ids: &[ItemId], read: bool) -> Result<Vec<WriteResult>> {
+        self.write_items("UpdateItem", ids, |chunk| protocol::set_read_body(chunk, read)).await
+    }
+
+    async fn set_flag(&self, ids: &[ItemId], flagged: bool) -> Result<Vec<WriteResult>> {
+        self.write_items("UpdateItem", ids, |chunk| protocol::set_flag_body(chunk, flagged)).await
+    }
+
+    async fn move_items(&self, ids: &[ItemId], to_folder: &FolderRef) -> Result<Vec<WriteResult>> {
+        self.write_items("MoveItem", ids, |chunk| protocol::move_item_body(chunk, to_folder)).await
+    }
+
+    async fn delete_items(&self, ids: &[ItemId], mode: DeleteMode) -> Result<Vec<WriteResult>> {
+        let delete_type = match mode {
+            DeleteMode::ToDeletedItems => "MoveToDeletedItems",
+            DeleteMode::Hard => "HardDelete",
+        };
+        self.write_items("DeleteItem", ids, |chunk| protocol::delete_item_body(chunk, delete_type)).await
+    }
+
     async fn logoff(&self) -> Result<()> {
         // Сначала защёлка, потом запрос: даже если GET не дошёл, транспорт больше не входит.
         self.inner.closed.store(true, Ordering::SeqCst);
@@ -634,6 +730,33 @@ mod tests {
         let r = clone.call("GetItem", protocol::V_2017, serde_json::json!({})).await;
         assert!(matches!(r, Err(TransportError::SessionExpired)), "{r:?}");
         assert_eq!(t.inner.generation.load(Ordering::SeqCst), 0, "повторного входа не было");
+    }
+
+    /// Отказ второй пачки после подтверждённой первой: результаты первой остаются, оставшиеся
+    /// элементы получают `Failed` с видом ошибки, длина и порядок — как у `ids`.
+    #[test]
+    fn failed_batch_after_confirmed_one_keeps_results_and_fails_the_rest() {
+        let ids: Vec<ItemId> = (1..=4).map(|i| ItemId { id: format!("id{i}"), change_key: None }).collect();
+        let mut out = vec![WriteResult::Ok { id: ids[0].clone() }, WriteResult::Failed { id: ids[1].clone(), code: "ErrorItemNotFound".into(), message: String::new() }];
+        fail_rest(&mut out, &ids, &TransportError::Throttled { retry_after: None });
+        assert_eq!(out.len(), ids.len());
+        assert!(out[0].is_ok(), "подтверждённый результат первой пачки сохранён");
+        assert!(matches!(&out[1], WriteResult::Failed { code, .. } if code == "ErrorItemNotFound"), "отказ по элементу первой пачки сохранён");
+        for (r, id) in out[2..].iter().zip(&ids[2..]) {
+            match r {
+                WriteResult::Failed { id: rid, code, message } => {
+                    assert_eq!(rid, id, "порядок как у ids");
+                    assert_eq!(code, "Throttled");
+                    assert!(!message.is_empty());
+                }
+                other => panic!("ожидался Failed: {other:?}"),
+            }
+        }
+        // Ничего не подтверждено — дописывать нечего сверх ids; `out` длиннее ids не становится.
+        let mut full = out.clone();
+        fail_rest(&mut full, &ids, &TransportError::SessionExpired);
+        assert_eq!(full.len(), ids.len(), "после полного ответа ничего не добавляется");
+        assert_eq!(error_kind(&TransportError::Network(Box::new(std::io::Error::other("x")))), "Network");
     }
 
     #[test]

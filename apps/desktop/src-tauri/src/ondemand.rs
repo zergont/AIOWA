@@ -104,7 +104,7 @@ async fn engine_for(state: &AppState, sync: &SyncState) -> CmdResult<Engine> {
     Ok(Engine::new(Arc::new(transport), state.store.clone(), state.account, Arc::new(AtomicBool::new(false))))
 }
 
-fn timed_out(limit: Duration) -> String {
+pub(crate) fn timed_out(limit: Duration) -> String {
     if limit.as_secs() >= 120 { format!("Сервер не ответил за {} мин, повторите попытку", limit.as_secs() / 60) } else { format!("Сервер не ответил за {} с, повторите попытку", limit.as_secs()) }
 }
 

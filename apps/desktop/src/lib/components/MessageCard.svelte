@@ -1,6 +1,10 @@
 <script lang="ts">
   import { onDestroy, untrack } from "svelte";
-  import { api, errorMessage, formatSize, fullDate, isExternalLink, isInlinePicture, listDate, messageNeedsFetch, personLabel, type Attachment, type Message } from "../api";
+  import { api, errorMessage, formatSize, fullDate, isExternalLink, isInlinePicture, listDate, messageNeedsFetch, personLabel, type Attachment, type Folder, type Message } from "../api";
+  import { ICON, type ItemAction } from "../actions";
+  import { focusBack } from "../popover";
+  import FolderPicker from "./FolderPicker.svelte";
+  import ConfirmPopover from "./ConfirmPopover.svelte";
 
   interface Props {
     message: Message;
@@ -8,14 +12,21 @@
     ontoggle: () => void;
     /** Догрузить письмо с сервера; промис отклоняется текстом ошибки для пользователя. */
     onfetch: (itemPk: number) => Promise<void>;
+    /** Папки для «Переместить…». */
+    folders: Folder[];
+    /** Папка «Удалённые»: письмо в ней удаляется только навсегда. */
+    deletedFolderPk: number | null;
+    /** Действие над этим письмом; промис отклоняется текстом ошибки для пользователя. */
+    onaction: (action: ItemAction) => Promise<void>;
   }
-  let { message, expanded, ontoggle, onfetch }: Props = $props();
+  let { message, expanded, ontoggle, onfetch, folders, deletedFolderPk, onaction }: Props = $props();
 
   const to = $derived(message.recipients.filter((r) => r.kind === 1).map((r) => personLabel(r.name, r.email)));
   const cc = $derived(message.recipients.filter((r) => r.kind === 2).map((r) => personLabel(r.name, r.email)));
   // В списке файлов всё, кроме инлайновых картинок: те уже стоят в теле письма.
   const files = $derived(message.attachments.filter((a) => !isInlinePicture(a)));
   const hasBody = $derived(message.body_html != null);
+  const inDeleted = $derived(deletedFolderPk != null && message.folder_pk === deletedFolderPk);
 
   // --- догрузка тела и инлайновых картинок ----------------------------------
 
@@ -46,6 +57,103 @@
       autoFetched = true;
       void fetchNow();
     });
+  });
+
+  // --- действия: прочитано, флаг, перенос, удаление -----------------------------
+
+  let busy = $state(false);
+  let actionError = $state<string | null>(null);
+  let picker = $state(false);
+  let confirmDelete = $state(false);
+  let moveBtn = $state<HTMLButtonElement | null>(null);
+  let deleteBtn = $state<HTMLButtonElement | null>(null);
+
+  async function run(action: ItemAction) {
+    if (busy) return;
+    // Ручная пометка отменяет автопометку: иначе таймер снова сделал бы письмо прочитанным.
+    if (action.kind === "read") autoMarked = true;
+    busy = true;
+    actionError = null;
+    try {
+      await onaction(action);
+    } catch (e) {
+      actionError = errorMessage(e);
+    } finally {
+      busy = false;
+    }
+  }
+
+  function requestDelete() {
+    if (inDeleted) confirmDelete = true;
+    else void run({ kind: "delete", permanent: false });
+  }
+  function confirmDeleteNow() {
+    confirmDelete = false;
+    focusBack(deleteBtn);
+    void run({ kind: "delete", permanent: true });
+  }
+  function cancelDelete() {
+    confirmDelete = false;
+    focusBack(deleteBtn);
+  }
+
+  function moveTo(f: Folder) {
+    closePicker();
+    void run({ kind: "move", folderPk: f.folder_pk });
+  }
+  function closePicker() {
+    picker = false;
+    focusBack(moveBtn);
+  }
+
+  // --- автопометка прочитанным --------------------------------------------------
+  // Непрочитанное письмо, развёрнутое и видимое 1,5 с, помечается прочитанным (как в OWA).
+  // Делается один раз на карточку: если пользователь вернул «непрочитано» (кнопкой карточки, меню
+  // списка или из другого клиента), таймер не повторяется. Идёт «тихо»: отказ (нет связи, нет
+  // пароля) только в консоль — это не действие пользователя, а строка состояния уже показывает
+  // ту же проблему; локальная пометка на бэкенде откатывается, точка непрочитанного остаётся.
+
+  let cardEl = $state<HTMLElement | null>(null);
+  let onScreen = $state(false);
+  let autoMarked = false;
+  // Нужно именно начальное значение: дальше его ведёт эффект автопометки.
+  let lastRead = untrack(() => message.is_read);
+  const AUTO_READ_MS = 1500;
+
+  async function autoRead() {
+    autoMarked = true;
+    busy = true;
+    try {
+      await onaction({ kind: "read", read: true });
+    } catch (e) {
+      console.warn("автопометка прочитанным не удалась:", errorMessage(e));
+    } finally {
+      busy = false;
+    }
+  }
+
+  $effect(() => {
+    const el = cardEl;
+    if (!el) return;
+    const io = new IntersectionObserver(([en]) => {
+      onScreen = en?.isIntersecting ?? false;
+    });
+    io.observe(el);
+    return () => io.disconnect();
+  });
+
+  $effect(() => {
+    const read = message.is_read;
+    // Переход «прочитано → непрочитано» при живой карточке — ручная пометка извне (меню списка,
+    // другой клиент): автопометку не повторяем, иначе через 1,5 с она отменила бы действие.
+    if (lastRead && !read) autoMarked = true;
+    lastRead = read;
+    if (!expanded || !onScreen || read || autoMarked) return;
+    const t = setTimeout(() => {
+      if (document.visibilityState !== "visible" || autoMarked || busy) return;
+      void autoRead();
+    }, AUTO_READ_MS);
+    return () => clearTimeout(t);
   });
 
   // --- вложения ---------------------------------------------------------------
@@ -175,28 +283,66 @@
   }
 </script>
 
-<article class="card" class:expanded>
-  <header class="head" onclick={ontoggle} role="button" tabindex="0" onkeydown={(e) => (e.key === "Enter" || e.key === " ") && ontoggle()} aria-expanded={expanded}>
-    <div class="avatar" aria-hidden="true">{initials(message.from_name, message.from_email)}</div>
-    <div class="who">
-      <div class="from">
-        <span class="name">{personLabel(message.from_name, message.from_email) || "(без отправителя)"}</span>
-        {#if message.from_name && message.from_email}<span class="email caption">{message.from_email}</span>{/if}
-        {#if message.importance === "High"}<span class="badge high">важное</span>{/if}
-        {#if message.is_draft}<span class="badge">черновик</span>{/if}
+<article class="card" class:expanded class:unread={!message.is_read} class:flagged={message.is_flagged} bind:this={cardEl}>
+  <div class="head">
+    <div class="head-main" onclick={ontoggle} role="button" tabindex="0" onkeydown={(e) => (e.key === "Enter" || e.key === " ") && ontoggle()} aria-expanded={expanded}>
+      <div class="avatar" aria-hidden="true">{initials(message.from_name, message.from_email)}</div>
+      <div class="who">
+        <div class="from">
+          <span class="name">{personLabel(message.from_name, message.from_email) || "(без отправителя)"}</span>
+          {#if message.from_name && message.from_email}<span class="email caption">{message.from_email}</span>{/if}
+          {#if message.importance === "High"}<span class="badge high">важное</span>{/if}
+          {#if message.is_draft}<span class="badge">черновик</span>{/if}
+        </div>
+        {#if expanded}
+          <div class="line caption">Кому: {to.length ? to.join(", ") : message.display_to || "—"}</div>
+          {#if cc.length}<div class="line caption">Копия: {cc.join(", ")}</div>{/if}
+        {:else}
+          <div class="line caption preview">{message.preview || ""}</div>
+        {/if}
       </div>
-      {#if expanded}
-        <div class="line caption">Кому: {to.length ? to.join(", ") : message.display_to || "—"}</div>
-        {#if cc.length}<div class="line caption">Копия: {cc.join(", ")}</div>{/if}
-      {:else}
-        <div class="line caption preview">{message.preview || ""}</div>
-      {/if}
+      <div class="when">
+        <span class="date-row">
+          {#if message.is_flagged}
+            <svg class="flag-mark" width="12" height="12" viewBox="0 0 16 16" role="img" aria-label="С флагом"><path d={ICON.flag} fill="currentColor" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round" /></svg>
+          {/if}
+          {#if !message.is_read}<span class="unread-dot" role="img" aria-label="Непрочитанное"></span>{/if}
+          <span class="date" title={fullDate(message.received_ms ?? message.sent_ms)}>{expanded ? fullDate(message.received_ms ?? message.sent_ms) : listDate(message.received_ms ?? message.sent_ms)}</span>
+        </span>
+        {#if message.folder_name}<span class="caption folder">{message.folder_name}</span>{/if}
+      </div>
     </div>
-    <div class="when">
-      <span class="date" title={fullDate(message.received_ms ?? message.sent_ms)}>{expanded ? fullDate(message.received_ms ?? message.sent_ms) : listDate(message.received_ms ?? message.sent_ms)}</span>
-      {#if message.folder_name}<span class="caption folder">{message.folder_name}</span>{/if}
+
+    {#if expanded}
+      <div class="actions" role="toolbar" aria-label="Действия с письмом" aria-busy={busy}>
+        <button class="act" onclick={() => run({ kind: "read", read: !message.is_read })} disabled={busy} aria-label={message.is_read ? "Пометить непрочитанным" : "Пометить прочитанным"} title={message.is_read ? "Пометить непрочитанным" : "Пометить прочитанным"}>
+          <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path d={message.is_read ? ICON.unread : ICON.read} fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round" /></svg>
+        </button>
+        <button class="act" class:on={message.is_flagged} onclick={() => run({ kind: "flag", flagged: !message.is_flagged })} disabled={busy} aria-label={message.is_flagged ? "Снять флаг" : "Поставить флаг"} title={message.is_flagged ? "Снять флаг" : "Поставить флаг"} aria-pressed={message.is_flagged}>
+          <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path d={ICON.flag} fill={message.is_flagged ? "currentColor" : "none"} stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round" /></svg>
+        </button>
+        <button class="act" bind:this={moveBtn} onclick={() => (picker = !picker)} disabled={busy} aria-label="Переместить…" title="Переместить…" aria-haspopup="dialog" aria-expanded={picker}>
+          <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path d={ICON.move} fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round" /></svg>
+        </button>
+        <button class="act danger" bind:this={deleteBtn} onclick={() => (confirmDelete ? cancelDelete() : requestDelete())} disabled={busy} aria-label={inDeleted ? "Удалить навсегда…" : "Удалить"} title={inDeleted ? "Удалить навсегда…" : "Удалить (в «Удалённые»)"} aria-haspopup={inDeleted ? "dialog" : undefined}>
+          <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path d={ICON.delete} fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round" /></svg>
+        </button>
+        {#if picker && moveBtn}
+          <FolderPicker {folders} currentFolderPk={message.folder_pk} anchor={moveBtn} onpick={moveTo} onclose={closePicker} />
+        {/if}
+        {#if confirmDelete && deleteBtn}
+          <ConfirmPopover anchor={deleteBtn} title="Удалить письмо навсегда?" text="Письмо исчезнет с сервера, вернуть его будет нельзя." confirmLabel="Удалить навсегда" onconfirm={confirmDeleteNow} oncancel={cancelDelete} />
+        {/if}
+      </div>
+    {/if}
+  </div>
+
+  {#if actionError}
+    <div class="note status failed action-error" role="alert">
+      <span class="status-text">{actionError}</span>
+      <button class="btn" onclick={() => (actionError = null)} aria-label="Скрыть сообщение об ошибке">Скрыть</button>
     </div>
-  </header>
+  {/if}
 
   {#if expanded}
     {#if files.length}
@@ -290,16 +436,30 @@
     box-shadow: var(--shadow-2);
     overflow: hidden;
   }
+  /* Непрочитанное: полоска у левого края, без сдвига содержимого. */
+  .card.unread {
+    box-shadow:
+      inset 3px 0 0 var(--unread),
+      var(--shadow-2);
+  }
   .head {
+    display: flex;
+    align-items: flex-start;
+    gap: var(--space-2);
+    padding: var(--space-3) var(--space-3) var(--space-3) var(--space-4);
+  }
+  .head-main {
+    flex: 1;
+    min-width: 0;
     display: grid;
     grid-template-columns: 36px 1fr auto;
     gap: var(--space-3);
-    padding: var(--space-3) var(--space-4);
     align-items: start;
     cursor: default;
+    border-radius: var(--radius-control);
   }
-  .head:focus-visible {
-    outline-offset: -2px;
+  .head-main:focus-visible {
+    outline-offset: 2px;
   }
   .card:not(.expanded) .head:hover {
     background: var(--bg-hover);
@@ -355,12 +515,73 @@
     text-align: right;
     display: flex;
     flex-direction: column;
+    align-items: flex-end;
     gap: 2px;
     white-space: nowrap;
+  }
+  .date-row {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    height: 16px;
   }
   .date {
     font: var(--text-caption);
     color: var(--fg-2);
+  }
+  .flag-mark {
+    color: var(--danger);
+    flex: none;
+  }
+  .unread-dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: var(--unread);
+    flex: none;
+  }
+
+  /* --- панель действий --- */
+  .actions {
+    flex: none;
+    display: flex;
+    align-items: center;
+    gap: 2px;
+    margin-top: -2px;
+  }
+  .act {
+    width: 28px;
+    height: 28px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: var(--radius-control);
+    color: var(--fg-3);
+    transition:
+      background var(--dur-fast) var(--ease-in),
+      color var(--dur-fast) var(--ease-in);
+  }
+  .act:hover:not(:disabled) {
+    background: var(--bg-hover);
+    color: var(--fg-1);
+  }
+  .act:active:not(:disabled) {
+    background: var(--bg-pressed);
+  }
+  .act:disabled {
+    color: var(--fg-disabled);
+  }
+  .act.on {
+    color: var(--danger);
+  }
+  .act.danger:hover:not(:disabled) {
+    color: var(--danger);
+  }
+  .act:focus-visible {
+    outline-offset: -2px;
+  }
+  .action-error {
+    border-top: 1px solid var(--stroke-1);
   }
 
   /* --- вложения --- */

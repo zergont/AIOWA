@@ -21,6 +21,7 @@ use tracing::warn;
 
 mod ondemand;
 mod sync;
+mod write;
 
 /// Лимит одной инлайновой картинки: больше не скачиваем и не подставляем.
 pub(crate) const INLINE_IMAGE_MAX_BYTES: u64 = 8 * 1024 * 1024;
@@ -75,6 +76,8 @@ struct ConversationDto {
     total_count: i64,
     last_received_ms: Option<i64>,
     has_attachments: bool,
+    /// В беседе (в любой папке) есть письмо с флагом «к исполнению».
+    has_flagged: bool,
 }
 
 #[derive(Serialize)]
@@ -108,6 +111,8 @@ pub(crate) struct MessageDto {
     received_ms: Option<i64>,
     sent_ms: Option<i64>,
     is_read: bool,
+    /// Флаг «к исполнению» поставлен.
+    is_flagged: bool,
     is_draft: bool,
     has_attachments: bool,
     importance: Option<String>,
@@ -129,6 +134,7 @@ struct MessageKeyDto {
     is_read: bool,
     /// Вложений с файлом в кэше по базе (без проверки диска).
     cached: i64,
+    is_flagged: bool,
 }
 
 #[derive(Serialize)]
@@ -301,6 +307,7 @@ pub(crate) fn build_message(store: &Store, h: MessageHead) -> CmdResult<MessageD
         received_ms: ms(h.received_at),
         sent_ms: ms(h.sent_at),
         is_read: h.is_read,
+        is_flagged: h.is_flagged,
         is_draft: h.is_draft,
         has_attachments: h.has_attachments,
         importance: h.importance,
@@ -355,6 +362,7 @@ fn conversations(state: State<'_, AppState>, folder_pk: i64, after_ms: Option<i6
             total_count: r.total_count,
             last_received_ms: ms(r.last_received_at),
             has_attachments: r.has_attachments,
+            has_flagged: r.has_flagged,
         })
         .collect())
 }
@@ -380,7 +388,7 @@ async fn conversation(state: State<'_, AppState>, conversation_pk: i64) -> CmdRe
 #[tauri::command]
 fn conversation_key(state: State<'_, AppState>, conversation_pk: i64) -> CmdResult<Vec<MessageKeyDto>> {
     let keys = state.store.conversation_keys(state.account, conversation_pk).map_err(err)?;
-    Ok(keys.into_iter().map(|k| MessageKeyDto { item_pk: k.item_pk, body_state: k.body_state, is_read: k.is_read, cached: k.cached }).collect())
+    Ok(keys.into_iter().map(|k| MessageKeyDto { item_pk: k.item_pk, body_state: k.body_state, is_read: k.is_read, cached: k.cached, is_flagged: k.is_flagged }).collect())
 }
 
 #[tauri::command]
@@ -424,6 +432,7 @@ pub fn run() {
         .manage(state)
         .manage(sync_state.clone())
         .manage(ondemand::OnDemand::default())
+        .manage(write::WriteState::default())
         .invoke_handler(tauri::generate_handler![
             account_info,
             folders,
@@ -437,7 +446,12 @@ pub fn run() {
             ondemand::message_fetch,
             ondemand::attachment_open,
             ondemand::attachment_save_as,
-            ondemand::open_external
+            ondemand::open_external,
+            write::items_mark_read,
+            write::items_set_flag,
+            write::items_move,
+            write::items_delete,
+            write::conversation_item_pks
         ])
         .build(tauri::generate_context!())
         .expect("ошибка запуска приложения");
