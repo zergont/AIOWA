@@ -1,15 +1,18 @@
 <script lang="ts">
   import { onDestroy, onMount, untrack } from "svelte";
-  import { api, errorMessage, formatSize, fullDate, isInlinePicture, messageNeedsFetch, personLabel, type ComposeContext, type ComposeRecipient, type ComposeRequest, type Message, type PickedFile, type SignatureDto } from "../api";
+  import { api, errorMessage, formatSize, fullDate, isInlinePicture, messageNeedsFetch, personLabel, type ComposeContext, type ComposeRecipient, type ComposeRequest, type DraftAttachment, type DraftRef, type Message, type PickedFile, type SignatureDto } from "../api";
   import { COMPOSE_TITLE, ICON } from "../actions";
   import { isValidEmail, mergeRecipients } from "../addresses";
-  import { htmlToText } from "../html";
+  import { cleanDraftHtml, htmlToText, restoreDraftHtml } from "../html";
   import { focusBack } from "../popover";
   import RecipientsInput from "./RecipientsInput.svelte";
   import Editor from "./Editor.svelte";
   import BodyFrame from "./BodyFrame.svelte";
-  import ConfirmPopover from "./ConfirmPopover.svelte";
+  import ChoicePopover from "./ChoicePopover.svelte";
   import SignatureDialog from "./SignatureDialog.svelte";
+
+  /** Почему композер закрылся: отправлено, сохранён черновик, черновик удалён, просто отменено. */
+  export type CloseReason = "sent" | "draft" | "discard" | "cancel";
 
   interface Props {
     /** Заготовка от бэкенда; новая заготовка — новый экземпляр композера (родитель оборачивает в {#key}). */
@@ -18,17 +21,52 @@
     dirty?: boolean;
     /** Идёт отправка или сохранение черновика: родитель не заменяет композер и не даёт закрыть окно. */
     busy?: "send" | "draft" | null;
-    onclose: (reason: "sent" | "draft" | "cancel") => void;
+    onclose: (reason: CloseReason) => void;
   }
   let { ctx, dirty = $bindable(false), busy = $bindable(null), onclose }: Props = $props();
 
   // Экземпляр мог быть уничтожен, пока шёл запрос: его итог тогда никому не нужен, и уж точно
   // нельзя звать onclose — родитель закрыл бы уже другой композер.
   let alive = true;
-  onDestroy(() => (alive = false));
+  onDestroy(() => {
+    alive = false;
+    settleClose(null);
+  });
+
+  // --- закрытие по просьбе родителя ------------------------------------------------------
+  // Родитель (замена композера другим письмом, закрытие окна) спрашивает через askClose: тот же
+  // выбор, что у «Отменить» (сохранить, закрыть без сохранения, удалить, вернуться). Промис
+  // разрешается причиной закрытия или null, если пользователь вернулся к письму.
+
+  let closeWaiter: ((reason: CloseReason | null) => void) | null = null;
+
+  function settleClose(reason: CloseReason | null) {
+    const w = closeWaiter;
+    closeWaiter = null;
+    w?.(reason);
+  }
+
+  /** Закрыть композер с причиной и сообщить её тому, кто ждёт askClose. */
+  function finish(reason: CloseReason) {
+    onclose(reason);
+    settleClose(reason);
+  }
+
+  /** Закрыть композер с вопросом, если есть правки; null — пользователь вернулся к письму (или идёт отправка). */
+  export function askClose(): Promise<CloseReason | null> {
+    if (busy) return Promise.resolve(null);
+    if (!isDirty) {
+      finish("cancel");
+      return Promise.resolve("cancel");
+    }
+    settleClose(null);
+    root?.scrollIntoView({ block: "nearest" });
+    cancelAsk = true;
+    return new Promise((resolve) => (closeWaiter = resolve));
+  }
 
   const uid = $props.id();
-  const title = $derived(COMPOSE_TITLE[ctx.kind]);
+  const title = $derived(ctx.draft ? "Черновик" : COMPOSE_TITLE[ctx.kind]);
 
   /** Лимиты вложений те же, что на бэкенде: 25 МиБ на файл, 35 МиБ всего. */
   const FILE_MAX = 25 * 1024 * 1024;
@@ -36,26 +74,70 @@
 
   // --- состояние письма (из заготовки, дальше живёт своей жизнью) -------------------------
 
-  /** Начальный текст: пустая строка под каретку и, если включено, подпись через пустую строку (как в OWA). */
-  function initialBody(sig: SignatureDto): string {
-    const s = sig.auto_add ? sig.html.trim() : "";
+  /**
+   * Тело открытого черновика, если бэкенд его прислал (в заготовке или в сведениях о черновике).
+   * Картинки `cid:` показываются из кэша, исходные `src` и стили спрятаны до сохранения (restoreDraftHtml).
+   */
+  function draftBody(c: ComposeContext): string | null {
+    const html = c.body_html ?? c.draft?.body_html ?? null;
+    return html == null ? null : cleanDraftHtml(html, c.draft?.inline_images ?? {}) || "<div><br></div>";
+  }
+
+  /**
+   * Начальный текст: у черновика — его тело, иначе пустая строка под каретку и, если включено,
+   * подпись через пустую строку (как в OWA).
+   */
+  function initialBody(c: ComposeContext): string {
+    const saved = draftBody(c);
+    if (saved != null) return saved;
+    const s = c.signature.auto_add ? c.signature.html.trim() : "";
     return s ? `<div><br></div><div><br></div>${s}` : "<div><br></div>";
   }
 
   // Без дублей: чипы идут в keyed each по адресу.
   let to = $state<ComposeRecipient[]>(untrack(() => mergeRecipients([], ctx.to)));
   let cc = $state<ComposeRecipient[]>(untrack(() => mergeRecipients([], ctx.cc)));
-  let bcc = $state<ComposeRecipient[]>([]);
-  let showBcc = $state(false);
+  let bcc = $state<ComposeRecipient[]>(untrack(() => mergeRecipients([], ctx.bcc ?? ctx.draft?.bcc ?? [])));
+  let showBcc = $state(untrack(() => bcc.length > 0));
   let subject = $state(untrack(() => ctx.subject));
-  let body = $state(untrack(() => initialBody(ctx.signature)));
+  const startBody = untrack(() => initialBody(ctx));
+  let body = $state(startBody);
   let attachments = $state<PickedFile[]>([]);
   let signature = $state<SignatureDto>(untrack(() => ctx.signature));
   let original = $state<Message | null>(untrack(() => ctx.original));
 
+  // --- черновик на сервере -----------------------------------------------------------------
+  // Открытый черновик приходит с серверным id и вложениями; новое письмо получает id после первого
+  // автосохранения. Отправка идёт по этому же черновику (draft_server_id), чтобы не плодить копии.
+
+  let draftRef = $state<DraftRef | null>(untrack(() => (ctx.draft ? { server_id: ctx.draft.server_id, change_key: ctx.draft.change_key ?? null, item_pk: ctx.draft.item_pk } : null)));
+  /** Вложения черновика, уже лежащие на сервере. */
+  let serverFiles = $state<DraftAttachment[]>(untrack(() => ctx.draft?.attachments ?? []));
+  /** Серверные вложения, убранные крестиком: уйдут в removed_attachment_ids при сохранении или отправке. */
+  let removedServerIds = $state<string[]>([]);
+  const keptServerFiles = $derived(serverFiles.filter((f) => !removedServerIds.includes(f.server_id)));
+  /** Список вложений черновика известен с сервера (открытый черновик или после сохранения с файлами). */
+  let serverListed = $state(untrack(() => ctx.draft != null));
+  /** Есть изменения вложений, которых ещё нет на сервере (автосохранение их не пишет). */
+  const pendingFiles = $derived(attachments.length > 0 || removedServerIds.length > 0);
+  /**
+   * Вложения черновика на сервере после сохранения или неудачной отправки: серверный список
+   * заменяет свой, загруженные файлы (то же имя без учёта регистра и размер, как сверяет бэкенд)
+   * перестают быть локальными, уже удалённые пропадают из убранных.
+   */
+  function applyServerFiles(list: DraftAttachment[]) {
+    const ids = new Set(list.map((f) => f.server_id));
+    const stillRemoved = removedServerIds.filter((id) => ids.has(id));
+    const uploaded = (a: PickedFile) => list.some((f) => !stillRemoved.includes(f.server_id) && f.size === a.size && (f.name ?? "").toLowerCase() === a.name.toLowerCase());
+    serverFiles = list;
+    removedServerIds = stillRemoved;
+    attachments = attachments.filter((a) => !uploaded(a));
+    serverListed = true;
+  }
+
   let error = $state<string | null>(null);
   let lastAction = $state<"send" | "draft" | null>(null);
-  let confirmCancel = $state(false);
+  let cancelAsk = $state(false);
   let sigOpen = $state(false);
   let showOriginal = $state(true);
   let origLoading = $state(false);
@@ -70,14 +152,16 @@
   let bccField = $state<ReturnType<typeof RecipientsInput> | null>(null);
 
   const keyOf = (rs: ComposeRecipient[]) => rs.map((r) => r.email.trim().toLowerCase()).join(",");
-  const init = untrack(() => ({ subject: ctx.subject, bodyText: htmlToText(initialBody(ctx.signature)), to: keyOf(mergeRecipients([], ctx.to)), cc: keyOf(mergeRecipients([], ctx.cc)) }));
-  const isDirty = $derived(subject !== init.subject || keyOf(to) !== init.to || keyOf(cc) !== init.cc || bcc.length > 0 || attachments.length > 0 || htmlToText(body) !== init.bodyText);
+  /** Разметка в том виде, как её сериализует браузер: правка одного форматирования (жирный, список) тоже правка. */
+  const normHtml = (h: string) => new DOMParser().parseFromString(h, "text/html").body.innerHTML;
+  const init = untrack(() => ({ subject: ctx.subject, bodyText: htmlToText(startBody), bodyHtml: normHtml(startBody), to: keyOf(to), cc: keyOf(cc), bcc: keyOf(bcc) }));
+  const isDirty = $derived(subject !== init.subject || keyOf(to) !== init.to || keyOf(cc) !== init.cc || keyOf(bcc) !== init.bcc || attachments.length > 0 || removedServerIds.length > 0 || htmlToText(body) !== init.bodyText || (body !== startBody && normHtml(body) !== init.bodyHtml));
   $effect(() => {
     dirty = isDirty;
   });
 
-  /** Файлы исходного письма при пересылке: их добавит сервер, здесь только показываем. */
-  const originalFiles = $derived(ctx.kind === "forward" && original ? original.attachments.filter((a) => !isInlinePicture(a)) : []);
+  /** Файлы исходного письма при пересылке: их добавит сервер, здесь только показываем (пока список с сервера не известен — там они уже есть). */
+  const originalFiles = $derived(ctx.kind === "forward" && original && !serverListed ? original.attachments.filter((a) => !isInlinePicture(a)) : []);
   const originalTo = $derived(original ? original.recipients.filter((r) => r.kind === 1).map((r) => personLabel(r.name, r.email)) : []);
   /**
    * «Ответить всем», а получатели исходного письма в базе неизвестны: они приходят только вместе с
@@ -87,8 +171,8 @@
 
   onMount(() => {
     root?.scrollIntoView({ block: "start" });
-    // Ответу нужен текст, остальным — адресат.
-    if (ctx.kind === "reply" || ctx.kind === "reply_all") editor?.focus();
+    // Ответу и черновику с адресатом нужен текст, остальным — адресат.
+    if (ctx.kind === "reply" || ctx.kind === "reply_all" || (ctx.draft && to.length)) editor?.focus();
     else document.getElementById(`${uid}-to`)?.focus();
     void loadOriginal();
   });
@@ -118,7 +202,7 @@
    * запрашивается заново и подставляется, если пользователь ещё не трогал «Кому» и «Копию».
    */
   async function refreshRecipients() {
-    if (ctx.kind !== "reply_all" || ctx.reference_item_pk == null) return;
+    if (ctx.kind !== "reply_all" || ctx.reference_item_pk == null || ctx.draft) return;
     const untouched = () => keyOf(to) === init.to && keyOf(cc) === init.cc;
     if (!untouched()) return;
     const fresh = await api.composeContext(ctx.kind, ctx.reference_item_pk);
@@ -166,10 +250,112 @@
       cc: clean(cc),
       bcc: clean(bcc),
       subject: subject.trim(),
-      body_html: body,
+      // Картинкам и стилям черновика возвращаются исходные src/style (cid:, внешние адреса).
+      body_html: restoreDraftHtml(body),
       attachments: attachments.map((a) => a.path),
+      draft_server_id: draftRef?.server_id ?? null,
+      removed_attachment_ids: removedServerIds,
     };
   }
+
+  /**
+   * Запрос автосохранения: только текст, тема и получатели. Недонабранное в полях не трогается
+   * (commit сорвал бы набор адреса), а чипы с неверным адресом не уходят — сервер бы их отверг.
+   * Файлы черновика автосохранение не меняет.
+   */
+  function draftRequest(): ComposeRequest {
+    const valid = (rs: ComposeRecipient[]) => clean(rs).filter((r) => isValidEmail(r.email));
+    return { ...request(), to: valid(to), cc: valid(cc), bcc: valid(bcc), attachments: [], removed_attachment_ids: [] };
+  }
+
+  /** Запрос ручного сохранения: как у автосохранения, но с новыми файлами и убранными вложениями. */
+  function saveRequest(): ComposeRequest {
+    return { ...draftRequest(), attachments: attachments.map((a) => a.path), removed_attachment_ids: removedServerIds };
+  }
+
+  // --- автосохранение черновика ------------------------------------------------------------
+  // Через 30 с после последней правки и не чаще раза в 60 с, пока письмо непустое и отличается от
+  // сохранённого. Первый раз создаёт черновик на сервере, дальше обновляет его. Отказ показывается
+  // в подвале и не повторяется до следующей правки. Отправка и ручное сохранение ждут идущее
+  // автосохранение, чтобы работать с тем же черновиком. Вложения пишет только ручное сохранение
+  // (saveNow(true)) и отправка.
+
+  const AUTOSAVE_DELAY_MS = 30_000;
+  const AUTOSAVE_GAP_MS = 60_000;
+  const timeOnly = new Intl.DateTimeFormat("ru-RU", { hour: "2-digit", minute: "2-digit" });
+
+  /** Что именно сохраняется: тема, получатели и разметка тела (форматирование тоже правка). */
+  const snapshot = $derived(JSON.stringify([subject.trim(), keyOf(to), keyOf(cc), keyOf(bcc), body]));
+  const nonEmpty = $derived(subject.trim() !== "" || to.length + cc.length + bcc.length > 0 || htmlToText(body) !== "");
+  /** Снимок, который лежит на сервере; у открытого черновика — его начальное состояние. */
+  let lastSavedKey = $state<string | null>(untrack(() => (ctx.draft ? snapshot : null)));
+  /** Снимок, на котором автосохранение отказало: повтор только после правки. */
+  let failedKey = $state<string | null>(null);
+  let lastSaveAt = 0;
+  let autosaving = $state(false);
+  let autosaveError = $state<string | null>(null);
+  let savedAt = $state<number | null>(null);
+  let autosavePromise: Promise<void> | null = null;
+
+  $effect(() => {
+    const key = snapshot;
+    if (busy || autosaving || !isDirty || !nonEmpty || key === lastSavedKey || key === failedKey) return;
+    const wait = Math.max(AUTOSAVE_DELAY_MS, lastSaveAt + AUTOSAVE_GAP_MS - Date.now());
+    const t = setTimeout(autosave, wait);
+    return () => clearTimeout(t);
+  });
+
+  /**
+   * Сохранить текущее состояние на сервере, если оно отличается от сохранённого (или черновика ещё
+   * нет). `withFiles` — ручное сохранение: новые файлы прикладываются, убранные вложения удаляются.
+   * Ошибку пробрасывает; текст сохранён, а с вложениями не вышло — возвращает причину.
+   */
+  async function saveNow(withFiles = false): Promise<string | null> {
+    const key = snapshot;
+    const files = withFiles && pendingFiles;
+    if (draftRef && key === lastSavedKey && !files) return null;
+    autosaving = true;
+    autosaveError = null;
+    lastSaveAt = Date.now();
+    try {
+      if (files) {
+        const rep = await api.composeSaveDraft(saveRequest());
+        if (!alive) return null;
+        if (rep.draft) draftRef = rep.draft;
+        if (rep.attachments) applyServerFiles(rep.attachments);
+        lastSavedKey = key;
+        failedKey = null;
+        savedAt = Date.now();
+        return rep.message;
+      }
+      const ref = await api.composeAutosave(draftRequest(), draftRef?.server_id ?? null);
+      if (!alive) return null;
+      draftRef = ref;
+      lastSavedKey = key;
+      failedKey = null;
+      savedAt = Date.now();
+      return null;
+    } finally {
+      if (alive) autosaving = false;
+    }
+  }
+
+  function autosave() {
+    if (autosavePromise || busy || !alive) return;
+    const key = snapshot;
+    autosavePromise = saveNow()
+      .then(() => undefined)
+      .catch((e) => {
+        if (!alive) return;
+        autosaveError = errorMessage(e);
+        failedKey = key;
+      })
+      .finally(() => {
+        autosavePromise = null;
+      });
+  }
+
+  // --- отправка, сохранение, отмена -------------------------------------------------------
 
   async function send() {
     if (busy) return;
@@ -183,16 +369,28 @@
     error = null;
     lastAction = "send";
     try {
+      // Идущее автосохранение должно закончиться: отправка пойдёт по его черновику.
+      await autosavePromise;
+      const key = snapshot;
       const rep = await api.composeSend(request());
       if (!alive) return;
       if (rep.sent) {
-        onclose("sent");
+        finish("sent");
         return;
       }
+      // Черновик остался на сервере: дальше (автосохранение, «Повторить», «Сохранить») — по нему,
+      // а не новым CreateItem. Его состояние — то, что ушло в этой попытке.
+      if (rep.draft) {
+        draftRef = rep.draft;
+        lastSavedKey = key;
+      }
+      if (rep.attachments) applyServerFiles(rep.attachments);
+      // Исход SendItem неизвестен: письмо могло уйти, автосохранение до следующей правки не пишет в черновик.
+      if (rep.maybe_sent) failedKey = key;
       error = rep.message ?? (rep.draft_saved ? "Письмо не отправлено, черновик сохранён на сервере в «Черновиках»" : "Письмо не отправлено.");
-      // Черновик уже на сервере: «Повторить» создал бы второй, а при неизвестном исходе SendItem —
-      // ещё и дубль адресатам. Осознанная повторная отправка остаётся через «Отправить».
-      if (rep.draft_saved || rep.maybe_sent) lastAction = null;
+      // Черновик уже на сервере: «Повторить» без известного id создал бы второй, а при неизвестном
+      // исходе SendItem — ещё и дубль адресатам. Осознанная повторная отправка остаётся через «Отправить».
+      if ((rep.draft_saved && !draftRef) || rep.maybe_sent) lastAction = null;
     } catch (e) {
       if (!alive) return;
       error = errorMessage(e);
@@ -201,6 +399,7 @@
     }
   }
 
+  /** Кнопка «Сохранить черновик» и Ctrl+S: текст и вложения на сервер; композер остаётся открытым. */
   async function saveDraft() {
     if (busy) return;
     const problem = validate(false);
@@ -213,15 +412,9 @@
     error = null;
     lastAction = "draft";
     try {
-      const rep = await api.composeSaveDraft(request());
-      if (!alive) return;
-      // Закрываем только при чистом успехе: с текстом (черновик без вложений) композер остаётся,
-      // чтобы пользователь увидел, чего в черновике нет, и не потерял выбранные файлы.
-      if (rep.draft_saved && !rep.message) {
-        onclose("draft");
-        return;
-      }
-      error = rep.message ?? "Черновик не сохранён.";
+      await autosavePromise;
+      const warn = await saveNow(true);
+      if (warn && alive) error = warn;
     } catch (e) {
       if (!alive) return;
       error = errorMessage(e);
@@ -237,16 +430,93 @@
 
   function requestCancel() {
     if (busy) return;
-    if (isDirty) confirmCancel = true;
-    else onclose("cancel");
-  }
-  function confirmCancelNow() {
-    confirmCancel = false;
-    onclose("cancel");
+    if (isDirty) cancelAsk = true;
+    else finish("cancel");
   }
   function keepWriting() {
-    confirmCancel = false;
+    cancelAsk = false;
+    settleClose(null);
     focusBack(cancelBtn);
+  }
+  function pickCancel(id: string) {
+    cancelAsk = false;
+    if (id === "save") void saveAndClose();
+    else if (id === "discard") void discardDraft();
+    // Открытый черновик остаётся на сервере таким, каким был при последнем сохранении.
+    else if (id === "close") finish("cancel");
+  }
+
+  /** Вопрос при отмене: тексты и варианты зависят от того, есть ли черновик на сервере. */
+  const cancelTitle = $derived(draftRef ? "Закрыть черновик?" : "Отменить текущее письмо?");
+  const cancelText = $derived(
+    (draftRef ? "Черновик уже в «Черновиках». Сохранить последние правки, закрыть без них или удалить черновик (он уйдёт в «Удалённые»)?" : "На сервере письма ещё нет: сохранить его в «Черновики» или не сохранять?") +
+      (pendingFiles ? " Новые файлы и убранные вложения сохранятся вместе с текстом." : ""),
+  );
+  const cancelOptions = $derived(
+    draftRef
+      ? [
+          { id: "save", label: "Сохранить черновик", primary: true },
+          { id: "close", label: "Закрыть без сохранения" },
+          { id: "discard", label: "Удалить черновик", danger: true },
+        ]
+      : [
+          { id: "save", label: "Сохранить черновик", primary: true },
+          { id: "discard", label: "Не сохранять", danger: true },
+        ],
+  );
+
+  /** «Сохранить черновик» при отмене: сохранить (с вложениями), если есть что, и закрыть. */
+  async function saveAndClose() {
+    if (busy) return;
+    const problem = validate(false);
+    if (problem) {
+      error = problem;
+      lastAction = null;
+      settleClose(null);
+      return;
+    }
+    busy = "draft";
+    error = null;
+    lastAction = null;
+    try {
+      await autosavePromise;
+      const warn = await saveNow(true);
+      if (!alive) return;
+      // Текст сохранён, а вложения нет: не закрывать молча — пользователь решит, что делать.
+      if (warn) {
+        error = warn;
+        lastAction = "draft";
+        settleClose(null);
+        return;
+      }
+      finish("draft");
+    } catch (e) {
+      if (!alive) return;
+      error = errorMessage(e);
+      settleClose(null);
+    } finally {
+      if (alive) busy = null;
+    }
+  }
+
+  /** «Удалить черновик»: на сервере — в «Удалённые», если он там есть; иначе просто закрыть. */
+  async function discardDraft() {
+    if (busy) return;
+    busy = "draft";
+    error = null;
+    lastAction = null;
+    try {
+      await autosavePromise;
+      const id = draftRef?.server_id ?? null;
+      if (id) await api.composeDiscardDraft(id);
+      if (alive) finish(id ? "discard" : "cancel");
+    } catch (e) {
+      if (!alive) return;
+      error = errorMessage(e);
+      settleClose(null);
+    } finally {
+      if (alive) busy = null;
+    }
   }
 
   // --- вложения ---------------------------------------------------------------------------
@@ -265,17 +535,24 @@
   function removeFile(path: string) {
     attachments = attachments.filter((a) => a.path !== path);
   }
+  function removeServerFile(serverId: string) {
+    if (!removedServerIds.includes(serverId)) removedServerIds = [...removedServerIds, serverId];
+  }
 
-  // --- клавиши: Ctrl+Enter — отправить, Esc — отменить ------------------------------------
+  // --- клавиши: Ctrl+Enter — отправить, Ctrl+S — сохранить черновик, Esc — отменить ----------
   // Слушаем окно и проверяем, что событие пришло изнутри композера: у всплывающих окон внутри
   // (подсказки адресатов, адрес ссылки) свой Esc, они его останавливают сами.
 
   function onWindowKey(e: KeyboardEvent) {
     if (!root || !(e.target instanceof Node) || !root.contains(e.target)) return;
-    if (sigOpen || confirmCancel) return;
-    if ((e.ctrlKey || e.metaKey) && e.key === "Enter") {
+    if (sigOpen || cancelAsk) return;
+    const ctrl = e.ctrlKey || e.metaKey;
+    if (ctrl && e.key === "Enter") {
       e.preventDefault();
       void send();
+    } else if (ctrl && !e.shiftKey && !e.altKey && (e.code === "KeyS" || e.key.toLowerCase() === "s")) {
+      e.preventDefault();
+      void saveDraft();
     } else if (e.key === "Escape") {
       e.preventDefault();
       requestCancel();
@@ -292,8 +569,8 @@
       <svg width="14" height="14" viewBox="0 0 16 16" aria-hidden="true"><path d="M2 8 14 2.5 11.5 14 8.5 9.5 2 8Zm6.5 1.5L12 5" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round" /></svg>
       Отправить
     </button>
-    <button class="btn" onclick={saveDraft} disabled={busy != null} title="Сохранить черновик на сервере">Сохранить черновик</button>
-    <button class="btn" bind:this={cancelBtn} onclick={() => (confirmCancel ? keepWriting() : requestCancel())} disabled={busy != null} title="Отменить (Esc)" aria-haspopup="dialog" aria-expanded={confirmCancel}>Отменить</button>
+    <button class="btn" onclick={saveDraft} disabled={busy != null} title="Сохранить черновик на сервере (Ctrl+S)">Сохранить черновик</button>
+    <button class="btn" bind:this={cancelBtn} onclick={() => (cancelAsk ? keepWriting() : requestCancel())} disabled={busy != null} title="Отменить (Esc)" aria-haspopup="dialog" aria-expanded={cancelAsk}>Отменить</button>
     {#if busy}
       <span class="progress caption" aria-live="polite">
         <span class="spinner" aria-hidden="true"></span>
@@ -343,10 +620,18 @@
     </div>
   </div>
 
-  {#if attachments.length || originalFiles.length}
+  {#if attachments.length || keptServerFiles.length || originalFiles.length}
     <div class="files" aria-label="Вложения">
+      {#each keptServerFiles as f (f.server_id)}
+        <span class="file server" title={[f.content_type ?? "", "Вложение черновика уже на сервере"].filter(Boolean).join("\n")}>
+          <svg width="14" height="14" viewBox="0 0 16 16" aria-hidden="true"><path d={ICON.attach} fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" /></svg>
+          <span class="file-name">{f.name ?? "вложение"}</span>
+          <span class="caption file-size">{formatSize(f.size)}</span>
+          <button class="file-x" onclick={() => removeServerFile(f.server_id)} disabled={busy != null} aria-label="Убрать вложение {f.name ?? 'без имени'}">×</button>
+        </span>
+      {/each}
       {#each attachments as a (a.path)}
-        <span class="file" title={a.path}>
+        <span class="file" title="{a.path}&#10;Файл прикрепится при сохранении черновика или отправке">
           <svg width="14" height="14" viewBox="0 0 16 16" aria-hidden="true"><path d={ICON.attach} fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" /></svg>
           <span class="file-name">{a.name}</span>
           <span class="caption file-size">{formatSize(a.size)}</span>
@@ -365,6 +650,21 @@
 
   <div class="editor-wrap">
     <Editor bind:this={editor} bind:value={body} disabled={busy != null} minHeight={240} />
+  </div>
+
+  <div class="foot caption" aria-live="polite">
+    {#if autosaving}
+      <span class="spinner small" aria-hidden="true"></span>
+      <span>Сохраняю…</span>
+    {:else if autosaveError}
+      <span class="foot-failed">Черновик не сохранён: {autosaveError}</span>
+    {:else if savedAt != null}
+      <span>Черновик сохранён в {timeOnly.format(new Date(savedAt))}{pendingFiles ? " · изменения вложений ещё не сохранены" : ""}</span>
+    {:else if draftRef}
+      <span>Черновик с сервера{isDirty ? " · есть несохранённые правки" : ""}</span>
+    {:else if isDirty && nonEmpty}
+      <span>Черновик сохранится автоматически</span>
+    {/if}
   </div>
 
   {#if original}
@@ -394,8 +694,17 @@
     </section>
   {/if}
 
-  {#if confirmCancel && cancelBtn}
-    <ConfirmPopover anchor={cancelBtn} align="start" title="Отменить текущее письмо?" text="Набранный текст будет потерян." confirmLabel="Отменить письмо" onconfirm={confirmCancelNow} oncancel={keepWriting} />
+  {#if cancelAsk && cancelBtn}
+    <ChoicePopover
+      anchor={cancelBtn}
+      align="start"
+      title={cancelTitle}
+      text={cancelText}
+      options={cancelOptions}
+      cancelLabel="Вернуться"
+      onpick={pickCancel}
+      oncancel={keepWriting}
+    />
   {/if}
   {#if sigOpen}
     <SignatureDialog {signature} onsaved={(s) => (signature = s)} onclose={() => ((sigOpen = false), focusBack(sigBtn))} />
@@ -567,6 +876,11 @@
     color: var(--fg-1);
     max-width: 360px;
   }
+  /* Вложение черновика с сервера: оно уже там, крестик лишь помечает его к удалению при отправке. */
+  .file.server {
+    border-color: var(--stroke-2);
+    background: var(--bg-layer-alt);
+  }
   .file.inherited {
     color: var(--fg-3);
     border-style: dashed;
@@ -596,9 +910,21 @@
     color: var(--fg-disabled);
   }
 
-  /* --- редактор и оригинал --- */
+  /* --- редактор, подвал и оригинал --- */
   .editor-wrap {
-    padding: var(--space-2) var(--space-3) var(--space-3);
+    padding: var(--space-2) var(--space-3) var(--space-2);
+  }
+  .foot {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    min-height: 24px;
+    padding: 0 var(--space-3) var(--space-2);
+    color: var(--fg-3);
+  }
+  .foot-failed {
+    color: var(--danger);
+    user-select: text;
   }
   .original {
     border-top: 1px solid var(--stroke-1);
@@ -664,6 +990,10 @@
     border: 2px solid var(--stroke-2);
     border-top-color: var(--accent);
     animation: spin 0.9s linear infinite;
+  }
+  .spinner.small {
+    width: 11px;
+    height: 11px;
   }
   @keyframes spin {
     to {

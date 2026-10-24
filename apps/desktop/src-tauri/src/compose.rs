@@ -9,18 +9,35 @@
 //! `SyncState::invalidate_on`. Один замок на отправку и сохранение черновика: второй вызов,
 //! пока идёт первый (двойной Ctrl+Enter), отклоняется сразу, а не ждёт и не шлёт письмо дважды.
 //!
+//! Черновики. Композер автосохраняет письмо (`compose_autosave`: первый раз `CreateItem`, дальше
+//! `UpdateItem`, вложения не трогает), сохраняет его вручную вместе с файлами
+//! (`compose_save_draft`) и открывает черновик из «Черновиков» (`compose_open_draft`: текст из
+//! базы, а если полного тела нет — `GetItem` с сервера; обрезанный сервером не открывается).
+//! Отправка существующего черновика (`ComposeRequest::draft_server_id`) идёт по тому же письму:
+//! `UpdateItem` → новые файлы (`CreateAttachment`) → убранные (`DeleteAttachment`) → `SendItem`;
+//! новое копию не плодит. Перед вложениями черновик сверяется с сервером: уже загруженные файлы и
+//! уже удалённые вложения повтор не трогает. Отказ после появления черновика возвращает его
+//! идентификатор (`SendReport::draft`), чтобы окно продолжало работать с ним, а не создавало второй.
+//! `compose_discard_draft` переносит черновик в «Удалённые». `UpdateItem` заменяет тело целиком, а
+//! цитату оригинала сервер добавляет только при создании ответа, поэтому при обновлении черновика
+//! ответа или пересылки цитата собирается заново (`quote_html`) из полного тела оригинала,
+//! прочитанного с сервера: в базе только `UniqueBody`, без истории переписки.
+//!
 //! Тело письма перед отправкой проходит ту же очистку ammonia, что и показ писем: во вставленном
-//! из буфера HTML не должно уйти скриптов и обработчиков. Цитату оригинала (и вложения оригинала
-//! у пересылки) добавляет сервер, клиент передаёт только новую часть.
+//! из буфера HTML не должно уйти скриптов и обработчиков. Ссылки `cid:` на инлайновые вложения
+//! при этом остаются как есть (`sanitize_keep_cid`): подмена на `data:` сломала бы картинки у
+//! адресата. Цитату оригинала (и вложения оригинала у пересылки) при создании добавляет сервер,
+//! клиент передаёт только новую часть.
 
 use crate::ondemand::{describe_transport, timed_out};
 use crate::sync::SyncState;
-use crate::{build_message, err, AppState, CmdResult, ComposeRecipientDto, InlineMap, MessageDto, ParticipantDto, RecipientDto};
-use aiowa_core::{AccountId, ComposeKind, Importance, OutgoingAttachment, OutgoingMessage, Participant};
-use aiowa_store::Store;
-use aiowa_transport::MailTransport;
+use crate::{build_message, err, prepare_attachments, AppState, CmdResult, ComposeRecipientDto, InlineMap, MessageDto, ParticipantDto, RecipientDto};
+use aiowa_core::{AccountId, AttachmentMeta, BodyType, ComposeKind, Importance, ItemId, MessageFull, OutgoingAttachment, OutgoingMessage, Participant};
+use aiowa_store::ui::RecipientRow;
+use aiowa_store::{AttachmentRow, Store};
+use aiowa_transport::{DeleteMode, ItemFetchShape, ItemResult, MailTransport, WriteResult};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::path::Path;
 use std::sync::Arc;
@@ -34,6 +51,10 @@ const CREATE_TIMEOUT: Duration = Duration::from_secs(60);
 const ATTACH_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 /// Таймаут отправки (`SendItem`).
 const SEND_TIMEOUT: Duration = Duration::from_secs(60);
+/// Таймаут перечитывания вложений черновика после их изменения: окно ждёт ответа, долго тянуть нельзя.
+const REREAD_TIMEOUT: Duration = Duration::from_secs(15);
+/// Сколько цитат оригиналов держать в памяти (композер один, хватит с запасом).
+const QUOTE_CACHE: usize = 4;
 /// Лимит одного файла вложения.
 pub(crate) const MAX_ATTACHMENT_BYTES: u64 = 25 * 1024 * 1024;
 /// Лимит всех вложений письма вместе.
@@ -49,10 +70,45 @@ const SIGNATURE_AUTO_KEY: &str = "desktop.signature_auto";
 /// Текст для окна, когда черновик создан, а дальше не вышло.
 const DRAFT_KEPT: &str = "Письмо не отправлено, черновик сохранён на сервере в «Черновиках»";
 
-/// Состояние композера: один замок на отправку и сохранение черновика.
+/// Состояние композера: один замок на отправку и сохранение черновика, последние известные
+/// ключи изменений черновиков, с которыми работало окно (окно передаёт только серверный `Id`), и
+/// цитаты оригиналов для обновляемых черновиков ответа и пересылки (ключ — `item_pk` оригинала:
+/// полное тело читается с сервера один раз, а не на каждое автосохранение).
 #[derive(Default)]
 pub(crate) struct ComposeState {
     sending: tokio::sync::Mutex<()>,
+    change_keys: std::sync::Mutex<HashMap<String, Option<String>>>,
+    quotes: std::sync::Mutex<Vec<(i64, Arc<String>)>>,
+}
+
+impl ComposeState {
+    /// Идентификатор черновика с последним известным `ChangeKey` (без него — только `Id`:
+    /// `UpdateItem` идёт с `AlwaysOverwrite`, устаревший ключ ему не помеха).
+    fn item_id(&self, server_id: &str) -> ItemId {
+        let change_key = self.change_keys.lock().unwrap_or_else(|p| p.into_inner()).get(server_id).cloned().flatten();
+        ItemId { id: server_id.to_string(), change_key }
+    }
+
+    fn remember(&self, id: &ItemId) {
+        self.change_keys.lock().unwrap_or_else(|p| p.into_inner()).insert(id.id.clone(), id.change_key.clone());
+    }
+
+    fn forget(&self, server_id: &str) {
+        self.change_keys.lock().unwrap_or_else(|p| p.into_inner()).remove(server_id);
+    }
+
+    fn cached_quote(&self, original_pk: i64) -> Option<Arc<String>> {
+        self.quotes.lock().unwrap_or_else(|p| p.into_inner()).iter().find(|(pk, _)| *pk == original_pk).map(|(_, q)| q.clone())
+    }
+
+    fn remember_quote(&self, original_pk: i64, quote: Arc<String>) {
+        let mut quotes = self.quotes.lock().unwrap_or_else(|p| p.into_inner());
+        quotes.retain(|(pk, _)| *pk != original_pk);
+        quotes.push((original_pk, quote));
+        if quotes.len() > QUOTE_CACHE {
+            quotes.remove(0);
+        }
+    }
 }
 
 /// Вид письма, как его называет окно.
@@ -78,18 +134,64 @@ pub(crate) struct SignatureDto {
     auto_add: bool,
 }
 
+/// Вложение черновика, уже лежащее на сервере.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub(crate) struct DraftAttachmentDto {
+    /// Запись в локальной базе; `None`, если черновик известен только с сервера.
+    attachment_pk: Option<i64>,
+    /// Серверный `AttachmentId`: им вложение убирается (`ComposeRequest::removed_attachment_ids`).
+    server_id: String,
+    name: Option<String>,
+    size: Option<i64>,
+    content_type: Option<String>,
+}
+
+impl DraftAttachmentDto {
+    fn of(a: &AttachmentMeta, attachment_pk: Option<i64>) -> Self {
+        Self { attachment_pk, server_id: a.id.clone(), name: a.name.clone(), size: a.size, content_type: a.content_type.clone() }
+    }
+}
+
+/// Открытый черновик: откуда он взялся и какие файлы уже приложены на сервере.
+#[derive(Debug, Serialize)]
+pub(crate) struct DraftInfoDto {
+    item_pk: Option<i64>,
+    server_id: String,
+    change_key: Option<String>,
+    attachments: Vec<DraftAttachmentDto>,
+    /// Инлайновые картинки тела для показа в редакторе: нормализованный `cid` (как у
+    /// `normalize_cid`: без `cid:` и `<>`, в нижнем регистре) → адрес протокола `aiowa-att`.
+    /// Только файлы, уже лежащие в кэше. Тело хранит `cid:`; окно подставляет адрес лишь для
+    /// показа и возвращает `cid:` перед сохранением.
+    inline_images: HashMap<String, String>,
+}
+
+/// Ссылка на черновик на сервере после автосохранения; `item_pk` — локальная запись, если
+/// синхронизация её уже принесла.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub(crate) struct DraftRef {
+    server_id: String,
+    change_key: Option<String>,
+    item_pk: Option<i64>,
+}
+
 /// Заготовка композера: получатели и тема подобраны по виду письма, оригинал — для показа
 /// под редактором (только чтение), собственные адреса — чтобы окно не предлагало их в «ответить всем».
+/// У открытого черновика (`compose_open_draft`) есть ещё скрытые получатели, тело и `draft`.
 #[derive(Serialize)]
 pub(crate) struct ComposeContext {
     kind: ComposeKindDto,
     reference_item_pk: Option<i64>,
     to: Vec<ComposeRecipientDto>,
     cc: Vec<ComposeRecipientDto>,
+    bcc: Vec<ComposeRecipientDto>,
     subject: String,
     original: Option<MessageDto>,
     own_addresses: Vec<String>,
     signature: SignatureDto,
+    /// Тело открытого черновика (очищенный HTML); у новой заготовки `None` — тело строится из подписи.
+    body_html: Option<String>,
+    draft: Option<DraftInfoDto>,
 }
 
 /// Письмо из окна: получатели, тема, HTML редактора, пути файлов-вложений.
@@ -109,6 +211,12 @@ pub(crate) struct ComposeRequest {
     body_html: String,
     #[serde(default)]
     attachments: Vec<String>,
+    /// Черновик уже на сервере (автосохранение или открытый из «Черновиков»): отправка идёт по нему.
+    #[serde(default)]
+    draft_server_id: Option<String>,
+    /// Серверные вложения черновика, убранные в композере (`AttachmentId`).
+    #[serde(default)]
+    removed_attachment_ids: Vec<String>,
 }
 
 /// Итог отправки или сохранения черновика.
@@ -121,6 +229,20 @@ pub(crate) struct SendReport {
     maybe_sent: bool,
     /// Текст для пользователя, если что-то не вышло после создания черновика.
     message: Option<String>,
+    /// Черновик на сервере, если он остался (не отправлено) или сохранён: окно продолжает работать
+    /// с ним (автосохранение и «Повторить» идут через `UpdateItem`), а не создаёт второй.
+    draft: Option<DraftRef>,
+    /// Файловые вложения черновика на сервере после того, как этот вызов их менял (`None` —
+    /// не менял или перечитать не вышло): окно сверяет с ними свой список.
+    attachments: Option<Vec<DraftAttachmentDto>>,
+}
+
+impl SendReport {
+    fn with_draft(mut self, draft: DraftRef, attachments: Option<Vec<DraftAttachmentDto>>) -> Self {
+        self.draft = Some(draft);
+        self.attachments = attachments;
+        self
+    }
 }
 
 #[derive(Serialize)]
@@ -232,7 +354,7 @@ pub(crate) fn check_sizes(sizes: &[(String, u64)]) -> CmdResult<()> {
 
 /// MIME-тип по расширению для частых случаев; остальное — `application/octet-stream`
 /// (сервер и так определяет тип по имени при показе).
-fn content_type_for(name: &str) -> &'static str {
+pub(crate) fn content_type_for(name: &str) -> &'static str {
     let ext = name.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase());
     match ext.as_deref() {
         Some("txt" | "log" | "md") => "text/plain",
@@ -248,6 +370,8 @@ fn content_type_for(name: &str) -> &'static str {
         Some("bmp") => "image/bmp",
         Some("webp") => "image/webp",
         Some("svg") => "image/svg+xml",
+        Some("ico") => "image/x-icon",
+        Some("avif") => "image/avif",
         Some("tif" | "tiff") => "image/tiff",
         Some("zip") => "application/zip",
         Some("7z") => "application/x-7z-compressed",
@@ -306,8 +430,9 @@ fn participants(rs: &[ComposeRecipientDto]) -> CmdResult<Vec<Participant>> {
         .collect()
 }
 
-/// Исходящее письмо из запроса окна: адреса проверены, тело очищено. `require_recipient` —
-/// для отправки нужен хотя бы один получатель; черновик можно сохранить и без него.
+/// Исходящее письмо из запроса окна: адреса проверены, тело очищено (ссылки `cid:` на инлайновые
+/// вложения черновика остаются). `require_recipient` — для отправки нужен хотя бы один
+/// получатель; черновик можно сохранить и без него.
 pub(crate) fn outgoing(req: &ComposeRequest, require_recipient: bool) -> CmdResult<OutgoingMessage> {
     let to = participants(&req.to)?;
     let cc = participants(&req.cc)?;
@@ -315,8 +440,74 @@ pub(crate) fn outgoing(req: &ComposeRequest, require_recipient: bool) -> CmdResu
     if require_recipient && to.is_empty() && cc.is_empty() && bcc.is_empty() {
         return Err("Укажите хотя бы одного получателя".into());
     }
-    let body_html = crate::sanitize_html(&req.body_html, &Arc::new(InlineMap::new()));
+    let body_html = crate::sanitize_keep_cid(&req.body_html);
     Ok(OutgoingMessage { to, cc, bcc, subject: req.subject.trim().to_string(), body_html, importance: Importance::Normal })
+}
+
+/// Идентификатор черновика из запроса; пустая строка — «черновика на сервере нет».
+fn draft_id_of(req: &ComposeRequest) -> Option<String> {
+    req.draft_server_id.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(String::from)
+}
+
+/// `AttachmentId` убранных вложений: без пустых и повторов, порядок сохранён.
+fn removed_ids(req: &ComposeRequest) -> Vec<String> {
+    let mut seen = HashSet::new();
+    req.removed_attachment_ids.iter().map(|s| s.trim()).filter(|s| !s.is_empty() && seen.insert(s.to_string())).map(String::from).collect()
+}
+
+/// Файлы, которых ещё нет среди вложений черновика на сервере (имя без учёта регистра и размер
+/// совпадают — значит, файл уже приложен): повтор отправки после оборванной загрузки не
+/// прикладывает загруженное второй раз.
+fn filter_new_files(files: Vec<OutgoingAttachment>, on_server: &[AttachmentMeta]) -> Vec<OutgoingAttachment> {
+    files
+        .into_iter()
+        .filter(|f| {
+            let name = f.name.to_lowercase();
+            !on_server.iter().any(|a| !a.is_inline && a.size == Some(f.bytes.len() as i64) && a.name.as_deref().is_some_and(|n| n.to_lowercase() == name))
+        })
+        .collect()
+}
+
+/// Сверка с вложениями черновика на сервере (см. `reconcile`): файлы, которых там ещё нет (убираемые
+/// вложения не в счёт), и убранные вложения, которые там ещё есть.
+fn reconcile_with(on_server: &[AttachmentMeta], removed: Vec<String>, files: Vec<OutgoingAttachment>) -> (Vec<OutgoingAttachment>, Vec<String>) {
+    let kept: Vec<AttachmentMeta> = on_server.iter().filter(|a| !removed.contains(&a.id)).cloned().collect();
+    let removed = removed.into_iter().filter(|id| on_server.iter().any(|a| &a.id == id)).collect();
+    (filter_new_files(files, &kept), removed)
+}
+
+fn esc(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
+}
+
+/// «Имя <адрес>», только адрес или только имя; пусто, если нет ни того, ни другого.
+fn person_label(name: Option<&str>, email: Option<&str>) -> String {
+    let name = name.map(str::trim).filter(|n| !n.is_empty());
+    let email = email.map(str::trim).filter(|e| !e.is_empty());
+    match (name, email) {
+        (Some(n), Some(e)) if n != e => format!("{n} <{e}>"),
+        (_, Some(e)) => e.to_string(),
+        (Some(n), None) => n.to_string(),
+        (None, None) => String::new(),
+    }
+}
+
+/// Цитата оригинала под текстом ответа или пересылки при обновлении черновика: шапка (от кого,
+/// когда, кому, копия, тема) и тело оригинала. Тело `body_html` уже очищено, остальное — текст,
+/// он экранируется. Пустые «Кому» и «Копия» в шапку не попадают.
+pub(crate) fn quote_html(from: &str, sent: Option<&str>, to: &str, cc: &str, subject: &str, body_html: &str) -> String {
+    let mut head = format!("<b>От:</b> {}", esc(from));
+    if let Some(sent) = sent {
+        head.push_str(&format!("<br><b>Отправлено:</b> {}", esc(sent)));
+    }
+    if !to.is_empty() {
+        head.push_str(&format!("<br><b>Кому:</b> {}", esc(to)));
+    }
+    if !cc.is_empty() {
+        head.push_str(&format!("<br><b>Копия:</b> {}", esc(cc)));
+    }
+    head.push_str(&format!("<br><b>Тема:</b> {}", esc(subject)));
+    format!("<hr><div>{head}</div><br><div>{body_html}</div>")
 }
 
 // --- база ----------------------------------------------------------------------------------
@@ -367,6 +558,103 @@ async fn prepare(state: &AppState, req: &ComposeRequest, require_recipient: bool
     Ok((kind, msg, files))
 }
 
+/// Черновик из локальной базы: заголовок, получатели, файлы и тело, если оно есть полностью.
+struct LocalDraft {
+    id: ItemId,
+    subject: String,
+    to: Vec<ComposeRecipientDto>,
+    cc: Vec<ComposeRecipientDto>,
+    bcc: Vec<ComposeRecipientDto>,
+    /// Полное тело вместе с цитатой, очищенное, с исходными `cid:`; `None` — локального тела нет
+    /// или оно обрезано.
+    body_html: Option<String>,
+    /// Файловые вложения (без инлайновых картинок тела).
+    files: Vec<AttachmentRow>,
+    /// Инлайновые картинки из кэша для показа в редакторе (`DraftInfoDto::inline_images`).
+    inline_images: HashMap<String, String>,
+}
+
+/// Получатели одного вида из строк базы (1 — Кому, 2 — Копия, 3 — Скрытая); без адреса SMTP не берутся.
+fn recipients_of(rows: &[RecipientRow], kind: i64) -> Vec<ComposeRecipientDto> {
+    rows.iter().filter(|r| r.kind == kind).filter_map(|r| compose_recipient(r.name.as_deref(), r.email.as_deref())).collect()
+}
+
+fn local_draft(store: &Store, item_pk: i64) -> CmdResult<LocalDraft> {
+    const GONE: &str = "Черновик удалён";
+    let item = store.item_ref(item_pk).map_err(err)?.ok_or_else(|| GONE.to_string())?;
+    let head = store.message_head(item_pk).map_err(err)?.ok_or_else(|| GONE.to_string())?;
+    if !head.is_draft {
+        return Err("Это письмо не черновик".into());
+    }
+    let rows = store.recipients(item_pk).map_err(err)?;
+    // Правится полное тело: UniqueBody у ответа обрезан до нового текста, а в черновике нужна и цитата.
+    let body = store.message_body(item_pk).map_err(err)?.filter(|b| !b.is_truncated);
+    let (atts, _) = prepare_attachments(store, item_pk, None)?;
+    // Ссылки cid: остаются в теле: при сохранении они должны уйти на сервер как были, а не data:.
+    let body_html = body.and_then(|b| match (b.full, b.body_type) {
+        (Some(html), BodyType::Html) => Some(crate::sanitize_keep_cid(&html)),
+        (Some(text), BodyType::Text) => Some(crate::text_to_html(&text)),
+        (None, _) => None,
+    });
+    let inline_images = inline_preview_urls(&atts);
+    Ok(LocalDraft {
+        id: item.id,
+        subject: head.subject.unwrap_or_default(),
+        to: recipients_of(&rows, 1),
+        cc: recipients_of(&rows, 2),
+        bcc: recipients_of(&rows, 3),
+        body_html,
+        files: atts.into_iter().filter(|a| !a.is_inline).collect(),
+        inline_images,
+    })
+}
+
+/// Адреса для показа инлайновых картинок черновика в редакторе: нормализованный `cid` → адрес
+/// протокола `aiowa-att` (только файлы, уже лежащие в кэше).
+fn inline_preview_urls(rows: &[AttachmentRow]) -> HashMap<String, String> {
+    rows.iter()
+        .filter(|a| a.is_inline && a.local_path.is_some())
+        .filter_map(|a| {
+            let key = crate::normalize_cid(a.content_id.as_deref()?);
+            (!key.is_empty()).then(|| (key, crate::preview::preview_url(a.attachment_pk)))
+        })
+        .collect()
+}
+
+/// Цитата оригинала из письма, прочитанного с сервера с полным телом (`ItemFetchShape::WithFullBody`):
+/// шапка (от кого, когда, кому, копия, тема) и тело вместе с историей переписки. Ссылки `cid:`
+/// остаются как есть — они указывают на инлайновые вложения, которые сервер скопировал в черновик
+/// при создании; `data:` не подставляется. Полного тела нет или оно обрезано — ошибка: черновик не
+/// должен уйти без цитаты или с обрезанной.
+pub(crate) fn quote_from_full(m: &MessageFull) -> CmdResult<String> {
+    const NO_BODY: &str = "Сервер не отдал полный текст исходного письма — цитату не собрать, черновик не обновлён";
+    let body = m.body.as_ref().ok_or(NO_BODY)?;
+    if body.is_truncated {
+        return Err("Исходное письмо слишком большое: цитата в черновике была бы обрезана, черновик не обновлён".into());
+    }
+    let raw = body.full_body.as_deref().ok_or(NO_BODY)?;
+    let html = match body.body_type {
+        BodyType::Html => crate::sanitize_keep_cid(raw),
+        BodyType::Text => crate::text_to_html(raw),
+    };
+    let list = |ps: &[Participant]| ps.iter().map(|p| person_label(p.name.as_deref(), p.email.as_deref())).filter(|s| !s.is_empty()).collect::<Vec<_>>().join("; ");
+    let sent = m.meta.sent_at.or(m.meta.received_at).map(|t| t.to_zoned(jiff::tz::TimeZone::system()).strftime("%d.%m.%Y %H:%M").to_string());
+    let from = m.meta.from.as_ref().map(|p| person_label(p.name.as_deref(), p.email.as_deref())).unwrap_or_default();
+    Ok(quote_html(&from, sent.as_deref(), &list(&m.to), &list(&m.cc), m.meta.subject.as_deref().unwrap_or_default(), &html))
+}
+
+/// Убирает черновик из локальной базы сразу, не дожидаясь синхронизации «Черновиков»: окно
+/// получает `items-changed`. Если черновика в базе нет (создан автосохранением и ещё не
+/// синхронизирован) — ничего.
+fn drop_local_draft(app: &AppHandle, store: &Store, account: AccountId, server_id: &str) {
+    let Ok(Some((pk, false))) = store.item_pk_by_server_id(account, server_id) else { return };
+    let folder_pk = store.item_ref(pk).ok().flatten().map(|r| r.folder_pk);
+    match store.mark_deleted_local(&[pk]) {
+        Ok(conversations) => crate::write::emit_items_changed(app, conversations, folder_pk.into_iter().collect()),
+        Err(e) => warn!(error = %e, "не удалось убрать черновик из локальной базы"),
+    }
+}
+
 // --- сеть ----------------------------------------------------------------------------------
 
 /// Один сетевой шаг под таймаутом: ошибка транспорта сбрасывает мёртвую сессию и превращается
@@ -388,13 +676,106 @@ async fn step<T>(sync: &SyncState, what: &'static str, limit: Duration, fut: imp
 
 /// Черновик остался на сервере, дальше не вышло.
 fn kept(why: String) -> SendReport {
-    SendReport { sent: false, draft_saved: true, maybe_sent: false, message: Some(format!("{DRAFT_KEPT}. {why}")) }
+    SendReport { draft_saved: true, message: Some(format!("{DRAFT_KEPT}. {why}")), ..SendReport::default() }
 }
 
 /// `SendItem` ушёл, а исход неизвестен: сказать «не отправлено» было бы неправдой, а повтор —
-/// возможным дублем. Окно по `maybe_sent` не предлагает «Повторить».
+/// возможным дублем. Окно по `maybe_sent` не предлагает «Повторить» и не автосохраняет.
 fn maybe_sent(why: String) -> SendReport {
-    SendReport { sent: false, draft_saved: true, maybe_sent: true, message: Some(format!("{why}, исход отправки неизвестен. Проверьте «Отправленные»: если письма там нет, черновик остался в «Черновиках»")) }
+    SendReport { sent: false, draft_saved: true, maybe_sent: true, message: Some(format!("{why}, исход отправки неизвестен. Проверьте «Отправленные»: если письма там нет, черновик остался в «Черновиках»")), ..SendReport::default() }
+}
+
+/// Ссылка на черновик для окна; `item_pk` — если синхронизация уже принесла его в базу.
+fn draft_ref(state: &AppState, id: &ItemId) -> DraftRef {
+    let item_pk = state.store.item_pk_by_server_id(state.account, &id.id).ok().flatten().and_then(|(pk, deleted)| (!deleted).then_some(pk));
+    DraftRef { server_id: id.id.clone(), change_key: id.change_key.clone(), item_pk }
+}
+
+/// Файловые вложения черновика на сервере после того, как их меняли: окно сверяет с ними свой
+/// список (загруженные файлы становятся серверными, удалённые пропадают). Не вышло — `None`:
+/// окно оставляет свой список, а следующий вызов сверится с сервером сам (`reconcile`).
+async fn server_files(sync: &SyncState, transport: &impl MailTransport, item: &ItemId) -> Option<Vec<DraftAttachmentDto>> {
+    match step(sync, "GetItem", REREAD_TIMEOUT, transport.get_draft(item)).await {
+        Ok(draft) => Some(draft.file_attachments().map(|a| DraftAttachmentDto::of(a, None)).collect()),
+        Err(why) => {
+            warn!(why, "вложения черновика не перечитаны после изменения");
+            None
+        }
+    }
+}
+
+/// Дописывает к телу обновляемого черновика цитату оригинала (ответ, ответ всем, пересылка):
+/// `UpdateItem` заменяет тело целиком, а сервер цитирует только при создании. Тело оригинала
+/// читается с сервера полностью (`ItemNormalizedBody`: в базе только `UniqueBody`, без истории
+/// переписки) и запоминается в `ComposeState`. Не вышло — ошибка: без цитаты черновик не обновляется.
+async fn append_quote(state: &AppState, sync: &SyncState, transport: &impl MailTransport, cs: &ComposeState, req: &ComposeRequest, msg: &mut OutgoingMessage) -> CmdResult<()> {
+    let (true, Some(pk)) = (req.kind.needs_reference(), req.reference_item_pk) else { return Ok(()) };
+    let quote = match cs.cached_quote(pk) {
+        Some(q) => q,
+        None => {
+            let reference = state.store.item_ref(pk).map_err(err)?.ok_or_else(|| "Исходное письмо удалено — цитату не собрать, черновик не обновлён".to_string())?.id;
+            let got = step(sync, "GetItem", CREATE_TIMEOUT, transport.get_items(std::slice::from_ref(&reference), ItemFetchShape::WithFullBody)).await?;
+            let q = match got.into_iter().next() {
+                Some(ItemResult::Ok(m)) => Arc::new(quote_from_full(&m)?),
+                Some(ItemResult::Failed { code, .. }) => return Err(format!("Исходное письмо не прочитано с сервера ({code}) — цитату не собрать, черновик не обновлён")),
+                None => return Err("Сервер не вернул исходное письмо — цитату не собрать, черновик не обновлён".into()),
+            };
+            cs.remember_quote(pk, q.clone());
+            q
+        }
+    };
+    msg.body_html.push_str(&quote);
+    Ok(())
+}
+
+/// Чем кончилась запись черновика с вложениями (`write_draft`), если не всем.
+enum DraftFailure {
+    /// Черновика на сервере нет или он не обновлён: ошибка команды.
+    Before(String),
+    /// Черновик есть (`id`), а с вложениями не вышло; `touched` — вложения могли измениться.
+    After { id: ItemId, why: String, touched: bool },
+}
+
+/// Записать письмо в черновик на сервере вместе с вложениями: нового — `CreateItem`, существующего
+/// (`existing`) — цитата у ответа и `UpdateItem`; затем сверка с сервером, новые файлы и удаление
+/// убранных. `prepared` — то, что вернул `prepare`. Ключ черновика запоминается после каждого
+/// шага. Возвращает черновик и признак, что вложения менялись.
+async fn write_draft(state: &AppState, sync: &SyncState, transport: &impl MailTransport, cs: &ComposeState, req: &ComposeRequest, prepared: (ComposeKind, OutgoingMessage, Vec<OutgoingAttachment>), existing: Option<&str>) -> Result<(ItemId, bool), DraftFailure> {
+    let (kind, mut msg, files) = prepared;
+    let (mut current, files, removed) = match existing {
+        None => {
+            let draft = step(sync, "CreateItem", CREATE_TIMEOUT, transport.create_draft(&kind, &msg)).await.map_err(DraftFailure::Before)?;
+            cs.remember(&draft);
+            (draft, files, Vec::new())
+        }
+        Some(sid) => {
+            append_quote(state, sync, transport, cs, req, &mut msg).await.map_err(DraftFailure::Before)?;
+            let current = step(sync, "UpdateItem", CREATE_TIMEOUT, transport.update_draft(&cs.item_id(sid), &msg)).await.map_err(DraftFailure::Before)?;
+            cs.remember(&current);
+            let (files, removed) = reconcile(sync, transport, &current, removed_ids(req), files).await;
+            (current, files, removed)
+        }
+    };
+    let touched = !files.is_empty() || !removed.is_empty();
+    if !files.is_empty() {
+        match step(sync, "CreateAttachment", ATTACH_TIMEOUT, transport.add_attachments(&current, &files)).await {
+            Ok(id) => {
+                cs.remember(&id);
+                current = id;
+            }
+            Err(why) => return Err(DraftFailure::After { id: current, why, touched }),
+        }
+    }
+    if !removed.is_empty() {
+        match step(sync, "DeleteAttachment", CREATE_TIMEOUT, transport.delete_attachments(&removed)).await {
+            Ok(id) => {
+                cs.remember(&id);
+                current = id;
+            }
+            Err(why) => return Err(DraftFailure::After { id: current, why, touched }),
+        }
+    }
+    Ok((current, touched))
 }
 
 /// Ошибка транспорта на `SendItem`, при которой письмо могло уйти: обрыв связи (в том числе при
@@ -416,7 +797,7 @@ pub(crate) async fn compose_context(kind: ComposeKindDto, item_pk: Option<i64>, 
     let own_addresses = own_addresses_of(&store, account, &state.user)?;
     let signature = signature_of(&store, account)?;
     if !kind.needs_reference() {
-        return Ok(ComposeContext { kind, reference_item_pk: None, to: vec![], cc: vec![], subject: String::new(), original: None, own_addresses, signature });
+        return Ok(ComposeContext { kind, reference_item_pk: None, to: vec![], cc: vec![], bcc: vec![], subject: String::new(), original: None, own_addresses, signature, body_html: None, draft: None });
     }
     let pk = item_pk.ok_or_else(|| "Не указано исходное письмо".to_string())?;
     // DTO читает файлы кэша (инлайновые картинки) — в блокирующем потоке.
@@ -428,62 +809,202 @@ pub(crate) async fn compose_context(kind: ComposeKindDto, item_pk: Option<i64>, 
     .map_err(err)??;
     let (to, cc) = reply_recipients(kind, original.from_name.as_deref(), original.from_email.as_deref(), &original.reply_to, &original.recipients, &own_addresses);
     let subject = subject_with_prefix(kind, original.subject.as_deref());
-    Ok(ComposeContext { kind, reference_item_pk: Some(pk), to, cc, subject, original: Some(original), own_addresses, signature })
+    Ok(ComposeContext { kind, reference_item_pk: Some(pk), to, cc, bcc: vec![], subject, original: Some(original), own_addresses, signature, body_html: None, draft: None })
 }
 
-/// Отправка: проверки → черновик → вложения → `SendItem`. Отказ до создания черновика — ошибка
-/// команды (окно покажет её с «Повторить»); после — `draft_saved` с текстом.
-#[tauri::command]
-pub(crate) async fn compose_send(req: ComposeRequest, state: State<'_, AppState>, sync: State<'_, Arc<SyncState>>, cs: State<'_, ComposeState>) -> CmdResult<SendReport> {
-    let _busy = cs.sending.try_lock().map_err(|_| "Отправка уже идёт".to_string())?;
-    let (kind, msg, files) = prepare(&state, &req, true).await?;
-    let transport = sync.transport().await.map_err(|e| e.to_string())?;
-    let draft = step(&sync, "CreateItem", CREATE_TIMEOUT, transport.create_draft(&kind, &msg)).await?;
-    let mut current = draft.clone();
-    if !files.is_empty() {
-        match step(&sync, "CreateAttachment", ATTACH_TIMEOUT, transport.add_attachments(&draft, &files)).await {
-            Ok(id) => current = id,
-            Err(why) => return Ok(kept(why)),
+/// Сверка с черновиком на сервере перед загрузкой и удалением вложений (`reconcile_with`): повтор
+/// после оборванной загрузки не прикладывает загруженное второй раз, а повтор после удачного
+/// `DeleteAttachment` (или вложение, убранное в OWA) не упирается в отказ по уже несуществующему
+/// вложению. Черновик прочитать не удалось — всё как есть.
+async fn reconcile(sync: &SyncState, transport: &impl MailTransport, item: &ItemId, removed: Vec<String>, files: Vec<OutgoingAttachment>) -> (Vec<OutgoingAttachment>, Vec<String>) {
+    if files.is_empty() && removed.is_empty() {
+        return (files, removed);
+    }
+    match step(sync, "GetItem", CREATE_TIMEOUT, transport.get_draft(item)).await {
+        Ok(draft) => reconcile_with(&draft.attachments, removed, files),
+        Err(why) => {
+            warn!(why, "черновик не прочитан перед изменением вложений, они меняются без сверки");
+            (files, removed)
         }
     }
+}
+
+/// Отправка: проверки → черновик → вложения → `SendItem`. Отказ до создания (или обновления)
+/// черновика — ошибка команды (окно покажет её с «Повторить»); после — `draft_saved` с текстом и
+/// ссылкой на черновик (`SendReport::draft`), чтобы окно продолжило с ним. Если черновик уже есть
+/// на сервере (`draft_server_id`), он обновляется вместо создания, новые файлы прикладываются,
+/// убранные удаляются, и уходит он же.
+#[tauri::command]
+pub(crate) async fn compose_send(req: ComposeRequest, app: AppHandle, state: State<'_, AppState>, sync: State<'_, Arc<SyncState>>, cs: State<'_, ComposeState>) -> CmdResult<SendReport> {
+    let _busy = cs.sending.try_lock().map_err(|_| "Отправка уже идёт".to_string())?;
+    let (kind, msg, files) = prepare(&state, &req, true).await?;
+    let existing = draft_id_of(&req);
+    let attached = files.len();
+    let (to, cc, bcc) = (msg.to.len(), msg.cc.len(), msg.bcc.len());
+    let transport = sync.transport().await.map_err(|e| e.to_string())?;
+    let (current, touched) = match write_draft(&state, &sync, &transport, &cs, &req, (kind, msg, files), existing.as_deref()).await {
+        Ok(v) => v,
+        Err(DraftFailure::Before(why)) => return Err(why),
+        Err(DraftFailure::After { id, why, touched }) => {
+            let files = if touched { server_files(&sync, &transport, &id).await } else { None };
+            return Ok(kept(why).with_draft(draft_ref(&state, &id), files));
+        }
+    };
     match tokio::time::timeout(SEND_TIMEOUT, transport.send_draft(&current)).await {
         Ok(Ok(())) => {
-            info!(kind = ?req.kind, to = msg.to.len(), cc = msg.cc.len(), bcc = msg.bcc.len(), attachments = files.len(), "письмо отправлено");
-            Ok(SendReport { sent: true, draft_saved: false, maybe_sent: false, message: None })
+            // Сервер перенёс черновик в «Отправленные» под новым идентификатором.
+            cs.forget(&current.id);
+            if let Some(sid) = existing.as_deref() {
+                cs.forget(sid);
+                drop_local_draft(&app, &state.store, state.account, sid);
+            }
+            info!(kind = ?req.kind, to, cc, bcc, attachments = attached, existing_draft = existing.is_some(), "письмо отправлено");
+            Ok(SendReport { sent: true, ..SendReport::default() })
         }
         // Обрыв связи или неразобранный ответ: запрос мог дойти, письмо могло уйти.
         Ok(Err(e)) if outcome_unknown(&e) => {
             warn!(error = %e, "SendItem без ответа, исход неизвестен");
             sync.invalidate_on(&e).await;
-            Ok(maybe_sent(describe_transport(&e)))
+            Ok(maybe_sent(describe_transport(&e)).with_draft(draft_ref(&state, &current), None))
         }
         Ok(Err(e)) => {
             warn!(error = %e, "SendItem отклонён");
             sync.invalidate_on(&e).await;
-            Ok(kept(describe_transport(&e)))
+            let files = if touched { server_files(&sync, &transport, &current).await } else { None };
+            Ok(kept(describe_transport(&e)).with_draft(draft_ref(&state, &current), files))
         }
         // Ответа на SendItem нет: письмо могло и уйти — сказать «не отправлено» было бы неправдой.
         Err(_) => {
             warn!("SendItem не уложился в таймаут, исход неизвестен");
-            Ok(maybe_sent(format!("Сервер не ответил за {} с", SEND_TIMEOUT.as_secs())))
+            Ok(maybe_sent(format!("Сервер не ответил за {} с", SEND_TIMEOUT.as_secs())).with_draft(draft_ref(&state, &current), None))
         }
     }
 }
 
-/// Сохранить черновик на сервере: черновик → вложения, без отправки. Получатели не обязательны.
+/// Открыть черновик из «Черновиков»: тема, получатели (и скрытые), тело и вложения. Текст берётся
+/// из локальной базы; если полного тела там нет (черновик создан в OWA и ещё не догружен или
+/// обрезан) — читается с сервера (`GetItem`), и тогда тема, получатели и вложения тоже оттуда.
+/// Если и сервер отдал тело обрезанным (больше `MaximumBodySize`), черновик не открывается:
+/// первое же сохранение записало бы обрезанный текст обратно. Ссылки `cid:` в теле остаются,
+/// картинки из кэша окно показывает по `DraftInfoDto::inline_images`.
+#[tauri::command]
+pub(crate) async fn compose_open_draft(item_pk: i64, state: State<'_, AppState>, sync: State<'_, Arc<SyncState>>, cs: State<'_, ComposeState>) -> CmdResult<ComposeContext> {
+    let store = state.store.clone();
+    let account = state.account;
+    let own_addresses = own_addresses_of(&store, account, &state.user)?;
+    let signature = signature_of(&store, account)?;
+    let local = tauri::async_runtime::spawn_blocking(move || local_draft(&store, item_pk)).await.map_err(err)??;
+    let inline_images = local.inline_images;
+    let (id, subject, to, cc, bcc, body_html, attachments) = match local.body_html {
+        Some(body_html) => {
+            let attachments: Vec<DraftAttachmentDto> = local
+                .files
+                .iter()
+                .map(|a| DraftAttachmentDto { attachment_pk: Some(a.attachment_pk), server_id: a.server_id.clone(), name: a.name.clone(), size: a.size, content_type: a.content_type.clone() })
+                .collect();
+            (local.id, local.subject, local.to, local.cc, local.bcc, body_html, attachments)
+        }
+        None => {
+            let transport = sync.transport().await.map_err(|e| e.to_string())?;
+            let draft = step(&sync, "GetItem", CREATE_TIMEOUT, transport.get_draft(&local.id)).await?;
+            if draft.is_truncated {
+                warn!(item_pk, body_chars = draft.body_html.chars().count(), "черновик с сервера обрезан, в композере не открывается");
+                return Err("Черновик слишком большой для правки в AIOWA: сервер отдал его обрезанным, и сохранение записало бы обрезанный текст обратно. Откройте его в OWA".into());
+            }
+            let people = |ps: &[Participant]| ps.iter().filter_map(|p| compose_recipient(p.name.as_deref(), p.email.as_deref())).collect::<Vec<_>>();
+            let body_html = crate::sanitize_keep_cid(&draft.body_html);
+            let attachments = draft.file_attachments().map(|a| DraftAttachmentDto::of(a, local.files.iter().find(|r| r.server_id == a.id).map(|r| r.attachment_pk))).collect();
+            let (to, cc, bcc) = (people(&draft.to), people(&draft.cc), people(&draft.bcc));
+            (draft.id, draft.subject, to, cc, bcc, body_html, attachments)
+        }
+    };
+    cs.remember(&id);
+    info!(item_pk, to = to.len(), cc = cc.len(), bcc = bcc.len(), attachments = attachments.len(), "черновик открыт в композере");
+    Ok(ComposeContext {
+        kind: ComposeKindDto::New,
+        reference_item_pk: None,
+        to,
+        cc,
+        bcc,
+        subject,
+        original: None,
+        own_addresses,
+        signature,
+        body_html: Some(body_html),
+        draft: Some(DraftInfoDto { item_pk: Some(item_pk), server_id: id.id, change_key: id.change_key, attachments, inline_images }),
+    })
+}
+
+/// Автосохранение: первый раз создаёт черновик на сервере, дальше обновляет тему, тело и
+/// получателей (`UpdateItem`); вложения не трогает — их меняют открытие и отправка. Получатели не
+/// обязательны. Возвращает серверный идентификатор для следующих вызовов и отправки.
+#[tauri::command]
+pub(crate) async fn compose_autosave(req: ComposeRequest, draft_server_id: Option<String>, state: State<'_, AppState>, sync: State<'_, Arc<SyncState>>, cs: State<'_, ComposeState>) -> CmdResult<DraftRef> {
+    let _busy = cs.sending.try_lock().map_err(|_| "Отправка уже идёт".to_string())?;
+    let existing = draft_server_id.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(String::from).or_else(|| draft_id_of(&req));
+    let mut msg = outgoing(&req, false)?;
+    let transport = sync.transport().await.map_err(|e| e.to_string())?;
+    let id = match existing.as_deref() {
+        None => {
+            let kind = compose_kind(&state.store, req.kind, req.reference_item_pk)?;
+            step(&sync, "CreateItem", CREATE_TIMEOUT, transport.create_draft(&kind, &msg)).await?
+        }
+        Some(sid) => {
+            append_quote(&state, &sync, &transport, &cs, &req, &mut msg).await?;
+            step(&sync, "UpdateItem", CREATE_TIMEOUT, transport.update_draft(&cs.item_id(sid), &msg)).await?
+        }
+    };
+    cs.remember(&id);
+    info!(kind = ?req.kind, updated = existing.is_some(), to = msg.to.len(), cc = msg.cc.len(), bcc = msg.bcc.len(), "черновик автосохранён");
+    Ok(draft_ref(&state, &id))
+}
+
+/// Удалить черновик: перенести в «Удалённые» (`DeleteItem` с `MoveToDeletedItems`, как обычное
+/// удаление и «Отменить» в OWA — из «Удалённых» его можно вернуть) и убрать из локальной базы,
+/// если он там есть. Черновика на сервере уже нет (удалён в OWA) — не ошибка.
+#[tauri::command]
+pub(crate) async fn compose_discard_draft(draft_server_id: String, app: AppHandle, state: State<'_, AppState>, sync: State<'_, Arc<SyncState>>, cs: State<'_, ComposeState>) -> CmdResult<()> {
+    let _busy = cs.sending.try_lock().map_err(|_| "Отправка уже идёт".to_string())?;
+    let sid = draft_server_id.trim();
+    if sid.is_empty() {
+        return Err("Не указан черновик".into());
+    }
+    let transport = sync.transport().await.map_err(|e| e.to_string())?;
+    let item = cs.item_id(sid);
+    let results = step(&sync, "DeleteItem", CREATE_TIMEOUT, transport.delete_items(std::slice::from_ref(&item), DeleteMode::ToDeletedItems)).await?;
+    if let Some(WriteResult::Failed { code, .. }) = results.first()
+        && code != "ErrorItemNotFound"
+    {
+        warn!(code = %code, "сервер не удалил черновик");
+        return Err(format!("Сервер отказал: {code}"));
+    }
+    cs.forget(sid);
+    drop_local_draft(&app, &state.store, state.account, sid);
+    info!("черновик перенесён в «Удалённые»");
+    Ok(())
+}
+
+/// Сохранить черновик на сервере вместе с файлами, без отправки (кнопка «Сохранить черновик»,
+/// Ctrl+S, «Сохранить» при отмене): нового — `CreateItem`, существующего (`draft_server_id`) —
+/// `UpdateItem` с цитатой у ответа; затем новые файлы и удаление убранных, как у отправки.
+/// Получатели не обязательны. В ответе — черновик (`draft`) и, если вложения менялись, их список
+/// на сервере; если текст сохранён, а с вложениями не вышло, — `message` с причиной.
 #[tauri::command]
 pub(crate) async fn compose_save_draft(req: ComposeRequest, state: State<'_, AppState>, sync: State<'_, Arc<SyncState>>, cs: State<'_, ComposeState>) -> CmdResult<SendReport> {
     let _busy = cs.sending.try_lock().map_err(|_| "Отправка уже идёт".to_string())?;
     let (kind, msg, files) = prepare(&state, &req, false).await?;
+    let existing = draft_id_of(&req);
+    let attached = files.len();
     let transport = sync.transport().await.map_err(|e| e.to_string())?;
-    let draft = step(&sync, "CreateItem", CREATE_TIMEOUT, transport.create_draft(&kind, &msg)).await?;
-    if !files.is_empty()
-        && let Err(why) = step(&sync, "CreateAttachment", ATTACH_TIMEOUT, transport.add_attachments(&draft, &files)).await
-    {
-        return Ok(SendReport { sent: false, draft_saved: true, maybe_sent: false, message: Some(format!("Черновик сохранён в «Черновиках» без вложений. {why}")) });
-    }
-    info!(kind = ?req.kind, attachments = files.len(), "черновик сохранён на сервере");
-    Ok(SendReport { sent: false, draft_saved: true, maybe_sent: false, message: None })
+    let (id, touched, why) = match write_draft(&state, &sync, &transport, &cs, &req, (kind, msg, files), existing.as_deref()).await {
+        Ok((id, touched)) => (id, touched, None),
+        Err(DraftFailure::Before(why)) => return Err(why),
+        Err(DraftFailure::After { id, why, touched }) => (id, touched, Some(why)),
+    };
+    let files = if touched { server_files(&sync, &transport, &id).await } else { None };
+    info!(kind = ?req.kind, attachments = attached, updated = existing.is_some(), attachments_failed = why.is_some(), "черновик сохранён на сервере");
+    let message = why.map(|w| format!("Текст черновика сохранён, а вложения изменить не вышло. {w}"));
+    Ok(SendReport { draft_saved: true, message, ..SendReport::default() }.with_draft(draft_ref(&state, &id), files))
 }
 
 /// Подсказки адресатов по началу адреса или слова имени. Первый вызов строит кэш по всей базе
@@ -694,6 +1215,8 @@ mod tests {
             subject: "  Тема  ".into(),
             body_html: r#"<div onclick="x()">Привет<script>alert(1)</script><a href="javascript:1">ссылка</a></div>"#.into(),
             attachments: vec![],
+            draft_server_id: None,
+            removed_attachment_ids: vec![],
         };
         let msg = outgoing(&req, true).unwrap();
         assert_eq!(msg.subject, "Тема");
@@ -709,6 +1232,11 @@ mod tests {
 
         let bad = ComposeRequest { bcc: vec![ComposeRecipientDto { name: None, email: "кто-то".into() }], ..empty };
         assert!(outgoing(&bad, false).unwrap_err().contains("не похож на почтовый"));
+
+        // Ссылки на инлайновые вложения черновика уходят на сервер как были, а не теряются.
+        let pictures = ComposeRequest { body_html: r#"<p>Лого: <img src="cid:image001.png@01DA"> <img src="https://x.ru/a.png"></p>"#.into(), ..bad };
+        let body = outgoing(&ComposeRequest { bcc: vec![], ..pictures }, false).unwrap().body_html;
+        assert!(body.contains(r#"src="cid:image001.png@01DA""#) && body.contains(r#"src="https://x.ru/a.png""#), "{body}");
     }
 
     #[test]
@@ -761,7 +1289,16 @@ mod tests {
         assert!(rep.message.as_deref().unwrap().contains("исход отправки неизвестен"), "{rep:?}");
         assert!(!rep.message.as_deref().unwrap().contains("повторите"), "повтор после неизвестного исхода не предлагается: {rep:?}");
         let rep = kept("Сервер отказал: X".into());
-        assert!(!rep.maybe_sent && rep.draft_saved);
+        assert!(!rep.maybe_sent && rep.draft_saved && rep.draft.is_none());
+        // Черновик остался на сервере: окно получает его id и продолжает с ним, а не создаёт второй.
+        let draft = DraftRef { server_id: "D".into(), change_key: Some("k".into()), item_pk: None };
+        let files = vec![DraftAttachmentDto { attachment_pk: None, server_id: "a1".into(), name: Some("отчёт.pdf".into()), size: Some(10), content_type: None }];
+        let rep = kept("Сервер отказал: X".into()).with_draft(draft.clone(), Some(files));
+        let v = serde_json::to_value(&rep).unwrap();
+        assert_eq!(v["draft"]["server_id"], "D");
+        assert_eq!(v["draft"]["change_key"], "k");
+        assert_eq!(v["attachments"][0]["server_id"], "a1");
+        assert_eq!(serde_json::to_value(SendReport { sent: true, ..SendReport::default() }).unwrap()["draft"], serde_json::Value::Null);
     }
 
     #[test]
@@ -769,5 +1306,191 @@ mod tests {
         assert_eq!(serde_json::from_str::<ComposeKindDto>("\"reply_all\"").unwrap(), ComposeKindDto::ReplyAll);
         assert_eq!(serde_json::to_string(&ComposeKindDto::Forward).unwrap(), "\"forward\"");
         assert!(ComposeKindDto::Reply.needs_reference() && !ComposeKindDto::New.needs_reference());
+    }
+
+    fn request(json: &str) -> ComposeRequest {
+        serde_json::from_str(json).unwrap()
+    }
+
+    #[test]
+    fn draft_fields_of_request_are_optional_and_cleaned() {
+        // Окно старой сборки или новое письмо без черновика: полей нет.
+        let req = request(r#"{"kind":"new","reference_item_pk":null,"to":[],"cc":[],"bcc":[],"subject":"s","body_html":"","attachments":[]}"#);
+        assert_eq!(draft_id_of(&req), None);
+        assert!(removed_ids(&req).is_empty());
+        // Окно шлёт null и пустой список.
+        let req = request(r#"{"kind":"new","reference_item_pk":null,"draft_server_id":null,"removed_attachment_ids":[]}"#);
+        assert_eq!((draft_id_of(&req), removed_ids(&req)), (None, vec![]));
+        assert_eq!(draft_id_of(&request(r#"{"kind":"new","reference_item_pk":null,"draft_server_id":"  "}"#)), None, "пустой id — черновика нет");
+        let req = request(r#"{"kind":"reply","reference_item_pk":5,"draft_server_id":"  AAA= ","removed_attachment_ids":["a1"," ","a1","a2"]}"#);
+        assert_eq!(draft_id_of(&req).as_deref(), Some("AAA="));
+        assert_eq!(removed_ids(&req), vec!["a1".to_string(), "a2".to_string()], "пустые и повторы убраны, порядок сохранён");
+    }
+
+    #[test]
+    fn change_keys_are_remembered_per_draft() {
+        let cs = ComposeState::default();
+        assert_eq!(cs.item_id("D1"), ItemId { id: "D1".into(), change_key: None });
+        cs.remember(&ItemId { id: "D1".into(), change_key: Some("k1".into()) });
+        cs.remember(&ItemId { id: "D1".into(), change_key: Some("k2".into()) });
+        assert_eq!(cs.item_id("D1").change_key.as_deref(), Some("k2"));
+        assert_eq!(cs.item_id("D2").change_key, None);
+        cs.forget("D1");
+        assert_eq!(cs.item_id("D1").change_key, None);
+    }
+
+    #[test]
+    fn files_already_on_the_draft_are_not_uploaded_again() {
+        let file = |name: &str, len: usize| OutgoingAttachment { name: name.into(), content_type: None, bytes: vec![0; len] };
+        let meta = |id: &str, name: &str, size: i64, inline: bool| AttachmentMeta { id: id.into(), name: Some(name.into()), content_type: None, size: Some(size), is_inline: inline, content_id: None };
+        let on_server = [meta("a1", "Отчёт.PDF", 10, false), meta("a2", "картинка.png", 5, true)];
+        let names = |v: Vec<OutgoingAttachment>| v.into_iter().map(|f| f.name).collect::<Vec<_>>();
+        // Тот же файл (имя без учёта регистра, размер) пропускается; другой размер, другое имя и инлайновая картинка — нет.
+        assert_eq!(names(filter_new_files(vec![file("отчёт.pdf", 10), file("отчёт.pdf", 11), file("другой.pdf", 10), file("картинка.png", 5)], &on_server)), vec!["отчёт.pdf", "другой.pdf", "картинка.png"]);
+        assert_eq!(filter_new_files(vec![file("отчёт.pdf", 10)], &on_server).len(), 0);
+        assert_eq!(filter_new_files(vec![file("x.txt", 1)], &[]).len(), 1);
+    }
+
+    #[test]
+    fn reconcile_skips_uploaded_files_and_already_removed_attachments() {
+        let file = |name: &str, len: usize| OutgoingAttachment { name: name.into(), content_type: None, bytes: vec![0; len] };
+        let meta = |id: &str, name: &str, size: i64| AttachmentMeta { id: id.into(), name: Some(name.into()), content_type: None, size: Some(size), is_inline: false, content_id: None };
+        let names = |v: Vec<OutgoingAttachment>| v.into_iter().map(|f| f.name).collect::<Vec<_>>();
+        let on_server = [meta("a1", "отчёт.pdf", 10), meta("a2", "старый.pdf", 7)];
+        // Уже загруженный файл не грузится второй раз; уже удалённое вложение не удаляется снова.
+        let (files, removed) = reconcile_with(&on_server, vec!["a2".into(), "gone".into()], vec![file("отчёт.pdf", 10), file("новый.pdf", 3)]);
+        assert_eq!(names(files), vec!["новый.pdf"]);
+        assert_eq!(removed, vec!["a2".to_string()]);
+        // Файл с тем же именем и размером, что у убираемого вложения, грузится: то вложение уйдёт.
+        let (files, removed) = reconcile_with(&on_server, vec!["a2".into()], vec![file("старый.pdf", 7)]);
+        assert_eq!((files.len(), removed), (1, vec!["a2".to_string()]));
+        // Повтор после удачного DeleteAttachment (или вложение убрано в OWA): удалять нечего.
+        let (files, removed) = reconcile_with(&on_server[..1], vec!["a2".into()], vec![]);
+        assert!(files.is_empty() && removed.is_empty());
+    }
+
+    #[test]
+    fn quote_escapes_header_and_keeps_cleaned_body() {
+        let q = quote_html("Иван <ivan@x.ru>", Some("24.10.2026 10:05"), "Анна <a@y.ru>; b@y.ru", "", "Смета <срочно> & \"точно\"", "<p>Текст <b>оригинала</b></p>");
+        assert!(q.starts_with("<hr><div><b>От:</b> Иван &lt;ivan@x.ru&gt;<br><b>Отправлено:</b> 24.10.2026 10:05<br><b>Кому:</b> Анна &lt;a@y.ru&gt;; b@y.ru<br><b>Тема:</b> Смета &lt;срочно&gt; &amp; &quot;точно&quot;</div>"), "{q}");
+        assert!(!q.contains("Копия"), "пустая «Копия» в шапку не попадает: {q}");
+        assert!(q.ends_with("<div><p>Текст <b>оригинала</b></p></div>"), "{q}");
+        let bare = quote_html("", None, "", "", "", "");
+        assert_eq!(bare, "<hr><div><b>От:</b> <br><b>Тема:</b> </div><br><div></div>");
+        assert_eq!(person_label(Some(" Иван "), Some("ivan@x.ru")), "Иван <ivan@x.ru>");
+        assert_eq!(person_label(Some("ivan@x.ru"), Some("ivan@x.ru")), "ivan@x.ru");
+        assert_eq!(person_label(None, Some(" ")), "");
+        assert_eq!(person_label(Some("Иван"), None), "Иван");
+    }
+
+    mod store_backed {
+        use super::*;
+        use aiowa_core::{ConversationId, Folder, FolderId, MessageBody, MessageFull, MessageMeta};
+
+        fn full(id: &str, is_draft: bool, unique: &str, full_body: Option<&str>, attachments: Vec<AttachmentMeta>) -> MessageFull {
+            let p = |name: &str, email: &str| Participant { name: Some(name.into()), email: Some(email.into()), routing_type: Some("SMTP".into()) };
+            MessageFull {
+                meta: MessageMeta {
+                    item_id: ItemId { id: id.into(), change_key: Some("ck1".into()) },
+                    parent_folder_id: None,
+                    conversation_id: Some(ConversationId("conv".into())),
+                    internet_message_id: None,
+                    item_class: Some("IPM.Note".into()),
+                    subject: Some("Смета на ремонт".into()),
+                    from: Some(p("Иван Петров", "ivan@x.ru")),
+                    sender: None,
+                    display_to: None,
+                    received_at: Some("2026-10-16T10:00:00Z".parse().unwrap()),
+                    sent_at: Some("2026-10-16T09:59:00Z".parse().unwrap()),
+                    last_modified_at: None,
+                    is_read: true,
+                    is_draft,
+                    has_attachments: !attachments.is_empty(),
+                    importance: Importance::Normal,
+                    flag: Default::default(),
+                    size: Some(100),
+                    preview: None,
+                },
+                to: vec![p("Анна", "a@y.ru"), Participant { name: Some("Старый адрес".into()), email: Some("/o=Org/cn=old".into()), routing_type: Some("EX".into()) }],
+                cc: vec![p("Вера", "v@z.ru")],
+                bcc: vec![p("Скрытый", "hidden@y.ru")],
+                reply_to: vec![],
+                body: Some(MessageBody { body_type: BodyType::Html, unique_body: Some(unique.into()), full_body: full_body.map(String::from), is_truncated: false }),
+                attachments,
+            }
+        }
+
+        fn setup(tag: &str, messages: &[MessageFull]) -> (Store, std::path::PathBuf, Vec<i64>) {
+            let dir = std::env::temp_dir().join(format!("aiowa-compose-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            let store = Store::open(dir.join("mail.db")).unwrap();
+            let acc = store.account("h", "u").unwrap();
+            let folder = Folder {
+                id: FolderId { id: "F".into(), change_key: None },
+                parent_id: None,
+                display_name: "Черновики".into(),
+                distinguished: Some("drafts".into()),
+                folder_class: Some("IPF.Note".into()),
+                total_count: 1,
+                unread_count: 0,
+                child_folder_count: 0,
+            };
+            store.upsert_folders(acc, &[folder]).unwrap();
+            let (fpk, _) = store.folder_by_distinguished(acc, "drafts").unwrap().unwrap();
+            store.store_full_messages(acc, fpk, messages).unwrap();
+            let pks = messages.iter().map(|m| store.item_pk_by_server_id(acc, &m.meta.item_id.id).unwrap().unwrap().0).collect();
+            (store, dir, pks)
+        }
+
+        fn att(id: &str, name: &str, inline: bool) -> AttachmentMeta {
+            AttachmentMeta { id: id.into(), name: Some(name.into()), content_type: Some("application/pdf".into()), size: Some(100), is_inline: inline, content_id: inline.then(|| format!("{id}@cid")) }
+        }
+
+        #[test]
+        fn local_draft_takes_full_body_recipients_and_file_attachments() {
+            let messages = [
+                full("D1", true, "<p>новый текст</p>", Some(r#"<p>новый текст</p><hr><p>цитата истории</p><img src="cid:img@cid">"#), vec![att("f1", "смета.pdf", false), att("img", "картинка.png", true)]),
+                full("D2", true, "<p>только уникальная часть</p>", None, vec![]),
+                full("M1", false, "<p>обычное письмо</p>", None, vec![]),
+            ];
+            let (store, dir, pks) = setup("local", &messages);
+
+            let d = local_draft(&store, pks[0]).unwrap();
+            assert_eq!((d.id.id.as_str(), d.id.change_key.as_deref(), d.subject.as_str()), ("D1", Some("ck1"), "Смета на ремонт"));
+            let body = d.body_html.as_deref().unwrap();
+            assert!(body.contains("цитата истории"), "в редактор идёт полное тело с цитатой: {body}");
+            assert!(body.contains(r#"src="cid:img@cid""#), "cid: остаётся в теле, а не превращается в data: или пропадает: {body}");
+            assert!(d.inline_images.is_empty(), "картинки нет в кэше — показывать нечем, но ссылка цела");
+            assert_eq!(d.to.iter().map(|r| r.email.as_str()).collect::<Vec<_>>(), vec!["a@y.ru"], "адрес Exchange без @ не берётся");
+            assert_eq!((d.cc[0].email.as_str(), d.bcc[0].email.as_str(), d.bcc[0].name.as_deref()), ("v@z.ru", "hidden@y.ru", Some("Скрытый")));
+            assert_eq!(d.files.iter().map(|a| a.server_id.as_str()).collect::<Vec<_>>(), vec!["f1"], "инлайновые картинки не показываются как файлы");
+
+            // Полного тела локально нет — нужен сервер (UniqueBody у ответа без цитаты не годится для правки).
+            assert!(local_draft(&store, pks[1]).unwrap().body_html.is_none());
+            assert_eq!(local_draft(&store, pks[2]).err().as_deref(), Some("Это письмо не черновик"));
+            assert_eq!(local_draft(&store, 999_999).err().as_deref(), Some("Черновик удалён"));
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn quote_comes_from_the_full_body_and_keeps_cid() {
+            let m = full("M1", false, "<p>новый текст</p>", Some(r#"<p>новый текст</p><p>старая переписка</p><img src="cid:logo@x"><img src="https://x.ru/a.png">"#), vec![]);
+            let q = quote_from_full(&m).unwrap();
+            assert!(q.contains("<b>От:</b> Иван Петров &lt;ivan@x.ru&gt;"), "{q}");
+            assert!(q.contains("<b>Кому:</b> Анна &lt;a@y.ru&gt;; Старый адрес &lt;/o=Org/cn=old&gt;"), "{q}");
+            assert!(q.contains("<b>Копия:</b> Вера &lt;v@z.ru&gt;") && !q.contains("hidden@y.ru"), "скрытые получатели в цитату не попадают: {q}");
+            assert!(q.contains("<b>Тема:</b> Смета на ремонт"), "{q}");
+            assert!(q.contains("старая переписка"), "цитируется полное тело с историей: {q}");
+            assert!(q.contains("<b>Отправлено:</b> 16.10.2026"), "{q}");
+            assert!(q.contains(r#"src="cid:logo@x""#) && q.contains(r#"src="https://x.ru/a.png""#) && !q.contains("data:"), "картинки остаются ссылками: {q}");
+            // Только UniqueBody (полного тела нет), обрезанное тело или тела нет вовсе — отказ, а не урезанная цитата.
+            assert!(quote_from_full(&full("M2", false, "<p>x</p>", None, vec![])).unwrap_err().contains("полный текст"));
+            let mut cut = full("M3", false, "<p>x</p>", Some("<p>x</p><p>история</p>"), vec![]);
+            cut.body.as_mut().unwrap().is_truncated = true;
+            assert!(quote_from_full(&cut).unwrap_err().contains("обрезана"));
+            let mut bodyless = full("M4", false, "<p>x</p>", Some("<p>x</p>"), vec![]);
+            bodyless.body = None;
+            assert!(quote_from_full(&bodyless).is_err());
+        }
     }
 }

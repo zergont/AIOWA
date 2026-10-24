@@ -32,8 +32,21 @@
     onaction: (targets: Conversation[], action: ItemAction, anchor: Anchor) => Promise<void>;
     /** Ответ, ответ всем или пересылка самого свежего письма беседы в текущей папке. */
     oncompose: (c: Conversation, kind: ComposeKind) => void;
+    /** В «Черновиках»: двойной клик или Enter по беседе открывает её черновик в композере. */
+    onopendraft?: (c: Conversation) => void;
   }
-  let { folder, conversations, selected, selectedPks, loading, hasMore, onselect, onselection, onmore, folders, archiveFolderPk, onaction, oncompose }: Props = $props();
+  let { folder, conversations, selected, selectedPks, loading, hasMore, onselect, onselection, onmore, folders, archiveFolderPk, onaction, oncompose, onopendraft }: Props = $props();
+
+  const inDrafts = $derived(folder?.distinguished === "drafts");
+
+  /** Enter по строке: в «Черновиках» — открыть черновик, иначе — выбрать беседу. */
+  function activate(c: Conversation) {
+    if (inDrafts && onopendraft) onopendraft(c);
+    else selectOne(c);
+  }
+  function onRowDblClick(c: Conversation) {
+    if (inDrafts && onopendraft) onopendraft(c);
+  }
 
   // Простая виртуализация: рисуем только строки в окне прокрутки плюс запас.
   const ROW = 72;
@@ -354,6 +367,10 @@
     } else if ((e.key === "ContextMenu" || (e.key === "F10" && e.shiftKey)) && selected && idx >= 0) {
       e.preventDefault();
       openMenu(selected, selectedAnchor());
+    } else if (e.key === "Enter" && plain && !e.shiftKey && e.target === scroller && selected && idx >= 0 && !multi) {
+      // Только когда фокус на самом списке: у строки свой обработчик Enter, и событие от неё всплывает сюда.
+      e.preventDefault();
+      activate(selected);
     }
   }
 
@@ -452,7 +469,8 @@
           tabindex="-1"
           draggable="true"
           onclick={(e) => onRowClick(e, c)}
-          onkeydown={(e) => e.key === "Enter" && selectOne(c)}
+          ondblclick={() => onRowDblClick(c)}
+          onkeydown={(e) => e.key === "Enter" && activate(c)}
           oncontextmenu={(e) => onRowContextMenu(e, c)}
           ondragstart={(e) => onDragStart(e, c)}
         >

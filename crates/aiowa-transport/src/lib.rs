@@ -6,8 +6,8 @@
 
 use aiowa_core::{FolderChanges, FolderId, FolderRef, ItemChanges, ItemId, MessageFull, Participant, SyncState};
 pub use aiowa_core::{
-    Attendee, CalendarEvent, CalendarEventDetails, CalendarItemChanges, CalendarItemType, ComposeKind, FreeBusy, MeetingMessageKind, MeetingRequestInfo, MeetingResponse, NewCalendarItem, OutgoingAttachment,
-    OutgoingMessage, ResponseType, Signature,
+    Attendee, CalendarEvent, CalendarEventDetails, CalendarItemChanges, CalendarItemType, ComposeKind, DraftContent, FreeBusy, MeetingMessageKind, MeetingRequestInfo, MeetingResponse, NewCalendarItem,
+    OutgoingAttachment, OutgoingMessage, ResponseType, Signature,
 };
 use jiff::Timestamp;
 use secrecy::SecretString;
@@ -107,6 +107,8 @@ pub enum ItemFetchShape {
 
 /// Результат запроса одного элемента в `get_items`: позиция соответствует запрошенному id.
 #[derive(Debug, Clone, PartialEq, Eq)]
+// Результаты живут недолго (вектор на пачку, сразу разбирается): упаковывать письмо в Box незачем.
+#[allow(clippy::large_enum_variant)]
 pub enum ItemResult {
     Ok(MessageFull),
     /// Сервер отказал по этому элементу (например, `ErrorItemNotFound`: удалён между вызовами).
@@ -354,9 +356,26 @@ pub trait MailTransport: Send + Sync {
     /// Отправить черновик (`SendItem` с копией в «Отправленных»).
     async fn send_draft(&self, item: &ItemId) -> Result<()>;
 
-    /// Перезаписать тему, тело и получателей черновика (`UpdateItem` с `SaveOnly`). Возвращает
-    /// идентификатор с новым `ChangeKey`.
+    /// Перезаписать тему, тело, получателей и (если она не обычная) важность черновика
+    /// (`UpdateItem` с `SaveOnly` и `AlwaysOverwrite`: `SetItemField` по `item:Subject`,
+    /// `item:Body`, `message:To/Cc/BccRecipients`, `item:Importance` только при `Importance` не
+    /// `Normal`; опустевший список — `DeleteItemField`). Вложения не трогает.
+    /// Возвращает идентификатор с новым `ChangeKey`; отказ сервера по черновику (например,
+    /// `ErrorItemNotFound`, если он удалён в OWA) — `Server`.
     async fn update_draft(&self, item: &ItemId, msg: &OutgoingMessage) -> Result<ItemId>;
+
+    /// Удалить вложения черновика по их `AttachmentId` (`DeleteAttachment`, одним запросом).
+    /// Возвращает идентификатор письма-родителя с новым `ChangeKey` (`RootItemId`/`RootItemChangeKey`
+    /// последнего ответа). Пустой список — ошибка `Protocol` (вызывающий его не передаёт). Отказ
+    /// сервера хотя бы по одному вложению — `Server` с кодом первого отказа; удалённые к этому
+    /// моменту вложения не восстанавливаются, вызывающий перечитывает черновик `get_draft`.
+    async fn delete_attachments(&self, ids: &[String]) -> Result<ItemId>;
+
+    /// Черновик целиком (`GetItem` с полным телом HTML, получателями и вложениями): для открытия
+    /// черновика, созданного в OWA, когда локального тела нет. Тело, обрезанное по
+    /// `MaximumBodySize`, помечено `DraftContent::is_truncated`. Отказ сервера по элементу
+    /// (`ErrorItemNotFound`) — `Server`.
+    async fn get_draft(&self, id: &ItemId) -> Result<DraftContent>;
 
     /// Подпись пользователя из настроек OWA (`GetUserConfiguration OWA.UserOptions`): `None`,
     /// если подпись не задана.

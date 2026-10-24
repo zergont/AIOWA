@@ -9,8 +9,8 @@ pub mod notify;
 pub mod protocol;
 
 use aiowa_core::{
-    CalendarEvent, CalendarEventDetails, CalendarItemChanges, ComposeKind, FolderChanges, FolderId, FolderRef, ItemChanges, ItemId, MeetingRequestInfo, MeetingResponse, NewCalendarItem, OutgoingAttachment,
-    OutgoingMessage, Signature, SyncState,
+    CalendarEvent, CalendarEventDetails, CalendarItemChanges, ComposeKind, DraftContent, FolderChanges, FolderId, FolderRef, ItemChanges, ItemId, MeetingRequestInfo, MeetingResponse, NewCalendarItem,
+    OutgoingAttachment, OutgoingMessage, Signature, SyncState,
 };
 use aiowa_transport::{
     async_trait, AttachmentContent, Credentials, DeleteMode, FolderCounts, ItemFetchShape, ItemResult, MailTransport, NotificationEvent, NotificationKind, Result, ServerInfo, StreamEnd, SubscriptionRequest,
@@ -19,7 +19,7 @@ use aiowa_transport::{
 use base64::prelude::*;
 use jiff::Timestamp;
 use notify::SubscribeForm;
-use protocol::CalendarItemShape;
+use protocol::{CalendarItemShape, DraftShape};
 use reqwest::cookie::{CookieStore, Jar};
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, ACCEPT_ENCODING, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_TYPE, LOCATION};
 use reqwest::redirect::Policy;
@@ -94,6 +94,8 @@ struct Inner {
     calendar_shape: AtomicU8,
     /// Какую форму `ItemShape` для `GetItem` письма о встрече принял сервер (`CALENDAR_SHAPE_*`).
     meeting_shape: AtomicU8,
+    /// Какую форму `GetItem` черновика принял сервер (`DRAFT_SHAPE_*`).
+    draft_shape: AtomicU8,
     /// Принимает ли сервер `message:ReplyTo` в `AdditionalProperties` поверх `ShapeName` у
     /// `GetItem` писем (`REPLY_TO_*`): при отказе по форме тела запрашиваются без него.
     reply_to_mode: AtomicU8,
@@ -133,6 +135,11 @@ const CALENDAR_MODES: [u8; 3] = [CALENDAR_MODE_FIND_ITEM_Z, CALENDAR_MODE_FIND_I
 const CALENDAR_SHAPE_UNKNOWN: u8 = 0;
 const CALENDAR_SHAPE_EXPLICIT: u8 = 1;
 const CALENDAR_SHAPE_ALL: u8 = 2;
+
+/// Форма `GetItem` черновика: не проверено, `AllProperties` с `BodyType: HTML`, `ItemNormalizedBody`.
+const DRAFT_SHAPE_UNKNOWN: u8 = 0;
+const DRAFT_SHAPE_ALL: u8 = 1;
+const DRAFT_SHAPE_NORMALIZED: u8 = 2;
 
 /// `message:ReplyTo` в `GetItem` писем: не проверено, принято, отвергнуто сервером.
 const REPLY_TO_UNKNOWN: u8 = 0;
@@ -223,6 +230,7 @@ impl OwaTransport {
             calendar_mode: AtomicU8::new(CALENDAR_MODE_UNKNOWN),
             calendar_shape: AtomicU8::new(CALENDAR_SHAPE_UNKNOWN),
             meeting_shape: AtomicU8::new(CALENDAR_SHAPE_UNKNOWN),
+            draft_shape: AtomicU8::new(DRAFT_SHAPE_UNKNOWN),
             reply_to_mode: AtomicU8::new(REPLY_TO_UNKNOWN),
             folder_version: AtomicU8::new(FOLDER_VERSION_UNKNOWN),
             subscribe_form: AtomicU8::new(0),
@@ -1335,7 +1343,121 @@ impl MailTransport for OwaTransport {
         let v = self.call("UpdateItem", protocol::V_2017, protocol::update_draft_body(item, msg)).await?;
         let m = Self::first_message("UpdateItem", &v)?;
         Self::log_shape("UpdateItem", &m);
-        Ok(protocol::written_item_id(&m).unwrap_or_else(|| item.clone()))
+        let new_id = protocol::written_item_id(&m);
+        debug!(
+            subject_len = msg.subject.chars().count(),
+            body_chars = msg.body_html.chars().count(),
+            to = msg.to.len(),
+            cc = msg.cc.len(),
+            bcc = msg.bcc.len(),
+            id_in_response = new_id.is_some(),
+            same_id = new_id.as_ref().map(|n| n.id == item.id),
+            ck_len = new_id.as_ref().and_then(|n| n.change_key.as_deref()).map(str::len),
+            "черновик обновлён"
+        );
+        Ok(new_id.unwrap_or_else(|| item.clone()))
+    }
+
+    /// `DeleteAttachment` одним запросом по всем идентификаторам: ответ — сообщение на каждое
+    /// вложение; отказ хотя бы по одному — `Server` с кодом первого отказа (`ErrorServerBusy` —
+    /// `Throttled`); корень берётся из последнего успешного сообщения.
+    async fn delete_attachments(&self, ids: &[String]) -> Result<ItemId> {
+        if ids.is_empty() {
+            return Err(TransportError::Protocol { op: "DeleteAttachment".into(), status: 0, raw: "список вложений для удаления пуст".into() });
+        }
+        let v = self.call("DeleteAttachment", protocol::V_2017, protocol::delete_attachment_body(ids)).await?;
+        let msgs = protocol::response_messages(&v);
+        if msgs.is_empty() {
+            if let Some(code) = v.pointer("/Body/ResponseCode").and_then(Value::as_str).filter(|c| *c != "NoError") {
+                return Err(TransportError::Server { code: code.to_string(), message: v.pointer("/Body/MessageText").and_then(Value::as_str).unwrap_or("").to_string() });
+            }
+            return Err(TransportError::Protocol { op: "DeleteAttachment".into(), status: 200, raw: format!("нет ResponseMessages: {}", truncate(&v.to_string(), 200)) });
+        }
+        let mut root: Option<ItemId> = None;
+        let mut first_err: Option<TransportError> = None;
+        let mut failed = 0usize;
+        for (i, m) in msgs.iter().enumerate() {
+            if let Some((code, message)) = protocol::message_error(m) {
+                failed += 1;
+                if first_err.is_none() {
+                    first_err = Some(server_error(code, message, m));
+                }
+                continue;
+            }
+            if i == 0 {
+                // Форма ответа без содержимого: ключи сообщения и форма RootItemId (строки — длинами).
+                debug!(op = "DeleteAttachment", response_type = protocol::str_of(m, "__type").unwrap_or("?"), shape = %protocol::json_shape(m, 2), "форма ответа");
+            }
+            if let Some(r) = protocol::parse_delete_attachment_root(m) {
+                root = Some(r);
+            }
+        }
+        debug!(requested = ids.len(), messages = msgs.len(), failed, root_in_response = root.is_some(), ck_len = root.as_ref().and_then(|r| r.change_key.as_deref()).map(str::len), "вложения черновика удалены");
+        if let Some(e) = first_err {
+            return Err(e);
+        }
+        root.ok_or_else(|| TransportError::Protocol { op: "DeleteAttachment".into(), status: 200, raw: format!("нет RootItemId в ответе: {}", protocol::json_shape(msgs[0], 2)) })
+    }
+
+    /// `GetItem` черновика: сначала `AllProperties` с `BodyType: HTML`, при отказе сервера по форме
+    /// (HTTP 500, ошибка по свойству) или без члена тела в ответе — `ItemNormalizedBody`; принятая
+    /// форма запоминается на сессию.
+    async fn get_draft(&self, id: &ItemId) -> Result<DraftContent> {
+        let known = self.inner.draft_shape.load(Ordering::Relaxed);
+        let candidates: &[(u8, DraftShape)] = match known {
+            DRAFT_SHAPE_ALL => &[(DRAFT_SHAPE_ALL, DraftShape::AllProperties)],
+            DRAFT_SHAPE_NORMALIZED => &[(DRAFT_SHAPE_NORMALIZED, DraftShape::NormalizedBody)],
+            _ => &[(DRAFT_SHAPE_ALL, DraftShape::AllProperties), (DRAFT_SHAPE_NORMALIZED, DraftShape::NormalizedBody)],
+        };
+        let mut last_err: Option<TransportError> = None;
+        for (i, (code, shape)) in candidates.iter().enumerate() {
+            let more = i + 1 < candidates.len();
+            let body = protocol::get_draft_body(id, *shape, self.inner.config.max_body_size);
+            let msg = match self.call("GetItem", protocol::V_2017, body).await.and_then(|v| Self::first_message("GetItem", &v)) {
+                Ok(m) => m,
+                Err(e) if more && (is_shape_rejection(&e) || matches!(&e, TransportError::Server { code, .. } if protocol::is_property_code(code))) => {
+                    warn!(error = %e, "GetItem черновика: форма {:?} отвергнута, пробую следующую", shape);
+                    last_err = Some(e);
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
+            Self::log_shape("GetItem", &msg);
+            let Some(item) = msg.pointer("/Items/0") else {
+                return Err(TransportError::Protocol { op: "GetItem".into(), status: 200, raw: format!("нет Items[0]: {}", truncate(&msg.to_string(), 200)) });
+            };
+            let body_key = protocol::body_key_of(item);
+            if body_key.is_none() && more {
+                let keys: Vec<&str> = item.as_object().map(|o| o.keys().map(String::as_str).collect()).unwrap_or_default();
+                warn!(?keys, "GetItem черновика: форма {:?} не отдала тело, пробую следующую", shape);
+                last_err = Some(TransportError::Protocol { op: "GetItem".into(), status: 200, raw: format!("нет тела у черновика, ключи {keys:?}") });
+                continue;
+            }
+            let Some(draft) = protocol::parse_draft_content(item) else {
+                return Err(TransportError::Protocol { op: "GetItem".into(), status: 200, raw: format!("нет ItemId у элемента: {}", protocol::json_shape(item, 1)) });
+            };
+            if known == DRAFT_SHAPE_UNKNOWN {
+                info!(shape = ?shape, keys = item.as_object().map(|o| o.len()).unwrap_or(0), body_key = body_key.unwrap_or("нет"), "GetItem черновика: сервер принял форму");
+            }
+            self.inner.draft_shape.store(*code, Ordering::Relaxed);
+            debug!(
+                subject_len = draft.subject.chars().count(),
+                body_chars = draft.body_html.chars().count(),
+                body_type = item.get(body_key.unwrap_or("Body")).and_then(|b| protocol::str_of(b, "BodyType")).unwrap_or("?"),
+                truncated = item.get(body_key.unwrap_or("Body")).map(|b| protocol::bool_of(b, "IsTruncated")),
+                to = draft.to.len(),
+                cc = draft.cc.len(),
+                bcc = draft.bcc.len(),
+                attachments = draft.attachments.len(),
+                inline = draft.attachments.iter().filter(|a| a.is_inline).count(),
+                is_draft = protocol::bool_of(item, "IsDraft"),
+                attachment_shape = %item.pointer("/Attachments/0").map(|a| protocol::json_shape(a, 2)).unwrap_or_default(),
+                ck_len = draft.id.change_key.as_deref().map(str::len),
+                "GetItem черновика"
+            );
+            return Ok(draft);
+        }
+        Err(last_err.unwrap_or(TransportError::Protocol { op: "GetItem".into(), status: 0, raw: "ни одна форма не принята".into() }))
     }
 
     /// Подпись из словаря `OWA.UserOptions` (`user_options`); нет объекта или подписи — `None`.

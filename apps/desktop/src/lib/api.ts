@@ -200,6 +200,40 @@ export interface SignatureDto {
   auto_add: boolean;
 }
 
+/** Вложение черновика, уже лежащее на сервере (compose_open_draft). */
+export interface DraftAttachment {
+  /** Запись в локальной базе; null, если черновик известен только с сервера. */
+  attachment_pk: number | null;
+  /** Серверный AttachmentId — им вложение убирается (removed_attachment_ids). */
+  server_id: string;
+  name: string | null;
+  size: number | null;
+  content_type: string | null;
+}
+
+/** Открытый черновик в заготовке композера: откуда он и какие вложения уже на сервере. */
+export interface DraftInfo {
+  item_pk: number | null;
+  server_id: string;
+  change_key?: string | null;
+  attachments: DraftAttachment[];
+  /** Тело черновика, если бэкенд положил его сюда, а не в `ComposeContext.body_html`. */
+  body_html?: string | null;
+  bcc?: ComposeRecipient[];
+  /**
+   * Инлайновые картинки тела из кэша для показа в редакторе: нормализованный cid (normalizeCid) →
+   * адрес aiowa-att. Тело хранит `cid:`; адрес подставляется только для показа.
+   */
+  inline_images?: Record<string, string>;
+}
+
+/** Ссылка на черновик на сервере после compose_autosave; item_pk — локальная запись, если она уже есть. */
+export interface DraftRef {
+  server_id: string;
+  change_key: string | null;
+  item_pk: number | null;
+}
+
 /** Заготовка композера от бэкенда: получатели и тема уже подобраны по виду письма. */
 export interface ComposeContext {
   kind: ComposeKind;
@@ -211,6 +245,12 @@ export interface ComposeContext {
   original: Message | null;
   own_addresses: string[];
   signature: SignatureDto;
+  /** Скрытые получатели: только у открытого черновика. */
+  bcc?: ComposeRecipient[];
+  /** Тело открытого черновика (HTML); у новой заготовки отсутствует — тело строится из подписи. */
+  body_html?: string | null;
+  /** Открыт существующий черновик (compose_open_draft); у новой заготовки отсутствует. */
+  draft?: DraftInfo | null;
 }
 
 export interface ComposeRequest {
@@ -223,17 +263,42 @@ export interface ComposeRequest {
   body_html: string;
   /** Пути файлов-вложений. */
   attachments: string[];
+  /**
+   * Черновик уже на сервере (автосохранение или открытый из «Черновиков»): отправка идёт по нему —
+   * update_draft → add_attachments для новых файлов → delete_attachments → send_draft.
+   */
+  draft_server_id?: string | null;
+  /** Серверные вложения черновика, убранные в композере (AttachmentId). */
+  removed_attachment_ids?: string[];
+}
+
+/** Ответ attachment_preview_url: адрес файла в кэше по протоколу aiowa-att и годится ли тип для показа в окне. */
+export interface PreviewDto {
+  url: string;
+  content_type: string | null;
+  previewable: boolean;
+  /** Почему предпросмотра нет: тип окно не показывает или файл больше лимита; null — показывать можно. */
+  reason?: "unsupported_type" | "too_large" | null;
+  /** Можно ли открыть системным приложением; исполняемые типы — только «Сохранить как…». */
+  openable?: boolean;
+  name: string | null;
+  size: number | null;
 }
 
 /**
- * Итог отправки: если не ушло, но черновик остался на сервере — draft_saved; message — текст для пользователя.
- * maybe_sent — ответа на SendItem нет (таймаут, обрыв связи): письмо могло уйти, повтор дал бы дубль адресатам.
+ * Итог отправки или сохранения черновика: если не ушло, но черновик остался на сервере — draft_saved;
+ * message — текст для пользователя. maybe_sent — ответа на SendItem нет (таймаут, обрыв связи): письмо
+ * могло уйти, повтор дал бы дубль адресатам.
  */
 export interface SendReport {
   sent: boolean;
   draft_saved: boolean;
   maybe_sent: boolean;
   message: string | null;
+  /** Черновик на сервере, если он остался или сохранён: композер продолжает с ним, а не создаёт второй. */
+  draft?: DraftRef | null;
+  /** Файловые вложения черновика на сервере, если этот вызов их менял (null — не менял или не перечитаны). */
+  attachments?: DraftAttachment[] | null;
 }
 
 export interface RecipientSuggestion {
@@ -442,6 +507,8 @@ export const api = {
   attachmentOpen: (attachmentPk: number) => invoke<void>("attachment_open", { attachmentPk }),
   /** Скачать при необходимости и показать диалог «Сохранить как»; null — пользователь отменил. */
   attachmentSaveAs: (attachmentPk: number) => invoke<string | null>("attachment_save_as", { attachmentPk }),
+  /** Скачать при необходимости и вернуть адрес файла в кэше по протоколу aiowa-att для предпросмотра. */
+  attachmentPreviewUrl: (attachmentPk: number) => invoke<PreviewDto>("attachment_preview_url", { attachmentPk }),
   /** Открыть ссылку (http, https, mailto) во внешнем приложении. */
   openExternal: (url: string) => invoke<void>("open_external", { url }),
   /**
@@ -481,7 +548,14 @@ export const api = {
   composeContext: (kind: ComposeKind, itemPk: number | null) => invoke<ComposeContext>("compose_context", { kind, itemPk }),
   /** Черновик → вложения → отправка; отказ после создания черновика приходит в SendReport (draft_saved). */
   composeSend: (req: ComposeRequest) => invoke<SendReport>("compose_send", { req }),
+  /** Сохранить черновик вместе с файлами (create или update по draft_server_id → новые файлы → удаление убранных), без отправки. */
   composeSaveDraft: (req: ComposeRequest) => invoke<SendReport>("compose_save_draft", { req }),
+  /** Заготовка композера из черновика в базе (текст с сервера, если локального тела нет). */
+  composeOpenDraft: (itemPk: number) => invoke<ComposeContext>("compose_open_draft", { itemPk }),
+  /** Автосохранение: без draftServerId — create_draft, с ним — update_draft; вложения не трогает. */
+  composeAutosave: (req: ComposeRequest, draftServerId: string | null) => invoke<DraftRef>("compose_autosave", { req, draftServerId }),
+  /** Удалить черновик: на сервере — в «Удалённые», локально — сразу из «Черновиков». */
+  composeDiscardDraft: (draftServerId: string) => invoke<void>("compose_discard_draft", { draftServerId }),
   /** Подсказки адресатов по началу адреса или слову имени. */
   recipientsSuggest: (prefix: string, limit?: number) => invoke<RecipientSuggestion[]>("recipients_suggest", { prefix, limit: limit ?? null }),
   ownAddresses: () => invoke<string[]>("own_addresses"),
@@ -621,6 +695,37 @@ function isImageType(contentType: string | null): boolean {
 /** Инлайновая картинка: живёт в теле письма по cid, в списке файлов не показывается. */
 export function isInlinePicture(a: Attachment): boolean {
   return a.is_inline && isImageType(a.content_type);
+}
+
+const PREVIEW_EXT = /\.(png|jpe?g|gif|webp|bmp|svg|ico|avif|pdf|txt|csv|log|md|html?)$/i;
+/** Те же типы, что у бэкенда (`preview::is_previewable`): картинки, которые рисует WebView, PDF и текст. */
+const PREVIEW_TYPES = new Set([
+  "image/png",
+  "image/jpeg",
+  "image/jpg",
+  "image/pjpeg",
+  "image/gif",
+  "image/webp",
+  "image/bmp",
+  "image/svg+xml",
+  "image/x-icon",
+  "image/vnd.microsoft.icon",
+  "image/avif",
+  "application/pdf",
+  "text/plain",
+  "text/csv",
+  "text/html",
+]);
+
+/**
+ * Тип вложения годится для предпросмотра в окне: картинки, PDF, простой текст, CSV и HTML (как текст).
+ * Как у бэкенда (`preview::resolved_type`): без Content-Type или с общим application/octet-stream —
+ * по расширению имени. Окончательно решает бэкенд (`PreviewDto.previewable`, ещё и по размеру).
+ */
+export function isPreviewable(a: Pick<Attachment, "name" | "content_type">): boolean {
+  const ct = (a.content_type ?? "").toLowerCase().split(";")[0].trim();
+  if (ct && ct !== "application/octet-stream") return PREVIEW_TYPES.has(ct);
+  return PREVIEW_EXT.test(a.name ?? "");
 }
 
 /** Инлайновое вложение, которое message_fetch скачает и подставит в тело: есть content_id, нет файла, тип image/* или неизвестен. */

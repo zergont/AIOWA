@@ -7,7 +7,11 @@
 //! подставляются из кэша вложений как `data:`-URI прямо при очистке.
 //!
 //! Новое письмо, ответ, ответ всем и пересылка — команды композера (`compose.rs`): черновик на
-//! сервере, вложения, отправка через тот же транспорт процесса.
+//! сервере, вложения, отправка через тот же транспорт процесса. Автосохранение, открытие и
+//! удаление черновиков — там же.
+//!
+//! Предпросмотр вложений (`preview.rs`): протокол `aiowa-att` отдаёт окну файлы из кэша вложений
+//! (картинки, PDF, текст), команда `attachment_preview_url` при необходимости скачивает файл.
 //!
 //! Календарь (`calendar.rs`): события окна и подробности события из кэша в базе; сервер —
 //! когда кэш не покрывает окно, устарел или окно просит обновить.
@@ -41,6 +45,7 @@ mod compose;
 mod folders;
 mod notify;
 mod ondemand;
+mod preview;
 mod reminders;
 mod staged;
 mod sync;
@@ -332,16 +337,31 @@ pub(crate) fn prepare_attachments(store: &Store, item_pk: i64, wanted: Option<&H
 /// а внешние ресурсы из CSS всё равно блокирует CSP фрейма. `src="cid:…"` у картинок
 /// заменяется на `data:` из карты; несопоставленные `cid:` теряют атрибут `src`.
 fn sanitize_html(html: &str, inline: &Arc<InlineMap>) -> String {
+    clean_html(html, Some(inline.clone()))
+}
+
+/// Очистка HTML, который уходит на сервер (тело письма, цитата, черновик для редактора): та же
+/// ammonia, но `src="cid:…"` остаётся как есть — это ссылки на инлайновые вложения письма на
+/// сервере, и подмена на `data:` (или потеря `src`) сломала бы картинки у адресата.
+pub(crate) fn sanitize_keep_cid(html: &str) -> String {
+    clean_html(html, None)
+}
+
+/// `inline = None` — `cid:` не подставляются и не снимаются.
+fn clean_html(html: &str, inline: Option<Arc<InlineMap>>) -> String {
     let mut b = ammonia::Builder::default();
     b.add_generic_attributes(["style", "width", "height", "align", "valign", "bgcolor", "border", "cellpadding", "cellspacing", "color", "face", "size"])
         .add_tags(["font", "center", "u", "s", "strike", "tt", "big", "small", "caption", "colgroup", "col", "thead", "tbody", "tfoot", "span", "div", "img", "table", "tr", "td", "th", "hr"])
         .link_rel(Some("noopener noreferrer"))
         .url_schemes(["http", "https", "mailto", "cid", "data"].into_iter().collect());
-    let inline = inline.clone();
     b.attribute_filter(move |element, attribute, value| {
         let is_cid = value.trim_start().get(..4).is_some_and(|p| p.eq_ignore_ascii_case("cid:"));
-        if element == "img" && attribute == "src" && is_cid {
-            return inline.get(&normalize_cid(value)).map(|uri| Cow::Owned(uri.clone()));
+        if element == "img"
+            && attribute == "src"
+            && is_cid
+            && let Some(map) = &inline
+        {
+            return map.get(&normalize_cid(value)).map(|uri| Cow::Owned(uri.clone()));
         }
         Some(Cow::Borrowed(value))
     });
@@ -514,6 +534,17 @@ pub fn run() {
     let app = tauri::Builder::default()
         // Тосты Windows о новых письмах показывает канал уведомлений из Rust; команд плагина окно не зовёт.
         .plugin(tauri_plugin_notification::init())
+        // Предпросмотр вложений: файл и база читаются не в потоке окна. Отдаются только файлы кэша
+        // вложений текущей учётной записи по числовому ключу (`preview::serve`).
+        .register_asynchronous_uri_scheme_protocol(preview::SCHEME, |ctx, request, responder| {
+            let app = ctx.app_handle().clone();
+            let method = request.method().clone();
+            let path = request.uri().path().to_string();
+            tauri::async_runtime::spawn_blocking(move || {
+                let state = app.state::<AppState>();
+                responder.respond(preview::serve(&state.store, state.account, &method, &path));
+            });
+        })
         .manage(state)
         .manage(sync_state.clone())
         .manage(notify_state.clone())
@@ -560,6 +591,7 @@ pub fn run() {
             ondemand::message_fetch,
             ondemand::attachment_open,
             ondemand::attachment_save_as,
+            preview::attachment_preview_url,
             ondemand::open_external,
             write::items_mark_read,
             write::items_set_flag,
@@ -575,6 +607,9 @@ pub fn run() {
             compose::compose_context,
             compose::compose_send,
             compose::compose_save_draft,
+            compose::compose_open_draft,
+            compose::compose_autosave,
+            compose::compose_discard_draft,
             compose::recipients_suggest,
             compose::own_addresses,
             compose::signature_get,

@@ -141,13 +141,13 @@ fn extension_of(name: &str) -> Option<String> {
 }
 
 /// Открывать системным приложением небезопасно: файл будет выполнен, а не показан.
-fn is_unsafe_to_open(name: Option<&str>) -> bool {
+pub(crate) fn is_unsafe_to_open(name: Option<&str>) -> bool {
     name.and_then(extension_of).is_some_and(|ext| UNSAFE_EXTENSIONS.contains(&ext.as_str()))
 }
 
 /// Путь к файлу вложения в кэше: скачивает, если файла нет (один раз на вложение, повторный клик
 /// ждёт), и отмечает обращение для вытеснения по давности.
-async fn ensure_cached(state: &AppState, sync: &SyncState, od: &OnDemand, attachment_pk: i64) -> CmdResult<PathBuf> {
+pub(crate) async fn ensure_cached(state: &AppState, sync: &SyncState, od: &OnDemand, attachment_pk: i64) -> CmdResult<PathBuf> {
     let lock = od.attachments.get(attachment_pk);
     let _busy = lock.lock().await;
     let store = &state.store;

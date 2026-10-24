@@ -1,13 +1,15 @@
 <script lang="ts">
   import { onDestroy, untrack } from "svelte";
-  import { api, errorMessage, formatSize, fullDate, isInlinePicture, listDate, meetingKindOf, messageNeedsFetch, personLabel, senderResponseOf, type Attachment, type ComposeKind, type Folder, type MeetingInfo, type MeetingResponse, type Message, type ResponseType } from "../api";
+  import { api, errorMessage, formatSize, fullDate, isInlinePicture, isPreviewable, listDate, meetingKindOf, messageNeedsFetch, personLabel, senderResponseOf, type Attachment, type ComposeKind, type Folder, type MeetingInfo, type MeetingResponse, type Message, type ResponseType } from "../api";
   import { COMPOSE_ACTIONS, ICON, type ItemAction } from "../actions";
   import { meetingWhen } from "../calendar";
   import { focusBack } from "../popover";
+  import { printMessage } from "../print";
   import FolderPicker from "./FolderPicker.svelte";
   import ConfirmPopover from "./ConfirmPopover.svelte";
   import ChoicePopover from "./ChoicePopover.svelte";
   import BodyFrame from "./BodyFrame.svelte";
+  import AttachmentPreview from "./AttachmentPreview.svelte";
 
   interface Props {
     message: Message;
@@ -21,14 +23,23 @@
     deletedFolderPk: number | null;
     /** Папка архива: письму в ней «В архив» недоступно; null — папки нет (родитель предложит создать). */
     archiveFolderPk?: number | null;
+    /** Папка «Черновики»: письмо в ней открывается композером, а не отвечается. */
+    draftsFolderPk?: number | null;
     /** Действие над этим письмом; `anchor` — нажатая кнопка (для вопросов вроде «создать папку архива?»); промис отклоняется текстом ошибки. */
     onaction: (action: ItemAction, anchor?: HTMLElement) => Promise<void>;
     /** Открыть композер: ответ, ответ всем или пересылка этого письма. */
     oncompose: (kind: ComposeKind) => void;
+    /** Открыть этот черновик в композере. */
+    onopendraft?: () => void;
+    /** Черновик открывается (может читаться с сервера): кнопка занята. */
+    draftOpening?: boolean;
     /** Дан ответ на приглашение или отменённая встреча убрана из календаря: родитель перечитывает беседу. */
     onmeeting?: () => void;
   }
-  let { message, expanded, ontoggle, onfetch, folders, deletedFolderPk, archiveFolderPk = null, onaction, oncompose, onmeeting }: Props = $props();
+  let { message, expanded, ontoggle, onfetch, folders, deletedFolderPk, archiveFolderPk = null, draftsFolderPk = null, onaction, oncompose, onopendraft, draftOpening = false, onmeeting }: Props = $props();
+
+  /** Черновик: по признаку письма или по папке — у него вместо панели действий «Открыть черновик». */
+  const isDraft = $derived(message.is_draft || (draftsFolderPk != null && message.folder_pk === draftsFolderPk));
 
   const to = $derived(message.recipients.filter((r) => r.kind === 1).map((r) => personLabel(r.name, r.email)));
   const cc = $derived(message.recipients.filter((r) => r.kind === 2).map((r) => personLabel(r.name, r.email)));
@@ -238,6 +249,57 @@
     for (const t of savedTimers.values()) clearTimeout(t);
   });
 
+  // --- предпросмотр вложений ----------------------------------------------------
+  // Картинки, PDF и текст открываются поверх области чтения; остальные типы — системным приложением.
+  // Листаются все файлы письма: для непредпросматриваемого окно предложит «Открыть».
+
+  let previewOpen = $state(false);
+  let previewIndex = $state(0);
+  let previewReturnTo: HTMLElement | null = null;
+
+  function clickAttachment(e: MouseEvent, a: Attachment) {
+    if (!isPreviewable(a)) {
+      void openAttachment(a);
+      return;
+    }
+    const i = files.findIndex((f) => f.attachment_pk === a.attachment_pk);
+    if (i < 0) return;
+    previewReturnTo = e.currentTarget instanceof HTMLElement ? e.currentTarget : null;
+    previewIndex = i;
+    previewOpen = true;
+  }
+  function closePreview() {
+    previewOpen = false;
+    focusBack(previewReturnTo);
+    previewReturnTo = null;
+  }
+  $effect(() => {
+    // Письмо перечитано и вложений стало меньше: индекс не должен указывать в пустоту.
+    if (previewOpen && previewIndex >= files.length) {
+      if (files.length) previewIndex = files.length - 1;
+      else previewOpen = false;
+    }
+  });
+
+  // --- печать -----------------------------------------------------------------
+  // Печатается шапка и то же очищенное тело, что в карточке; письмо без тела сначала догружается.
+
+  let printing = $state(false);
+
+  async function print() {
+    if (printing) return;
+    printing = true;
+    actionError = null;
+    try {
+      if (needsFetch) await onfetch(message.item_pk);
+      await printMessage(message);
+    } catch (e) {
+      actionError = errorMessage(e);
+    } finally {
+      printing = false;
+    }
+  }
+
   // --- встреча: приглашение, отмена, ответ участника ----------------------------------------
   // По классу письма карточка знает, что это письмо о встрече, а поля встречи (время, место,
   // организатор, мой ответ) берёт у бэкенда (`meeting_info`, GetItem по письму) при первом
@@ -405,13 +467,32 @@
       </div>
     </div>
 
-    {#if expanded}
+    {#if expanded && isDraft}
+      <div class="actions" role="toolbar" aria-label="Действия с черновиком">
+        <button class="act open-draft" onclick={() => onopendraft?.()} disabled={!onopendraft || draftOpening} aria-busy={draftOpening} title="Открыть черновик в композере (Enter в списке)">
+          {#if draftOpening}
+            <span class="spinner" aria-hidden="true"></span>
+            Открываю…
+          {:else}
+            <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path d={ICON.draft} fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round" /></svg>
+            Открыть черновик
+          {/if}
+        </button>
+      </div>
+    {:else if expanded}
       <div class="actions" role="toolbar" aria-label="Действия с письмом" aria-busy={busy}>
         {#each COMPOSE_ACTIONS as a (a.kind)}
           <button class="act" onclick={() => oncompose(a.kind)} aria-label={a.label} title="{a.label} ({a.keys})">
             <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path d={a.icon} fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round" /></svg>
           </button>
         {/each}
+        <button class="act" onclick={print} disabled={printing} aria-label="Печать" title="Печать (Ctrl+P)" aria-busy={printing}>
+          {#if printing}
+            <span class="spinner" aria-hidden="true"></span>
+          {:else}
+            <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path d={ICON.print} fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round" /></svg>
+          {/if}
+        </button>
         <span class="act-sep" aria-hidden="true"></span>
         <button class="act" onclick={() => run({ kind: "read", read: !message.is_read })} disabled={busy} aria-label={message.is_read ? "Пометить непрочитанным" : "Пометить прочитанным"} title={message.is_read ? "Пометить непрочитанным" : "Пометить прочитанным"}>
           <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path d={message.is_read ? ICON.unread : ICON.read} fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round" /></svg>
@@ -512,8 +593,9 @@
           {@const st = status(a.attachment_pk)}
           {@const cached = a.cached || cachedHere.has(a.attachment_pk)}
           {@const name = a.name ?? "вложение"}
-          <div class="file" class:cached class:busy={st.busy != null} class:failed={st.error != null} title={[a.content_type ?? "", cached ? "Файл в кэше" : "Файл будет скачан при открытии"].filter(Boolean).join("\n")}>
-            <button class="file-open" onclick={() => openAttachment(a)} disabled={st.busy != null} aria-label="Открыть вложение {name}" aria-busy={st.busy === "open"}>
+          {@const previewable = isPreviewable(a)}
+          <div class="file" class:cached class:busy={st.busy != null} class:failed={st.error != null} title={[a.content_type ?? "", previewable ? "Клик — предпросмотр" : "Клик — открыть в приложении", cached ? "Файл в кэше" : "Файл будет скачан при открытии"].filter(Boolean).join("\n")}>
+            <button class="file-open" onclick={(e) => clickAttachment(e, a)} disabled={st.busy != null} aria-label={previewable ? `Предпросмотр вложения ${name}` : `Открыть вложение ${name}`} aria-haspopup={previewable ? "dialog" : undefined} aria-busy={st.busy === "open"}>
               {#if st.busy === "open"}
                 <span class="spinner" aria-hidden="true"></span>
               {:else}
@@ -560,7 +642,7 @@
         </div>
       {/if}
       {#if hasBody}
-        <BodyFrame html={message.body_html ?? ""} />
+        <BodyFrame html={message.body_html ?? ""} onprint={() => void print()} />
         {#if message.is_truncated}<div class="caption note">Письмо обрезано при загрузке.</div>{/if}
       {:else if message.body_state === 2}
         <div class="note status">
@@ -579,6 +661,18 @@
     </div>
   {/if}
 </article>
+
+{#if previewOpen && files.length}
+  <AttachmentPreview
+    {files}
+    bind:index={previewIndex}
+    status={status(files[previewIndex]?.attachment_pk ?? -1)}
+    onopen={(a) => void openAttachment(a)}
+    onsave={(a) => void saveAttachment(a)}
+    onclearerror={(a) => setStatus(a.attachment_pk, { error: null })}
+    onclose={closePreview}
+  />
+{/if}
 
 <style>
   .card {
@@ -736,6 +830,26 @@
   }
   .act:focus-visible {
     outline-offset: -2px;
+  }
+  /* «Открыть черновик»: единственная кнопка панели, с подписью. */
+  .act.open-draft {
+    width: auto;
+    gap: 6px;
+    padding: 0 10px;
+    border: 1px solid var(--accent);
+    background: var(--accent);
+    color: var(--fg-on-accent);
+  }
+  .act.open-draft:hover:not(:disabled) {
+    background: var(--accent-hover);
+    color: var(--fg-on-accent);
+  }
+  .act.open-draft:active:not(:disabled) {
+    background: var(--accent-pressed);
+  }
+  .act.open-draft:disabled {
+    opacity: 0.6;
+    color: var(--fg-on-accent);
   }
   .act-sep {
     width: 1px;

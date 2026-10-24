@@ -2,10 +2,14 @@
 //! список бесед, поиск с операторами, вложения, операции записи (прочитано, флаг, перенос, удаление),
 //! папки (создание, переименование, удаление, живая проверка), отправка письма, подпись из OWA,
 //! подсказки адресов, календарь (окно событий, одно событие, создание, изменение и удаление события,
-//! письмо о встрече), проверка поля Reply-To.
+//! письмо о встрече), проверка поля Reply-To, живая проверка черновиков (создание, чтение,
+//! изменение, удаление вложения, удаление).
 //! Пароль хранится в диспетчере учётных данных Windows и не передаётся аргументом.
 
-use aiowa_core::{AccountId, CalendarItemChanges, CalendarItemType, ComposeKind, FolderChange, FolderId, FolderRef, FreeBusy, Importance, ItemId, NewCalendarItem, OutgoingAttachment, OutgoingMessage, Participant, SyncState};
+use aiowa_core::{
+    AccountId, CalendarItemChanges, CalendarItemType, ComposeKind, DraftContent, FolderChange, FolderId, FolderRef, FreeBusy, Importance, ItemId, NewCalendarItem, OutgoingAttachment, OutgoingMessage,
+    Participant, RecipientKind, SyncState,
+};
 use aiowa_store::{AttachmentTodo, CalendarRow, Store};
 use aiowa_sync::{Engine, FolderSelection, SyncOptions};
 use aiowa_transport::{new_guid, Credentials, DeleteMode, MailTransport, NotificationEvent, NotificationKind, SubscriptionRequest, WriteResult};
@@ -237,6 +241,20 @@ enum Cmd {
         /// При отказе отправки оставить черновик на сервере (по умолчанию удаляется навсегда)
         #[arg(long)]
         keep_draft: bool,
+    },
+    /// Живая проверка черновиков одной сессией: CreateItem «[AIOWA] черновик» → CreateAttachment
+    /// (маленький текстовый файл) → GetItem черновика → UpdateItem (тема, тело, получатель — свой адрес)
+    /// → GetItem → DeleteAttachment → GetItem → DeleteItem HardDelete. Ничего не отправляется.
+    /// Без --yes-i-know только печатает план
+    DraftCheck {
+        /// Между шагами синхронизировать папку «Черновики» в локальную базу (SyncFolderItems, GetItem тел,
+        /// вложения) и сверить строку тестового черновика: is_draft, получатели, вложения, тело; после
+        /// удаления — что строка помечена удалённой
+        #[arg(long)]
+        sync_drafts: bool,
+        /// Подтверждение: это запись в настоящий ящик (один тестовый черновик, он удаляется навсегда)
+        #[arg(long)]
+        yes_i_know: bool,
     },
     /// Показать подпись пользователя из настроек OWA (GetUserConfiguration), ничего не сохраняя
     Signature,
@@ -1241,6 +1259,209 @@ async fn send_flow(t: &OwaTransport, msg: &OutgoingMessage, files: &[OutgoingAtt
     Ok(())
 }
 
+const DRAFT_CHECK_SUBJECT: &str = "[AIOWA] черновик";
+const DRAFT_CHECK_SUBJECT_2: &str = "[AIOWA] черновик 2";
+const DRAFT_CHECK_ATTACHMENT: &str = "aiowa-draft-check.txt";
+/// Маркеры в теле черновика: по ним проверяется, что сервер вернул именно записанное тело
+/// (HTML сервер нормализует, поэтому сравнивается не строка целиком, а наличие маркера).
+const DRAFT_CHECK_MARK_1: &str = "AIOWA draft check 1";
+const DRAFT_CHECK_MARK_2: &str = "AIOWA draft check 2";
+
+/// Ожидание от `GetItem` черновика на шаге проверки.
+struct DraftExpect<'a> {
+    subject: &'a str,
+    body_mark: &'a str,
+    to: usize,
+    files: usize,
+}
+
+/// Печатает сверку содержимого черновика с ожиданием: только счётчики и совпадения, без текста.
+/// Возвращает, всё ли совпало.
+fn check_draft(label: &str, d: &DraftContent, expect: &DraftExpect<'_>) -> bool {
+    let files: Vec<_> = d.file_attachments().collect();
+    let subject_ok = d.subject == expect.subject;
+    let body_ok = d.body_html.contains(expect.body_mark);
+    let to_ok = d.to.len() == expect.to && d.cc.is_empty() && d.bcc.is_empty();
+    let files_ok = files.len() == expect.files && files.iter().all(|a| a.name.as_deref() == Some(DRAFT_CHECK_ATTACHMENT));
+    let ok = subject_ok && body_ok && to_ok && files_ok;
+    println!(
+        "  {label}: тема {}, тело {} символов (маркер {}), Кому {} / Копия {} / Скрытая {}{}, вложений {} (файловых {}{}), ChangeKey {} — {}",
+        if subject_ok { "совпала" } else { "ДРУГАЯ" },
+        d.body_html.chars().count(),
+        if body_ok { "найден" } else { "НЕ найден" },
+        d.to.len(),
+        d.cc.len(),
+        d.bcc.len(),
+        if to_ok { "" } else { " — НЕ как ожидалось" },
+        d.attachments.len(),
+        files.len(),
+        files.iter().map(|a| format!(", {} байт, тип {}", a.size.map(|s| s.to_string()).unwrap_or_else(|| "?".into()), a.content_type.as_deref().unwrap_or("?"))).collect::<String>(),
+        d.id.change_key.as_ref().map(|c| format!("{} символов", c.len())).unwrap_or_else(|| "нет".into()),
+        if ok { "ок" } else { "РАСХОЖДЕНИЕ" }
+    );
+    ok
+}
+
+/// Синхронизация папки «Черновики» в локальную базу: иерархия, элементы, тела и вложения за 90 дней
+/// (вложения до 1 МиБ). Печатает счётчики отчёта.
+async fn sync_drafts_folder(t: &OwaTransport, store: &Arc<Store>, account: AccountId) -> Result<()> {
+    let opts = SyncOptions {
+        folders: FolderSelection::Named(vec!["drafts".into()]),
+        max_attachment_bytes: 1024 * 1024,
+        ..SyncOptions::default()
+    };
+    let engine = Engine::new(Arc::new(t.clone()), store.clone(), account, Arc::new(AtomicBool::new(false)));
+    let started = std::time::Instant::now();
+    let r = engine.run(&opts).await.map_err(|e| anyhow!("синхронизация «Черновиков»: {e}"))?;
+    println!(
+        "  Sync «Черновики» за {} мс: пачек {}, писем создано {} / обновлено {} / удалено {}, тел загружено {} (ошибок {}, исчезло {}), вложений скачано {} (ошибок {})",
+        started.elapsed().as_millis(),
+        r.pages,
+        r.items_created,
+        r.items_updated,
+        r.items_deleted,
+        r.bodies_fetched,
+        r.bodies_failed,
+        r.bodies_gone,
+        r.attachments_fetched,
+        r.attachments_failed
+    );
+    Ok(())
+}
+
+/// Сверка строки тестового черновика в локальной базе после синхронизации. `expect_present` —
+/// черновик должен быть (не удалён) с `to` получателями и `files` файловыми вложениями.
+fn check_local_draft(store: &Store, account: AccountId, server_id: &str, expect_present: bool, to: usize, files: usize) -> Result<bool> {
+    let Some((pk, deleted)) = store.item_pk_by_server_id(account, server_id)? else {
+        println!("  в базе: строки черновика нет{}", if expect_present { " — НЕ как ожидалось" } else { " (ок)" });
+        return Ok(!expect_present);
+    };
+    if deleted {
+        println!("  в базе: item_pk {pk} помечен удалённым{}", if expect_present { " — НЕ как ожидалось" } else { " (ок)" });
+        return Ok(!expect_present);
+    }
+    if !expect_present {
+        println!("  в базе: item_pk {pk} ЕЩЁ ЕСТЬ и не удалён");
+        return Ok(false);
+    }
+    let head = store.message_head(pk)?.ok_or_else(|| anyhow!("message_head({pk}) пуст"))?;
+    let recipients = store.recipients(pk)?;
+    let to_n = recipients.iter().filter(|r| r.kind == RecipientKind::To.as_i64()).count();
+    let atts = store.attachments_of_item(pk)?;
+    let files_rows: Vec<_> = atts.iter().filter(|a| !a.is_inline).collect();
+    let body = store.message_body(pk)?;
+    let ok = head.is_draft && to_n == to && files_rows.len() == files && body.is_some();
+    println!(
+        "  в базе: item_pk {pk}, папка {}, is_draft {}, has_attachments {}, received_at {}, sent_at {}, получателей Кому {} (всего {}), вложений {} (файловых {}, скачано {}, с текстом {}), тело {} — {}",
+        head.folder_name.as_deref().unwrap_or("?"),
+        head.is_draft,
+        head.has_attachments,
+        if head.received_at.is_some() { "есть" } else { "НЕТ" },
+        if head.sent_at.is_some() { "есть" } else { "нет" },
+        to_n,
+        recipients.len(),
+        atts.len(),
+        files_rows.len(),
+        files_rows.iter().filter(|a| a.fetched_at.is_some()).count(),
+        files_rows.iter().filter(|a| a.text_len > 0).count(),
+        match &body {
+            Some(b) => format!("есть ({} символов текста)", b.text.as_deref().map(|t| t.chars().count()).unwrap_or(0)),
+            None => "НЕТ".into(),
+        },
+        if ok { "ок" } else { "РАСХОЖДЕНИЕ" }
+    );
+    Ok(ok)
+}
+
+/// Живая проверка черновиков: CreateItem → CreateAttachment → GetItem → UpdateItem → GetItem →
+/// DeleteAttachment → GetItem → DeleteItem HardDelete. Сбой после создания всё равно заканчивается
+/// удалением черновика навсегда. `owner` — свой адрес (единственный получатель после обновления).
+async fn draft_check_flow(t: &OwaTransport, store: &Arc<Store>, account: AccountId, owner: &str, sync_drafts: bool) -> Result<()> {
+    let msg1 = OutgoingMessage { subject: DRAFT_CHECK_SUBJECT.into(), body_html: text_to_html(&format!("{DRAFT_CHECK_MARK_1}\n\nПервая версия тела.")), ..OutgoingMessage::default() };
+    let file = OutgoingAttachment { name: DRAFT_CHECK_ATTACHMENT.into(), content_type: Some("text/plain".into()), bytes: format!("AIOWA draft-check {}\n", jiff::Timestamp::now()).into_bytes() };
+    let started = std::time::Instant::now();
+    let draft = t.create_draft(&ComposeKind::New, &msg1).await.map_err(|e| anyhow!("CreateItem: {e}"))?;
+    println!("CreateItem (черновик без получателей): Ok за {} мс; ItemId {} символов, ChangeKey {}", started.elapsed().as_millis(), draft.id.len(), draft.change_key.as_ref().map(|c| format!("{} символов", c.len())).unwrap_or_else(|| "нет".into()));
+    let mut all_ok = true;
+    let outcome = async {
+        let started = std::time::Instant::now();
+        let current = t.add_attachments(&draft, std::slice::from_ref(&file)).await.map_err(|e| anyhow!("CreateAttachment: {e}"))?;
+        println!("CreateAttachment ({} байт): Ok за {} мс; RootItemId {}, RootItemChangeKey {}", file.bytes.len(), started.elapsed().as_millis(), if current.id == draft.id { "тот же" } else { "ДРУГОЙ" }, describe_change_key(&draft, &current));
+
+        let started = std::time::Instant::now();
+        let d1 = t.get_draft(&current).await.map_err(|e| anyhow!("GetItem черновика: {e}"))?;
+        println!("GetItem черновика после создания: Ok за {} мс", started.elapsed().as_millis());
+        all_ok &= check_draft("содержимое", &d1, &DraftExpect { subject: DRAFT_CHECK_SUBJECT, body_mark: DRAFT_CHECK_MARK_1, to: 0, files: 1 });
+        let att_id = d1.file_attachments().next().map(|a| a.id.clone()).ok_or_else(|| anyhow!("в черновике нет файлового вложения — нечего удалять"))?;
+
+        let msg2 = OutgoingMessage {
+            to: vec![Participant { name: None, email: Some(owner.to_string()), routing_type: None }],
+            subject: DRAFT_CHECK_SUBJECT_2.into(),
+            body_html: text_to_html(&format!("{DRAFT_CHECK_MARK_2}\n\nВторая версия тела: тема, тело и получатель изменены.")),
+            ..OutgoingMessage::default()
+        };
+        let started = std::time::Instant::now();
+        let updated = t.update_draft(&d1.id, &msg2).await.map_err(|e| anyhow!("UpdateItem черновика: {e}"))?;
+        println!("UpdateItem (тема, тело, Кому = свой адрес): Ok за {} мс; Id {}, ChangeKey {}", started.elapsed().as_millis(), if updated.id == draft.id { "тот же" } else { "ДРУГОЙ" }, describe_change_key(&d1.id, &updated));
+        let started = std::time::Instant::now();
+        let d2 = t.get_draft(&updated).await.map_err(|e| anyhow!("GetItem черновика после UpdateItem: {e}"))?;
+        println!("GetItem черновика после обновления: Ok за {} мс", started.elapsed().as_millis());
+        all_ok &= check_draft("содержимое", &d2, &DraftExpect { subject: DRAFT_CHECK_SUBJECT_2, body_mark: DRAFT_CHECK_MARK_2, to: 1, files: 1 });
+        all_ok &= d2.file_attachments().next().map(|a| a.id == att_id).unwrap_or(false);
+        if d2.file_attachments().next().map(|a| a.id != att_id).unwrap_or(false) {
+            println!("  AttachmentId после UpdateItem ДРУГОЙ (ожидался тот же)");
+        }
+        if sync_drafts {
+            sync_drafts_folder(t, store, account).await?;
+            all_ok &= check_local_draft(store, account, &draft.id, true, 1, 1)?;
+        }
+
+        let started = std::time::Instant::now();
+        let after_delete = t.delete_attachments(std::slice::from_ref(&att_id)).await.map_err(|e| anyhow!("DeleteAttachment: {e}"))?;
+        println!("DeleteAttachment: Ok за {} мс; RootItemId {}, RootItemChangeKey {}", started.elapsed().as_millis(), if after_delete.id == draft.id { "тот же" } else { "ДРУГОЙ" }, describe_change_key(&d2.id, &after_delete));
+        all_ok &= after_delete.id == draft.id;
+        let started = std::time::Instant::now();
+        let d3 = t.get_draft(&after_delete).await.map_err(|e| anyhow!("GetItem черновика после DeleteAttachment: {e}"))?;
+        println!("GetItem черновика после удаления вложения: Ok за {} мс", started.elapsed().as_millis());
+        all_ok &= check_draft("содержимое", &d3, &DraftExpect { subject: DRAFT_CHECK_SUBJECT_2, body_mark: DRAFT_CHECK_MARK_2, to: 1, files: 0 });
+        Ok::<ItemId, anyhow::Error>(d3.id)
+    }
+    .await;
+    let current = match outcome {
+        Ok(id) => id,
+        Err(e) => {
+            println!("Сбой после создания: {e}. Удаляю тестовый черновик навсегда.");
+            all_ok = false;
+            ItemId { id: draft.id.clone(), change_key: None }
+        }
+    };
+    let started = std::time::Instant::now();
+    let results = t.delete_items(std::slice::from_ref(&current), DeleteMode::Hard).await.map_err(|e| anyhow!("DeleteItem HardDelete: {e} (черновик «{DRAFT_CHECK_SUBJECT}» мог остаться в «Черновиках»!)"))?;
+    match results.first() {
+        Some(WriteResult::Ok { .. }) => println!("DeleteItem HardDelete: Ok за {} мс", started.elapsed().as_millis()),
+        Some(WriteResult::Failed { code, message, .. }) => bail!("DeleteItem HardDelete: {code}: {message} (черновик мог остаться в «Черновиках»!)"),
+        None => bail!("DeleteItem HardDelete: пустой ответ (черновик мог остаться в «Черновиках»!)"),
+    }
+    match t.get_draft(&ItemId { id: draft.id.clone(), change_key: None }).await {
+        Err(aiowa_transport::TransportError::Server { code, .. }) if code == "ErrorItemNotFound" => println!("  GetItem по удалённому черновику: ErrorItemNotFound (ок)"),
+        Err(e) => println!("  GetItem по удалённому черновику: {e} (ожидался ErrorItemNotFound)"),
+        Ok(_) => {
+            println!("  GetItem по удалённому черновику: ЕЩЁ ЧИТАЕТСЯ");
+            all_ok = false;
+        }
+    }
+    if sync_drafts {
+        sync_drafts_folder(t, store, account).await?;
+        all_ok &= check_local_draft(store, account, &draft.id, false, 0, 0)?;
+    }
+    if all_ok {
+        println!("Живая проверка черновиков пройдена: создание, чтение, обновление, удаление вложения и удаление подтверждены.");
+        Ok(())
+    } else {
+        bail!("живая проверка черновиков не пройдена (см. строки с НЕ/ДРУГОЙ/РАСХОЖДЕНИЕ выше)")
+    }
+}
+
 fn keyring_entry(user: &str) -> Result<keyring::Entry> {
     keyring::Entry::new(KEYRING_SERVICE, user).map_err(|e| anyhow!("keyring: {e}"))
 }
@@ -1771,6 +1992,24 @@ async fn real_main() -> Result<()> {
             let outcome = send_flow(&t, &msg, &files, *keep_draft).await;
             t.logoff().await.ok();
             outcome?;
+        }
+        Cmd::DraftCheck { sync_drafts, yes_i_know } => {
+            let store = Arc::new(Store::open(&db_path)?);
+            let account = store.account(&cli.host, &cli.user)?;
+            let owner = store.own_addresses(account)?.into_iter().next().ok_or_else(|| anyhow!("в локальной базе нет писем в «Отправленных»: собственный адрес неизвестен"))?;
+            println!(
+                "План одной сессией: CreateItem «{DRAFT_CHECK_SUBJECT}» без получателей → CreateAttachment «{DRAFT_CHECK_ATTACHMENT}» → GetItem → UpdateItem (тема «{DRAFT_CHECK_SUBJECT_2}», новое тело, Кому — свой адрес) → GetItem{} → DeleteAttachment → GetItem → DeleteItem HardDelete{}. Ничего не отправляется.",
+                if *sync_drafts { " → Sync «Черновики» и сверка строки в базе" } else { "" },
+                if *sync_drafts { " → Sync «Черновики» и сверка удаления" } else { "" }
+            );
+            if !yes_i_know {
+                println!("Это запись в настоящий ящик (один тестовый черновик, удаляется навсегда). Повторите с --yes-i-know, чтобы выполнить.");
+                return Ok(());
+            }
+            let t = connect(&cli).await?;
+            let result = draft_check_flow(&t, &store, account, &owner, *sync_drafts).await;
+            t.logoff().await.ok();
+            result?;
         }
         Cmd::Signature => {
             let t = connect(&cli).await?;

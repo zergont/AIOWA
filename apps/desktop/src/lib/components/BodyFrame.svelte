@@ -5,8 +5,10 @@
     /** Тело письма (HTML уже с data:-картинками вместо cid). */
     html: string;
     title?: string;
+    /** Ctrl+P при фокусе внутри фрейма: печатать письмо, а не окно целиком. Без него клавиша просто гасится. */
+    onprint?: () => void;
   }
-  let { html, title = "Текст письма" }: Props = $props();
+  let { html, title = "Текст письма", onprint }: Props = $props();
 
   // Письмо живёт в изолированном фрейме: без скриптов, без внешних ресурсов, своя «бумага».
   // Инлайновые картинки приходят уже как data: (подставляет бэкенд), поэтому cid: в CSP не нужен.
@@ -50,6 +52,11 @@
   function onFrameKey(e: KeyboardEvent) {
     const ctrl = e.ctrlKey || e.metaKey;
     if (e.key === "F5" || (ctrl && !e.altKey && (e.code === "KeyR" || e.key.toLowerCase() === "r"))) e.preventDefault();
+    // Ctrl+P изнутри фрейма напечатал бы окно приложения целиком.
+    if (ctrl && !e.altKey && !e.shiftKey && (e.code === "KeyP" || e.key.toLowerCase() === "p")) {
+      e.preventDefault();
+      onprint?.();
+    }
   }
 
   function onFrameClick(e: MouseEvent) {

@@ -16,12 +16,18 @@
     deletedFolderPk: number | null;
     /** Папка архива для кнопки «В архив» на карточке; null — папки нет. */
     archiveFolderPk?: number | null;
+    /** Папка «Черновики»: у письма в ней вместо панели действий «Открыть черновик». */
+    draftsFolderPk?: number | null;
     /** Выбрано несколько бесед в списке: вместо письма — заглушка «Выбрано N бесед». */
     multiCount?: number;
     /** Действие над одним письмом; `anchor` — нажатая кнопка; ошибку пробрасывает, карточка покажет её у себя. */
     onaction: (itemPk: number, action: ItemAction, anchor?: HTMLElement) => Promise<void>;
     /** Ответ, ответ всем или пересылка письма с карточки. */
     oncompose: (itemPk: number, kind: ComposeKind) => void;
+    /** Открыть черновик с карточки в композере. */
+    onopendraft?: (itemPk: number) => void;
+    /** Черновик открывается (может читаться с сервера): кнопка карточки показывает это и не жмётся повторно. */
+    draftOpening?: boolean;
     /** Композер: над карточками беседы, а при `composerAlone` — вместо неё (новое письмо, чужая беседа). */
     composer?: Snippet;
     composerAlone?: boolean;
@@ -30,7 +36,7 @@
     /** С карточки дан ответ на приглашение (или отмена убрана из календаря): беседу стоит перечитать. */
     onmeeting?: () => void;
   }
-  let { conversation, messages, loading, onfetch, folders, deletedFolderPk, archiveFolderPk = null, multiCount = 0, onaction, oncompose, composer, composerAlone = false, topExpandedPk = $bindable(null), onmeeting }: Props = $props();
+  let { conversation, messages, loading, onfetch, folders, deletedFolderPk, archiveFolderPk = null, draftsFolderPk = null, multiCount = 0, onaction, oncompose, onopendraft, draftOpening = false, composer, composerAlone = false, topExpandedPk = $bindable(null), onmeeting }: Props = $props();
 
   // Письма идут от новых к старым; самое свежее развёрнуто, остальные свёрнуты до заголовка.
   // Раскрытие пересчитывается только при смене беседы: точечная замена письма (догрузка тела)
@@ -120,7 +126,7 @@
           <div class="caption loading">Загрузка…</div>
         {/if}
         {#each messages as m (m.item_pk)}
-          <MessageCard message={m} expanded={expanded.has(m.item_pk)} ontoggle={() => toggle(m.item_pk)} {onfetch} {folders} {deletedFolderPk} {archiveFolderPk} onaction={(a, el) => onaction(m.item_pk, a, el)} oncompose={(kind) => oncompose(m.item_pk, kind)} {onmeeting} />
+          <MessageCard message={m} expanded={expanded.has(m.item_pk)} ontoggle={() => toggle(m.item_pk)} {onfetch} {folders} {deletedFolderPk} {archiveFolderPk} {draftsFolderPk} onaction={(a, el) => onaction(m.item_pk, a, el)} oncompose={(kind) => oncompose(m.item_pk, kind)} onopendraft={onopendraft ? () => onopendraft(m.item_pk) : undefined} {draftOpening} {onmeeting} />
         {/each}
       {/if}
     </div>

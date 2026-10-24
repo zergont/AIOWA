@@ -4,8 +4,8 @@
 
 use aiowa_core::{
     response_from_item_class, AttachmentMeta, Attendee, BodyType, CalendarEvent, CalendarEventDetails, CalendarItemChanges, CalendarItemType, ComposeKind, ConversationId, DistinguishedFolder,
-    FlagStatus, Folder, FolderChange, FolderId, FolderRef, FreeBusy, Importance, ItemChange, ItemId, MeetingMessageKind, MeetingRequestInfo, MeetingResponse, MessageBody, MessageFull, MessageMeta,
-    NewCalendarItem, OutgoingAttachment, OutgoingMessage, Participant, ResponseType, Signature, SyncState,
+    DraftContent, FlagStatus, Folder, FolderChange, FolderId, FolderRef, FreeBusy, Importance, ItemChange, ItemId, MeetingMessageKind, MeetingRequestInfo, MeetingResponse, MessageBody, MessageFull,
+    MessageMeta, NewCalendarItem, OutgoingAttachment, OutgoingMessage, Participant, ResponseType, Signature, SyncState,
 };
 use aiowa_transport::WriteResult;
 use base64::prelude::*;
@@ -390,15 +390,19 @@ pub fn send_item_body(item: &ItemId) -> Value {
     })
 }
 
-/// `UpdateItem` черновика целиком: тема, тело, важность и списки получателей. Пустой список
-/// снимается `DeleteItemField`, иначе сервер оставил бы старых получателей.
+/// `UpdateItem` черновика целиком: тема, тело, списки получателей и важность. Пустой список
+/// снимается `DeleteItemField`, иначе сервер оставил бы старых получателей. Важность пишется,
+/// только если она не обычная (как у ответов в `outgoing_item_json`): у композера выбора важности
+/// нет, и `Normal` значит «не трогать» — иначе важность, заданная черновику в OWA, сбросилась бы.
 pub fn update_draft_body(item: &ItemId, msg: &OutgoingMessage) -> Value {
     let set = |field: &str, value: Value| json!({ "__type": "SetItemField:#Exchange", "Path": property_uri(field), "Item": value });
     let mut updates = vec![
         set("item:Subject", json!({ "__type": "Message:#Exchange", "Subject": msg.subject })),
         set("item:Body", json!({ "__type": "Message:#Exchange", "Body": body_content_json(&msg.body_html) })),
-        set("item:Importance", json!({ "__type": "Message:#Exchange", "Importance": msg.importance.as_str() })),
     ];
+    if msg.importance != Importance::Normal {
+        updates.push(set("item:Importance", json!({ "__type": "Message:#Exchange", "Importance": msg.importance.as_str() })));
+    }
     for (field, key, list) in [("message:ToRecipients", "ToRecipients", &msg.to), ("message:CcRecipients", "CcRecipients", &msg.cc), ("message:BccRecipients", "BccRecipients", &msg.bcc)] {
         if list.is_empty() {
             updates.push(json!({ "__type": "DeleteItemField:#Exchange", "Path": property_uri(field) }));
@@ -414,6 +418,121 @@ pub fn update_draft_body(item: &ItemId, msg: &OutgoingMessage) -> Value {
         "MessageDisposition": "SaveOnly",
         "SuppressReadReceipts": true,
         "ItemChanges": [ { "__type": "ItemChange:#Exchange", "ItemId": item_id_json(item), "Updates": updates } ],
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Черновики: удаление вложений и чтение целиком (см. docs/protocol-owa-json.md § 5k)
+
+/// `DeleteAttachment` по идентификаторам вложений: несколько за один запрос, ответ — по одному
+/// сообщению на каждое вложение в порядке запроса, у каждого `RootItemId` с новым ключом письма.
+pub fn delete_attachment_body(ids: &[String]) -> Value {
+    json!({
+        "__type": "DeleteAttachmentRequest:#Exchange",
+        "AttachmentIds": ids.iter().map(|id| json!({ "__type": "AttachmentId:#Exchange", "Id": id })).collect::<Vec<_>>(),
+    })
+}
+
+/// Идентификатор письма-родителя из сообщения ответа `DeleteAttachment`: `RootItemId` — объект с
+/// `RootItemId` и `RootItemChangeKey` (атрибуты элемента `m:RootItemId` схемы EWS); терпимо и к
+/// форме `{ Id, ChangeKey }`, и к строке с ключом рядом (`RootItemChangeKey` на уровне сообщения).
+/// Нет — `None`.
+pub fn parse_delete_attachment_root(msg: &Value) -> Option<ItemId> {
+    match msg.get("RootItemId")? {
+        Value::String(s) if !s.is_empty() => Some(ItemId { id: s.clone(), change_key: str_of(msg, "RootItemChangeKey").map(String::from) }),
+        root @ Value::Object(_) => {
+            let id = str_of(root, "RootItemId").or_else(|| str_of(root, "Id")).filter(|s| !s.is_empty())?;
+            Some(ItemId { id: id.to_string(), change_key: str_of(root, "RootItemChangeKey").or_else(|| str_of(root, "ChangeKey")).map(String::from) })
+        }
+        _ => None,
+    }
+}
+
+/// Форма `ItemShape` для `GetItem` черновика.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DraftShape {
+    /// `AllProperties` с `BodyType: HTML`: полное тело в члене `Body`, получатели, вложения.
+    AllProperties,
+    /// Именованная форма `ItemNormalizedBody` (§ 5b'): полное тело в `NormalizedBody`.
+    NormalizedBody,
+}
+
+/// `GetItem` одного черновика с полным телом HTML, получателями и вложениями. `AllProperties` —
+/// основная форма (у писем даёт `Body`, `ToRecipients`/`CcRecipients`/`BccRecipients`,
+/// `Attachments`, § 5b'), `ItemNormalizedBody` — запасная.
+pub fn get_draft_body(id: &ItemId, shape: DraftShape, max_body: u64) -> Value {
+    match shape {
+        DraftShape::NormalizedBody => get_item_body(std::slice::from_ref(id), "ItemNormalizedBody", max_body, false),
+        DraftShape::AllProperties => json!({
+            "__type": "GetItemRequest:#Exchange",
+            "ItemShape": {
+                "__type": "ItemResponseShape:#Exchange",
+                "BaseShape": "AllProperties",
+                "BodyType": "HTML",
+                "FilterHtmlContent": true,
+                "BlockExternalImagesIfSenderUntrusted": true,
+                "MaximumBodySize": max_body,
+                "MaximumRecipientsToReturn": 500
+            },
+            "ItemIds": [ item_id_json(id) ],
+            "ShapeName": null,
+        }),
+    }
+}
+
+/// Какой член тела есть у элемента ответа `GetItem`: `Body`, `NormalizedBody`, `UniqueBody` или
+/// ни одного (тогда черновик без тела — или форма его не отдала).
+pub fn body_key_of(item: &Value) -> Option<&'static str> {
+    ["Body", "NormalizedBody", "UniqueBody"].into_iter().find(|k| item.get(k).is_some_and(|b| b.get("Value").is_some()))
+}
+
+/// Обычный текст в HTML: экранирование `& < >` и `<div>` на строку (пустая строка — `<div><br></div>`,
+/// как в OWA). Нужен, когда сервер отдал тело черновика типом `Text`.
+pub fn text_to_html(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + 32);
+    for line in text.lines() {
+        let escaped: String = line.chars().map(|c| match c {
+            '&' => "&amp;".to_string(),
+            '<' => "&lt;".to_string(),
+            '>' => "&gt;".to_string(),
+            c => c.to_string(),
+        }).collect();
+        if escaped.trim().is_empty() {
+            out.push_str("<div><br></div>");
+        } else {
+            out.push_str("<div>");
+            out.push_str(&escaped);
+            out.push_str("</div>");
+        }
+    }
+    out
+}
+
+/// Черновик из элемента ответа `GetItem` (`parse_message_full` плюс сведение тела к HTML): тело —
+/// `Body`, иначе `NormalizedBody`, иначе `UniqueBody`; тело типа `Text` переводится в HTML; без
+/// тела — пустая строка. Без `ItemId` черновика нет.
+pub fn parse_draft_content(item: &Value) -> Option<DraftContent> {
+    let full = parse_message_full(item)?;
+    let body_html = match &full.body {
+        Some(b) => {
+            let raw = b.full_body.as_deref().or(b.unique_body.as_deref()).unwrap_or("");
+            match b.body_type {
+                BodyType::Html => raw.to_string(),
+                BodyType::Text => text_to_html(raw),
+            }
+        }
+        None => String::new(),
+    };
+    Some(DraftContent {
+        id: full.meta.item_id,
+        subject: full.meta.subject.unwrap_or_default(),
+        body_html,
+        to: full.to,
+        cc: full.cc,
+        bcc: full.bcc,
+        importance: full.meta.importance,
+        attachments: full.attachments,
+        is_truncated: full.body.as_ref().is_some_and(|b| b.is_truncated),
     })
 }
 
@@ -1766,8 +1885,105 @@ mod tests {
         let s = serde_json::to_string(&update_draft_body(&ItemId { id: "D".into(), change_key: Some("dk".into()) }, &outgoing())).unwrap();
         assert_eq!(
             s,
-            r#"{"__type":"UpdateItemRequest:#Exchange","ConflictResolution":"AlwaysOverwrite","MessageDisposition":"SaveOnly","SuppressReadReceipts":true,"ItemChanges":[{"__type":"ItemChange:#Exchange","ItemId":{"__type":"ItemId:#Exchange","Id":"D","ChangeKey":"dk"},"Updates":[{"__type":"SetItemField:#Exchange","Path":{"__type":"PropertyUri:#Exchange","FieldURI":"item:Subject"},"Item":{"__type":"Message:#Exchange","Subject":"Тема"}},{"__type":"SetItemField:#Exchange","Path":{"__type":"PropertyUri:#Exchange","FieldURI":"item:Body"},"Item":{"__type":"Message:#Exchange","Body":{"__type":"BodyContentType:#Exchange","BodyType":"HTML","Value":"<p>Привет</p>"}}},{"__type":"SetItemField:#Exchange","Path":{"__type":"PropertyUri:#Exchange","FieldURI":"item:Importance"},"Item":{"__type":"Message:#Exchange","Importance":"Normal"}},{"__type":"SetItemField:#Exchange","Path":{"__type":"PropertyUri:#Exchange","FieldURI":"message:ToRecipients"},"Item":{"__type":"Message:#Exchange","ToRecipients":[{"__type":"EmailAddress:#Exchange","Name":"Иван","EmailAddress":"i@x.ru","RoutingType":"SMTP"}]}},{"__type":"DeleteItemField:#Exchange","Path":{"__type":"PropertyUri:#Exchange","FieldURI":"message:CcRecipients"}},{"__type":"SetItemField:#Exchange","Path":{"__type":"PropertyUri:#Exchange","FieldURI":"message:BccRecipients"},"Item":{"__type":"Message:#Exchange","BccRecipients":[{"__type":"EmailAddress:#Exchange","EmailAddress":"b@x.ru","RoutingType":"SMTP"}]}}]}]}"#
+            r#"{"__type":"UpdateItemRequest:#Exchange","ConflictResolution":"AlwaysOverwrite","MessageDisposition":"SaveOnly","SuppressReadReceipts":true,"ItemChanges":[{"__type":"ItemChange:#Exchange","ItemId":{"__type":"ItemId:#Exchange","Id":"D","ChangeKey":"dk"},"Updates":[{"__type":"SetItemField:#Exchange","Path":{"__type":"PropertyUri:#Exchange","FieldURI":"item:Subject"},"Item":{"__type":"Message:#Exchange","Subject":"Тема"}},{"__type":"SetItemField:#Exchange","Path":{"__type":"PropertyUri:#Exchange","FieldURI":"item:Body"},"Item":{"__type":"Message:#Exchange","Body":{"__type":"BodyContentType:#Exchange","BodyType":"HTML","Value":"<p>Привет</p>"}}},{"__type":"SetItemField:#Exchange","Path":{"__type":"PropertyUri:#Exchange","FieldURI":"message:ToRecipients"},"Item":{"__type":"Message:#Exchange","ToRecipients":[{"__type":"EmailAddress:#Exchange","Name":"Иван","EmailAddress":"i@x.ru","RoutingType":"SMTP"}]}},{"__type":"DeleteItemField:#Exchange","Path":{"__type":"PropertyUri:#Exchange","FieldURI":"message:CcRecipients"}},{"__type":"SetItemField:#Exchange","Path":{"__type":"PropertyUri:#Exchange","FieldURI":"message:BccRecipients"},"Item":{"__type":"Message:#Exchange","BccRecipients":[{"__type":"EmailAddress:#Exchange","EmailAddress":"b@x.ru","RoutingType":"SMTP"}]}}]}]}"#
         );
+    }
+
+    #[test]
+    fn update_draft_body_clears_all_recipient_lists_when_empty() {
+        let msg = OutgoingMessage { subject: "Т".into(), body_html: "<div>х</div>".into(), ..OutgoingMessage::default() };
+        let s = serde_json::to_string(&update_draft_body(&ItemId { id: "D".into(), change_key: None }, &msg)).unwrap();
+        assert_eq!(s.matches(r#""__type":"DeleteItemField:#Exchange""#).count(), 3, "три пустых списка — три DeleteItemField: {s}");
+        assert_eq!(s.matches(r#""__type":"SetItemField:#Exchange""#).count(), 2, "тема и тело; обычная важность не пишется: {s}");
+        assert!(!s.contains("item:Importance"), "{s}");
+        assert!(s.contains(r#""ItemId":{"__type":"ItemId:#Exchange","Id":"D"},"Updates""#), "без ChangeKey ключ не передаётся: {s}");
+    }
+
+    #[test]
+    fn update_draft_body_writes_importance_only_when_not_normal() {
+        let msg = OutgoingMessage { subject: "Т".into(), body_html: "<div>х</div>".into(), importance: Importance::High, ..OutgoingMessage::default() };
+        let s = serde_json::to_string(&update_draft_body(&ItemId { id: "D".into(), change_key: None }, &msg)).unwrap();
+        assert!(s.contains(r#"{"__type":"SetItemField:#Exchange","Path":{"__type":"PropertyUri:#Exchange","FieldURI":"item:Importance"},"Item":{"__type":"Message:#Exchange","Importance":"High"}}"#), "{s}");
+    }
+
+    #[test]
+    fn delete_attachment_body_exact() {
+        let s = serde_json::to_string(&delete_attachment_body(&["A1".to_string(), "A2".to_string()])).unwrap();
+        assert_eq!(s, r#"{"__type":"DeleteAttachmentRequest:#Exchange","AttachmentIds":[{"__type":"AttachmentId:#Exchange","Id":"A1"},{"__type":"AttachmentId:#Exchange","Id":"A2"}]}"#);
+        let env = envelope("DeleteAttachment", V_2017, "UTC", delete_attachment_body(&["A1".to_string()]));
+        assert!(serde_json::to_string(&env).unwrap().starts_with(r#"{"__type":"DeleteAttachmentJsonRequest:#Exchange","Header":{"#));
+    }
+
+    #[test]
+    fn parses_delete_attachment_root() {
+        // Форма схемы EWS: атрибуты элемента m:RootItemId становятся членами объекта.
+        let v: Value = serde_json::from_str(r#"{"Body":{"ResponseMessages":{"Items":[{"__type":"DeleteAttachmentResponseMessage:#Exchange","ResponseClass":"Success","ResponseCode":"NoError","RootItemId":{"__type":"RootItemIdType:#Exchange","RootItemId":"D1","RootItemChangeKey":"k3"}}]}}}"#).unwrap();
+        assert_eq!(parse_delete_attachment_root(response_messages(&v)[0]), Some(ItemId { id: "D1".into(), change_key: Some("k3".into()) }));
+        // Форма ItemId: Id/ChangeKey.
+        let m: Value = serde_json::json!({ "ResponseClass": "Success", "RootItemId": { "__type": "ItemId:#Exchange", "Id": "D1", "ChangeKey": "k4" } });
+        assert_eq!(parse_delete_attachment_root(&m), Some(ItemId { id: "D1".into(), change_key: Some("k4".into()) }));
+        // Строка с ключом рядом.
+        let m: Value = serde_json::json!({ "RootItemId": "D1", "RootItemChangeKey": "k5" });
+        assert_eq!(parse_delete_attachment_root(&m), Some(ItemId { id: "D1".into(), change_key: Some("k5".into()) }));
+        // Без ключа и без идентификатора.
+        let m: Value = serde_json::json!({ "RootItemId": { "RootItemId": "D1" } });
+        assert_eq!(parse_delete_attachment_root(&m), Some(ItemId { id: "D1".into(), change_key: None }));
+        assert_eq!(parse_delete_attachment_root(&serde_json::json!({ "ResponseClass": "Success" })), None);
+        assert_eq!(parse_delete_attachment_root(&serde_json::json!({ "RootItemId": "" })), None);
+        assert_eq!(parse_delete_attachment_root(&serde_json::json!({ "RootItemId": { "ChangeKey": "k" } })), None);
+    }
+
+    #[test]
+    fn get_draft_body_exact() {
+        let id = ItemId { id: "D".into(), change_key: Some("dk".into()) };
+        assert_eq!(
+            serde_json::to_string(&get_draft_body(&id, DraftShape::AllProperties, 4096)).unwrap(),
+            r#"{"__type":"GetItemRequest:#Exchange","ItemShape":{"__type":"ItemResponseShape:#Exchange","BaseShape":"AllProperties","BodyType":"HTML","FilterHtmlContent":true,"BlockExternalImagesIfSenderUntrusted":true,"MaximumBodySize":4096,"MaximumRecipientsToReturn":500},"ItemIds":[{"__type":"ItemId:#Exchange","Id":"D","ChangeKey":"dk"}],"ShapeName":null}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&get_draft_body(&id, DraftShape::NormalizedBody, 4096)).unwrap(),
+            r#"{"__type":"GetItemRequest:#Exchange","ItemShape":{"__type":"ItemResponseShape:#Exchange","BaseShape":"IdOnly","FilterHtmlContent":true,"BlockExternalImagesIfSenderUntrusted":true,"MaximumBodySize":4096,"MaximumRecipientsToReturn":200},"ItemIds":[{"__type":"ItemId:#Exchange","Id":"D","ChangeKey":"dk"}],"ShapeName":"ItemNormalizedBody"}"#
+        );
+    }
+
+    #[test]
+    fn parses_draft_content() {
+        let item: Value = serde_json::json!({
+            "__type": "Message:#Exchange",
+            "ItemId": { "Id": "D1", "ChangeKey": "k1" },
+            "Subject": "[AIOWA] черновик",
+            "IsDraft": true,
+            "Importance": "High",
+            "Body": { "BodyType": "HTML", "Value": "<div>Привет</div>", "IsTruncated": false },
+            "ToRecipients": [ { "Name": "Я", "EmailAddress": "me@x.ru", "RoutingType": "SMTP", "MailboxType": "Mailbox" } ],
+            "CcRecipients": [],
+            "Attachments": [
+                { "__type": "FileAttachment:#Exchange", "AttachmentId": { "Id": "A1", "RootItemId": "D1", "RootItemChangeKey": "k1" }, "Name": "a.txt", "ContentType": "text/plain", "Size": 120, "IsInline": false },
+                { "__type": "FileAttachment:#Exchange", "AttachmentId": { "Id": "A2" }, "Name": "img.png", "ContentType": "image/png", "Size": 5, "IsInline": true, "ContentId": "cid1" }
+            ]
+        });
+        let d = parse_draft_content(&item).unwrap();
+        assert_eq!(d.id, ItemId { id: "D1".into(), change_key: Some("k1".into()) });
+        assert_eq!((d.subject.as_str(), d.body_html.as_str(), d.importance), ("[AIOWA] черновик", "<div>Привет</div>", Importance::High));
+        assert_eq!(d.to.len(), 1);
+        assert!(d.cc.is_empty() && d.bcc.is_empty());
+        assert_eq!(d.attachments.len(), 2);
+        assert_eq!(d.file_attachments().map(|a| a.id.as_str()).collect::<Vec<_>>(), vec!["A1"]);
+        assert_eq!(d.attachments[0].size, Some(120));
+        assert_eq!(body_key_of(&item), Some("Body"));
+
+        // Запасная форма: NormalizedBody вместо Body; тело типа Text переводится в HTML.
+        let item: Value = serde_json::json!({ "ItemId": { "Id": "D2" }, "NormalizedBody": { "BodyType": "Text", "Value": "строка 1\n\nстрока <2> & 3" } });
+        let d = parse_draft_content(&item).unwrap();
+        assert_eq!(d.body_html, "<div>строка 1</div><div><br></div><div>строка &lt;2&gt; &amp; 3</div>");
+        assert_eq!((d.subject.as_str(), d.importance, d.attachments.len()), ("", Importance::Normal, 0));
+        assert_eq!(body_key_of(&item), Some("NormalizedBody"));
+
+        // Без тела — пустая строка, без ItemId — None.
+        let item: Value = serde_json::json!({ "ItemId": { "Id": "D3" }, "Subject": "x" });
+        assert_eq!(parse_draft_content(&item).unwrap().body_html, "");
+        assert_eq!(body_key_of(&item), None);
+        assert!(parse_draft_content(&serde_json::json!({ "Subject": "x" })).is_none());
     }
 
     #[test]

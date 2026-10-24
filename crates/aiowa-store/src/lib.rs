@@ -312,7 +312,9 @@ pub struct EvictReport {
 }
 
 /// Служебные папки, которые не синхронизируются при выборе «все почтовые»; подпапки тоже.
-pub const SERVICE_FOLDERS: &[&str] = &["junkemail", "deleteditems", "drafts", "outbox", "conversationhistory", "syncissues", "conflicts", "localfailures", "serverfailures"];
+/// «Черновики» (`drafts`) сюда не входят: они синхронизируются по умолчанию, чтобы черновики (в том
+/// числе созданные в OWA) были в списке и открывались в композере.
+pub const SERVICE_FOLDERS: &[&str] = &["junkemail", "deleteditems", "outbox", "conversationhistory", "syncissues", "conflicts", "localfailures", "serverfailures"];
 
 fn now_ms() -> i64 {
     Timestamp::now().as_millisecond()
@@ -500,9 +502,10 @@ impl Store {
     }
 
     /// Все почтовые папки для синхронизации: класс `IPF.Note*`, не удалённые, кроме служебных
-    /// (нежелательная, удалённые, черновики, исходящие, журнал бесед, ошибки синхронизации) и их
-    /// подпапок. Служебная папка, которую пользователь уже синхронизировал отдельно (есть состояние
-    /// синхронизации), остаётся в наборе: раз попросили, дальше обновляем сами.
+    /// (нежелательная, удалённые, исходящие, журнал бесед, ошибки синхронизации) и их подпапок;
+    /// «Черновики» синхронизируются как обычная папка (`SERVICE_FOLDERS`). Служебная папка, которую
+    /// пользователь уже синхронизировал отдельно (есть состояние синхронизации), остаётся в наборе:
+    /// раз попросили, дальше обновляем сами.
     /// Порядок: входящие, отправленные, затем по убыванию числа писем.
     pub fn folders_for_sync(&self, account: AccountId) -> Result<Vec<SyncFolder>> {
         self.with_conn(|c| {
@@ -1020,6 +1023,15 @@ impl Store {
         })
     }
 
+    /// Вложение по ключу, только если письмо принадлежит учётной записи `account`: для протокола
+    /// предпросмотра, который не должен отдавать чужие и несуществующие ключи.
+    pub fn attachment_of_account(&self, account: AccountId, attachment_pk: i64) -> Result<Option<AttachmentRow>> {
+        self.with_conn(|c| {
+            let mut st = c.prepare_cached(&format!("SELECT {ATTACHMENT_COLUMNS} FROM attachments WHERE attachment_pk = ?1 AND item_pk IN (SELECT item_pk FROM items WHERE account_id = ?2)"))?;
+            Ok(st.query_row(params![attachment_pk, account.0], attachment_row).optional()?)
+        })
+    }
+
     /// Отмечает обращение к файлу кэша (для вытеснения по давности).
     pub fn touch_attachment(&self, attachment_pk: i64) -> Result<()> {
         self.with_conn(|c| {
@@ -1033,6 +1045,15 @@ impl Store {
         self.with_conn(|c| {
             c.execute("UPDATE attachments SET local_path = NULL WHERE attachment_pk = ?1", params![attachment_pk])?;
             Ok(())
+        })
+    }
+
+    /// Ключ письма по серверному идентификатору (и удалённого тоже) вместе с признаком `deleted`:
+    /// для сверки после записи на сервер (черновик после `CreateItem`/`DeleteItem`).
+    pub fn item_pk_by_server_id(&self, account: AccountId, server_id: &str) -> Result<Option<(i64, bool)>> {
+        self.with_conn(|c| {
+            Ok(c.query_row("SELECT item_pk, deleted FROM items WHERE account_id = ?1 AND server_id = ?2", params![account.0, server_id], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)? != 0)))
+                .optional()?)
         })
     }
 
@@ -2418,6 +2439,11 @@ mod tests {
         let one = s.attachment(pdf.attachment_pk).unwrap().unwrap();
         assert_eq!((one.attachment_pk, one.item_pk, one.server_id.as_str(), one.name.as_deref()), (pdf.attachment_pk, a_pk, "f1", Some("отчёт.pdf")));
         assert!(s.attachment(999_999).unwrap().is_none());
+        // По учётной записи: свой ключ виден, чужой и несуществующий — нет.
+        assert_eq!(s.attachment_of_account(acc, pdf.attachment_pk).unwrap().map(|r| r.server_id), Some("f1".to_string()));
+        let other = s.account("h", "другой").unwrap();
+        assert!(s.attachment_of_account(other, pdf.attachment_pk).unwrap().is_none());
+        assert!(s.attachment_of_account(acc, 999_999).unwrap().is_none());
         let todo = one.todo();
         assert_eq!(todo, AttachmentTodo { attachment_pk: pdf.attachment_pk, item_pk: a_pk, server_id: "f1".into(), name: Some("отчёт.pdf".into()), content_type: Some("application/pdf".into()), size: Some(100) });
 
@@ -2700,6 +2726,8 @@ mod tests {
                 folder_with("Проекты", None, Some("IPF.Note"), None, 300),
                 folder_with("Мелочь", None, Some("IPF.Note"), None, 10),
                 folder_with("Удаленные", Some("deleteditems"), Some("IPF.Note"), None, 900),
+                folder_with("Черновики", Some("drafts"), Some("IPF.Note"), None, 12),
+                folder_with("Исходящие", Some("outbox"), Some("IPF.Note"), None, 1),
                 folder_with("Старое", None, Some("IPF.Note"), Some("Удаленные"), 50),
                 folder_with("Совсем старое", None, Some("IPF.Note"), Some("Старое"), 5),
                 folder_with("Ошибки синхронизации", Some("syncissues"), Some("IPF.Note"), None, 0),
@@ -2712,7 +2740,8 @@ mod tests {
         )
         .unwrap();
         let names: Vec<String> = s.folders_for_sync(acc).unwrap().into_iter().map(|f| f.name).collect();
-        assert_eq!(names, vec!["Входящие", "Отправленные", "Проекты", "Мелочь", "RSS"]);
+        assert_eq!(names, vec!["Входящие", "Отправленные", "Проекты", "Черновики", "Мелочь", "RSS"], "черновики синхронизируются по умолчанию, исходящие и удалённые — нет");
+        assert!(!SERVICE_FOLDERS.contains(&"drafts") && SERVICE_FOLDERS.contains(&"outbox"));
         assert_eq!(s.resolve_folder(acc, "SENTITEMS").unwrap().map(|f| f.name), None, "известное имя чувствительно к регистру");
         assert_eq!(s.resolve_folder(acc, "sentitems").unwrap().map(|f| f.name), Some("Отправленные".into()));
         assert_eq!(s.resolve_folder(acc, "проекты").unwrap().map(|f| f.name), Some("Проекты".into()));

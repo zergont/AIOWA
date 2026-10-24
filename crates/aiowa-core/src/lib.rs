@@ -378,6 +378,39 @@ impl ComposeKind {
     }
 }
 
+/// Содержимое черновика с сервера (`GetItem` по черновику): тема, тело HTML, получатели,
+/// важность и серверные вложения. Нужно композеру, когда черновик создан в OWA или на другом
+/// клиенте и локального тела ещё нет. `id` — идентификатор с актуальным `ChangeKey`, с которым
+/// можно сразу делать `update_draft`/`delete_attachments`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DraftContent {
+    pub id: ItemId,
+    pub subject: String,
+    pub body_html: String,
+    pub to: Vec<Participant>,
+    pub cc: Vec<Participant>,
+    pub bcc: Vec<Participant>,
+    pub importance: Importance,
+    /// Вложения черновика на сервере (включая инлайновые картинки тела: у них `is_inline`).
+    pub attachments: Vec<AttachmentMeta>,
+    /// Сервер обрезал тело по `MaximumBodySize`: править такой черновик нельзя — `UpdateItem`
+    /// записал бы обрезанное тело обратно и хвост пропал бы на сервере.
+    pub is_truncated: bool,
+}
+
+impl DraftContent {
+    /// Исходящее письмо из содержимого черновика: то, что композер правит и отдаёт в
+    /// `update_draft`/`compose_send`.
+    pub fn to_outgoing(&self) -> OutgoingMessage {
+        OutgoingMessage { to: self.to.clone(), cc: self.cc.clone(), bcc: self.bcc.clone(), subject: self.subject.clone(), body_html: self.body_html.clone(), importance: self.importance }
+    }
+
+    /// Файловые вложения (без инлайновых картинок тела): их показывает список вложений композера.
+    pub fn file_attachments(&self) -> impl Iterator<Item = &AttachmentMeta> {
+        self.attachments.iter().filter(|a| !a.is_inline)
+    }
+}
+
 /// Подпись пользователя: HTML и признак «добавлять автоматически к новым письмам».
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct Signature {
@@ -930,6 +963,25 @@ mod tests {
         assert_eq!(effective_reply_to(None, &[p("owner@x.ru")]), vec![p("owner@x.ru")]);
         let empty = Participant::default();
         assert!(effective_reply_to(Some(&from), std::slice::from_ref(&empty)).is_empty(), "участник без имени и адреса отбрасывается");
+    }
+
+    #[test]
+    fn draft_content_to_outgoing_and_file_attachments() {
+        let att = |id: &str, inline: bool| AttachmentMeta { id: id.into(), name: Some(format!("{id}.txt")), content_type: None, size: Some(3), is_inline: inline, content_id: None };
+        let d = DraftContent {
+            id: ItemId { id: "D".into(), change_key: Some("k".into()) },
+            subject: "Тема".into(),
+            body_html: "<p>х</p>".into(),
+            to: vec![Participant { name: None, email: Some("a@x.ru".into()), routing_type: None }],
+            cc: vec![],
+            bcc: vec![],
+            importance: Importance::High,
+            attachments: vec![att("a1", false), att("img", true), att("a2", false)],
+            is_truncated: false,
+        };
+        let out = d.to_outgoing();
+        assert_eq!((out.subject.as_str(), out.body_html.as_str(), out.to.len(), out.importance), ("Тема", "<p>х</p>", 1, Importance::High));
+        assert_eq!(d.file_attachments().map(|a| a.id.as_str()).collect::<Vec<_>>(), vec!["a1", "a2"], "инлайновые картинки в списке файлов не показываются");
     }
 
     #[test]

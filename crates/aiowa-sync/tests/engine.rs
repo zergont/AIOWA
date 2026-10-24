@@ -218,6 +218,14 @@ impl MailTransport for Fake {
         Ok(item.clone())
     }
 
+    async fn delete_attachments(&self, _ids: &[String]) -> TResult<ItemId> {
+        Ok(ItemId { id: "draft".into(), change_key: Some("d3".into()) })
+    }
+
+    async fn get_draft(&self, id: &ItemId) -> TResult<DraftContent> {
+        Ok(DraftContent { id: id.clone(), subject: String::new(), body_html: String::new(), to: vec![], cc: vec![], bcc: vec![], importance: Importance::Normal, attachments: vec![], is_truncated: false })
+    }
+
     async fn user_signature(&self) -> TResult<Option<Signature>> {
         Ok(None)
     }
