@@ -139,11 +139,14 @@ impl MailTransport for Fake {
                     } else {
                         vec![]
                     };
+                    // У письма «a» есть Reply-To на другой адрес: ответ должен идти туда, а не отправителю.
+                    let reply_to = if id.id == "a" { vec![Participant { name: Some("Отдел снабжения".into()), email: Some("supply@fake.ru".into()), routing_type: Some("SMTP".into()) }] } else { vec![] };
                     ItemResult::Ok(MessageFull {
                         meta: m,
                         to: vec![Participant { name: Some("Я".into()), email: Some("me@fake.ru".into()), routing_type: None }],
                         cc: vec![],
                         bcc: vec![],
+                        reply_to,
                         body: Some(MessageBody { body_type: BodyType::Html, unique_body: Some("<p>Отгрузили <b>запчасти</b> на Колыму</p>".into()), full_body: None, is_truncated: false }),
                         attachments,
                     })
@@ -181,6 +184,22 @@ impl MailTransport for Fake {
 
     async fn delete_items(&self, ids: &[ItemId], _mode: DeleteMode) -> TResult<Vec<WriteResult>> {
         Ok(ids.iter().map(|id| WriteResult::Ok { id: id.clone() }).collect())
+    }
+
+    async fn create_folder(&self, _parent: &FolderRef, display_name: &str) -> TResult<FolderId> {
+        Ok(FolderId { id: format!("F-{display_name}"), change_key: Some("fk1".into()) })
+    }
+
+    async fn rename_folder(&self, id: &FolderId, _display_name: &str) -> TResult<FolderId> {
+        Ok(FolderId { id: id.id.clone(), change_key: Some("fk2".into()) })
+    }
+
+    async fn move_folder(&self, id: &FolderId, _parent: &FolderRef) -> TResult<FolderId> {
+        Ok(id.clone())
+    }
+
+    async fn delete_folder(&self, _id: &FolderId, _permanent: bool) -> TResult<()> {
+        Ok(())
     }
 
     async fn create_draft(&self, _kind: &ComposeKind, _msg: &OutgoingMessage) -> TResult<ItemId> {
@@ -370,6 +389,17 @@ async fn fetch_body_on_demand() {
     assert!(store.message_body(a_pk).unwrap().is_some());
     let atts = store.attachments_of_item(a_pk).unwrap();
     assert_eq!(atts.iter().find(|x| x.server_id == "att-inline").unwrap().content_id.as_deref(), Some("cid1"));
+    // Reply-To письма «a» лёг в recipients с kind = 4 и виден в заголовке письма.
+    let recipients = store.recipients(a_pk).unwrap();
+    assert_eq!(recipients.iter().filter(|r| r.kind == RecipientKind::ReplyTo.as_i64()).map(|r| r.email.as_deref()).collect::<Vec<_>>(), vec![Some("supply@fake.ru")]);
+    assert_eq!(recipients.iter().filter(|r| r.kind == 1).count(), 1, "получатель «Кому» на месте");
+    let head = store.message_head(a_pk).unwrap().unwrap();
+    assert_eq!(head.reply_to.len(), 1);
+    assert_eq!(head.reply_to[0].name.as_deref(), Some("Отдел снабжения"));
+    let conv_pk = store.item_ref(a_pk).unwrap().unwrap().conversation_pk.unwrap();
+    let in_conversation = store.conversation_messages(account, conv_pk).unwrap();
+    assert_eq!(in_conversation.iter().find(|h| h.item_pk == a_pk).unwrap().reply_to.len(), 1, "Reply-To виден и в письмах беседы");
+    assert!(in_conversation.iter().filter(|h| h.item_pk != a_pk).all(|h| h.reply_to.is_empty()));
 
     // Исчезло на сервере: помечено удалённым.
     let g = store.item_ref(gone_pk).unwrap().unwrap();

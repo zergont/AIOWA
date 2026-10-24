@@ -142,12 +142,43 @@ pub struct Participant {
     pub routing_type: Option<String>,
 }
 
-/// Тип получателя.
+/// Тип получателя. Числа — значения колонки `recipients.kind` в хранилище.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum RecipientKind {
     To = 1,
     Cc = 2,
     Bcc = 3,
+    /// Адрес из заголовка `Reply-To` (`message:ReplyTo`): куда слать ответ вместо `From`.
+    ReplyTo = 4,
+}
+
+impl RecipientKind {
+    pub const fn as_i64(self) -> i64 {
+        self as i64
+    }
+}
+
+/// Символы, запрещённые в имени папки (как в Outlook и OWA).
+pub const FOLDER_NAME_FORBIDDEN: &[char] = &['\\', '/', ':', '*', '?', '"', '<', '>', '|'];
+
+/// Проверяет имя папки для создания или переименования: 1–255 символов после обрезки пробелов,
+/// без управляющих символов и без `\ / : * ? " < > |`. Возвращает обрезанное имя или текст ошибки
+/// по-русски для показа пользователю.
+pub fn validate_folder_name(name: &str) -> std::result::Result<String, String> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Err("Имя папки не может быть пустым".to_string());
+    }
+    if trimmed.chars().count() > 255 {
+        return Err("Имя папки длиннее 255 символов".to_string());
+    }
+    if trimmed.chars().any(char::is_control) {
+        return Err("Имя папки содержит управляющие символы".to_string());
+    }
+    if let Some(c) = trimmed.chars().find(|c| FOLDER_NAME_FORBIDDEN.contains(c)) {
+        return Err(format!("Имя папки не может содержать символ «{c}» (запрещены \\ / : * ? \" < > |)"));
+    }
+    Ok(trimmed.to_string())
 }
 
 /// Важность письма.
@@ -276,8 +307,29 @@ pub struct MessageFull {
     pub to: Vec<Participant>,
     pub cc: Vec<Participant>,
     pub bcc: Vec<Participant>,
+    /// Адреса `Reply-To` (`message:ReplyTo`): пусто, если заголовка нет. Ответ идёт сюда,
+    /// а не на `From`, если список непуст и отличается от отправителя.
+    #[serde(default)]
+    pub reply_to: Vec<Participant>,
     pub body: Option<MessageBody>,
     pub attachments: Vec<AttachmentMeta>,
+}
+
+impl MessageFull {
+    /// Адреса `Reply-To`, отличающиеся от отправителя (`From`, без учёта регистра адреса):
+    /// именно их композер ставит в «Кому» у ответа вместо отправителя. Пусто — отвечать `From`.
+    pub fn effective_reply_to(&self) -> Vec<Participant> {
+        effective_reply_to(self.meta.from.as_ref(), &self.reply_to)
+    }
+}
+
+/// Адреса `Reply-To`, которые заменяют отправителя в ответе: список непуст и не сводится к самому
+/// `from` (сравнение адресов без учёта регистра). Если `Reply-To` — тот же адрес, что `From`,
+/// заменять нечего, и возвращается пусто.
+pub fn effective_reply_to(from: Option<&Participant>, reply_to: &[Participant]) -> Vec<Participant> {
+    let from_email = from.and_then(|p| p.email.as_deref()).map(str::to_ascii_lowercase);
+    let differs = reply_to.iter().any(|p| p.email.as_deref().map(str::to_ascii_lowercase) != from_email);
+    if differs { reply_to.iter().filter(|p| p.email.is_some() || p.name.is_some()).cloned().collect() } else { Vec::new() }
 }
 
 /// Файл, прикладываемый к исходящему письму (содержимое целиком в памяти: лимиты
@@ -849,6 +901,35 @@ mod tests {
         assert_eq!(all_day_civil_date(ts("2026-10-26T00:00:00Z")), jiff::civil::date(2026, 10, 26));
         assert_eq!(all_day_civil_date(ts("2026-10-25T21:00:00Z")), jiff::civil::date(2026, 10, 26));
         assert_eq!(all_day_civil_date(ts("2026-10-26T05:00:00Z")), jiff::civil::date(2026, 10, 26));
+    }
+
+    #[test]
+    fn folder_name_validation() {
+        assert_eq!(validate_folder_name("  AIOWA тест  ").unwrap(), "AIOWA тест");
+        assert!(validate_folder_name("").is_err());
+        assert!(validate_folder_name("   ").is_err());
+        assert!(validate_folder_name(&"я".repeat(256)).is_err());
+        assert_eq!(validate_folder_name(&"я".repeat(255)).unwrap().chars().count(), 255);
+        assert!(validate_folder_name("а\tб").is_err());
+        for bad in ["a/b", "a\\b", "a:b", "a*b", "a?b", "a\"b", "a<b", "a>b", "a|b"] {
+            let e = validate_folder_name(bad).unwrap_err();
+            assert!(e.contains("не может содержать"), "{bad}: {e}");
+        }
+        assert_eq!(RecipientKind::ReplyTo.as_i64(), 4);
+        assert_eq!(RecipientKind::To.as_i64(), 1);
+    }
+
+    #[test]
+    fn reply_to_replaces_sender_only_when_different() {
+        let p = |e: &str| Participant { name: None, email: Some(e.into()), routing_type: None };
+        let from = p("list@x.ru");
+        assert!(effective_reply_to(Some(&from), &[]).is_empty(), "нет Reply-To — отвечать отправителю");
+        assert!(effective_reply_to(Some(&from), &[p("LIST@x.ru")]).is_empty(), "тот же адрес в другом регистре — заменять нечего");
+        assert_eq!(effective_reply_to(Some(&from), &[p("owner@x.ru")]), vec![p("owner@x.ru")]);
+        assert_eq!(effective_reply_to(Some(&from), &[p("list@x.ru"), p("owner@x.ru")]).len(), 2, "хотя бы один другой адрес — весь список");
+        assert_eq!(effective_reply_to(None, &[p("owner@x.ru")]), vec![p("owner@x.ru")]);
+        let empty = Participant::default();
+        assert!(effective_reply_to(Some(&from), std::slice::from_ref(&empty)).is_empty(), "участник без имени и адреса отбрасывается");
     }
 
     #[test]

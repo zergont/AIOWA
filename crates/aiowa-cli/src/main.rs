@@ -1,7 +1,8 @@
 //! `aiowa`: консольная утилита этапа 1. Вход, папки, синхронизация в локальную базу,
 //! список бесед, поиск с операторами, вложения, операции записи (прочитано, флаг, перенос, удаление),
-//! отправка письма, подпись из OWA, подсказки адресов, календарь (окно событий, одно событие,
-//! создание, изменение и удаление события, письмо о встрече).
+//! папки (создание, переименование, удаление, живая проверка), отправка письма, подпись из OWA,
+//! подсказки адресов, календарь (окно событий, одно событие, создание, изменение и удаление события,
+//! письмо о встрече), проверка поля Reply-To.
 //! Пароль хранится в диспетчере учётных данных Windows и не передаётся аргументом.
 
 use aiowa_core::{AccountId, CalendarItemChanges, CalendarItemType, ComposeKind, FolderChange, FolderId, FolderRef, FreeBusy, Importance, ItemId, NewCalendarItem, OutgoingAttachment, OutgoingMessage, Participant, SyncState};
@@ -153,6 +154,62 @@ enum Cmd {
         /// Подтверждение: это запись в настоящий ящик
         #[arg(long)]
         yes_i_know: bool,
+    },
+    /// Создать почтовую папку на сервере (CreateFolder) и в базе. Без --yes-i-know только показывает, что сделает
+    FolderCreate {
+        /// Имя новой папки (1–255 символов, без \ / : * ? " < > |)
+        #[arg(long)]
+        name: String,
+        /// Родитель: известное имя (inbox) или отображаемое; без флага — корень ящика
+        #[arg(long)]
+        parent: Option<String>,
+        /// Подтверждение: это запись в настоящий ящик
+        #[arg(long)]
+        yes_i_know: bool,
+    },
+    /// Переименовать папку на сервере (UpdateFolder folder:DisplayName) и в базе. Служебные папки не переименовываются
+    FolderRename {
+        /// folder_pk папки в локальной базе (см. `sql "SELECT folder_pk, display_name FROM folders"`)
+        #[arg(long)]
+        folder_pk: i64,
+        #[arg(long)]
+        name: String,
+        /// Подтверждение: это запись в настоящий ящик
+        #[arg(long)]
+        yes_i_know: bool,
+    },
+    /// Удалить папку с содержимым на сервере (DeleteFolder): в «Удалённые» или навсегда. Служебные папки не удаляются
+    FolderDelete {
+        #[arg(long)]
+        folder_pk: i64,
+        /// Удалить навсегда (HardDelete) вместо переноса в «Удалённые»
+        #[arg(long)]
+        permanent: bool,
+        /// Подтверждение: это запись в настоящий ящик
+        #[arg(long)]
+        yes_i_know: bool,
+    },
+    /// Живая проверка операций с папками одной сессией: CreateFolder «AIOWA тест» в корне →
+    /// SyncFolderHierarchy → UpdateFolder «AIOWA тест 2» → SyncFolderHierarchy → DeleteFolder
+    /// HardDelete → SyncFolderHierarchy. Письма не трогаются. Без --yes-i-know только печатает план
+    FolderCheck {
+        /// Заодно проверить Reply-To: один GetItem (ItemPart + message:ReplyTo) по N свежим письмам
+        /// «Входящих» из базы, только чтение; печатаются счётчики и форма без содержимого
+        #[arg(long)]
+        probe_reply_to: Option<usize>,
+        /// Подтверждение: это запись в настоящий ящик
+        #[arg(long)]
+        yes_i_know: bool,
+    },
+    /// Проверка Reply-To без записи: GetItem в форме ItemPart с message:ReplyTo по свежим письмам
+    /// папки; печатаются только счётчики, наличие ключа и форма значения без содержимого
+    ReplyToProbe {
+        /// Папка: известное имя (inbox) или отображаемое
+        #[arg(long, default_value = "inbox")]
+        folder: String,
+        /// Сколько свежих писем взять (не больше 25 — одна пачка GetItem)
+        #[arg(long, default_value_t = 25)]
+        limit: usize,
     },
     /// Отправить новое письмо: черновик (CreateItem) → вложения (CreateAttachment) → отправка (SendItem).
     /// Без --yes-i-know только печатает план
@@ -836,6 +893,225 @@ async fn calendar_check_flow(t: &OwaTransport, store: &Store, account: AccountId
     }
 }
 
+/// Имена тестовой папки живой проверки (`folder-check`).
+const FOLDER_CHECK_NAME: &str = "AIOWA тест";
+const FOLDER_CHECK_NAME_2: &str = "AIOWA тест 2";
+
+/// Инкрементальная синхронизация иерархии в локальную базу (как `Engine::sync_hierarchy`), но с
+/// возвратом самих изменений: по ним проверяется, что сервер показал созданную, переименованную
+/// или удалённую папку. Недействительное состояние — одна полная выгрузка.
+async fn refresh_hierarchy(t: &OwaTransport, store: &Store, account: AccountId) -> Result<Vec<FolderChange>> {
+    let mut state = store.get_state(account, "hierarchy")?.map(SyncState);
+    let mut out = Vec::new();
+    let mut reset_once = false;
+    for _ in 0..50 {
+        let changes = match t.sync_folder_hierarchy(state.as_ref()).await {
+            Ok(c) => c,
+            Err(e) if e.invalidates_sync_state() && !reset_once => {
+                println!("  SyncFolderHierarchy: состояние недействительно ({e}), полная выгрузка");
+                reset_once = true;
+                state = None;
+                continue;
+            }
+            Err(e) => return Err(anyhow!("SyncFolderHierarchy: {e}")),
+        };
+        store.apply_hierarchy_batch(account, &changes.changes, &changes.state)?;
+        let done = changes.includes_last || changes.changes.is_empty();
+        state = Some(changes.state);
+        out.extend(changes.changes);
+        if done {
+            break;
+        }
+    }
+    Ok(out)
+}
+
+/// Что сервер сообщил о папке `id` в изменениях иерархии: `Create`, `Update`, `Delete` (последнее
+/// упоминание) с именем папки у первых двух; `None` — папка не упоминалась.
+fn hierarchy_mention<'a>(changes: &'a [FolderChange], id: &str) -> Option<(&'static str, Option<&'a str>)> {
+    changes.iter().rev().find_map(|c| match c {
+        FolderChange::Create(f) if f.id.id == id => Some(("Create", Some(f.display_name.as_str()))),
+        FolderChange::Update(f) if f.id.id == id => Some(("Update", Some(f.display_name.as_str()))),
+        FolderChange::Delete(fid) if fid.id == id => Some(("Delete", None)),
+        _ => None,
+    })
+}
+
+/// Строка папки для вставки в базу после `CreateFolder`: класс почтовый, счётчики нули.
+fn new_mail_folder(id: &FolderId, parent_server_id: Option<&str>, display_name: &str) -> aiowa_core::Folder {
+    aiowa_core::Folder {
+        id: id.clone(),
+        parent_id: parent_server_id.map(|p| FolderId { id: p.to_string(), change_key: None }),
+        display_name: display_name.to_string(),
+        distinguished: None,
+        folder_class: Some(aiowa_transport_owa::protocol::MAIL_FOLDER_CLASS.to_string()),
+        total_count: 0,
+        unread_count: 0,
+        child_folder_count: 0,
+    }
+}
+
+/// Родитель для `CreateFolder`: по имени из базы или корень ящика (`msgfolderroot`). Возвращает
+/// ссылку для сервера, `server_id` родителя для локальной строки и подпись для вывода.
+fn resolve_parent(store: &Store, account: AccountId, parent: Option<&str>) -> Result<(FolderRef, Option<String>, String)> {
+    match parent {
+        Some(name) => {
+            let f = store.resolve_folder(account, name)?.ok_or_else(|| anyhow!("папка «{name}» не найдена в локальной базе"))?;
+            Ok((FolderRef::Id(FolderId { id: f.server_id.clone(), change_key: None }), Some(f.server_id), format!("папке «{}» (folder_pk {})", f.name, f.folder_pk)))
+        }
+        None => Ok((FolderRef::Distinguished(aiowa_core::DistinguishedFolder::MsgFolderRoot), store.msgfolderroot_server_id(account)?, "корне ящика (msgfolderroot)".to_string())),
+    }
+}
+
+/// Лежит ли папка `folder_pk` внутри папки `ancestor_pk` (на любой глубине) по локальной базе.
+fn folder_is_under(store: &Store, account: AccountId, folder_pk: i64, ancestor_pk: i64) -> Result<bool> {
+    let folders = store.list_folders(account)?;
+    let by_id: std::collections::HashMap<&str, &(i64, aiowa_core::Folder)> = folders.iter().map(|row| (row.1.id.id.as_str(), row)).collect();
+    let mut cur = folders.iter().find(|(pk, _)| *pk == folder_pk).and_then(|(_, f)| f.parent_id.as_ref()).map(|p| p.id.as_str());
+    for _ in 0..64 {
+        let Some(pid) = cur else { return Ok(false) };
+        let Some((pk, f)) = by_id.get(pid) else { return Ok(false) };
+        if *pk == ancestor_pk {
+            return Ok(true);
+        }
+        cur = f.parent_id.as_ref().map(|p| p.id.as_str());
+    }
+    Ok(false)
+}
+
+fn describe_folder_id(id: &FolderId) -> String {
+    format!("FolderId {} символов, ChangeKey {}", id.id.len(), id.change_key.as_ref().map(|c| format!("{} символов", c.len())).unwrap_or_else(|| "нет".into()))
+}
+
+/// Проверка Reply-To по свежим письмам папки (только чтение): один `GetItem` в форме `ItemPart` с
+/// `message:ReplyTo` — принял ли сервер форму, у скольких писем есть ключ `ReplyTo`, у скольких он
+/// непуст, форма значения без содержимого; затем обычный `get_items` по первым пяти — что разбор
+/// доносит `reply_to` до `MessageFull`.
+async fn reply_to_probe(t: &OwaTransport, store: &Store, account: AccountId, folder: &str, limit: usize) -> Result<()> {
+    let f = store.resolve_folder(account, folder)?.ok_or_else(|| anyhow!("папка «{folder}» не найдена в локальной базе"))?;
+    let rows = store.list_items(account, f.folder_pk, limit.clamp(1, 25))?;
+    if rows.is_empty() {
+        bail!("в папке «{}» нет писем в локальной базе", f.name);
+    }
+    let ids: Vec<ItemId> = rows.iter().map(|r| r.item_id.clone()).collect();
+    let started = std::time::Instant::now();
+    let probes = t.probe_reply_to(&ids).await.map_err(|e| anyhow!("GetItem ItemPart + message:ReplyTo отвергнут: {e}"))?;
+    let errors = probes.iter().filter(|p| p.error.is_some()).count();
+    let with_key = probes.iter().filter(|p| p.has_key).count();
+    let non_empty = probes.iter().filter(|p| p.count > 0).count();
+    let differing = probes.iter().filter(|p| p.differs_from_sender).count();
+    println!(
+        "GetItem ItemPart + message:ReplyTo по {} письмам «{}»: Ok за {} мс; отказов по письму {}, ключ ReplyTo есть у {}, непустой у {}, отличается от отправителя у {}; ключей у элемента {}",
+        probes.len(),
+        f.name,
+        started.elapsed().as_millis(),
+        errors,
+        with_key,
+        non_empty,
+        differing,
+        probes.iter().map(|p| p.item_keys).max().unwrap_or(0)
+    );
+    if let Some(p) = probes.iter().find(|p| p.count > 0) {
+        println!("  форма непустого ReplyTo (строки — длинами): {}", p.shape);
+    }
+    if let Some(p) = probes.iter().find(|p| p.has_key && p.count == 0) {
+        println!("  форма пустого ReplyTo: {}", p.shape);
+    } else if with_key < probes.len() - errors {
+        println!("  без Reply-To ключа ReplyTo в элементе нет (поле опускается)");
+    }
+    for p in probes.iter().filter(|p| p.error.is_some()).take(3) {
+        println!("  отказ по письму: {}", p.error.as_deref().unwrap_or("?"));
+    }
+    let sample: Vec<ItemId> = ids.iter().take(5).cloned().collect();
+    let started = std::time::Instant::now();
+    let results = t.get_items(&sample, aiowa_transport::ItemFetchShape::WithUniqueBody).await.map_err(|e| anyhow!("GetItem (get_items): {e}"))?;
+    let parsed_non_empty = results.iter().filter(|r| matches!(r, aiowa_transport::ItemResult::Ok(m) if !m.reply_to.is_empty())).count();
+    println!("get_items WithUniqueBody по {} письмам: Ok за {} мс; с непустым reply_to {}", results.len(), started.elapsed().as_millis(), parsed_non_empty);
+    Ok(())
+}
+
+/// Живая проверка папок одной сессией: создать «AIOWA тест» в корне → иерархия → переименовать в
+/// «AIOWA тест 2» → иерархия → удалить навсегда → иерархия. Удаление выполняется и после сбоя
+/// промежуточных шагов, чтобы тестовая папка не осталась в ящике.
+async fn folder_check_flow(t: &OwaTransport, store: &Store, account: AccountId) -> Result<()> {
+    let pre = refresh_hierarchy(t, store, account).await?;
+    println!("SyncFolderHierarchy до проверки: изменений {}", pre.len());
+    let root = store.msgfolderroot_server_id(account)?;
+    if let Some(existing) = store.resolve_folder(account, FOLDER_CHECK_NAME)?.or(store.resolve_folder(account, FOLDER_CHECK_NAME_2)?) {
+        bail!("папка «{}» уже есть в ящике (folder_pk {}): удалите её вручную или командой folder-delete --permanent", existing.name, existing.folder_pk);
+    }
+    let started = std::time::Instant::now();
+    let id = t.create_folder(&FolderRef::Distinguished(aiowa_core::DistinguishedFolder::MsgFolderRoot), FOLDER_CHECK_NAME).await.map_err(|e| anyhow!("CreateFolder: {e}"))?;
+    println!("CreateFolder «{FOLDER_CHECK_NAME}» в msgfolderroot: Ok за {} мс; {}", started.elapsed().as_millis(), describe_folder_id(&id));
+    // Локальная вставка — внутри блока с остальными шагами: её сбой тоже не должен оставить
+    // тестовую папку в ящике. Ключ запоминается снаружи, чтобы и после сбоя убрать строку локально.
+    let mut pk: Option<i64> = None;
+    let outcome = async {
+        let new_pk = store.insert_folder(account, &new_mail_folder(&id, root.as_deref(), FOLDER_CHECK_NAME))?;
+        pk = Some(new_pk);
+        let pk = new_pk;
+        println!("  локально folder_pk {pk}, родитель {}", if root.is_some() { "корень из базы" } else { "неизвестен (NULL)" });
+        let mut all_ok = true;
+        let changes = refresh_hierarchy(t, store, account).await?;
+        let seen = hierarchy_mention(&changes, &id.id);
+        println!("  SyncFolderHierarchy после создания: изменений {}, тестовая папка: {}", changes.len(), seen.map(|(k, n)| format!("{k}{}", if n == Some(FOLDER_CHECK_NAME) { ", имя совпало" } else { ", имя ДРУГОЕ" })).unwrap_or_else(|| "НЕ упомянута".into()));
+        all_ok &= matches!(seen, Some(("Create" | "Update", Some(FOLDER_CHECK_NAME))));
+        let local = store.folder_by_pk(account, pk)?;
+        all_ok &= local.as_ref().map(|f| f.name == FOLDER_CHECK_NAME).unwrap_or(false);
+        println!("  в базе после иерархии: {}", local.map(|f| format!("есть, имя {}", if f.name == FOLDER_CHECK_NAME { "совпало" } else { "ДРУГОЕ" })).unwrap_or_else(|| "НЕТ".into()));
+
+        let started = std::time::Instant::now();
+        let renamed = t.rename_folder(&id, FOLDER_CHECK_NAME_2).await.map_err(|e| anyhow!("UpdateFolder: {e}"))?;
+        println!("UpdateFolder «{FOLDER_CHECK_NAME_2}»: Ok за {} мс; в ответе {}, Id {}", started.elapsed().as_millis(), describe_folder_id(&renamed), if renamed.id == id.id { "тот же" } else { "ДРУГОЙ" });
+        store.rename_folder_local(pk, FOLDER_CHECK_NAME_2, Some(&renamed))?;
+        let changes = refresh_hierarchy(t, store, account).await?;
+        let seen = hierarchy_mention(&changes, &renamed.id);
+        println!("  SyncFolderHierarchy после переименования: изменений {}, тестовая папка: {}", changes.len(), seen.map(|(k, n)| format!("{k}{}", if n == Some(FOLDER_CHECK_NAME_2) { ", имя совпало" } else { ", имя ДРУГОЕ" })).unwrap_or_else(|| "НЕ упомянута".into()));
+        all_ok &= matches!(seen, Some(("Create" | "Update", Some(FOLDER_CHECK_NAME_2))));
+        let local = store.folder_by_pk(account, pk)?;
+        all_ok &= local.as_ref().map(|f| f.name == FOLDER_CHECK_NAME_2).unwrap_or(false);
+        println!("  в базе после иерархии: {}", local.map(|f| format!("есть, имя {}", if f.name == FOLDER_CHECK_NAME_2 { "совпало" } else { "ДРУГОЕ" })).unwrap_or_else(|| "НЕТ".into()));
+        Ok::<(bool, FolderId), anyhow::Error>((all_ok, renamed))
+    }
+    .await;
+    let (checks_ok, current) = match outcome {
+        Ok(v) => v,
+        Err(e) => {
+            println!("Сбой после создания: {e}. Удаляю тестовую папку навсегда.");
+            (false, FolderId { id: id.id.clone(), change_key: None })
+        }
+    };
+    let started = std::time::Instant::now();
+    t.delete_folder(&current, true).await.map_err(|e| anyhow!("DeleteFolder HardDelete: {e} (папка «AIOWA тест» могла остаться в ящике!)"))?;
+    println!("DeleteFolder HardDelete: Ok за {} мс", started.elapsed().as_millis());
+    if let Some(pk) = pk {
+        match store.delete_folder_local(pk, None) {
+            Ok(st) => println!("  локально: папок помечено {}, писем {}", st.folders, st.items),
+            Err(e) => println!("  локально удалить не удалось: {e} (иерархия ниже поправит)"),
+        }
+    }
+    let changes = refresh_hierarchy(t, store, account).await?;
+    let seen = hierarchy_mention(&changes, &current.id);
+    let gone_by_pk = match pk {
+        Some(pk) => store.folder_by_pk(account, pk)?.is_none(),
+        None => true,
+    };
+    let gone_locally = gone_by_pk && store.resolve_folder(account, FOLDER_CHECK_NAME)?.is_none() && store.resolve_folder(account, FOLDER_CHECK_NAME_2)?.is_none();
+    println!(
+        "  SyncFolderHierarchy после удаления: изменений {}, тестовая папка: {}; в базе {}",
+        changes.len(),
+        seen.map(|(k, _)| k.to_string()).unwrap_or_else(|| "не упомянута".into()),
+        if gone_locally { "отсутствует" } else { "ЕЩЁ ЕСТЬ" }
+    );
+    let delete_ok = matches!(seen, Some(("Delete", _)) | None) && gone_locally;
+    if checks_ok && delete_ok {
+        println!("Живая проверка папок пройдена: создание, переименование и удаление подтверждены иерархией.");
+        Ok(())
+    } else {
+        bail!("живая проверка папок не пройдена (см. строки с НЕ/ДРУГОЕ выше)")
+    }
+}
+
 /// Лимиты вложений при отправке, как в композере окна.
 const MAX_ATTACHMENT_BYTES: u64 = 25 * 1024 * 1024;
 const MAX_ATTACHMENTS_TOTAL_BYTES: u64 = 35 * 1024 * 1024;
@@ -1002,9 +1278,15 @@ fn fmt_date(t: Option<jiff::Timestamp>) -> String {
 }
 
 fn main() -> Result<()> {
-    // Будущее `real_main` в отладочной сборке огромно (все команды — одна функция): на куче,
-    // иначе переполняется стек главного потока ещё до разбора аргументов.
-    tokio::runtime::Builder::new_multi_thread().enable_all().build()?.block_on(Box::pin(real_main()))
+    // Будущее `real_main` в отладочной сборке огромно (все команды — одна функция): на куче и в
+    // потоке с большим стеком, иначе главный поток (1 МиБ на Windows) переполняется ещё до
+    // разбора аргументов: кадр опроса такого будущего растёт с каждой командой.
+    let worker = std::thread::Builder::new()
+        .name("aiowa-main".into())
+        .stack_size(64 * 1024 * 1024)
+        .spawn(|| tokio::runtime::Builder::new_multi_thread().enable_all().build()?.block_on(Box::pin(real_main())))
+        .context("не удалось запустить главный поток")?;
+    worker.join().map_err(|_| anyhow!("главный поток завершился аварийно"))?
 }
 
 async fn real_main() -> Result<()> {
@@ -1292,6 +1574,167 @@ async fn real_main() -> Result<()> {
                 Some(WriteResult::Failed { code, message, .. }) => println!("DeleteItem: Failed {code}: {message}"),
                 None => println!("DeleteItem: пустой ответ"),
             }
+        }
+        Cmd::FolderCreate { name, parent, yes_i_know } => {
+            let store = Store::open(&db_path)?;
+            let account = store.account(&cli.host, &cli.user)?;
+            let name = aiowa_core::validate_folder_name(name).map_err(|e| anyhow!(e))?;
+            let (parent_ref, parent_server_id, parent_label) = resolve_parent(&store, account, parent.as_deref())?;
+            if let Some(existing) = store.resolve_folder(account, &name)? {
+                println!("Внимание: папка с именем «{}» уже есть в базе (folder_pk {}); сервер откажет, если она в том же родителе.", existing.name, existing.folder_pk);
+            }
+            println!("Создать папку «{name}» в {parent_label} операцией CreateFolder (класс IPF.Note)");
+            if !yes_i_know {
+                println!("Это запись в настоящий ящик. Повторите с --yes-i-know, чтобы выполнить.");
+                return Ok(());
+            }
+            let t = connect(&cli).await?;
+            let started = std::time::Instant::now();
+            let result = t.create_folder(&parent_ref, &name).await;
+            // Локальная правка и иерархия — без `?` до logoff: ошибка базы не должна оставлять сессию.
+            let outcome = match &result {
+                Ok(id) => Some(
+                    async {
+                        let pk = store.insert_folder(account, &new_mail_folder(id, parent_server_id.as_deref(), &name))?;
+                        let changes = refresh_hierarchy(&t, &store, account).await?;
+                        Ok::<_, anyhow::Error>((pk, changes))
+                    }
+                    .await,
+                ),
+                Err(_) => None,
+            };
+            t.logoff().await.ok();
+            let id = result.map_err(|e| anyhow!("CreateFolder: {e}"))?;
+            let (pk, changes) = outcome.expect("при успехе заполнено")?;
+            println!(
+                "CreateFolder: Ok за {} мс; {}; локально folder_pk {pk}; SyncFolderHierarchy: изменений {}, папка {}",
+                started.elapsed().as_millis(),
+                describe_folder_id(&id),
+                changes.len(),
+                hierarchy_mention(&changes, &id.id).map(|(k, _)| k).unwrap_or("не упомянута")
+            );
+        }
+        Cmd::FolderRename { folder_pk, name, yes_i_know } => {
+            let store = Store::open(&db_path)?;
+            let account = store.account(&cli.host, &cli.user)?;
+            let f = store.folder_by_pk(account, *folder_pk)?.ok_or_else(|| anyhow!("папка #{folder_pk} не найдена в базе или удалена"))?;
+            if let Some(d) = &f.distinguished {
+                bail!("папка «{}» служебная ({d}): переименовывать нельзя", f.name);
+            }
+            let name = aiowa_core::validate_folder_name(name).map_err(|e| anyhow!(e))?;
+            if name == f.name {
+                bail!("папка #{folder_pk} уже называется «{name}»");
+            }
+            let id = store.folder_id_by_pk(account, *folder_pk)?.ok_or_else(|| anyhow!("папка #{folder_pk} не найдена"))?;
+            println!("Переименовать папку #{folder_pk} «{}» → «{name}» операцией UpdateFolder (folder:DisplayName)", f.name);
+            if !yes_i_know {
+                println!("Это запись в настоящий ящик. Повторите с --yes-i-know, чтобы выполнить.");
+                return Ok(());
+            }
+            let t = connect(&cli).await?;
+            let started = std::time::Instant::now();
+            let result = t.rename_folder(&id, &name).await;
+            // Локальная правка и иерархия — без `?` до logoff: ошибка базы не должна оставлять сессию.
+            let changes = match &result {
+                Ok(new_id) => Some(
+                    async {
+                        store.rename_folder_local(*folder_pk, &name, Some(new_id))?;
+                        refresh_hierarchy(&t, &store, account).await
+                    }
+                    .await,
+                ),
+                Err(_) => None,
+            };
+            t.logoff().await.ok();
+            let new_id = result.map_err(|e| anyhow!("UpdateFolder: {e}"))?;
+            let changes = changes.expect("при успехе заполнено")?;
+            println!(
+                "UpdateFolder: Ok за {} мс; в ответе {}, Id {}; локально имя «{name}»; SyncFolderHierarchy: изменений {}, папка {}",
+                started.elapsed().as_millis(),
+                describe_folder_id(&new_id),
+                if new_id.id == id.id { "тот же" } else { "другой" },
+                changes.len(),
+                hierarchy_mention(&changes, &new_id.id).map(|(k, n)| format!("{k}{}", if n == Some(name.as_str()) { ", имя совпало" } else { "" })).unwrap_or_else(|| "не упомянута".into())
+            );
+        }
+        Cmd::FolderDelete { folder_pk, permanent, yes_i_know } => {
+            let store = Store::open(&db_path)?;
+            let account = store.account(&cli.host, &cli.user)?;
+            let f = store.folder_by_pk(account, *folder_pk)?.ok_or_else(|| anyhow!("папка #{folder_pk} не найдена в базе или удалена"))?;
+            if let Some(d) = &f.distinguished {
+                bail!("папка «{}» служебная ({d}): удалять нельзя", f.name);
+            }
+            let trash = store.folder_by_distinguished(account, "deleteditems")?;
+            let in_trash = match &trash {
+                Some((trash_pk, _)) => folder_is_under(&store, account, *folder_pk, *trash_pk)?,
+                None => false,
+            };
+            if in_trash && !permanent {
+                bail!("папка #{folder_pk} уже в «Удалённых»: используйте --permanent для удаления навсегда");
+            }
+            if !permanent && trash.is_none() {
+                bail!("папка «Удалённые» не найдена в локальной базе: выполните синхронизацию или используйте --permanent");
+            }
+            let id = store.folder_id_by_pk(account, *folder_pk)?.ok_or_else(|| anyhow!("папка #{folder_pk} не найдена"))?;
+            println!("Удалить папку #{folder_pk} «{}» ({} писем по счётчику) операцией DeleteFolder {}", f.name, f.total_count, if *permanent { "HardDelete (навсегда, с содержимым и подпапками)" } else { "MoveToDeletedItems (в «Удалённые»)" });
+            if !yes_i_know {
+                println!("Это запись в настоящий ящик. Повторите с --yes-i-know, чтобы выполнить.");
+                return Ok(());
+            }
+            let t = connect(&cli).await?;
+            let started = std::time::Instant::now();
+            let result = t.delete_folder(&id, *permanent).await;
+            // Локальная правка и иерархия — без `?` до logoff: ошибка базы не должна оставлять сессию.
+            let outcome = match &result {
+                Ok(()) => Some(
+                    async {
+                        let st = store.delete_folder_local(*folder_pk, if *permanent { None } else { trash.as_ref().map(|(pk, _)| *pk) })?;
+                        let changes = refresh_hierarchy(&t, &store, account).await?;
+                        Ok::<_, anyhow::Error>((st, changes))
+                    }
+                    .await,
+                ),
+                Err(_) => None,
+            };
+            t.logoff().await.ok();
+            result.map_err(|e| anyhow!("DeleteFolder: {e}"))?;
+            let (st, changes) = outcome.expect("при успехе заполнено")?;
+            println!(
+                "DeleteFolder: Ok за {} мс; локально папок {}, писем помечено {}; SyncFolderHierarchy: изменений {}, папка {}",
+                started.elapsed().as_millis(),
+                st.folders,
+                st.items,
+                changes.len(),
+                hierarchy_mention(&changes, &id.id).map(|(k, _)| k).unwrap_or("не упомянута")
+            );
+        }
+        Cmd::FolderCheck { probe_reply_to, yes_i_know } => {
+            let store = Store::open(&db_path)?;
+            let account = store.account(&cli.host, &cli.user)?;
+            println!("План одной сессией: CreateFolder «{FOLDER_CHECK_NAME}» в корне ящика → SyncFolderHierarchy → UpdateFolder «{FOLDER_CHECK_NAME_2}» → SyncFolderHierarchy → DeleteFolder HardDelete → SyncFolderHierarchy{}. Письма не трогаются.", probe_reply_to.map(|n| format!(" → GetItem ItemPart + message:ReplyTo по {n} письмам «Входящих» (только чтение)")).unwrap_or_default());
+            if !yes_i_know {
+                println!("Это запись в настоящий ящик (одна тестовая папка). Повторите с --yes-i-know, чтобы выполнить.");
+                return Ok(());
+            }
+            let t = connect(&cli).await?;
+            let result = folder_check_flow(&t, &store, account).await;
+            let probe = match probe_reply_to {
+                Some(n) => Some(reply_to_probe(&t, &store, account, "inbox", *n).await),
+                None => None,
+            };
+            t.logoff().await.ok();
+            result?;
+            if let Some(p) = probe {
+                p?;
+            }
+        }
+        Cmd::ReplyToProbe { folder, limit } => {
+            let store = Store::open(&db_path)?;
+            let account = store.account(&cli.host, &cli.user)?;
+            let t = connect(&cli).await?;
+            let result = reply_to_probe(&t, &store, account, folder, *limit).await;
+            t.logoff().await.ok();
+            result?;
         }
         Cmd::Send { to, to_self, cc, subject, body, attach, yes_i_know, keep_draft } => {
             let mut recipients = split_addresses(to);

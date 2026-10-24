@@ -122,7 +122,7 @@ X-OWA-UrlPostData: <JSON запроса в URL-кодировке>   — при 
 | `GetPresence`, `ResetPresence`, `InstantMessageSignIn` | Lync | клиенту не нужны |
 | `GetFavorites`, `GetAllowedOptions`, `GetUserVoiceData`, `GetUnseenLightningIds` | старт | второстепенны |
 
-Не наблюдалось в этой сессии (проверяется в Rust-спайке напрямую): `SyncFolderItems`, `SyncFolderHierarchy`, `MarkAllItemsAsRead`, `CreateItem`, `UpdateItem`, `GetAttachment`. Позже сняты клиентом: `SyncFolderItems`/`SyncFolderHierarchy`/`GetItem` (§ 5b'), `GetFileAttachment` (§ 5), `UpdateItem` (§ 5e), `CreateItem`/`CreateAttachment`/`SendItem`/`GetUserConfiguration` (§ 5f), `FindItem` с `CalendarView` и `GetItem` события (§ 5g).
+Не наблюдалось в этой сессии (проверяется в Rust-спайке напрямую): `SyncFolderItems`, `SyncFolderHierarchy`, `MarkAllItemsAsRead`, `CreateItem`, `UpdateItem`, `GetAttachment`. Позже сняты клиентом: `SyncFolderItems`/`SyncFolderHierarchy`/`GetItem` (§ 5b'), `GetFileAttachment` (§ 5), `UpdateItem` (§ 5e), `CreateItem`/`CreateAttachment`/`SendItem`/`GetUserConfiguration` (§ 5f), `FindItem` с `CalendarView` и `GetItem` события (§ 5g), `CreateFolder`/`UpdateFolder`/`DeleteFolder` и `message:ReplyTo` поверх `ShapeName` (§ 5j).
 
 ## 4. Канал уведомлений
 
@@ -617,6 +617,65 @@ X-OWA-CANARY: <канарейка>          — дублируется заго�
 - `AllProperties` (4,5–7,7 КБ, 200–414 мс) отдаёт сверх того обычные поля письма (`Body`, `Sender`, `ToRecipients`/`CcRecipients`, `DisplayTo`, `ConversationId`, `Flag`, `IsRead`, `EffectiveRights`, …) и поля встречи: `UID`, `DateTimeStamp`, `IsOrganizer`, `ReminderIsSet`/`ReminderMinutesBeforeStart`/`ReminderDueBy`/`ReminderNextTime`, `ResponseObjects` (3 элемента с `__type`), а у приглашения ещё `MeetingRequestType`, `IntendedFreeBusyStatus`, `IsMeeting`, `IsCancelled`, `IsRecurring`, `MeetingRequestWasSent`, `RequiredAttendees`/`OptionalAttendees` (с `ResponseType` у каждого), `ConflictingMeetingCount`, `AdjacentMeetingCount`, `Duration`, `TimeZone`, `AppointmentSequenceNumber`, `AppointmentState`, `ConferenceType`, `IsOnlineMeeting`, `StartWallClock`/`EndWallClock`, `StartTimeZoneId`/`EndTimeZoneId`. Клиент при отказе явной формы (HTTP 500 или ошибка по свойству) переходит на `AllProperties` и запоминает форму на сессию (`OwaTransport::meeting_request_item`).
 
 Хранилище: `calendar_items.reminder_minutes` заполняется из `FindItem`; `Store::upsert_calendar_event` (после `CreateItem`/`UpdateItem`, чтобы кэш не ждал перечитывания окна), `remove_calendar_event` (после `DeleteItem`), `calendar_events_with_reminders(account, from_ms, to_ms)` — события с напоминанием (не отменённые, не отклонённые), у которых момент `start_at − reminder_minutes` лежит в окне; закрытые и отложенные напоминания — в `sync_state` под ключами `desktop.reminder.<server_id>` со значениями `dismissed:<момент напоминания>` или `snoozed_until:<мс>:<момент напоминания>` (`reminder_state`/`set_reminder_state`/`reminder_states`/`prune_reminder_states`; состояние действует только для того момента напоминания, при котором записано, — перенос события или смена напоминания взводят его заново); пояс пользователя — в `sync_state` под ключом `desktop.owa_timezone` (`aiowa_store::OWA_TIME_ZONE_KEY`, `Store::owa_time_zone`/`set_owa_time_zone`; окно кладёт его при обращении к календарю или записи, CLI — при команде записи, когда записи нет или она старше суток (`OWA_TIME_ZONE_TTL_MS`); «в OWA пояс не задан» кэшируется пустой строкой на тот же срок, чтобы не спрашивать сервер на каждом окне; при отказе сервера остаётся устаревший пояс из кэша); `ui::MessageHead.item_class` — чтобы окно узнавало письма о встречах. CLI: `aiowa calendar-create`, `calendar-update --calendar-pk`, `calendar-delete --calendar-pk [--permanent]`, `calendar-check [--date] [--all-day] [--probe]` (вся живая проверка одной сессией, четыре записи: создать с местом → сменить место и время или тему → снять место → удалить навсегда; с `--probe` после каждой записи `GetItem AllProperties` + `PidLidLocation` своего события), `meeting-info --item-pk a,b,c [--probe]` (только чтение); все команды записи печатают план и без `--yes-i-know` ничего не делают. Подбор формы места 24.10.2026 делался временным флагом `calendar-check --location-forms` (формы по одной через сырой `UpdateItem`, принятая форма оказалась первой же — текущей), после проверки флаг убран.
+
+## 5j. Папки: `CreateFolder`, `UpdateFolder`, `DeleteFolder` и поле `Reply-To` письма (клиент `aiowa`, 24.10.2026)
+
+Снято одним запуском `aiowa folder-check --probe-reply-to 25 --yes-i-know` на рабочем ящике (одна сессия, `logoff` в конце): `SyncFolderHierarchy` (инкрементально, по состоянию из базы) → `CreateFolder` «AIOWA тест» в корне → `SyncFolderHierarchy` → `UpdateFolder` «AIOWA тест 2» → `SyncFolderHierarchy` → `DeleteFolder HardDelete` → `SyncFolderHierarchy` → один `GetItem` по 25 свежим письмам «Входящих» (только чтение) → `get_items` по пяти из них. Три записи на сервер, все по папкам; письма не трогались. Все операции — обычный `service.svc`, `__type` первым ключом, `RequestServerVersion: V2017_08_18` (как у операций записи писем § 5e; запасная `Exchange2013` в клиенте не понадобилась). Ответы 180–350 мс.
+
+**`CreateFolder`** (184 мс, ответ 519 байт):
+
+```json
+{ "__type": "CreateFolderRequest:#Exchange",
+  "ParentFolderId": { "__type": "TargetFolderId:#Exchange",
+      "BaseFolderId": { "__type": "DistinguishedFolderId:#Exchange", "Id": "msgfolderroot" } },
+  "Folders": [ { "__type": "Folder:#Exchange", "DisplayName": "AIOWA тест", "FolderClass": "IPF.Note" } ] }
+```
+
+`BaseFolderId` для подпапки — `{ "__type": "FolderId:#Exchange", "Id": "…" }` (форма та же, что у `MoveItem`). Ответ `Body.ResponseMessages.Items[0]`:
+
+```json
+{ "__type": "FolderInfoResponseMessage:#Exchange", "ResponseCode": "NoError", "ResponseClass": "Success",
+  "Folders": [ { "__type": "Folder:#Exchange", "FolderId": { "Id": "<120 символов>", "ChangeKey": "<40 символов>" } } ] }
+```
+
+`FolderId.Id` папки — 120 символов (у писем 152), `ChangeKey` полный, 40. Следующий инкрементальный `SyncFolderHierarchy` (228 мс, 2 802 байта) вернул ровно одно изменение — `Create` с тем же `Id` и `DisplayName` «AIOWA тест». Клиент сразу после ответа вставляет строку в `folders` (`Store::insert_folder`: `server_id` из ответа, `parent_server_id` родителя — для корня это `Store::msgfolderroot_server_id`, родитель «Входящих», так как сам корень в иерархии не приходит; класс `IPF.Note`, счётчики нули), а синхронизация иерархии потом обновляет ту же строку по `UNIQUE(account_id, server_id)`. Отказ ожидается тем же сообщением с `ResponseClass: Error` (например, `ErrorFolderExists` при занятом имени в том же родителе) — в проверке не наблюдался.
+
+**`UpdateFolder`** (переименование, 348 мс, ответ 519 байт):
+
+```json
+{ "__type": "UpdateFolderRequest:#Exchange",
+  "FolderChanges": [ { "__type": "FolderChange:#Exchange",
+      "FolderId": { "__type": "FolderId:#Exchange", "Id": "…", "ChangeKey": "…" },
+      "Updates": [ { "__type": "SetFolderField:#Exchange",
+          "Path": { "__type": "PropertyUri:#Exchange", "FieldURI": "folder:DisplayName" },
+          "Folder": { "__type": "Folder:#Exchange", "DisplayName": "AIOWA тест 2" } } ] } ] }
+```
+
+Ответ — тот же `FolderInfoResponseMessage` с `Folders[0].FolderId`: **`Id` тот же** (120 символов), `ChangeKey` новый, полный (40 символов, без усечения до 8, как у `UpdateItem` писем). `SyncFolderHierarchy` после этого (168 мс) вернул одно изменение `Update` с новым `DisplayName`. Клиент правит имя и ключ локально (`Store::rename_folder_local`).
+
+**`DeleteFolder`** (`HardDelete`, 179 мс, ответ 232 байта):
+
+```json
+{ "__type": "DeleteFolderRequest:#Exchange",
+  "FolderIds": [ { "__type": "FolderId:#Exchange", "Id": "…", "ChangeKey": "…" } ],
+  "DeleteType": "HardDelete" }
+```
+
+Сообщение ответа **без `__type`** и без `Folders`: `{ "ResponseCode": "NoError", "ResponseClass": "Success" }` (как у `SendItem` § 5f). `SyncFolderHierarchy` после удаления (168 мс, 2 276 байт) вернул одно изменение `Delete` с `FolderId` папки. `DeleteType: "MoveToDeletedItems"` — папка становится подпапкой «Удалённых» вместе с содержимым; **на сервере не проверялось** (бюджет записей — одна тестовая папка), форма по схеме EWS покрыта юнит-тестом. Клиент при `HardDelete` помечает папку, подпапки и их письма удалёнными (`Store::delete_folder_local(pk, None)`: письма снимаются с индекса, агрегаты бесед пересчитываются), при `MoveToDeletedItems` — только меняет родителя папки на «Удалённые» (`delete_folder_local(pk, Some(trash_pk))`), письма остаются в ней; следующая синхронизация иерархии сверяет. Служебные папки (`distinguished`) клиент не переименовывает и не удаляет; имя — 1–255 символов без управляющих и `\ / : * ? " < > |` (`aiowa_core::validate_folder_name`).
+
+**`MoveFolder`** (для перетаскивания папки) реализован по схеме EWS — `{ "__type": "MoveFolderRequest:#Exchange", "ToFolderId": { TargetFolderId{BaseFolderId} }, "FolderIds": [ FolderId ] }`, ответ ожидается `FolderInfoResponseMessage` с `Folders[0].FolderId` — **на сервере не выполнялся**, покрыт юнит-тестом формы.
+
+Разбор ответов (`protocol::parse_written_folder_id`): идентификатор из `Folders[0].FolderId`; его нет — у `UpdateFolder`/`MoveFolder` остаётся исходный. Версия схемы подбирается один раз на сессию (`OwaTransport::folder_call`): `V2017_08_18`, при HTTP 500 на форму — `Exchange2013`. CLI: `aiowa folder-create --name … [--parent …]`, `folder-rename --folder-pk … --name …`, `folder-delete --folder-pk … [--permanent]`, `folder-check [--probe-reply-to N]` (вся проверка одной сессией); все команды записи без `--yes-i-know` только печатают план, после записи выполняют инкрементальный `SyncFolderHierarchy` и печатают, упомянута ли папка в изменениях.
+
+**`Reply-To` письма.** В именованных формах `GetItem` (`ItemPart`, § 5b') поля `ReplyTo` нет. Клиент добавляет к `ItemShape` формы `AdditionalProperties: [ { "__type": "PropertyUri:#Exchange", "FieldURI": "message:ReplyTo" } ]` рядом с `ShapeName: "ItemPart"` — **сервер принимает `AdditionalProperties` поверх `ShapeName`**: `GetItem` по 25 письмам прошёл (16 с первым запросом свежей сессии после долгой паузы, 197 КБ; следующий по пяти письмам — 277 мс), у элементов те же 43 ключа `ItemPart`, у трёх из 25 — ещё ключ `ReplyTo`:
+
+```json
+"ReplyTo": [ { "Name": "…", "EmailAddress": "…", "RoutingType": "SMTP", "MailboxType": "OneOff", "Submitted": false, "RelevanceScore": 0 } ]
+```
+
+Массив адресов той же формы, что получатели (`EmailAddress`-подобный объект с `MailboxType`, плюс поля OWA `Submitted` и `RelevanceScore`). **Без заголовка `Reply-To` ключа `ReplyTo` в элементе нет** (поле опускается, пустой массив не приходит). У двух из трёх писем `Reply-To` совпадал с `From` (рассылки, подставляющие себя же), у одного — отличался; клиент заменяет отправителя в «Кому» ответа только при отличии (`aiowa_core::effective_reply_to`, сравнение адресов без учёта регистра). Отказ сервера по форме с `message:ReplyTo` — HTTP 500 на запрос или `ErrorInvalidProperty*`/`*Shape*` в **каждом** `ResponseMessage` при HTTP 200 (так OWA JSON отвергает форму по элементам; смешанные отказы вроде `ErrorItemNotFound` формой не считаются) — клиент обрабатывает повтором пачки без свойства и запоминает отказ на сессию (`OwaTransport::get_item_chunk`, предикат `protocol::all_property_rejections`); на этом сервере не понадобилось. У формы списка `MailListItem` свойство не запрашивается.
+
+Хранилище: `Reply-To` лежит в `recipients` с **`kind = 4`** (`aiowa_core::RecipientKind::ReplyTo`) рядом с «Кому» (1), «Копией» (2) и «Скрытой копией» (3): миграции схемы не нужно (идемпотентно по построению), представление индекса `items_fts_src` берёт только `kind IN (1, 2)`, так что адрес `Reply-To` не ищется оператором `кому:` и не считается получателем; `Store::recipients` отдаёт его строкой с `kind = 4`, `ui::MessageHead.reply_to` и `MessageFull.reply_to` — списком участников. CLI `aiowa reply-to-probe [--folder …] [--limit N]` — та же проверка без записи.
 
 ## 6. Что это значит для клиента
 

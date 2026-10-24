@@ -13,6 +13,7 @@
     "windows": [
       {
         "label": "main",
+        "dragDropEnabled": false,
         "title": "AIOWA",
         "width": 1320,
         "height": 860,

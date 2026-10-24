@@ -1,5 +1,6 @@
 <script lang="ts">
   import type { NotifyStatus, SyncStage, SyncStatus } from "../api";
+  import { ICON } from "../actions";
 
   interface Props {
     status: SyncStatus | null;
@@ -15,8 +16,15 @@
     ontoasts?: (enabled: boolean) => void;
     /** Клик по строке «Новое письмо»: открыть его во «Входящих». */
     onnewmail?: () => void;
+    /**
+     * Окно отмены последнего действия (удаление, перенос, архив): текст и срок; полоска убывает
+     * до `untilMs`, родитель убирает строку сам. `id` меняется с каждым новым действием — по нему
+     * перезапускается анимация.
+     */
+    undo?: { id: string; text: string; sinceMs: number; untilMs: number } | null;
+    onundo?: () => void;
   }
-  let { status, notice = null, notify = null, newMail = null, onrefresh, oncancel, ontoasts, onnewmail }: Props = $props();
+  let { status, notice = null, notify = null, newMail = null, onrefresh, oncancel, ontoasts, onnewmail, undo = null, onundo }: Props = $props();
 
   const STAGES: Record<SyncStage, string> = {
     login: "Вход на сервер",
@@ -116,6 +124,19 @@
   {/if}
 
   <div class="middle">
+    {#if undo}
+      {#key undo.id}
+        <span class="undo">
+          <span class="undo-text">{undo.text}</span>
+          <span class="undo-dot" aria-hidden="true">·</span>
+          <button class="undo-btn" onclick={onundo} title="Отменить (Ctrl+Z)">
+            <svg width="12" height="12" viewBox="0 0 16 16" aria-hidden="true"><path d={ICON.undo} fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" /></svg>
+            Отменить
+          </button>
+          <span class="undo-track" aria-hidden="true"><span class="undo-fill" style="animation-duration: {Math.max(0, undo.untilMs - undo.sinceMs)}ms"></span></span>
+        </span>
+      {/key}
+    {/if}
     {#if notice}
       <span class="notice">
         <svg width="12" height="12" viewBox="0 0 16 16" aria-hidden="true"><path d="m3 8.5 3 3 7-7" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" /></svg>
@@ -226,6 +247,76 @@
     gap: 6px;
     color: var(--success);
     white-space: nowrap;
+  }
+  /* Окно отмены: текст, кнопка и полоска, убывающая до конца срока. */
+  .undo {
+    position: relative;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    min-width: 0;
+    max-width: 60%;
+    height: 22px;
+    padding: 0 8px;
+    border-radius: var(--radius-control);
+    background: var(--bg-layer-alt);
+    border: 1px solid var(--stroke-1);
+    color: var(--fg-2);
+    overflow: hidden;
+  }
+  .undo-text {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .undo-dot {
+    color: var(--fg-4);
+  }
+  .undo-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    height: 18px;
+    padding: 0 4px;
+    border-radius: 3px;
+    color: var(--accent);
+    font-weight: 600;
+    white-space: nowrap;
+    transition: background var(--dur-fast) var(--ease-in);
+  }
+  .undo-btn:hover {
+    background: var(--bg-hover);
+  }
+  .undo-btn:active {
+    background: var(--bg-pressed);
+  }
+  .undo-btn:focus-visible {
+    outline-offset: -1px;
+  }
+  .undo-track {
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    height: 2px;
+    background: transparent;
+  }
+  .undo-fill {
+    display: block;
+    height: 100%;
+    width: 100%;
+    background: var(--accent);
+    animation-name: drain;
+    animation-timing-function: linear;
+    animation-fill-mode: forwards;
+  }
+  @keyframes drain {
+    from {
+      width: 100%;
+    }
+    to {
+      width: 0%;
+    }
   }
   .new-mail {
     display: inline-flex;

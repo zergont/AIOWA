@@ -1,6 +1,6 @@
 <script lang="ts">
   import { untrack, type Snippet } from "svelte";
-  import type { ComposeKind, Conversation, Folder, Message } from "../api";
+  import { conversationsText, type ComposeKind, type Conversation, type Folder, type Message } from "../api";
   import type { ItemAction } from "../actions";
   import MessageCard from "./MessageCard.svelte";
 
@@ -14,8 +14,12 @@
     folders: Folder[];
     /** Папка «Удалённые»: письма в ней удаляются только навсегда. */
     deletedFolderPk: number | null;
-    /** Действие над одним письмом; ошибку пробрасывает, карточка покажет её у себя. */
-    onaction: (itemPk: number, action: ItemAction) => Promise<void>;
+    /** Папка архива для кнопки «В архив» на карточке; null — папки нет. */
+    archiveFolderPk?: number | null;
+    /** Выбрано несколько бесед в списке: вместо письма — заглушка «Выбрано N бесед». */
+    multiCount?: number;
+    /** Действие над одним письмом; `anchor` — нажатая кнопка; ошибку пробрасывает, карточка покажет её у себя. */
+    onaction: (itemPk: number, action: ItemAction, anchor?: HTMLElement) => Promise<void>;
     /** Ответ, ответ всем или пересылка письма с карточки. */
     oncompose: (itemPk: number, kind: ComposeKind) => void;
     /** Композер: над карточками беседы, а при `composerAlone` — вместо неё (новое письмо, чужая беседа). */
@@ -26,7 +30,7 @@
     /** С карточки дан ответ на приглашение (или отмена убрана из календаря): беседу стоит перечитать. */
     onmeeting?: () => void;
   }
-  let { conversation, messages, loading, onfetch, folders, deletedFolderPk, onaction, oncompose, composer, composerAlone = false, topExpandedPk = $bindable(null), onmeeting }: Props = $props();
+  let { conversation, messages, loading, onfetch, folders, deletedFolderPk, archiveFolderPk = null, multiCount = 0, onaction, oncompose, composer, composerAlone = false, topExpandedPk = $bindable(null), onmeeting }: Props = $props();
 
   // Письма идут от новых к старым; самое свежее развёрнуто, остальные свёрнуты до заголовка.
   // Раскрытие пересчитывается только при смене беседы: точечная замена письма (догрузка тела)
@@ -80,7 +84,13 @@
   ответом меняет только карточки под ним, а не ветку {#if}, иначе экземпляр композера пересоздавался
   бы и набранный текст, получатели и вложения сбрасывались бы к заготовке.
 -->
-{#if !composer && !conversation}
+{#if !composer && multiCount > 1}
+  <div class="placeholder" aria-live="polite">
+    <svg width="48" height="48" viewBox="0 0 48 48" aria-hidden="true"><rect x="10" y="8" width="30" height="22" rx="3" fill="none" stroke="currentColor" stroke-width="1.5" /><rect x="6" y="16" width="30" height="22" rx="3" fill="var(--bg-layer)" stroke="currentColor" stroke-width="1.5" /><path d="m6 19 15 10 15-10" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" /></svg>
+    <p>Выбрано {conversationsText(multiCount)}</p>
+    <p class="caption">Действия — в заголовке списка или в контекстном меню. Esc оставляет одну беседу.</p>
+  </div>
+{:else if !composer && !conversation}
   <div class="placeholder">
     <svg width="48" height="48" viewBox="0 0 48 48" aria-hidden="true"><rect x="6" y="12" width="36" height="26" rx="3" fill="none" stroke="currentColor" stroke-width="1.5" /><path d="m6 15 18 12 18-12" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" /></svg>
     <p>Выбери беседу, чтобы прочитать её здесь.</p>
@@ -110,7 +120,7 @@
           <div class="caption loading">Загрузка…</div>
         {/if}
         {#each messages as m (m.item_pk)}
-          <MessageCard message={m} expanded={expanded.has(m.item_pk)} ontoggle={() => toggle(m.item_pk)} {onfetch} {folders} {deletedFolderPk} onaction={(a) => onaction(m.item_pk, a)} oncompose={(kind) => oncompose(m.item_pk, kind)} {onmeeting} />
+          <MessageCard message={m} expanded={expanded.has(m.item_pk)} ontoggle={() => toggle(m.item_pk)} {onfetch} {folders} {deletedFolderPk} {archiveFolderPk} onaction={(a, el) => onaction(m.item_pk, a, el)} oncompose={(kind) => oncompose(m.item_pk, kind)} {onmeeting} />
         {/each}
       {/if}
     </div>

@@ -323,6 +323,24 @@ pub trait MailTransport: Send + Sync {
     /// (для `ToDeletedItems` — новый, если сервер его сообщил).
     async fn delete_items(&self, ids: &[ItemId], mode: DeleteMode) -> Result<Vec<WriteResult>>;
 
+    /// Создать почтовую папку (`CreateFolder`, класс `IPF.Note`) внутри `parent` (известная папка,
+    /// `msgfolderroot` для корня ящика, или папка по идентификатору). Возвращает идентификатор
+    /// созданной папки (`Folders[0].FolderId`). Отказ сервера (например, имя занято:
+    /// `ErrorFolderExists`) приходит как `Server`.
+    async fn create_folder(&self, parent: &FolderRef, display_name: &str) -> Result<FolderId>;
+
+    /// Переименовать папку (`UpdateFolder` поля `folder:DisplayName`). Возвращает идентификатор с
+    /// новым `ChangeKey` (или исходный, если сервер его не вернул).
+    async fn rename_folder(&self, id: &FolderId, display_name: &str) -> Result<FolderId>;
+
+    /// Перенести папку вместе с содержимым в другую папку (`MoveFolder`). Возвращает идентификатор
+    /// папки после переноса (`Folders[0].FolderId`, у папок он обычно не меняется).
+    async fn move_folder(&self, id: &FolderId, parent: &FolderRef) -> Result<FolderId>;
+
+    /// Удалить папку с содержимым (`DeleteFolder`): `permanent` — навсегда (`HardDelete`), иначе
+    /// в «Удалённые» (`MoveToDeletedItems`: папка становится подпапкой «Удалённых»).
+    async fn delete_folder(&self, id: &FolderId, permanent: bool) -> Result<()>;
+
     /// Создать черновик в «Черновиках» (`CreateItem` с `MessageDisposition: SaveOnly`).
     /// Для `Reply`/`ReplyAll`/`Forward` сервер сам добавляет цитируемый оригинал (у пересылки —
     /// и его вложения); получатели и тема передаются явно. Возвращает идентификатор черновика.

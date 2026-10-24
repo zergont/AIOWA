@@ -12,6 +12,9 @@
 //! Один замок на все операции записи: два действия не переплетаются; синхронизация идёт
 //! параллельно. В конце — событие `items-changed` с затронутыми беседами и папками, по нему
 //! окно перечитывает открытую беседу, список бесед и счётчики папок.
+//!
+//! Те же шаги по отдельности (`prepare`, `apply_local`, `send_to_server`, `rollback`) использует
+//! `staged.rs`: действия с окном отмены применяются локально сразу, а на сервер уходят через 6 с.
 
 use crate::ondemand::{describe_transport, timed_out};
 use crate::sync::SyncState;
@@ -37,26 +40,34 @@ const DELETED_ITEMS: &str = "deleteditems";
 /// Имя события для окна.
 const ITEMS_CHANGED: &str = "items-changed";
 
-/// Состояние команд записи: один замок на все операции.
+/// Состояние команд записи: один замок на все операции. Его же держат отложенные действия с
+/// окном отмены (`staged.rs`): применение, откат и отправка на сервер не переплетаются.
 #[derive(Default)]
 pub(crate) struct WriteState {
     lock: tokio::sync::Mutex<()>,
 }
 
+impl WriteState {
+    /// Замок записи: ждёт, пока закончится текущая операция.
+    pub(crate) async fn lock(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.lock.lock().await
+    }
+}
+
 /// Отказ по одному письму; локальное изменение по нему уже откачено.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub(crate) struct WriteFailure {
-    item_pk: i64,
+    pub(crate) item_pk: i64,
     /// Текст для пользователя, по-русски, без ответов сервера.
-    message: String,
+    pub(crate) message: String,
 }
 
 /// Итог команды записи.
 #[derive(Debug, Default, Serialize)]
 pub(crate) struct WriteReport {
     /// Писем, подтверждённых сервером.
-    done: i64,
-    failed: Vec<WriteFailure>,
+    pub(crate) done: i64,
+    pub(crate) failed: Vec<WriteFailure>,
 }
 
 /// Событие `items-changed`.
@@ -77,7 +88,7 @@ pub(crate) fn emit_items_changed(app: &AppHandle, conversation_pks: Vec<i64>, fo
 /// Что затронуто: собирается по ходу операции (применение, подтверждение, откат), в конце
 /// уходит событием в окно.
 #[derive(Default)]
-struct Changed {
+pub(crate) struct Changed {
     conversations: BTreeSet<i64>,
     folders: BTreeSet<i64>,
 }
@@ -96,18 +107,43 @@ impl Changed {
         self.conversations.extend(r.conversation_pk);
     }
 
-    fn is_empty(&self) -> bool {
+    /// Всё, что задевает операция над письмами `refs`: их папки и беседы, папка назначения.
+    pub(crate) fn operation(&mut self, action: &Action, refs: &[ItemRef]) {
+        for r in refs {
+            self.item(r);
+        }
+        if let Some(f) = action.target_folder() {
+            self.folder(f);
+        }
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
         self.conversations.is_empty() && self.folders.is_empty()
     }
 
     fn into_event(self) -> ItemsChanged {
         ItemsChanged { conversation_pks: self.conversations.into_iter().collect(), folder_pks: self.folders.into_iter().collect() }
     }
+
+    /// Событие `items-changed` окну и обновление счётчика непрочитанных в заголовке: локальная
+    /// запись уже поправила счётчики папок в базе, ждать следующей синхронизации не нужно.
+    /// Пустой набор ничего не шлёт.
+    pub(crate) fn emit(self, app: &AppHandle) {
+        if self.is_empty() {
+            return;
+        }
+        if let Err(e) = app.emit(ITEMS_CHANGED, self.into_event()) {
+            warn!(error = %e, "не удалось отправить событие items-changed");
+        }
+        if let Some(notify) = app.try_state::<Arc<crate::notify::NotifyState>>() {
+            notify.refresh_unread(app);
+        }
+    }
 }
 
 /// Операция записи: как применить локально, что вызвать на сервере, как подтвердить и откатить.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum Action {
+pub(crate) enum Action {
     Read(bool),
     Flag(bool),
     /// Перенос в папку базы `folder_pk`; `target` — она же для сервера.
@@ -130,7 +166,7 @@ enum Undo {
 }
 
 impl Action {
-    fn name(&self) -> &'static str {
+    pub(crate) fn name(&self) -> &'static str {
         match self {
             Action::Read(true) => "прочитано",
             Action::Read(false) => "непрочитано",
@@ -231,7 +267,7 @@ impl Undo {
 
 /// Откат локального изменения писем. Ошибка отката только в журнал: событие заставит окно
 /// перечитать базу, а следующая синхронизация сверит её с сервером.
-fn rollback(action: &Action, store: &Store, refs: &[ItemRef], changed: &mut Changed) {
+pub(crate) fn rollback(action: &Action, store: &Store, refs: &[ItemRef], changed: &mut Changed) {
     for r in refs {
         let undo = action.undo_for(r);
         match undo.run(store, r.item_pk) {
@@ -284,13 +320,24 @@ fn dedup(item_pks: &[i64]) -> Vec<i64> {
     item_pks.iter().copied().filter(|pk| seen.insert(*pk)).collect()
 }
 
-/// Выполняет операцию над письмами. `changed` заполняется и при ошибке: локальные изменения
-/// и их откаты окно должно увидеть в любом случае.
-async fn execute(state: &AppState, sync: &SyncState, item_pks: &[i64], action: &Action, changed: &mut Changed) -> CmdResult<WriteReport> {
-    let store = &state.store;
-    let mut report = WriteReport::default();
+/// Папка «Удалённые» в локальной базе (ключ): без неё удаление в «Удалённые» невозможно.
+pub(crate) fn deleted_items_pk(state: &AppState) -> CmdResult<i64> {
+    let (deleted_pk, _) = state.store.folder_by_distinguished(state.account, DELETED_ITEMS).map_err(err)?.ok_or_else(|| "Папка «Удалённые» не найдена в локальной базе: выполните синхронизацию".to_string())?;
+    Ok(deleted_pk)
+}
 
-    // Ссылки на письма: неизвестные и уже удалённые — сразу в отказ.
+/// Перенос в папку `folder_pk` локальной базы: ссылка на неё же для сервера.
+pub(crate) fn move_action(state: &AppState, folder_pk: i64) -> CmdResult<Action> {
+    let folder = state.store.folder_by_pk(state.account, folder_pk).map_err(err)?.ok_or_else(|| "Папка не найдена".to_string())?;
+    let target = FolderRef::Id(FolderId { id: folder.server_id, change_key: None });
+    Ok(Action::Move { folder_pk, target })
+}
+
+/// Письма операции до сервера: ссылки из базы (неизвестные и уже удалённые — сразу в `failed`),
+/// без тех, что уже в нужном состоянии, и без тех, к которым операция неприменима (тоже `failed`).
+/// Возвращает, что делать, и отчёт с отказами проверок.
+pub(crate) fn prepare(store: &Store, item_pks: &[i64], action: &Action) -> CmdResult<(Vec<ItemRef>, WriteReport)> {
+    let mut report = WriteReport::default();
     let unique = dedup(item_pks);
     let refs = store.item_refs(&unique).map_err(err)?;
     let known: HashSet<i64> = refs.iter().map(|r| r.item_pk).collect();
@@ -299,8 +346,6 @@ async fn execute(state: &AppState, sync: &SyncState, item_pks: &[i64], action: &
             report.failed.push(WriteFailure { item_pk: pk, message: "Письмо уже удалено".into() });
         }
     }
-
-    // Проверки до сервера.
     let mut todo: Vec<ItemRef> = Vec::with_capacity(refs.len());
     for r in refs {
         if action.already_applied(&r) {
@@ -311,38 +356,57 @@ async fn execute(state: &AppState, sync: &SyncState, item_pks: &[i64], action: &
             None => todo.push(r),
         }
     }
+    Ok((todo, report))
+}
+
+/// Локальное применение (оптимистично, окно видит результат сразу). При ошибке базы изменение
+/// откатывается, а `changed` всё равно заполнен: окно должно перечитать то, что могло поменяться.
+pub(crate) fn apply_local(store: &Store, action: &Action, todo: &[ItemRef], changed: &mut Changed) -> CmdResult<()> {
+    changed.operation(action, todo);
+    match action.apply(store, todo) {
+        Ok(convs) => {
+            changed.conversations(convs);
+            Ok(())
+        }
+        Err(e) => {
+            warn!(action = action.name(), error = %e, "локальное применение не удалось");
+            rollback(action, store, todo, changed);
+            Err(format!("Ошибка локальной базы: {e}"))
+        }
+    }
+}
+
+/// Выполняет операцию над письмами: проверки, локальное применение, сервер. `changed`
+/// заполняется и при ошибке: локальные изменения и их откаты окно должно увидеть в любом случае.
+async fn execute(state: &AppState, sync: &SyncState, item_pks: &[i64], action: &Action, changed: &mut Changed) -> CmdResult<WriteReport> {
+    let store = &state.store;
+    let (todo, mut report) = prepare(store, item_pks, action)?;
     if todo.is_empty() {
         return Ok(report);
     }
-    for r in &todo {
-        changed.item(r);
-    }
-    if let Some(f) = action.target_folder() {
-        changed.folder(f);
-    }
+    apply_local(store, action, &todo, changed)?;
+    send_to_server(sync, store, action, &todo, changed, &mut report).await?;
+    Ok(report)
+}
 
-    // Локально, сразу.
-    match action.apply(store, &todo) {
-        Ok(convs) => changed.conversations(convs),
-        Err(e) => {
-            warn!(action = action.name(), error = %e, "локальное применение не удалось");
-            rollback(action, store, &todo, changed);
-            return Err(format!("Ошибка локальной базы: {e}"));
-        }
+/// Отправка уже применённой локально операции на сервер пачками (без повторного локального
+/// применения — так же работает коммит отложенного действия из `staged.rs`). Отказ целого вызова
+/// откатывает всё, что сервер ещё не подтвердил: до первого ответа это ошибка (`Err` с текстом,
+/// локально всё откачено), после — отказ по оставшимся письмам в `report.failed` (подтверждённые
+/// пачки уже применены на сервере, их откатывать нельзя). Отказ по письму откатывает его.
+pub(crate) async fn send_to_server(sync: &SyncState, store: &Store, action: &Action, todo: &[ItemRef], changed: &mut Changed, report: &mut WriteReport) -> CmdResult<()> {
+    if todo.is_empty() {
+        return Ok(());
     }
-
     // Транспорт процесса: без новых входов, если сессия уже есть.
     let transport = match sync.transport().await {
         Ok(t) => t,
         Err(e) => {
-            rollback(action, store, &todo, changed);
+            rollback(action, store, todo, changed);
             return Err(e.to_string());
         }
     };
 
-    // На сервер пачками. Отказ целого вызова откатывает всё, что сервер ещё не подтвердил:
-    // до первого ответа это ошибка команды, после — отказ по оставшимся письмам (подтверждённые
-    // пачки уже применены на сервере, их откатывать нельзя).
     let mut answered = 0usize;
     for (i, chunk) in todo.chunks(BATCH).enumerate() {
         let ids: Vec<ItemId> = chunk.iter().map(|r| r.id.clone()).collect();
@@ -382,7 +446,7 @@ async fn execute(state: &AppState, sync: &SyncState, item_pks: &[i64], action: &
                 answered += chunk.len();
             }
             Err(message) => {
-                let rest = unsent(&todo, i);
+                let rest = unsent(todo, i);
                 rollback(action, store, rest, changed);
                 if answered == 0 {
                     return Err(message);
@@ -393,24 +457,15 @@ async fn execute(state: &AppState, sync: &SyncState, item_pks: &[i64], action: &
         }
     }
     info!(action = action.name(), done = report.done, failed = report.failed.len(), "операция записи завершена");
-    Ok(report)
+    Ok(())
 }
 
 /// Общая обвязка команд: замок на операции записи, выполнение, событие окну.
 async fn run(app: &AppHandle, state: &AppState, sync: &SyncState, ws: &WriteState, item_pks: &[i64], action: Action) -> CmdResult<WriteReport> {
-    let _busy = ws.lock.lock().await;
+    let _busy = ws.lock().await;
     let mut changed = Changed::default();
     let result = execute(state, sync, item_pks, &action, &mut changed).await;
-    if !changed.is_empty() {
-        if let Err(e) = app.emit(ITEMS_CHANGED, changed.into_event()) {
-            warn!(error = %e, "не удалось отправить событие items-changed");
-        }
-        // Локальная запись уже поправила счётчики папок в базе: заголовок окна и значок на
-        // панели задач обновляются сразу, не дожидаясь следующей синхронизации.
-        if let Some(notify) = app.try_state::<Arc<crate::notify::NotifyState>>() {
-            notify.refresh_unread(app);
-        }
-    }
+    changed.emit(app);
     result
 }
 
@@ -431,21 +486,15 @@ pub(crate) async fn items_set_flag(item_pks: Vec<i64>, flagged: bool, app: AppHa
 /// Перенести письма в папку `folder_pk` (ключ локальной базы).
 #[tauri::command]
 pub(crate) async fn items_move(item_pks: Vec<i64>, folder_pk: i64, app: AppHandle, state: State<'_, AppState>, sync: State<'_, Arc<SyncState>>, ws: State<'_, WriteState>) -> CmdResult<WriteReport> {
-    let folder = state.store.folder_by_pk(state.account, folder_pk).map_err(err)?.ok_or_else(|| "Папка не найдена".to_string())?;
-    let target = FolderRef::Id(FolderId { id: folder.server_id, change_key: None });
-    run(&app, &state, &sync, &ws, &item_pks, Action::Move { folder_pk, target }).await
+    let action = move_action(&state, folder_pk)?;
+    run(&app, &state, &sync, &ws, &item_pks, action).await
 }
 
 /// Удалить письма: `permanent = false` — в «Удалённые» (письмо, уже лежащее там, отказывает),
 /// `permanent = true` — навсегда.
 #[tauri::command]
 pub(crate) async fn items_delete(item_pks: Vec<i64>, permanent: bool, app: AppHandle, state: State<'_, AppState>, sync: State<'_, Arc<SyncState>>, ws: State<'_, WriteState>) -> CmdResult<WriteReport> {
-    let action = if permanent {
-        Action::Hard
-    } else {
-        let (deleted_pk, _) = state.store.folder_by_distinguished(state.account, DELETED_ITEMS).map_err(err)?.ok_or_else(|| "Папка «Удалённые» не найдена в локальной базе: выполните синхронизацию".to_string())?;
-        Action::ToDeleted { deleted_pk }
-    };
+    let action = if permanent { Action::Hard } else { Action::ToDeleted { deleted_pk: deleted_items_pk(&state)? } };
     run(&app, &state, &sync, &ws, &item_pks, action).await
 }
 

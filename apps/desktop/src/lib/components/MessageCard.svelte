@@ -19,17 +19,28 @@
     folders: Folder[];
     /** Папка «Удалённые»: письмо в ней удаляется только навсегда. */
     deletedFolderPk: number | null;
-    /** Действие над этим письмом; промис отклоняется текстом ошибки для пользователя. */
-    onaction: (action: ItemAction) => Promise<void>;
+    /** Папка архива: письму в ней «В архив» недоступно; null — папки нет (родитель предложит создать). */
+    archiveFolderPk?: number | null;
+    /** Действие над этим письмом; `anchor` — нажатая кнопка (для вопросов вроде «создать папку архива?»); промис отклоняется текстом ошибки. */
+    onaction: (action: ItemAction, anchor?: HTMLElement) => Promise<void>;
     /** Открыть композер: ответ, ответ всем или пересылка этого письма. */
     oncompose: (kind: ComposeKind) => void;
     /** Дан ответ на приглашение или отменённая встреча убрана из календаря: родитель перечитывает беседу. */
     onmeeting?: () => void;
   }
-  let { message, expanded, ontoggle, onfetch, folders, deletedFolderPk, onaction, oncompose, onmeeting }: Props = $props();
+  let { message, expanded, ontoggle, onfetch, folders, deletedFolderPk, archiveFolderPk = null, onaction, oncompose, onmeeting }: Props = $props();
 
   const to = $derived(message.recipients.filter((r) => r.kind === 1).map((r) => personLabel(r.name, r.email)));
   const cc = $derived(message.recipients.filter((r) => r.kind === 2).map((r) => personLabel(r.name, r.email)));
+  /** Адреса Reply-To, отличные от отправителя: ответ уйдёт им, карточка это показывает. */
+  const replyTo = $derived.by(() => {
+    const from = (message.from_email ?? "").trim().toLowerCase();
+    return (message.reply_to ?? [])
+      .filter((p) => (p.email ?? "").trim().toLowerCase() !== from || !p.email)
+      .map((p) => personLabel(p.name, p.email))
+      .filter(Boolean);
+  });
+  const inArchive = $derived(archiveFolderPk != null && message.folder_pk === archiveFolderPk);
   // В списке файлов всё, кроме инлайновых картинок: те уже стоят в теле письма.
   const files = $derived(message.attachments.filter((a) => !isInlinePicture(a)));
   const hasBody = $derived(message.body_html != null);
@@ -73,16 +84,17 @@
   let picker = $state(false);
   let confirmDelete = $state(false);
   let moveBtn = $state<HTMLButtonElement | null>(null);
+  let archiveBtn = $state<HTMLButtonElement | null>(null);
   let deleteBtn = $state<HTMLButtonElement | null>(null);
 
-  async function run(action: ItemAction) {
+  async function run(action: ItemAction, anchor?: HTMLElement | null) {
     if (busy) return;
     // Ручная пометка отменяет автопометку: иначе таймер снова сделал бы письмо прочитанным.
     if (action.kind === "read") autoMarked = true;
     busy = true;
     actionError = null;
     try {
-      await onaction(action);
+      await onaction(action, anchor ?? undefined);
     } catch (e) {
       actionError = errorMessage(e);
     } finally {
@@ -374,6 +386,7 @@
           {#if message.is_draft}<span class="badge">черновик</span>{/if}
         </div>
         {#if expanded}
+          {#if replyTo.length}<div class="line caption reply-to" title="Ответ уйдёт по адресу из заголовка Reply-To, а не отправителю">Ответ на: {replyTo.join(", ")}</div>{/if}
           <div class="line caption">Кому: {to.length ? to.join(", ") : message.display_to || "—"}</div>
           {#if cc.length}<div class="line caption">Копия: {cc.join(", ")}</div>{/if}
         {:else}
@@ -408,6 +421,9 @@
         </button>
         <button class="act" bind:this={moveBtn} onclick={() => (picker = !picker)} disabled={busy} aria-label="Переместить…" title="Переместить…" aria-haspopup="dialog" aria-expanded={picker}>
           <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path d={ICON.move} fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round" /></svg>
+        </button>
+        <button class="act" bind:this={archiveBtn} onclick={() => run({ kind: "archive" }, archiveBtn)} disabled={busy || inArchive} aria-label="В архив" title={inArchive ? "Письмо уже в архиве" : "В архив"}>
+          <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path d={ICON.archive} fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round" /></svg>
         </button>
         <button class="act danger" bind:this={deleteBtn} onclick={() => (confirmDelete ? cancelDelete() : requestDelete())} disabled={busy} aria-label={inDeleted ? "Удалить навсегда…" : "Удалить"} title={inDeleted ? "Удалить навсегда…" : "Удалить (в «Удалённые»)"} aria-haspopup={inDeleted ? "dialog" : undefined}>
           <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path d={ICON.delete} fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round" /></svg>
@@ -648,6 +664,9 @@
     text-overflow: ellipsis;
     white-space: nowrap;
     user-select: text;
+  }
+  .reply-to {
+    color: var(--fg-2);
   }
   .when {
     text-align: right;

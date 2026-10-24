@@ -2,9 +2,9 @@
 //! Пагинация keyset: `(last_received_at, conversation_pk)` строго убывают, OFFSET не используется.
 
 use crate::{decompress, ms_ts, ConversationRow, Result, Store, HAS_FLAGGED_SQL};
-use aiowa_core::{AccountId, BodyType};
+use aiowa_core::{AccountId, BodyType, Participant, RecipientKind};
 use jiff::Timestamp;
-use rusqlite::{params, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension};
 
 /// Заголовок письма для области чтения.
 #[derive(Debug, Clone)]
@@ -30,6 +30,9 @@ pub struct MessageHead {
     /// Класс письма: `IPM.Note`, приглашение `IPM.Schedule.Meeting.Request`, отмена
     /// `…Canceled`, ответ участника `…Resp.Pos`/`Neg`/`Tent`.
     pub item_class: Option<String>,
+    /// Адреса `Reply-To` письма (`recipients.kind = 4`), как прислал сервер; пусто без заголовка
+    /// или пока тело не загружено. Что из них ставить в «Кому» ответа — `aiowa_core::effective_reply_to`.
+    pub reply_to: Vec<Participant>,
 }
 
 /// Тело письма для показа.
@@ -46,7 +49,7 @@ pub struct BodyView {
 
 #[derive(Debug, Clone)]
 pub struct RecipientRow {
-    /// 1 to, 2 cc, 3 bcc.
+    /// 1 to, 2 cc, 3 bcc, 4 Reply-To (`RecipientKind`).
     pub kind: i64,
     pub name: Option<String>,
     pub email: Option<String>,
@@ -95,7 +98,20 @@ fn head_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<MessageHead> {
         body_state: r.get(14)?,
         is_flagged: r.get::<_, Option<i64>>(15)?.unwrap_or(0) != 0,
         item_class: r.get(16)?,
+        reply_to: Vec::new(),
     })
+}
+
+/// Дописывает заголовкам адреса `Reply-To` из `recipients` (kind 4) отдельным запросом на письмо:
+/// заголовков в беседе десятки, строк Reply-To почти никогда нет.
+fn fill_reply_to(c: &Connection, heads: &mut [MessageHead]) -> rusqlite::Result<()> {
+    let mut st = c.prepare_cached("SELECT name, email FROM recipients WHERE item_pk = ?1 AND kind = ?2 ORDER BY position")?;
+    for h in heads {
+        h.reply_to = st
+            .query_map(params![h.item_pk, RecipientKind::ReplyTo.as_i64()], |r| Ok(Participant { name: r.get(0)?, email: r.get(1)?, routing_type: None }))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+    }
+    Ok(())
 }
 
 impl Store {
@@ -152,7 +168,9 @@ impl Store {
                  ORDER BY COALESCE(i.received_at, i.sent_at) DESC, i.item_pk DESC"
             ))?;
             let rows = st.query_map(params![conversation_pk, account.0], head_row)?;
-            Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+            let mut heads = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+            fill_reply_to(c, &mut heads)?;
+            Ok(heads)
         })
     }
 
@@ -178,7 +196,11 @@ impl Store {
     pub fn message_head(&self, item_pk: i64) -> Result<Option<MessageHead>> {
         self.with_conn(|c| {
             let mut st = c.prepare_cached(&format!("{HEAD_SELECT} WHERE i.item_pk = ?1 AND i.deleted = 0"))?;
-            Ok(st.query_row(params![item_pk], head_row).optional()?)
+            let mut head = st.query_row(params![item_pk], head_row).optional()?;
+            if let Some(h) = head.as_mut() {
+                fill_reply_to(c, std::slice::from_mut(h))?;
+            }
+            Ok(head)
         })
     }
 

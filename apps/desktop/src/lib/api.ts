@@ -36,6 +36,12 @@ export interface Recipient {
   email: string | null;
 }
 
+/** Участник письма без вида: адрес из Reply-To. */
+export interface Participant {
+  name: string | null;
+  email: string | null;
+}
+
 export interface Attachment {
   attachment_pk: number;
   name: string | null;
@@ -75,6 +81,11 @@ export interface Message {
    * по нему карточка узнаёт приглашение, отмену или ответ на встречу. Может отсутствовать в старом ответе.
    */
   item_class?: string | null;
+  /**
+   * Адреса Reply-To, если заголовок есть и отличается от From: ответ уходит сюда, карточка
+   * показывает «Ответ на: …». Может отсутствовать в старом ответе.
+   */
+  reply_to?: Participant[] | null;
 }
 
 /** Ключ состояния письма в беседе (без тел и картинок): для сравнения после синхронизации. */
@@ -149,6 +160,29 @@ export interface WriteReport {
 export interface ItemsChanged {
   conversation_pks: number[];
   folder_pks: number[];
+}
+
+/**
+ * Событие `write-failed`: сервер отказал по отложенному действию, когда окно отмены уже закрыто.
+ * `message` — текст по-русски для показа, `item_pks` — письма, по которым локальное изменение откачено.
+ */
+export interface WriteFailed {
+  message: string;
+  item_pks: number[];
+}
+
+/** Действие с окном отмены: удаление в «Удалённые», перенос, архив. */
+export type StageAction = "delete" | "move" | "archive";
+
+/**
+ * Итог `items_stage`: локально уже применено, сервер ждёт до `undo_until_ms` (миллисекунды эпохи);
+ * до этого срока `items_undo(stage_id)` откатывает, после — бэкенд сам отправляет на сервер.
+ */
+export interface StagedDto {
+  stage_id: string;
+  done: number;
+  failed: WriteFailure[];
+  undo_until_ms: number;
 }
 
 // --- композер: новое письмо, ответ, ответ всем, пересылка ---------------------
@@ -427,6 +461,21 @@ export const api = {
   /** Письма беседы; с folderPk — только лежащие в этой папке. */
   conversationItemPks: (conversationPk: number, folderPk: number | null) => invoke<number[]>("conversation_item_pks", { conversationPk, folderPk }),
 
+  // --- запись с окном отмены: локально сразу, на сервер через 6 с (или по items_commit) --------
+  /** `folderPk` — папка назначения для move и archive; `permanent` — только для delete. */
+  itemsStage: (action: StageAction, itemPks: number[], folderPk: number | null, permanent = false) => invoke<StagedDto>("items_stage", { action, itemPks, folderPk, permanent }),
+  /** Откатить, пока окно отмены не истекло; иначе отказ «Отмена уже невозможна». */
+  itemsUndo: (stageId: string) => invoke<WriteReport>("items_undo", { stageId }),
+  /** Отправить на сервер сейчас, не дожидаясь таймера. */
+  itemsCommit: (stageId: string) => invoke<WriteReport | void>("items_commit", { stageId }),
+
+  // --- папки -------------------------------------------------------------------------------
+  /** Создать папку; parentPk null — в корне ящика. После — событие folders-changed. */
+  folderCreate: (parentPk: number | null, name: string) => invoke<Folder>("folder_create", { parentPk, name }),
+  folderRename: (folderPk: number, name: string) => invoke<Folder>("folder_rename", { folderPk, name }),
+  /** permanent=false — в «Удалённые» вместе с подпапками и письмами, permanent=true — навсегда. */
+  folderDelete: (folderPk: number, permanent: boolean) => invoke<void>("folder_delete", { folderPk, permanent }),
+
   // --- композер ----------------------------------------------------------------------------
   /** Заготовка композера: для ответа/пересылки itemPk — исходное письмо. */
   composeContext: (kind: ComposeKind, itemPk: number | null) => invoke<ComposeContext>("compose_context", { kind, itemPk }),
@@ -497,6 +546,16 @@ export function onSyncProgress(cb: (status: SyncStatus) => void): Promise<Unlist
 /** Подписка на изменения писем после команд записи. Возвращает функцию отписки. */
 export function onItemsChanged(cb: (ev: ItemsChanged) => void): Promise<UnlistenFn> {
   return listen<ItemsChanged>("items-changed", (e) => cb(e.payload));
+}
+
+/** Подписка на отказ сервера по отложенному действию (после окна отмены). Возвращает функцию отписки. */
+export function onWriteFailed(cb: (ev: WriteFailed) => void): Promise<UnlistenFn> {
+  return listen<WriteFailed>("write-failed", (e) => cb(e.payload));
+}
+
+/** Подписка на изменения дерева папок (создание, переименование, удаление, синхронизация иерархии). Возвращает функцию отписки. */
+export function onFoldersChanged(cb: () => void): Promise<UnlistenFn> {
+  return listen<void>("folders-changed", () => cb());
 }
 
 /** Подписка на состояние канала уведомлений. Возвращает функцию отписки. */
@@ -624,4 +683,19 @@ export function formatSize(bytes: number | null): string {
 
 export function personLabel(name: string | null, email: string | null): string {
   return name || email || "";
+}
+
+/** Русская форма слова по числу: plural(3, "беседа", "беседы", "бесед") → «беседы». */
+export function plural(n: number, one: string, few: string, many: string): string {
+  const abs = Math.abs(n) % 100;
+  const d = abs % 10;
+  if (abs > 10 && abs < 20) return many;
+  if (d === 1) return one;
+  if (d >= 2 && d <= 4) return few;
+  return many;
+}
+
+/** «1 беседа», «3 беседы», «12 бесед». */
+export function conversationsText(n: number): string {
+  return `${n.toLocaleString("ru-RU")} ${plural(n, "беседа", "беседы", "бесед")}`;
 }

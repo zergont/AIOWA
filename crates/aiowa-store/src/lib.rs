@@ -14,7 +14,7 @@ pub mod schema;
 pub mod text;
 pub mod ui;
 
-use aiowa_core::{AccountId, Folder, FolderChange, FolderId, ItemChange, ItemId, MessageFull, MessageMeta, SyncState};
+use aiowa_core::{AccountId, Folder, FolderChange, FolderId, ItemChange, ItemId, MessageFull, MessageMeta, RecipientKind, SyncState};
 use jiff::Timestamp;
 use rusqlite::types::Value as SqlValue;
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension, Transaction};
@@ -291,6 +291,17 @@ pub struct ConversationRow {
 
 /// Подзапрос «в беседе есть письмо с флагом» для списков бесед (`c` — `conversations`).
 const HAS_FLAGGED_SQL: &str = "EXISTS(SELECT 1 FROM items fi WHERE fi.conversation_pk = c.conversation_pk AND fi.deleted = 0 AND fi.flag_status = 'Flagged')";
+
+/// Итог локального удаления папки (`Store::delete_folder_local`).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct FolderDeleteStats {
+    /// Папок в поддереве вместе с самой папкой.
+    pub folders: usize,
+    /// Писем, помеченных удалёнными (при переносе в «Удалённые» — 0: письма остаются в папке).
+    pub items: usize,
+    /// Беседы, чьи письма помечены удалёнными (по возрастанию): окно перечитает открытую из них.
+    pub conversation_pks: Vec<i64>,
+}
 
 /// Итог вытеснения кэша вложений.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -590,6 +601,124 @@ impl Store {
         })
     }
 
+    /// Идентификатор не удалённой папки на сервере (с `ChangeKey`, если известен).
+    pub fn folder_id_by_pk(&self, account: AccountId, folder_pk: i64) -> Result<Option<FolderId>> {
+        self.with_conn(|c| {
+            Ok(c.query_row("SELECT server_id, change_key FROM folders WHERE account_id = ?1 AND folder_pk = ?2 AND deleted = 0", params![account.0, folder_pk], |r| Ok(FolderId { id: r.get(0)?, change_key: r.get(1)? }))
+                .optional()?)
+        })
+    }
+
+    /// Идентификатор корня почтовых папок (`msgfolderroot`) по локальной базе: сам корень
+    /// `SyncFolderHierarchy` не присылает, но он — родитель «Входящих» и прочих папок верхнего
+    /// уровня. `None`, пока иерархия не синхронизирована.
+    pub fn msgfolderroot_server_id(&self, account: AccountId) -> Result<Option<String>> {
+        self.with_conn(|c| {
+            let by_inbox: Option<String> = c
+                .query_row("SELECT parent_server_id FROM folders WHERE account_id = ?1 AND distinguished = 'inbox' AND deleted = 0", params![account.0], |r| r.get(0))
+                .optional()?
+                .flatten();
+            if by_inbox.is_some() {
+                return Ok(by_inbox);
+            }
+            // Нет «Входящих»: самый частый родитель, которого нет среди известных папок.
+            Ok(c.query_row(
+                "SELECT f.parent_server_id FROM folders f
+                 WHERE f.account_id = ?1 AND f.deleted = 0 AND f.parent_server_id IS NOT NULL
+                   AND NOT EXISTS (SELECT 1 FROM folders p WHERE p.account_id = f.account_id AND p.server_id = f.parent_server_id)
+                 GROUP BY f.parent_server_id ORDER BY COUNT(*) DESC LIMIT 1",
+                params![account.0],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten())
+        })
+    }
+
+    // --- локальные операции с папками ------------------------------------------
+    //
+    // Зеркало серверных CreateFolder/UpdateFolder/DeleteFolder: окно меняет дерево сразу после
+    // ответа сервера, не дожидаясь синхронизации иерархии (она потом сверит имена, счётчики и
+    // родителей). Агрегаты бесед по папкам пересчитываются только при удалении писем.
+
+    /// Вставляет созданную на сервере папку: `folder.id` — из ответа `CreateFolder`, `parent_id` —
+    /// родитель (для корня — `msgfolderroot_server_id`), класс `IPF.Note`, счётчики нули. Если
+    /// синхронизация иерархии уже успела создать строку, она обновляется. Возвращает `folder_pk`.
+    pub fn insert_folder(&self, account: AccountId, folder: &Folder) -> Result<i64> {
+        self.with_tx(|tx| {
+            upsert_folder(tx, account, folder, now_ms())?;
+            Ok(tx.query_row("SELECT folder_pk FROM folders WHERE account_id = ?1 AND server_id = ?2", params![account.0, folder.id.id], |r| r.get(0))?)
+        })
+    }
+
+    /// Переименовывает папку локально; `new_id` — идентификатор из ответа `UpdateFolder` (новый
+    /// `ChangeKey`), если сервер его вернул.
+    pub fn rename_folder_local(&self, folder_pk: i64, display_name: &str, new_id: Option<&FolderId>) -> Result<()> {
+        self.with_conn(|c| {
+            let now = now_ms();
+            let n = match new_id {
+                Some(id) => c.execute("UPDATE folders SET display_name = ?2, server_id = ?3, change_key = COALESCE(?4, change_key), updated_at = ?5 WHERE folder_pk = ?1", params![folder_pk, display_name, id.id, id.change_key, now])?,
+                None => c.execute("UPDATE folders SET display_name = ?2, updated_at = ?3 WHERE folder_pk = ?1", params![folder_pk, display_name, now])?,
+            };
+            if n == 0 {
+                return Err(StoreError::Other(format!("папка #{folder_pk} не найдена")));
+            }
+            Ok(())
+        })
+    }
+
+    /// Удаляет папку локально вместе с подпапками. `to_deleted = Some(pk «Удалённых»)` — сервер
+    /// перенёс папку в «Удалённые» (`DeleteFolder MoveToDeletedItems`): папка с подпапками и
+    /// письмами остаётся, меняется только её родитель. `None` — удалена навсегда (`HardDelete`):
+    /// папки поддерева получают `deleted = 1`, их письма тоже (снимаются с индекса, агрегаты бесед
+    /// пересчитываются). Служебную папку (`distinguished`) удалить нельзя.
+    pub fn delete_folder_local(&self, folder_pk: i64, to_deleted: Option<i64>) -> Result<FolderDeleteStats> {
+        self.write_generation.fetch_add(1, Ordering::Relaxed);
+        self.with_tx(|tx| {
+            let (account_id, distinguished): (i64, Option<String>) = tx
+                .query_row("SELECT account_id, distinguished FROM folders WHERE folder_pk = ?1 AND deleted = 0", params![folder_pk], |r| Ok((r.get(0)?, r.get(1)?)))
+                .optional()?
+                .ok_or_else(|| StoreError::Other(format!("папка #{folder_pk} не найдена")))?;
+            if let Some(d) = distinguished {
+                return Err(StoreError::Other(format!("служебную папку ({d}) удалить нельзя")));
+            }
+            let subtree = folder_subtree(tx, account_id, folder_pk)?;
+            let now = now_ms();
+            match to_deleted {
+                Some(trash_pk) => {
+                    if subtree.contains(&trash_pk) {
+                        return Err(StoreError::Other("папку нельзя перенести в её же подпапку".into()));
+                    }
+                    let trash_id: String = tx
+                        .query_row("SELECT server_id FROM folders WHERE account_id = ?1 AND folder_pk = ?2 AND deleted = 0", params![account_id, trash_pk], |r| r.get(0))
+                        .optional()?
+                        .ok_or_else(|| StoreError::Other(format!("папка «Удалённые» #{trash_pk} не найдена")))?;
+                    tx.execute("UPDATE folders SET parent_server_id = ?2, updated_at = ?3 WHERE folder_pk = ?1", params![folder_pk, trash_id, now])?;
+                    Ok(FolderDeleteStats { folders: subtree.len(), items: 0, conversation_pks: Vec::new() })
+                }
+                None => {
+                    let mut touched = Touched::default();
+                    let mut items = 0usize;
+                    for &pk in &subtree {
+                        let rows: Vec<(i64, Option<i64>)> = tx
+                            .prepare_cached("SELECT item_pk, conversation_pk FROM items WHERE folder_pk = ?1 AND deleted = 0")?
+                            .query_map(params![pk], |r| Ok((r.get(0)?, r.get(1)?)))?
+                            .collect::<std::result::Result<Vec<_>, _>>()?;
+                        for (item_pk, conv) in rows {
+                            fts_delete(tx, item_pk)?;
+                            touched.add(conv, pk);
+                            tx.prepare_cached("UPDATE items SET deleted = 1, updated_at = ?2 WHERE item_pk = ?1")?.execute(params![item_pk, now])?;
+                            items += 1;
+                        }
+                        tx.prepare_cached("UPDATE folders SET deleted = 1, total_count = 0, unread_count = 0, updated_at = ?2 WHERE folder_pk = ?1")?.execute(params![pk, now])?;
+                    }
+                    let conversation_pks = touched.recompute(tx)?;
+                    Ok(FolderDeleteStats { folders: subtree.len(), items, conversation_pks })
+                }
+            }
+        })
+    }
+
     pub fn folder_sync_state(&self, folder_pk: i64) -> Result<Option<SyncState>> {
         self.with_conn(|c| Ok(c.query_row("SELECT sync_state FROM folders WHERE folder_pk = ?1", params![folder_pk], |r| r.get::<_, Option<String>>(0)).optional()?.flatten().map(SyncState)))
     }
@@ -716,11 +845,13 @@ impl Store {
                 let conv_pk = link_conversation(tx, account, item_pk, &m.meta)?;
                 touched.add(Some(conv_pk), folder_pk);
 
+                // Reply-To лежит в той же таблице с kind = 4 (`RecipientKind::ReplyTo`): отдельной
+                // колонки и миграции не нужно, представление индекса берёт только kind 1 и 2.
                 tx.execute("DELETE FROM recipients WHERE item_pk = ?1", params![item_pk])?;
                 let mut rec = tx.prepare_cached("INSERT INTO recipients(item_pk, kind, name, email, position) VALUES (?1, ?2, ?3, ?4, ?5)")?;
-                for (kind, list) in [(1i64, &m.to), (2, &m.cc), (3, &m.bcc)] {
+                for (kind, list) in [(RecipientKind::To, &m.to), (RecipientKind::Cc, &m.cc), (RecipientKind::Bcc, &m.bcc), (RecipientKind::ReplyTo, &m.reply_to)] {
                     for (i, p) in list.iter().enumerate() {
-                        rec.execute(params![item_pk, kind, p.name, p.email, i as i64])?;
+                        rec.execute(params![item_pk, kind.as_i64(), p.name, p.email, i as i64])?;
                     }
                 }
 
@@ -1520,16 +1651,43 @@ fn upsert_folder(tx: &Transaction, account: AccountId, f: &Folder, now: i64) -> 
     Ok(())
 }
 
-/// Текущее положение письма: ключ, беседа, папка.
+/// Поддерево папки (сама папка первой, затем не удалённые подпапки в ширину) по цепочке
+/// `parent_server_id`; защита от цикла — через множество увиденных и предел глубины.
+fn folder_subtree(tx: &Transaction, account_id: i64, folder_pk: i64) -> Result<Vec<i64>> {
+    let mut out = vec![folder_pk];
+    let mut queue: Vec<(i64, usize)> = vec![(folder_pk, 0)];
+    let mut st = tx.prepare_cached("SELECT c.folder_pk FROM folders c JOIN folders p ON p.account_id = c.account_id AND p.server_id = c.parent_server_id WHERE p.folder_pk = ?1 AND c.account_id = ?2 AND c.deleted = 0")?;
+    while let Some((pk, depth)) = queue.pop() {
+        if depth > 64 {
+            break;
+        }
+        let children = st.query_map(params![pk, account_id], |r| r.get::<_, i64>(0))?.collect::<std::result::Result<Vec<_>, _>>()?;
+        for c in children {
+            if !out.contains(&c) {
+                out.push(c);
+                queue.push((c, depth + 1));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Текущее положение письма: ключ, беседа, папка, прочитанность и признак удаления.
 struct ItemState {
     item_pk: i64,
     conversation_pk: Option<i64>,
     folder_pk: i64,
+    is_read: bool,
+    deleted: bool,
 }
 
 fn item_state(tx: &Transaction, account: AccountId, server_id: &str) -> Result<Option<ItemState>> {
-    let mut st = tx.prepare_cached("SELECT item_pk, conversation_pk, folder_pk FROM items WHERE account_id = ?1 AND server_id = ?2")?;
-    Ok(st.query_row(params![account.0, server_id], |r| Ok(ItemState { item_pk: r.get(0)?, conversation_pk: r.get(1)?, folder_pk: r.get(2)? })).optional()?)
+    let mut st = tx.prepare_cached("SELECT item_pk, conversation_pk, folder_pk, is_read, deleted FROM items WHERE account_id = ?1 AND server_id = ?2")?;
+    Ok(st
+        .query_row(params![account.0, server_id], |r| {
+            Ok(ItemState { item_pk: r.get(0)?, conversation_pk: r.get(1)?, folder_pk: r.get(2)?, is_read: r.get::<_, i64>(3)? != 0, deleted: r.get::<_, i64>(4)? != 0 })
+        })
+        .optional()?)
 }
 
 /// Положение и состояние письма по первичному ключу (для локальных операций записи).
@@ -1575,16 +1733,17 @@ impl Touched {
         }
     }
 
-    fn recompute(&self, tx: &Transaction) -> Result<()> {
+    /// Пересчитывает агрегаты затронутых пар и бесед; возвращает беседы (по возрастанию).
+    fn recompute(&self, tx: &Transaction) -> Result<Vec<i64>> {
         let mut convs: BTreeSet<i64> = BTreeSet::new();
         for (c, f) in &self.pairs {
             recompute_conversation_folder(tx, *c, *f)?;
             convs.insert(*c);
         }
-        for c in convs {
-            recompute_conversation(tx, c)?;
+        for c in &convs {
+            recompute_conversation(tx, *c)?;
         }
-        Ok(())
+        Ok(convs.into_iter().collect())
     }
 }
 
@@ -1650,6 +1809,14 @@ fn apply_changes_in_tx(tx: &Transaction, account: AccountId, folder_pk: i64, cha
                 if let Some(p) = &prev {
                     fts_delete(tx, p.item_pk)?;
                     touched.add(p.conversation_pk, p.folder_pk);
+                    // Сервер видит письмо в другой папке, чем локальная строка (перенос локально
+                    // применён, а сервер ещё ждёт окно отмены, и `Update` вернул письмо назад):
+                    // счётчики папок сдвигаются вместе со строкой, иначе `move_local` при
+                    // подтверждении или откате посчитает дельту от фактической папки второй раз.
+                    if !p.deleted && p.folder_pk != folder_pk {
+                        adjust_folder_counts(tx, p.folder_pk, -1, -(!p.is_read as i64), now)?;
+                        adjust_folder_counts(tx, folder_pk, 1, !m.is_read as i64, now)?;
+                    }
                 }
                 let up = upsert_meta(tx, account, folder_pk, m, now)?;
                 if let Some((c, f)) = up.adopted_from {
@@ -1881,9 +2048,124 @@ mod tests {
             to: vec![Participant { name: Some("Я".into()), email: Some("me@x.ru".into()), routing_type: None }],
             cc: vec![],
             bcc: vec![],
+            reply_to: vec![],
             body: Some(MessageBody { body_type: BodyType::Html, unique_body: Some(body.into()), full_body: None, is_truncated: false }),
             attachments,
         }
+    }
+
+    #[test]
+    fn reply_to_is_stored_as_kind_4() {
+        let s = tmp_store("replyto");
+        let acc = s.account("h", "u").unwrap();
+        s.upsert_folders(acc, &[folder("Входящие", Some("inbox"))]).unwrap();
+        let (fpk, _) = s.folder_by_distinguished(acc, "inbox").unwrap().unwrap();
+        let mut m = full(meta("A", "Рассылка"), "<p>Новости</p>", vec![]);
+        m.reply_to = vec![Participant { name: Some("Шлёпанцев Владелец".into()), email: Some("owner@list.ru".into()), routing_type: Some("SMTP".into()) }];
+        s.store_full_messages(acc, fpk, std::slice::from_ref(&m)).unwrap();
+        let pk: i64 = s.debug_query("SELECT item_pk FROM items WHERE server_id = 'A'").unwrap()[1].parse().unwrap();
+        let rec = s.recipients(pk).unwrap();
+        assert_eq!(rec.iter().map(|r| (r.kind, r.email.clone().unwrap())).collect::<Vec<_>>(), vec![(1, "me@x.ru".to_string()), (4, "owner@list.ru".to_string())]);
+        let head = s.message_head(pk).unwrap().unwrap();
+        assert_eq!(head.reply_to, vec![Participant { name: Some("Шлёпанцев Владелец".into()), email: Some("owner@list.ru".into()), routing_type: None }]);
+        assert_eq!(aiowa_core::effective_reply_to(Some(&meta("A", "x").from.unwrap()), &head.reply_to).len(), 1, "адрес отличается от отправителя — ответ идёт на него");
+        let conv = s.item_ref(pk).unwrap().unwrap().conversation_pk.unwrap();
+        assert_eq!(s.conversation_messages(acc, conv).unwrap()[0].reply_to.len(), 1);
+        // Reply-To не попадает в индекс получателей (представление берёт kind 1 и 2) и в подсказки не мешает «Кому».
+        assert!(s.search(acc, "кому:шлепанцев", 10).unwrap().is_empty(), "Reply-To не индексируется как получатель");
+        assert_eq!(s.search(acc, "кому:я", 10).unwrap().len(), 1);
+        // Повторная запись без Reply-To (заголовок исчез) убирает строки kind 4.
+        m.reply_to.clear();
+        s.store_full_messages(acc, fpk, &[m]).unwrap();
+        assert!(s.message_head(pk).unwrap().unwrap().reply_to.is_empty());
+        assert_eq!(s.recipients(pk).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn folder_local_operations() {
+        let s = tmp_store("folderops");
+        let acc = s.account("h", "u").unwrap();
+        s.upsert_folders(
+            acc,
+            &[
+                folder_with("Входящие", Some("inbox"), Some("IPF.Note"), Some("ROOT"), 100),
+                folder_with("Удаленные", Some("deleteditems"), Some("IPF.Note"), Some("ROOT"), 5),
+                folder_with("Проекты", None, Some("IPF.Note"), Some("ROOT"), 3),
+                folder_with("Старые", None, Some("IPF.Note"), Some("Проекты"), 2),
+                folder_with("Архив 2020", None, Some("IPF.Note"), Some("Старые"), 1),
+            ],
+        )
+        .unwrap();
+        assert_eq!(s.msgfolderroot_server_id(acc).unwrap().as_deref(), Some("F-ROOT"), "корень — родитель «Входящих»");
+        let (inbox, _) = s.folder_by_distinguished(acc, "inbox").unwrap().unwrap();
+        let (trash, _) = s.folder_by_distinguished(acc, "deleteditems").unwrap().unwrap();
+        let projects = s.resolve_folder(acc, "Проекты").unwrap().unwrap().folder_pk;
+        let old = s.resolve_folder(acc, "Старые").unwrap().unwrap().folder_pk;
+        let archive = s.resolve_folder(acc, "Архив 2020").unwrap().unwrap().folder_pk;
+
+        // insert_folder: новая папка в корне, повтор (синхронизация успела первой) не дублирует.
+        let created = Folder {
+            id: FolderId { id: "F-NEW".into(), change_key: Some("n1".into()) },
+            parent_id: Some(FolderId { id: "F-ROOT".into(), change_key: None }),
+            display_name: "AIOWA тест".into(),
+            distinguished: None,
+            folder_class: Some("IPF.Note".into()),
+            total_count: 0,
+            unread_count: 0,
+            child_folder_count: 0,
+        };
+        let new_pk = s.insert_folder(acc, &created).unwrap();
+        assert_eq!(s.insert_folder(acc, &created).unwrap(), new_pk);
+        assert_eq!(s.folder_id_by_pk(acc, new_pk).unwrap(), Some(created.id.clone()));
+        assert_eq!(s.list_folders(acc).unwrap().iter().filter(|(_, f)| f.display_name == "AIOWA тест").count(), 1);
+
+        // rename_folder_local: имя и ChangeKey из ответа сервера; неизвестная папка — ошибка.
+        s.rename_folder_local(new_pk, "AIOWA тест 2", Some(&FolderId { id: "F-NEW".into(), change_key: Some("n2".into()) })).unwrap();
+        let f = s.folder_by_pk(acc, new_pk).unwrap().unwrap();
+        assert_eq!(f.name, "AIOWA тест 2");
+        assert_eq!(s.folder_id_by_pk(acc, new_pk).unwrap().unwrap().change_key.as_deref(), Some("n2"));
+        s.rename_folder_local(new_pk, "AIOWA тест 3", None).unwrap();
+        assert_eq!(s.folder_id_by_pk(acc, new_pk).unwrap().unwrap().change_key.as_deref(), Some("n2"), "без идентификатора ключ не трогается");
+        assert!(s.rename_folder_local(9999, "x", None).is_err());
+
+        // Письма в поддереве «Проекты»: по одному в каждой папке, одна беседа.
+        s.apply_item_changes(acc, projects, &[ItemChange::Create(meta_at("P", "Проект", "2026-10-01T10:00:00Z", Some("c1")))]).unwrap();
+        s.apply_item_changes(acc, old, &[ItemChange::Create(meta_at("O", "RE: Проект", "2026-10-02T10:00:00Z", Some("c1")))]).unwrap();
+        s.apply_item_changes(acc, archive, &[ItemChange::Create(meta_at("Z", "Другое", "2026-10-03T10:00:00Z", None))]).unwrap();
+        s.apply_item_changes(acc, inbox, &[ItemChange::Create(meta_at("I", "RE: Проект", "2026-10-04T10:00:00Z", Some("c1")))]).unwrap();
+        assert_eq!(s.search(acc, "тема:проект", 10).unwrap().len(), 3);
+
+        // Служебную папку удалить нельзя; перенос в собственную подпапку — тоже.
+        assert!(s.delete_folder_local(inbox, None).is_err());
+        assert!(s.delete_folder_local(projects, Some(old)).is_err());
+
+        // В «Удалённые»: поддерево целиком меняет родителя, письма на месте.
+        let st = s.delete_folder_local(projects, Some(trash)).unwrap();
+        assert_eq!(st, FolderDeleteStats { folders: 3, items: 0, conversation_pks: Vec::new() });
+        let folders = s.list_folders(acc).unwrap();
+        let parent_of = |name: &str| folders.iter().find(|(_, f)| f.display_name == name).map(|(_, f)| f.parent_id.as_ref().unwrap().id.clone()).unwrap();
+        assert_eq!(parent_of("Проекты"), "F-Удаленные");
+        assert_eq!(parent_of("Старые"), "F-Проекты", "подпапка остаётся под своей папкой");
+        assert_eq!(s.list_items(acc, old, 10).unwrap().len(), 1);
+        assert_eq!(s.search(acc, "тема:проект", 10).unwrap().len(), 3);
+
+        // Навсегда: три папки и три письма помечены удалёнными, беседа в «Входящих» похудела, индекс чист.
+        let st = s.delete_folder_local(projects, None).unwrap();
+        assert_eq!((st.folders, st.items), (3, 3));
+        let project_conv = s.list_conversations(acc, inbox, 10).unwrap().into_iter().find(|c| c.topic.as_deref() == Some("Проект")).unwrap().conversation_pk;
+        assert_eq!(st.conversation_pks.len(), 2, "беседы «Проект» и «Другое»");
+        assert!(st.conversation_pks.contains(&project_conv), "беседа с письмом во «Входящих» названа: окно перечитает её");
+        assert!(s.folder_by_pk(acc, projects).unwrap().is_none());
+        assert!(s.folder_by_pk(acc, archive).unwrap().is_none());
+        assert!(s.list_folders(acc).unwrap().iter().all(|(_, f)| f.display_name != "Старые"));
+        assert!(s.list_items(acc, old, 10).unwrap().is_empty());
+        assert_eq!(s.search(acc, "тема:проект", 10).unwrap().len(), 1, "осталось письмо во «Входящих»");
+        assert!(s.search(acc, "тема:другое", 10).unwrap().is_empty());
+        let conv = s.list_conversations(acc, inbox, 10).unwrap().into_iter().find(|c| c.topic.as_deref() == Some("Проект")).unwrap();
+        assert_eq!((conv.item_count, conv.total_count), (1, 1), "агрегаты беседы пересчитаны без удалённых писем");
+        assert!(s.list_conversations(acc, old, 10).unwrap().is_empty());
+        assert!(s.delete_folder_local(projects, None).is_err(), "удалённая папка не находится");
+        assert_eq!(s.stats(acc).unwrap().items, 1);
     }
 
     #[test]
@@ -2338,6 +2620,72 @@ mod tests {
         assert_eq!(conv_in(inbox).item_count, 1);
         assert_eq!(conv_in(archive).item_count, 1);
         assert_eq!(s.stats(acc).unwrap().items, 4, "A, X, S и B2");
+    }
+
+    /// Окно отмены: письмо перенесено локально (`move_local` без идентификатора), а синхронизация
+    /// исходной папки принесла по нему `Update` — строка возвращается в исходную папку вместе со
+    /// счётчиками, и подтверждение (или откат) переноса даёт верную дельту. `ReadFlag` строку не возвращает.
+    #[test]
+    fn sync_update_during_undo_window_keeps_folder_counts() {
+        let s = tmp_store("staged-update");
+        let acc = s.account("h", "u").unwrap();
+        s.upsert_folders(acc, &[folder("Входящие", Some("inbox")), folder("Удаленные", Some("deleteditems"))]).unwrap();
+        let (inbox, _) = s.folder_by_distinguished(acc, "inbox").unwrap().unwrap();
+        let (trash, _) = s.folder_by_distinguished(acc, "deleteditems").unwrap().unwrap();
+        let counts = |fpk: i64| -> (i64, i64) {
+            let line = &s.debug_query(&format!("SELECT total_count || ',' || unread_count FROM folders WHERE folder_pk = {fpk}")).unwrap()[1];
+            let (t, u) = line.split_once(',').unwrap();
+            (t.parse().unwrap(), u.parse().unwrap())
+        };
+        let a_meta = meta_at("A", "Договор", "2026-10-01T10:00:00Z", Some("c1"));
+        s.apply_item_changes(acc, inbox, &[ItemChange::Create(a_meta.clone())]).unwrap();
+        let a: i64 = s.debug_query("SELECT item_pk FROM items WHERE server_id = 'A'").unwrap()[1].parse().unwrap();
+        assert_eq!((counts(inbox), counts(trash)), ((10, 1), (10, 1)), "счётчики из иерархии; синхронизация их не трогает");
+
+        // Удаление поставлено в окно отмены: локально письмо в «Удалённых».
+        s.move_local(a, trash, None).unwrap();
+        assert_eq!((counts(inbox), counts(trash)), ((9, 0), (11, 2)));
+        assert!(s.list_conversations(acc, inbox, 10).unwrap().is_empty());
+
+        // Другой клиент изменил письмо: Update по «Входящим» возвращает строку туда же вместе со счётчиками.
+        s.apply_item_changes(acc, inbox, &[ItemChange::Update(a_meta.clone())]).unwrap();
+        assert_eq!(s.item_ref(a).unwrap().unwrap().folder_pk, inbox, "сервер видит письмо во «Входящих»");
+        assert_eq!((counts(inbox), counts(trash)), ((10, 1), (10, 1)), "счётчики следуют за строкой");
+        assert_eq!(s.list_conversations(acc, inbox, 10).unwrap().len(), 1);
+
+        // Срок вышел: подтверждение переноса с новым идентификатором — дельта ровно одна.
+        s.move_local(a, trash, Some(&ItemId { id: "A2".into(), change_key: Some("k2".into()) })).unwrap();
+        assert_eq!(s.item_ref(a).unwrap().unwrap().folder_pk, trash);
+        assert_eq!((counts(inbox), counts(trash)), ((9, 0), (11, 2)), "как после одного переноса, а не двух");
+        assert!(s.list_conversations(acc, inbox, 10).unwrap().is_empty());
+
+        // Откат после такого же Update: строка и счётчики как до действия (письмо прочитанное,
+        // чтобы счётчик непрочитанных не упирался в ноль).
+        let mut b_meta = meta_at("B", "Счёт", "2026-10-02T10:00:00Z", Some("c2"));
+        b_meta.is_read = true;
+        s.apply_item_changes(acc, inbox, &[ItemChange::Create(b_meta.clone())]).unwrap();
+        let b: i64 = s.debug_query("SELECT item_pk FROM items WHERE server_id = 'B'").unwrap()[1].parse().unwrap();
+        let before = (counts(inbox), counts(trash));
+        s.move_local(b, trash, None).unwrap();
+        s.apply_item_changes(acc, inbox, &[ItemChange::Update(b_meta)]).unwrap();
+        s.move_local(b, inbox, None).unwrap();
+        assert_eq!(s.item_ref(b).unwrap().unwrap().folder_pk, inbox);
+        assert_eq!((counts(inbox), counts(trash)), before, "после отката дрейфа нет");
+
+        // ReadFlagChange строку не возвращает и счётчики папок не трогает.
+        s.move_local(b, trash, None).unwrap();
+        let moved = (counts(inbox), counts(trash));
+        s.apply_item_changes(acc, inbox, &[ItemChange::ReadFlag { item_id: ItemId { id: "B".into(), change_key: None }, is_read: false }]).unwrap();
+        let r = s.item_ref(b).unwrap().unwrap();
+        assert_eq!((r.folder_pk, r.is_read), (trash, false));
+        assert_eq!((counts(inbox), counts(trash)), moved);
+
+        // Update по удалённой строке счётчики не сдвигает (её в исходной папке не считали).
+        s.mark_deleted_local(&[b]).unwrap();
+        let after_delete = (counts(inbox), counts(trash));
+        s.apply_item_changes(acc, inbox, &[ItemChange::Update(meta_at("B", "Счёт", "2026-10-02T10:00:00Z", Some("c2")))]).unwrap();
+        assert_eq!(s.item_ref(b).unwrap().unwrap().folder_pk, inbox);
+        assert_eq!((counts(inbox), counts(trash)), after_delete);
     }
 
     #[test]

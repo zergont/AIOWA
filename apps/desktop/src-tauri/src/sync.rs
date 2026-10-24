@@ -119,18 +119,42 @@ struct Inner {
     pending: Option<PendingSync>,
 }
 
-/// Отложенная синхронизация: все почтовые папки или список ключей папок без повторов.
+/// Что синхронизировать за один запуск.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Scope {
+    /// Дерево папок и все почтовые папки.
+    AllMail,
+    /// Дерево папок и только эти папки (ключи локальной базы, не пусто).
+    Folders(Vec<i64>),
+    /// Только дерево папок (`SyncFolderHierarchy`): после создания, переименования и удаления
+    /// папки из окна, когда письма перечитывать не нужно.
+    HierarchyOnly,
+}
+
+impl Scope {
+    /// Из аргумента команды окна: `None` или пустой список — все почтовые папки.
+    fn from_folders(folders: Option<Vec<i64>>) -> Self {
+        match folders {
+            Some(pks) if !pks.is_empty() => Scope::Folders(pks),
+            _ => Scope::AllMail,
+        }
+    }
+}
+
+/// Отложенная синхронизация: всё, список ключей папок без повторов и/или только дерево.
 #[derive(Debug, Default)]
 struct PendingSync {
     all: bool,
     folders: Vec<i64>,
+    hierarchy: bool,
 }
 
 impl PendingSync {
-    fn merge(&mut self, folders: Option<Vec<i64>>) {
-        match folders {
-            None => self.all = true,
-            Some(pks) => {
+    fn merge(&mut self, scope: Scope) {
+        match scope {
+            Scope::AllMail => self.all = true,
+            Scope::HierarchyOnly => self.hierarchy = true,
+            Scope::Folders(pks) => {
                 for pk in pks {
                     if !self.folders.contains(&pk) {
                         self.folders.push(pk);
@@ -140,9 +164,16 @@ impl PendingSync {
         }
     }
 
-    /// Аргумент `folders` для `start`: `None` — все папки.
-    fn into_folders(self) -> Option<Vec<i64>> {
-        if self.all { None } else { Some(self.folders) }
+    /// Объём следующего запуска: всё перекрывает список папок, список — одно дерево
+    /// (прогон по папкам и так начинается с дерева).
+    fn into_scope(self) -> Scope {
+        if self.all {
+            Scope::AllMail
+        } else if !self.folders.is_empty() {
+            Scope::Folders(self.folders)
+        } else {
+            Scope::HierarchyOnly
+        }
     }
 }
 
@@ -225,22 +256,30 @@ impl SyncState {
     /// Запускает синхронизацию, если она не идёт. Возвращает статус сразу после запуска.
     /// `folders` — только эти папки (ключи локальной базы); `None` или пусто — все почтовые.
     pub fn start(self: &Arc<Self>, app: AppHandle, days: Option<u32>, folders: Option<Vec<i64>>) -> SyncStatusDto {
-        self.launch(app, days, folders, false)
+        self.launch(app, days, Scope::from_folders(folders), false)
     }
 
     /// Запрос от канала уведомлений: как `start`, но если синхронизация уже идёт, папки
     /// запоминаются и запускаются сразу по её концу (объединяясь с другими такими запросами).
     pub fn request(self: &Arc<Self>, app: AppHandle, folders: Option<Vec<i64>>) {
-        self.launch(app, None, folders, true);
+        self.launch(app, None, Scope::from_folders(folders), true);
     }
 
-    fn launch(self: &Arc<Self>, app: AppHandle, days: Option<u32>, folders: Option<Vec<i64>>, queue_if_busy: bool) -> SyncStatusDto {
+    /// Запрос только дерева папок после операции с папкой из окна (`folders.rs`): сервер уже
+    /// ответил, локальная строка поправлена, иерархия сверит имена, родителей и счётчики. Если
+    /// синхронизация идёт, дерево обновится сразу по её концу. По завершении — событие
+    /// `folders-changed`.
+    pub fn request_hierarchy(self: &Arc<Self>, app: AppHandle) {
+        self.launch(app, None, Scope::HierarchyOnly, true);
+    }
+
+    fn launch(self: &Arc<Self>, app: AppHandle, days: Option<u32>, scope: Scope, queue_if_busy: bool) -> SyncStatusDto {
         let cancel = Arc::new(AtomicBool::new(false));
         {
             let mut g = self.lock();
             if g.status.running || self.closing.load(Ordering::SeqCst) {
                 if queue_if_busy && g.status.running {
-                    g.pending.get_or_insert_with(PendingSync::default).merge(folders);
+                    g.pending.get_or_insert_with(PendingSync::default).merge(scope);
                 }
                 return g.status.clone();
             }
@@ -265,7 +304,7 @@ impl SyncState {
         let this = self.clone();
         let app_for_task = app.clone();
         let handle = tauri::async_runtime::spawn(async move {
-            this.run(app_for_task, days, folders, cancel).await;
+            this.run(app_for_task, days, scope, cancel).await;
         });
         let mut g = self.lock();
         g.task = Some(handle);
@@ -364,9 +403,17 @@ impl SyncState {
         }
     }
 
-    async fn run(self: Arc<Self>, app: AppHandle, days: Option<u32>, folders: Option<Vec<i64>>, cancel: Arc<AtomicBool>) {
-        let outcome = self.run_inner(&app, days, folders, cancel).await;
+    async fn run(self: Arc<Self>, app: AppHandle, days: Option<u32>, scope: Scope, cancel: Arc<AtomicBool>) {
+        let hierarchy_only = scope == Scope::HierarchyOnly;
+        let outcome = self.run_inner(&app, days, scope, cancel).await;
         match &outcome {
+            // Прогон по одному дереву время «последней синхронизации» и итог не меняет: письма не читались.
+            Ok(report) if hierarchy_only => {
+                info!(elapsed_ms = report.elapsed.as_millis() as u64, folders = report.folders_in_hierarchy, "дерево папок обновлено по запросу окна");
+                if let Err(e) = app.emit("folders-changed", ()) {
+                    warn!(error = %e, "не удалось отправить событие folders-changed");
+                }
+            }
             Ok(report) => {
                 let ms = now_ms();
                 if let Err(e) = self.store.set_state(self.account, LAST_OK_KEY, Some(&ms.to_string())) {
@@ -391,6 +438,7 @@ impl SyncState {
             s.done = 0;
             s.total = None;
             match &outcome {
+                Ok(_) if hierarchy_only => s.last_error = None,
                 Ok(report) => {
                     s.last_ok_ms = Some(finished_ms);
                     s.last_error = None;
@@ -413,26 +461,41 @@ impl SyncState {
             g.cancel = None;
             g.pending.take()
         };
-        // Папки, о которых канал сообщил во время прогона: сразу следующий прогон (не при выходе).
+        // Папки, о которых канал сообщил во время прогона (или дерево, которое окно поправило):
+        // сразу следующий прогон (не при выходе).
         if let Some(p) = pending
             && !self.closing.load(Ordering::SeqCst)
         {
-            let folders = p.into_folders();
-            info!(folders = folders.as_ref().map(Vec::len), "синхронизация по отложенному запросу канала уведомлений");
-            self.start(app, None, folders);
+            let scope = p.into_scope();
+            info!(?scope, "синхронизация по отложенному запросу");
+            self.launch(app, None, scope, false);
         }
     }
 
-    async fn run_inner(self: &Arc<Self>, app: &AppHandle, days: Option<u32>, folders: Option<Vec<i64>>, cancel: Arc<AtomicBool>) -> Result<SyncReport, Outcome> {
+    async fn run_inner(self: &Arc<Self>, app: &AppHandle, days: Option<u32>, scope: Scope, cancel: Arc<AtomicBool>) -> Result<SyncReport, Outcome> {
         let transport = self.transport().await.map_err(|e| Outcome::Failed { message: e.to_string(), cause: None })?;
         if cancel.load(Ordering::Relaxed) {
             return Err(Outcome::Cancelled);
         }
+        let progress: aiowa_sync::ProgressFn = {
+            let app = app.clone();
+            let st = self.clone();
+            Arc::new(move |e: &SyncEvent| st.on_event(&app, e))
+        };
+        let engine = Engine::new(Arc::new(transport.clone()), self.store.clone(), self.account, cancel).on_progress(progress);
+        let folders = match scope {
+            Scope::AllMail => FolderSelection::AllMail,
+            Scope::Folders(pks) => FolderSelection::Ids(pks),
+            Scope::HierarchyOnly => {
+                let started = std::time::Instant::now();
+                return match engine.sync_hierarchy().await {
+                    Ok(n) => Ok(SyncReport { folders_in_hierarchy: n, elapsed: started.elapsed(), ..SyncReport::default() }),
+                    Err(e) => Err(Self::failed(e)),
+                };
+            }
+        };
         let opts = SyncOptions {
-            folders: match folders {
-                Some(pks) if !pks.is_empty() => FolderSelection::Ids(pks),
-                _ => FolderSelection::AllMail,
-            },
+            folders,
             body_days: match days {
                 Some(0) => None,
                 Some(d) => Some(d),
@@ -440,17 +503,15 @@ impl SyncState {
             },
             ..SyncOptions::default()
         };
-        let progress: aiowa_sync::ProgressFn = {
-            let app = app.clone();
-            let st = self.clone();
-            Arc::new(move |e: &SyncEvent| st.on_event(&app, e))
-        };
-        let engine = Engine::new(Arc::new(transport.clone()), self.store.clone(), self.account, cancel).on_progress(progress);
-        match engine.run(&opts).await {
-            Ok(r) => Ok(r),
-            Err(aiowa_sync::SyncError::Cancelled) => Err(Outcome::Cancelled),
-            Err(aiowa_sync::SyncError::Transport(e)) => Err(Outcome::Failed { message: e.to_string(), cause: Some(e) }),
-            Err(e) => Err(Outcome::Failed { message: e.to_string(), cause: None }),
+        engine.run(&opts).await.map_err(Self::failed)
+    }
+
+    /// Ошибка движка в исход запуска: транспортная сохраняет причину для `invalidate_on`.
+    fn failed(e: aiowa_sync::SyncError) -> Outcome {
+        match e {
+            aiowa_sync::SyncError::Cancelled => Outcome::Cancelled,
+            aiowa_sync::SyncError::Transport(e) => Outcome::Failed { message: e.to_string(), cause: Some(e) },
+            e => Outcome::Failed { message: e.to_string(), cause: None },
         }
     }
 

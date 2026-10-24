@@ -1,7 +1,7 @@
 <script lang="ts">
   import { SvelteSet } from "svelte/reactivity";
-  import { errorMessage, listDate, type ComposeKind, type Conversation, type Folder } from "../api";
-  import { COMPOSE_ACTIONS, ICON, conversationActionLabels, isDeletedFolder, type ItemAction } from "../actions";
+  import { conversationsText, errorMessage, listDate, type ComposeKind, type Conversation, type Folder } from "../api";
+  import { COMPOSE_ACTIONS, DND_CONVERSATIONS, ICON, conversationActionLabels, isDeletedFolder, type DragPayload, type ItemAction } from "../actions";
   import { focusBack, type Anchor } from "../popover";
   import ContextMenu, { type MenuItem } from "./ContextMenu.svelte";
   import FolderPicker from "./FolderPicker.svelte";
@@ -10,19 +10,30 @@
   interface Props {
     folder: Folder | null;
     conversations: Conversation[];
+    /** Беседа в фокусе: открыта в области чтения, когда выбор одиночный; при множественном — строка-курсор. */
     selected: Conversation | null;
+    /** Множественный выбор (Ctrl/Shift+клик, Ctrl+A): все выбранные беседы, включая `selected`. */
+    selectedPks: Set<number>;
     loading: boolean;
     hasMore: boolean;
+    /** Одиночный выбор: открыть беседу. */
     onselect: (c: Conversation) => void;
+    /** Множественный выбор (две и больше): `focus` — строка-курсор для клавиатуры. */
+    onselection: (pks: number[], focus: Conversation) => void;
     onmore: () => void;
     /** Папки для «Переместить…». */
     folders: Folder[];
-    /** Действие над всеми письмами беседы в текущей папке («снять флаг» — во всех папках); промис отклоняется текстом ошибки. */
-    onaction: (c: Conversation, action: ItemAction) => Promise<void>;
+    /** Папка архива (для «В архив» в ней самой кнопка недоступна); null — папки нет, App предложит создать. */
+    archiveFolderPk: number | null;
+    /**
+     * Действие над всеми письмами выбранных бесед в текущей папке («снять флаг» — во всех папках);
+     * `anchor` — откуда вызвано (для вопросов вроде «создать папку архива?»); промис отклоняется текстом ошибки.
+     */
+    onaction: (targets: Conversation[], action: ItemAction, anchor: Anchor) => Promise<void>;
     /** Ответ, ответ всем или пересылка самого свежего письма беседы в текущей папке. */
     oncompose: (c: Conversation, kind: ComposeKind) => void;
   }
-  let { folder, conversations, selected, loading, hasMore, onselect, onmore, folders, onaction, oncompose }: Props = $props();
+  let { folder, conversations, selected, selectedPks, loading, hasMore, onselect, onselection, onmore, folders, archiveFolderPk, onaction, oncompose }: Props = $props();
 
   // Простая виртуализация: рисуем только строки в окне прокрутки плюс запас.
   const ROW = 72;
@@ -43,12 +54,21 @@
     if (hasMore && !loading && scroller.scrollTop + scroller.clientHeight > scroller.scrollHeight - ROW * 10) onmore();
   }
 
+  /** Строка с индексом idx целиком в окне прокрутки (после хода клавиатурой). */
+  function ensureVisible(idx: number) {
+    if (!scroller || idx < 0) return;
+    const top = idx * ROW;
+    if (top < scroller.scrollTop) scroller.scrollTop = top;
+    else if (top + ROW > scroller.scrollTop + scroller.clientHeight) scroller.scrollTop = top + ROW - scroller.clientHeight;
+  }
+
   // Ключ папки, а не объект: после синхронизации объект папки заменяется свежим (новые счётчики),
   // и список не должен прыгать в начало.
   const folderPk = $derived(folder?.folder_pk ?? null);
   $effect(() => {
-    // При смене папки прокрутка в начало.
+    // При смене папки прокрутка в начало; якорь диапазона из прежней папки не годится.
     void folderPk;
+    anchorPk = null;
     if (scroller) {
       scroller.scrollTop = 0;
       scrollTop = 0;
@@ -62,12 +82,95 @@
     return names.length > 3 ? `${names.slice(0, 3).join(", ")} +${names.length - 3}` : names.join(", ");
   }
 
-  // --- действия над беседой: контекстное меню, перенос, удаление -------------------
+  // --- выбор: одиночный, Ctrl/Shift+клик, Ctrl+A, Shift+стрелки ---------------------------------
+
+  /** Выбранные беседы: если родитель ещё не дал набор, это одна открытая беседа. */
+  const sel = $derived<Set<number>>(selectedPks.size ? selectedPks : selected ? new Set([selected.conversation_pk]) : new Set());
+  const multi = $derived(sel.size > 1);
+  /** Выбранные беседы в порядке списка. */
+  const targets = $derived.by((): Conversation[] => (multi ? conversations.filter((c) => sel.has(c.conversation_pk)) : selected ? [selected] : []));
+  /** Строка, от которой считается диапазон Shift+клика и Shift+стрелок. */
+  let anchorPk: number | null = null;
+  $effect(() => {
+    // Одиночный выбор извне (сосед после удаления, новое письмо из тоста, восстановление) переносит
+    // якорь на открытую беседу; при множественном выборе якорь остаётся — от него идут Shift+стрелки.
+    if (selectedPks.size <= 1) anchorPk = selected?.conversation_pk ?? null;
+  });
+
+  function indexOf(pk: number | null | undefined): number {
+    return pk == null ? -1 : conversations.findIndex((c) => c.conversation_pk === pk);
+  }
+
+  /** Отдать набор родителю: одна беседа — обычный выбор, больше — множественный. */
+  function emitSelection(pks: number[], focus: Conversation) {
+    if (pks.length <= 1) {
+      const only = conversations.find((c) => c.conversation_pk === pks[0]) ?? focus;
+      anchorPk = only.conversation_pk;
+      onselect(only);
+    } else onselection(pks, focus);
+  }
+
+  function selectOne(c: Conversation) {
+    anchorPk = c.conversation_pk;
+    onselect(c);
+  }
+
+  /** Диапазон от якоря до c (включительно); якорь остаётся, курсор — c. Якоря в списке нет — от курсора. */
+  function selectRange(c: Conversation) {
+    let a = indexOf(anchorPk);
+    if (a < 0) a = indexOf(selected?.conversation_pk);
+    const b = indexOf(c.conversation_pk);
+    if (a < 0 || b < 0) {
+      selectOne(c);
+      return;
+    }
+    const [lo, hi] = a < b ? [a, b] : [b, a];
+    emitSelection(
+      conversations.slice(lo, hi + 1).map((x) => x.conversation_pk),
+      c,
+    );
+  }
+
+  /** Ctrl+клик: добавить или снять; последнюю выбранную снять нельзя. */
+  function toggleOne(c: Conversation) {
+    const next = new Set(sel);
+    const pk = c.conversation_pk;
+    if (next.has(pk)) {
+      if (next.size === 1) return;
+      next.delete(pk);
+    } else next.add(pk);
+    anchorPk = pk;
+    const focus = next.has(pk) ? c : selected && next.has(selected.conversation_pk) ? selected : (conversations.find((x) => next.has(x.conversation_pk)) ?? c);
+    emitSelection([...next], focus);
+  }
+
+  function selectAll() {
+    if (!conversations.length) return;
+    emitSelection(
+      conversations.map((c) => c.conversation_pk),
+      selected ?? conversations[0],
+    );
+  }
+
+  /** Esc: оставить только беседу-курсор. */
+  function collapseSelection() {
+    const focus = selected ?? targets[0];
+    if (focus) selectOne(focus);
+  }
+
+  function onRowClick(e: MouseEvent, c: Conversation) {
+    if (e.shiftKey) selectRange(c);
+    else if (e.ctrlKey || e.metaKey) toggleOne(c);
+    else selectOne(c);
+  }
+
+  // --- действия над беседами: контекстное меню, перенос, архив, удаление -----------------------
 
   const inDeleted = $derived(isDeletedFolder(folder));
-  let menu = $state<{ c: Conversation; anchor: Anchor } | null>(null);
-  let picker = $state<{ c: Conversation; anchor: Anchor } | null>(null);
-  let confirm = $state<{ c: Conversation; anchor: Anchor } | null>(null);
+  const inArchive = $derived(archiveFolderPk != null && archiveFolderPk === folderPk);
+  let menu = $state<{ targets: Conversation[]; anchor: Anchor } | null>(null);
+  let picker = $state<{ targets: Conversation[]; anchor: Anchor } | null>(null);
+  let confirm = $state<{ targets: Conversation[]; anchor: Anchor } | null>(null);
   let actionError = $state<string | null>(null);
   /**
    * Беседы, по которым идёт команда: повторный запуск по той же беседе не нужен, а действия над
@@ -75,44 +178,54 @@
    */
   const busy = new SvelteSet<number>();
 
+  const labels = $derived(conversationActionLabels(targets, inDeleted));
+
   const menuItems = $derived.by((): MenuItem[] => {
     if (!menu) return [];
-    const l = conversationActionLabels(menu.c, inDeleted);
+    const l = conversationActionLabels(menu.targets, inDeleted);
+    const single = menu.targets.length === 1;
     return [
-      ...COMPOSE_ACTIONS.map((a) => ({ id: a.kind, label: a.label, icon: a.icon })),
-      { id: "read", label: l.read, icon: menu.c.unread_count > 0 ? ICON.read : ICON.unread, separator: true },
+      ...(single ? COMPOSE_ACTIONS.map((a) => ({ id: a.kind, label: a.label, icon: a.icon })) : []),
+      { id: "read", label: l.read, icon: l.anyUnread ? ICON.read : ICON.unread, separator: single },
       { id: "flag", label: l.flag, icon: ICON.flag },
       { id: "move", label: l.move, icon: ICON.move },
+      { id: "archive", label: l.archive, icon: ICON.archive, disabled: inArchive },
       { id: "delete", label: l.delete, icon: ICON.delete, danger: true, separator: true },
     ];
   });
 
-  async function run(c: Conversation, action: ItemAction) {
-    const pk = c.conversation_pk;
-    if (busy.has(pk)) return;
-    busy.add(pk);
+  async function run(ts: Conversation[], action: ItemAction, anchor: Anchor) {
+    const free = ts.filter((c) => !busy.has(c.conversation_pk));
+    if (!free.length) return;
+    for (const c of free) busy.add(c.conversation_pk);
     actionError = null;
     try {
-      await onaction(c, action);
+      await onaction(free, action, anchor);
     } catch (e) {
       actionError = errorMessage(e);
     } finally {
-      busy.delete(pk);
+      for (const c of free) busy.delete(c.conversation_pk);
     }
   }
 
-  /** Якорь для окон, открытых с клавиатуры: точка у строки выбранной беседы, если она отрисована, иначе у верха списка. */
+  /** Якорь для окон, открытых с клавиатуры: точка у строки-курсора, если она отрисована, иначе у верха списка. */
   function selectedAnchor(): Anchor {
-    const row = scroller?.querySelector<HTMLElement>(".row.selected");
+    const row = scroller?.querySelector<HTMLElement>(".row.focused");
     const r = (row ?? scroller)?.getBoundingClientRect();
     return { x: (r?.left ?? 0) + 40, y: row && r ? r.bottom - 8 : (r?.top ?? 0) + 40 };
   }
 
+  /** Меню для строки: по беседе вне выбора — выбор переходит к ней; по выбранной — ко всему выбору. */
   function openMenu(c: Conversation, anchor: Anchor) {
-    if (selected?.conversation_pk !== c.conversation_pk) onselect(c);
+    let ts: Conversation[];
+    if (sel.has(c.conversation_pk)) ts = targets;
+    else {
+      selectOne(c);
+      ts = [c];
+    }
     picker = null;
     confirm = null;
-    menu = { c, anchor };
+    menu = { targets: ts, anchor };
   }
 
   function onRowContextMenu(e: MouseEvent, c: Conversation) {
@@ -129,42 +242,48 @@
     const m = menu;
     menu = null;
     if (!m) return;
-    const c = m.c;
+    const ts = m.targets;
+    const l = conversationActionLabels(ts, inDeleted);
     switch (id) {
       case "reply":
       case "reply_all":
       case "forward":
         focusBack(scroller);
-        oncompose(c, id);
+        if (ts.length === 1) oncompose(ts[0], id);
         break;
       case "read":
         focusBack(scroller);
-        void run(c, { kind: "read", read: c.unread_count > 0 });
+        void run(ts, { kind: "read", read: l.anyUnread }, m.anchor);
         break;
       case "flag":
         focusBack(scroller);
-        void run(c, { kind: "flag", flagged: !c.has_flagged });
+        void run(ts, { kind: "flag", flagged: !l.anyFlagged }, m.anchor);
         break;
       case "move":
-        picker = { c, anchor: m.anchor };
+        picker = { targets: ts, anchor: m.anchor };
+        break;
+      case "archive":
+        focusBack(scroller);
+        void run(ts, { kind: "archive" }, m.anchor);
         break;
       case "delete":
-        requestDelete(c, false, m.anchor);
+        requestDelete(ts, false, m.anchor);
         break;
     }
   }
 
-  /** Удаление: из «Удалённых» или с Shift — навсегда, с подтверждением; иначе сразу в «Удалённые». */
-  function requestDelete(c: Conversation, permanent: boolean, anchor: Anchor) {
-    if (inDeleted || permanent) confirm = { c, anchor };
-    else void run(c, { kind: "delete", permanent: false });
+  /** Удаление: из «Удалённых» или с Shift — навсегда, с подтверждением; иначе сразу в «Удалённые» (с окном отмены). */
+  function requestDelete(ts: Conversation[], permanent: boolean, anchor: Anchor) {
+    if (!ts.length) return;
+    if (inDeleted || permanent) confirm = { targets: ts, anchor };
+    else void run(ts, { kind: "delete", permanent: false }, anchor);
   }
 
   function confirmDelete() {
     const d = confirm;
     confirm = null;
     focusBack(scroller);
-    if (d) void run(d.c, { kind: "delete", permanent: true });
+    if (d) void run(d.targets, { kind: "delete", permanent: true }, d.anchor);
   }
 
   function cancelPopups() {
@@ -177,36 +296,131 @@
     const p = picker;
     picker = null;
     focusBack(scroller);
-    if (p) void run(p.c, { kind: "move", folderPk: f.folder_pk });
+    if (p) void run(p.targets, { kind: "move", folderPk: f.folder_pk }, p.anchor);
   }
+
+  /**
+   * Кнопки панели «Выбрано N»: якорь окон — сама кнопка, фокус — списку, чтобы обещанные подсказками
+   * клавиши (Esc, Delete, стрелки, Ctrl+A) работали и после клика по панели (onKey висит на списке).
+   */
+  function bulk(e: MouseEvent, action: ItemAction) {
+    const btn = e.currentTarget as HTMLElement;
+    focusBack(scroller);
+    if (action.kind === "delete") requestDelete(targets, false, btn);
+    else void run(targets, action, btn);
+  }
+
+  /** «Снять выбор» с панели: фокус списку до коллапса — после него панель исчезает вместе с кнопкой. */
+  function bulkCollapse() {
+    focusBack(scroller);
+    collapseSelection();
+  }
+
+  function bulkMove(e: MouseEvent) {
+    picker = picker ? null : { targets, anchor: e.currentTarget as HTMLElement };
+  }
+
+  const confirmTitle = $derived(confirm && confirm.targets.length > 1 ? `Удалить ${conversationsText(confirm.targets.length)} навсегда?` : "Удалить беседу навсегда?");
+  const confirmText = $derived(confirm && confirm.targets.length > 1 ? "Письма этих бесед в текущей папке исчезнут с сервера, вернуть их будет нельзя." : "Письма этой беседы в текущей папке исчезнут с сервера, вернуть их будет нельзя.");
+
+  // --- клавиатура ---------------------------------------------------------------------------------
 
   function onKey(e: KeyboardEvent) {
     if (!conversations.length) return;
-    const idx = selected ? conversations.findIndex((c) => c.conversation_pk === selected!.conversation_pk) : -1;
-    if (e.key === "ArrowDown" || e.key === "j") {
+    const ctrl = e.ctrlKey || e.metaKey;
+    const plain = !ctrl && !e.altKey;
+    const idx = indexOf(selected?.conversation_pk);
+    if (e.key === "ArrowDown" || (plain && !e.shiftKey && e.code === "KeyJ")) {
       e.preventDefault();
-      onselect(conversations[Math.min(conversations.length - 1, idx + 1)]);
-    } else if (e.key === "ArrowUp" || e.key === "k") {
+      moveFocus(Math.min(conversations.length - 1, idx + 1), e.shiftKey);
+    } else if (e.key === "ArrowUp" || (plain && !e.shiftKey && e.code === "KeyK")) {
       e.preventDefault();
-      onselect(conversations[Math.max(0, idx - 1)]);
-    } else if (e.key === "Delete" && selected && idx >= 0) {
+      moveFocus(Math.max(0, idx - 1), e.shiftKey);
+    } else if (e.key === "Home" || e.key === "End") {
       e.preventDefault();
-      requestDelete(selected, e.shiftKey, selectedAnchor());
+      moveFocus(e.key === "Home" ? 0 : conversations.length - 1, e.shiftKey);
+    } else if (ctrl && !e.shiftKey && !e.altKey && e.code === "KeyA") {
+      e.preventDefault();
+      selectAll();
+    } else if (e.key === "Escape" && multi) {
+      e.preventDefault();
+      collapseSelection();
+    } else if (e.key === "Delete" && targets.length) {
+      e.preventDefault();
+      requestDelete(targets, e.shiftKey, selectedAnchor());
+    } else if (plain && !e.shiftKey && e.code === "KeyE" && targets.length && !inArchive) {
+      e.preventDefault();
+      void run(targets, { kind: "archive" }, selectedAnchor());
     } else if ((e.key === "ContextMenu" || (e.key === "F10" && e.shiftKey)) && selected && idx >= 0) {
       e.preventDefault();
       openMenu(selected, selectedAnchor());
     }
   }
+
+  /** Стрелки: курсор на строку next; с Shift — диапазон от якоря до неё. */
+  function moveFocus(next: number, extend: boolean) {
+    const c = conversations[next];
+    if (!c) return;
+    ensureVisible(next);
+    if (extend) selectRange(c);
+    else selectOne(c);
+  }
+
+  // --- перетаскивание бесед на папки дерева --------------------------------------------------------
+
+  function onDragStart(e: DragEvent, c: Conversation) {
+    if (!e.dataTransfer || folderPk == null) return;
+    // Тащат беседу вне выбора — выбор переходит к ней; выбранную — тащится весь выбор.
+    const pks = sel.has(c.conversation_pk) ? [...sel] : [c.conversation_pk];
+    if (!sel.has(c.conversation_pk)) selectOne(c);
+    const payload: DragPayload = { conversation_pks: pks, folder_pk: folderPk };
+    e.dataTransfer.setData(DND_CONVERSATIONS, JSON.stringify(payload));
+    e.dataTransfer.effectAllowed = "move";
+    const ghost = document.createElement("div");
+    ghost.className = "drag-ghost";
+    ghost.textContent = pks.length > 1 ? conversationsText(pks.length) : c.topic || "(без темы)";
+    document.body.appendChild(ghost);
+    e.dataTransfer.setDragImage(ghost, 12, 14);
+    setTimeout(() => ghost.remove(), 0);
+    menu = null;
+  }
 </script>
 
-<div class="head">
-  <h2 class="title">{folder?.name ?? "Почта"}</h2>
-  <span class="caption">
-    {#if folder}
-      {folder.total.toLocaleString("ru-RU")} писем{folder.unread ? `, ${folder.unread.toLocaleString("ru-RU")} непрочитанных` : ""}
-    {/if}
-  </span>
-</div>
+{#if multi}
+  <div class="head bulk" role="toolbar" aria-label="Действия с выбранными беседами">
+    <span class="bulk-title" aria-live="polite">Выбрано {sel.size.toLocaleString("ru-RU")}</span>
+    <span class="bulk-actions">
+      <button class="act" onclick={(e) => bulk(e, { kind: "read", read: labels.anyUnread })} aria-label={labels.read} title={labels.read}>
+        <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path d={labels.anyUnread ? ICON.read : ICON.unread} fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round" /></svg>
+      </button>
+      <button class="act" class:on={labels.anyFlagged} onclick={(e) => bulk(e, { kind: "flag", flagged: !labels.anyFlagged })} aria-label={labels.flag} title={labels.flag}>
+        <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path d={ICON.flag} fill={labels.anyFlagged ? "currentColor" : "none"} stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round" /></svg>
+      </button>
+      <button class="act" onclick={bulkMove} aria-label={labels.move} title={labels.move} aria-haspopup="dialog" aria-expanded={picker !== null}>
+        <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path d={ICON.move} fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round" /></svg>
+      </button>
+      <button class="act" onclick={(e) => bulk(e, { kind: "archive" })} disabled={inArchive} aria-label={labels.archive} title={inArchive ? "Беседы уже в архиве" : `${labels.archive} (E)`}>
+        <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path d={ICON.archive} fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round" /></svg>
+      </button>
+      <button class="act danger" onclick={(e) => bulk(e, { kind: "delete", permanent: false })} aria-label={labels.delete} title="{labels.delete} (Delete)">
+        <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path d={ICON.delete} fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round" /></svg>
+      </button>
+      <span class="act-sep" aria-hidden="true"></span>
+      <button class="act" onclick={bulkCollapse} aria-label="Снять выбор" title="Снять выбор (Esc)">
+        <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path d={ICON.close} fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" /></svg>
+      </button>
+    </span>
+  </div>
+{:else}
+  <div class="head">
+    <h2 class="title">{folder?.name ?? "Почта"}</h2>
+    <span class="caption">
+      {#if folder}
+        {folder.total.toLocaleString("ru-RU")} писем{folder.unread ? `, ${folder.unread.toLocaleString("ru-RU")} непрочитанных` : ""}
+      {/if}
+    </span>
+  </div>
+{/if}
 
 {#if actionError}
   <div class="action-error" role="alert">
@@ -215,7 +429,7 @@
   </div>
 {/if}
 
-<div class="scroller" bind:this={scroller} onscroll={onScroll} role="listbox" aria-label="Беседы" tabindex="0" onkeydown={onKey} aria-busy={busy.size > 0}>
+<div class="scroller" bind:this={scroller} onscroll={onScroll} role="listbox" aria-label="Беседы" aria-multiselectable="true" tabindex="0" onkeydown={onKey} aria-busy={busy.size > 0}>
   {#if conversations.length === 0 && !loading}
     <div class="empty">
       <p>В этой папке пока нет бесед.</p>
@@ -224,8 +438,24 @@
   {:else}
     <div class="spacer" style="height: {conversations.length * ROW}px">
       {#each slice as c, i (c.conversation_pk)}
-        {@const isSelected = selected?.conversation_pk === c.conversation_pk}
-        <div class="row" class:selected={isSelected} class:unread={c.unread_count > 0} class:busy={busy.has(c.conversation_pk)} style="top: {(start + i) * ROW}px" role="option" aria-selected={isSelected} tabindex="-1" onclick={() => onselect(c)} onkeydown={(e) => e.key === "Enter" && onselect(c)} oncontextmenu={(e) => onRowContextMenu(e, c)}>
+        {@const inSel = sel.has(c.conversation_pk)}
+        {@const focused = selected?.conversation_pk === c.conversation_pk}
+        <div
+          class="row"
+          class:selected={inSel}
+          class:focused
+          class:unread={c.unread_count > 0}
+          class:busy={busy.has(c.conversation_pk)}
+          style="top: {(start + i) * ROW}px"
+          role="option"
+          aria-selected={inSel}
+          tabindex="-1"
+          draggable="true"
+          onclick={(e) => onRowClick(e, c)}
+          onkeydown={(e) => e.key === "Enter" && selectOne(c)}
+          oncontextmenu={(e) => onRowContextMenu(e, c)}
+          ondragstart={(e) => onDragStart(e, c)}
+        >
           <div class="line1">
             <span class="people">{participantsLabel(c) || "(без отправителя)"}</span>
             {#if c.total_count > 1}<span class="count">{c.total_count}</span>{/if}
@@ -234,7 +464,7 @@
           <div class="line2">
             <span class="topic">{c.topic || "(без темы)"}</span>
             {#if c.has_attachments}
-              <svg class="clip" width="14" height="14" viewBox="0 0 16 16" aria-label="Есть вложения"><path d="M10.5 4.5 5.8 9.2a1.5 1.5 0 0 0 2.1 2.1l5-5a3 3 0 0 0-4.2-4.2l-5.3 5.3a4.5 4.5 0 0 0 6.4 6.4l4.2-4.2" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" /></svg>
+              <svg class="clip" width="14" height="14" viewBox="0 0 16 16" aria-label="Есть вложения"><path d={ICON.attach} fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" /></svg>
             {/if}
             {#if c.has_flagged}
               <svg class="flag" width="13" height="13" viewBox="0 0 16 16" aria-label="С флагом"><path d={ICON.flag} fill="currentColor" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round" /></svg>
@@ -250,13 +480,13 @@
 </div>
 
 {#if menu}
-  <ContextMenu items={menuItems} anchor={menu.anchor} label="Действия с беседой" onpick={pickMenu} onclose={closeMenu} />
+  <ContextMenu items={menuItems} anchor={menu.anchor} label={menu.targets.length > 1 ? "Действия с выбранными беседами" : "Действия с беседой"} onpick={pickMenu} onclose={closeMenu} />
 {/if}
 {#if picker}
   <FolderPicker {folders} currentFolderPk={folderPk} anchor={picker.anchor} align="start" onpick={moveTo} onclose={cancelPopups} />
 {/if}
 {#if confirm}
-  <ConfirmPopover anchor={confirm.anchor} align="start" title="Удалить беседу навсегда?" text="Письма этой беседы в текущей папке исчезнут с сервера, вернуть их будет нельзя." confirmLabel="Удалить навсегда" onconfirm={confirmDelete} oncancel={cancelPopups} />
+  <ConfirmPopover anchor={confirm.anchor} align="start" title={confirmTitle} text={confirmText} confirmLabel="Удалить навсегда" onconfirm={confirmDelete} oncancel={cancelPopups} />
 {/if}
 
 <style>
@@ -265,6 +495,7 @@
     align-items: baseline;
     justify-content: space-between;
     gap: var(--space-3);
+    min-height: 48px;
     padding: var(--space-3) var(--space-4) var(--space-2);
     border-bottom: 1px solid var(--stroke-1);
   }
@@ -274,6 +505,59 @@
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
+  }
+  /* Панель массовых действий на месте заголовка: счётчик слева, значки справа. */
+  .head.bulk {
+    align-items: center;
+    padding: var(--space-2) var(--space-3) var(--space-2) var(--space-4);
+    background: var(--accent-soft);
+  }
+  .bulk-title {
+    font: var(--text-body-strong);
+    color: var(--fg-1);
+    white-space: nowrap;
+  }
+  .bulk-actions {
+    display: inline-flex;
+    align-items: center;
+    gap: 2px;
+  }
+  .act {
+    width: 28px;
+    height: 28px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: var(--radius-control);
+    color: var(--fg-2);
+    transition:
+      background var(--dur-fast) var(--ease-in),
+      color var(--dur-fast) var(--ease-in);
+  }
+  .act:hover:not(:disabled) {
+    background: var(--bg-hover);
+    color: var(--fg-1);
+  }
+  .act:active:not(:disabled) {
+    background: var(--bg-pressed);
+  }
+  .act:disabled {
+    color: var(--fg-disabled);
+  }
+  .act.on {
+    color: var(--danger);
+  }
+  .act.danger:hover:not(:disabled) {
+    color: var(--danger);
+  }
+  .act:focus-visible {
+    outline-offset: -2px;
+  }
+  .act-sep {
+    width: 1px;
+    height: 16px;
+    margin: 0 4px;
+    background: var(--stroke-2);
   }
   .action-error {
     display: flex;
@@ -343,7 +627,8 @@
   .row.busy {
     opacity: 0.6;
   }
-  .row.selected::before {
+  /* Полоска акцента — у строки-курсора (она же открыта в области чтения при одиночном выборе). */
+  .row.focused::before {
     content: "";
     position: absolute;
     left: 6px;
@@ -364,7 +649,7 @@
     border-radius: 50%;
     background: var(--unread);
   }
-  .row.unread.selected::after {
+  .row.unread.focused::after {
     left: 12px;
   }
   .line1,

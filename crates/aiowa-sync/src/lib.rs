@@ -257,7 +257,9 @@ impl Engine {
     }
 
     /// Иерархия папок с сохранённым состоянием; при недействительном состоянии — заново.
-    async fn sync_hierarchy(&self) -> Result<usize> {
+    /// Открыт отдельно от `run`: окно зовёт его после операций с папками (создание,
+    /// переименование, удаление), когда письма перечитывать не нужно. Возвращает число upsert-ов.
+    pub async fn sync_hierarchy(&self) -> Result<usize> {
         self.emit(SyncEvent::Stage { stage: SyncStage::Hierarchy, folder: None });
         let mut state = self.store.get_state(self.account, "hierarchy")?.map(SyncState);
         let mut reset_once = false;

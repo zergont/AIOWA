@@ -9,8 +9,8 @@ pub mod notify;
 pub mod protocol;
 
 use aiowa_core::{
-    CalendarEvent, CalendarEventDetails, CalendarItemChanges, ComposeKind, FolderChanges, FolderRef, ItemChanges, ItemId, MeetingRequestInfo, MeetingResponse, NewCalendarItem, OutgoingAttachment, OutgoingMessage,
-    Signature, SyncState,
+    CalendarEvent, CalendarEventDetails, CalendarItemChanges, ComposeKind, FolderChanges, FolderId, FolderRef, ItemChanges, ItemId, MeetingRequestInfo, MeetingResponse, NewCalendarItem, OutgoingAttachment,
+    OutgoingMessage, Signature, SyncState,
 };
 use aiowa_transport::{
     async_trait, AttachmentContent, Credentials, DeleteMode, FolderCounts, ItemFetchShape, ItemResult, MailTransport, NotificationEvent, NotificationKind, Result, ServerInfo, StreamEnd, SubscriptionRequest,
@@ -94,6 +94,11 @@ struct Inner {
     calendar_shape: AtomicU8,
     /// Какую форму `ItemShape` для `GetItem` письма о встрече принял сервер (`CALENDAR_SHAPE_*`).
     meeting_shape: AtomicU8,
+    /// Принимает ли сервер `message:ReplyTo` в `AdditionalProperties` поверх `ShapeName` у
+    /// `GetItem` писем (`REPLY_TO_*`): при отказе по форме тела запрашиваются без него.
+    reply_to_mode: AtomicU8,
+    /// Какую `RequestServerVersion` принял сервер для операций с папками (`FOLDER_VERSION_*`).
+    folder_version: AtomicU8,
     /// Какую форму `SubscribeToNotification` принял сервер (`SubscribeForm::code`, 0 не известно).
     subscribe_form: AtomicU8,
     /// Подписки текущей сессии: вид по идентификатору, чтобы разбирать события потока.
@@ -128,6 +133,17 @@ const CALENDAR_MODES: [u8; 3] = [CALENDAR_MODE_FIND_ITEM_Z, CALENDAR_MODE_FIND_I
 const CALENDAR_SHAPE_UNKNOWN: u8 = 0;
 const CALENDAR_SHAPE_EXPLICIT: u8 = 1;
 const CALENDAR_SHAPE_ALL: u8 = 2;
+
+/// `message:ReplyTo` в `GetItem` писем: не проверено, принято, отвергнуто сервером.
+const REPLY_TO_UNKNOWN: u8 = 0;
+const REPLY_TO_ACCEPTED: u8 = 1;
+const REPLY_TO_REJECTED: u8 = 2;
+
+/// Версия схемы операций с папками: сначала `V2017_08_18` (как у операций записи писем), при
+/// HTTP 500 на форму запроса — `Exchange2013` (как у `SyncFolderHierarchy`/`GetFolder`).
+const FOLDER_VERSION_UNKNOWN: u8 = 0;
+const FOLDER_VERSION_2017: u8 = 1;
+const FOLDER_VERSION_2013: u8 = 2;
 
 /// Самое узкое окно, на которое делится выдача календаря при `IncludesLastItemInRange: false`.
 const CALENDAR_MIN_WINDOW: jiff::SignedDuration = jiff::SignedDuration::from_hours(1);
@@ -207,6 +223,8 @@ impl OwaTransport {
             calendar_mode: AtomicU8::new(CALENDAR_MODE_UNKNOWN),
             calendar_shape: AtomicU8::new(CALENDAR_SHAPE_UNKNOWN),
             meeting_shape: AtomicU8::new(CALENDAR_SHAPE_UNKNOWN),
+            reply_to_mode: AtomicU8::new(REPLY_TO_UNKNOWN),
+            folder_version: AtomicU8::new(FOLDER_VERSION_UNKNOWN),
             subscribe_form: AtomicU8::new(0),
             subscriptions: RwLock::new(HashMap::new()),
             subscriptions_stale: AtomicBool::new(false),
@@ -905,6 +923,118 @@ impl OwaTransport {
         Ok(())
     }
 
+    /// Одна пачка `GetItem` в именованной форме. При `want_reply_to` к форме добавляется
+    /// `message:ReplyTo` (§ 5j); если сервер отвергает такую форму — HTTP 500 на запрос или
+    /// отказ по свойству (`ErrorInvalidProperty*`, `*Shape*`) в каждом сообщении ответа при
+    /// HTTP 200 (`call` отдаёт `Server` только после разбора сообщений, которого здесь нет) —
+    /// пачка повторяется без него, и отказ запоминается на сессию. Принятая форма (хоть одно
+    /// успешное сообщение) тоже запоминается, а первый ответ с ней пишет в журнал, пришёл ли ключ
+    /// `ReplyTo`. Смешанные отказы по элементам (`ErrorItemNotFound`) режим не меняют.
+    async fn get_item_chunk(&self, chunk: &[ItemId], shape_name: &str, want_reply_to: bool) -> Result<Value> {
+        let mode = self.inner.reply_to_mode.load(Ordering::Relaxed);
+        let with_reply_to = want_reply_to && mode != REPLY_TO_REJECTED;
+        let body = protocol::get_item_body(chunk, shape_name, self.inner.config.max_body_size, with_reply_to);
+        match self.call("GetItem", protocol::V_2017, body).await {
+            Ok(v) if with_reply_to && mode == REPLY_TO_UNKNOWN && protocol::all_property_rejections(&v) => {
+                let code = protocol::response_messages(&v).first().and_then(|m| protocol::message_error(m)).map(|(c, _)| c).unwrap_or_default();
+                warn!(code, items = chunk.len(), "GetItem: сервер отверг message:ReplyTo по каждому элементу, тела запрашиваются без Reply-To");
+                self.inner.reply_to_mode.store(REPLY_TO_REJECTED, Ordering::Relaxed);
+                self.call("GetItem", protocol::V_2017, protocol::get_item_body(chunk, shape_name, self.inner.config.max_body_size, false)).await
+            }
+            Ok(v) => {
+                if with_reply_to && mode == REPLY_TO_UNKNOWN {
+                    let msgs = protocol::response_messages(&v);
+                    if msgs.iter().any(|m| protocol::message_error(m).is_none()) {
+                        let first = msgs.first().and_then(|m| m.pointer("/Items/0").cloned());
+                        let has_key = first.as_ref().map(|i| i.get("ReplyTo").is_some()).unwrap_or(false);
+                        let reply_to_shape = first.as_ref().and_then(|i| i.get("ReplyTo")).map(|r| protocol::json_shape(r, 2)).unwrap_or_default();
+                        info!(shape_name, has_key, reply_to_shape, "GetItem: сервер принял message:ReplyTo в AdditionalProperties поверх ShapeName");
+                        self.inner.reply_to_mode.store(REPLY_TO_ACCEPTED, Ordering::Relaxed);
+                    }
+                }
+                Ok(v)
+            }
+            Err(e) if with_reply_to && mode == REPLY_TO_UNKNOWN && is_shape_rejection(&e) => {
+                warn!(error = %e, "GetItem: сервер отверг message:ReplyTo в AdditionalProperties, тела запрашиваются без Reply-To");
+                self.inner.reply_to_mode.store(REPLY_TO_REJECTED, Ordering::Relaxed);
+                self.call("GetItem", protocol::V_2017, protocol::get_item_body(chunk, shape_name, self.inner.config.max_body_size, false)).await
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Проверка формы `Reply-To` на живом сервере (только чтение): один `GetItem` в форме
+    /// `ItemPart` с `message:ReplyTo`; по каждому письму — есть ли ключ `ReplyTo` в ответе, сколько
+    /// в нём адресов и форма значения без содержимого (`json_shape`). Отказ сервера по форме
+    /// приходит как ошибка (без повтора без свойства).
+    pub async fn probe_reply_to(&self, ids: &[ItemId]) -> Result<Vec<ReplyToProbe>> {
+        let body = protocol::get_item_body(ids, "ItemPart", 4096, true);
+        let v = self.call("GetItem", protocol::V_2017, body).await?;
+        let msgs = protocol::response_messages(&v);
+        let mut out = Vec::with_capacity(msgs.len());
+        for msg in msgs {
+            if let Some((code, message)) = protocol::message_error(msg) {
+                out.push(ReplyToProbe { error: Some(format!("{code}: {message}")), ..ReplyToProbe::default() });
+                continue;
+            }
+            let item = msg.pointer("/Items/0");
+            let reply_to = item.and_then(|i| i.get("ReplyTo"));
+            let parsed = item.and_then(protocol::parse_message_full);
+            out.push(ReplyToProbe {
+                has_key: reply_to.is_some(),
+                count: parsed.as_ref().map(|m| m.reply_to.len()).unwrap_or(0),
+                differs_from_sender: parsed.as_ref().map(|m| !m.effective_reply_to().is_empty()).unwrap_or(false),
+                shape: reply_to.map(|r| protocol::json_shape(r, 2)).unwrap_or_default(),
+                item_keys: item.and_then(Value::as_object).map(|o| o.len()).unwrap_or(0),
+                error: None,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Операция с папкой через `call`: версия схемы подбирается один раз на сессию
+    /// (`V2017_08_18`, при HTTP 500 на форму — `Exchange2013`). Возвращает первое сообщение ответа.
+    async fn folder_call(&self, op: &str, body: Value) -> Result<Value> {
+        let known = self.inner.folder_version.load(Ordering::Relaxed);
+        let candidates: &[(u8, &str)] = match known {
+            FOLDER_VERSION_2013 => &[(FOLDER_VERSION_2013, protocol::V_2013)],
+            FOLDER_VERSION_2017 => &[(FOLDER_VERSION_2017, protocol::V_2017)],
+            _ => &[(FOLDER_VERSION_2017, protocol::V_2017), (FOLDER_VERSION_2013, protocol::V_2013)],
+        };
+        let mut last_err: Option<TransportError> = None;
+        for (i, (code, version)) in candidates.iter().enumerate() {
+            match self.call(op, version, body.clone()).await.and_then(|v| Self::first_message(op, &v)) {
+                Ok(msg) => {
+                    if known == FOLDER_VERSION_UNKNOWN {
+                        info!(op, version, "папки: сервер принял форму запроса");
+                    }
+                    self.inner.folder_version.store(*code, Ordering::Relaxed);
+                    Self::log_folder_shape(op, &msg);
+                    return Ok(msg);
+                }
+                Err(e) if i + 1 < candidates.len() && matches!(e, TransportError::Protocol { status: 500, .. }) => {
+                    warn!(op, version, error = %e, "папки: форма отвергнута, пробую другую версию схемы");
+                    last_err = Some(e);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Err(last_err.unwrap_or(TransportError::Protocol { op: op.into(), status: 0, raw: "ни одна форма не принята".into() }))
+    }
+
+    /// Форма ответа операции с папкой без содержимого: тип, код, ключи сообщения и папки, длины
+    /// идентификатора — для документа протокола.
+    fn log_folder_shape(op: &str, msg: &Value) {
+        fn keys(v: Option<&Value>) -> Vec<&str> {
+            v.and_then(Value::as_object).map(|o| o.keys().map(String::as_str).collect()).unwrap_or_default()
+        }
+        let msg_keys = keys(Some(msg));
+        let folder_keys = keys(msg.pointer("/Folders/0"));
+        let id_len = msg.pointer("/Folders/0/FolderId/Id").and_then(Value::as_str).map(str::len);
+        let ck_len = msg.pointer("/Folders/0/FolderId/ChangeKey").and_then(Value::as_str).map(str::len);
+        debug!(op, response_type = protocol::str_of(msg, "__type").unwrap_or("?"), response_code = protocol::str_of(msg, "ResponseCode").unwrap_or("?"), ?msg_keys, ?folder_keys, ?id_len, ?ck_len, "форма ответа");
+    }
+
     /// Первое сообщение ответа, с проверкой `ResponseClass`.
     fn first_message(op: &str, v: &Value) -> Result<Value> {
         let msgs = protocol::response_messages(v);
@@ -922,6 +1052,30 @@ impl OwaTransport {
         }
         Ok((*first).clone())
     }
+}
+
+/// Итог проверки `Reply-To` по одному письму (`OwaTransport::probe_reply_to`), без содержимого.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReplyToProbe {
+    /// Ключ `ReplyTo` присутствует в элементе ответа (и когда адресов нет).
+    pub has_key: bool,
+    /// Адресов в `ReplyTo`.
+    pub count: usize,
+    /// Reply-To непуст и отличается от отправителя (ответ пойдёт на него).
+    pub differs_from_sender: bool,
+    /// Форма значения `ReplyTo` без содержимого (`json_shape`), пусто без ключа.
+    pub shape: String,
+    /// Ключей у элемента ответа (сколько полей дала форма).
+    pub item_keys: usize,
+    /// Отказ сервера по этому письму (`код: текст`).
+    pub error: Option<String>,
+}
+
+/// Отказ сервера по форме запроса до разбора ответа: HTTP 500 на десериализации. Отказ по
+/// свойству в сообщениях ответа (HTTP 200) `call` ошибкой не отдаёт — его проверяет
+/// `protocol::all_property_rejections` по успешному ответу.
+fn is_shape_rejection(e: &TransportError) -> bool {
+    matches!(e, TransportError::Protocol { status: 500, .. })
 }
 
 fn calendar_mode_name(mode: u8) -> &'static str {
@@ -1031,10 +1185,11 @@ impl MailTransport for OwaTransport {
             ItemFetchShape::WithUniqueBody => "ItemPart",
             ItemFetchShape::WithFullBody => "ItemNormalizedBody",
         };
+        // Reply-To нужен только формам с получателями; у списка (`MailListItem`) его не просим.
+        let want_reply_to = shape != ItemFetchShape::Meta;
         let mut out: Vec<ItemResult> = Vec::with_capacity(ids.len());
         for chunk in ids.chunks(self.inner.config.get_item_batch.max(1)) {
-            let body = protocol::get_item_body(chunk, shape_name, self.inner.config.max_body_size);
-            let v = self.call("GetItem", protocol::V_2017, body).await?;
+            let v = self.get_item_chunk(chunk, shape_name, want_reply_to).await?;
             let msgs = protocol::response_messages(&v);
             if msgs.is_empty() {
                 return Err(TransportError::Protocol { op: "GetItem".into(), status: 200, raw: truncate(&v.to_string(), 200) });
@@ -1112,6 +1267,34 @@ impl MailTransport for OwaTransport {
             DeleteMode::Hard => "HardDelete",
         };
         self.write_items("DeleteItem", ids, |chunk| protocol::delete_item_body(chunk, delete_type)).await
+    }
+
+    async fn create_folder(&self, parent: &FolderRef, display_name: &str) -> Result<FolderId> {
+        let m = self.folder_call("CreateFolder", protocol::create_folder_body(parent, display_name)).await?;
+        let id = protocol::parse_written_folder_id(&m).ok_or_else(|| TransportError::Protocol { op: "CreateFolder".into(), status: 200, raw: format!("нет Folders[0].FolderId: {}", truncate(&m.to_string(), 200)) })?;
+        debug!(name_len = display_name.chars().count(), id_len = id.id.len(), ck_len = id.change_key.as_deref().map(str::len), "папка создана");
+        Ok(id)
+    }
+
+    async fn rename_folder(&self, id: &FolderId, display_name: &str) -> Result<FolderId> {
+        let m = self.folder_call("UpdateFolder", protocol::rename_folder_body(id, display_name)).await?;
+        let new_id = protocol::parse_written_folder_id(&m);
+        debug!(name_len = display_name.chars().count(), id_in_response = new_id.is_some(), same_id = new_id.as_ref().map(|n| n.id == id.id), "папка переименована");
+        Ok(new_id.unwrap_or_else(|| id.clone()))
+    }
+
+    async fn move_folder(&self, id: &FolderId, parent: &FolderRef) -> Result<FolderId> {
+        let m = self.folder_call("MoveFolder", protocol::move_folder_body(id, parent)).await?;
+        let new_id = protocol::parse_written_folder_id(&m);
+        debug!(id_in_response = new_id.is_some(), same_id = new_id.as_ref().map(|n| n.id == id.id), "папка перенесена");
+        Ok(new_id.unwrap_or_else(|| id.clone()))
+    }
+
+    async fn delete_folder(&self, id: &FolderId, permanent: bool) -> Result<()> {
+        let delete_type = if permanent { "HardDelete" } else { "MoveToDeletedItems" };
+        self.folder_call("DeleteFolder", protocol::delete_folder_body(id, delete_type)).await?;
+        debug!(delete_type, "папка удалена");
+        Ok(())
     }
 
     async fn create_draft(&self, kind: &ComposeKind, msg: &OutgoingMessage) -> Result<ItemId> {

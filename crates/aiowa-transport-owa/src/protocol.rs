@@ -132,17 +132,28 @@ pub fn sync_folder_items_body(folder: &FolderRef, state: Option<&SyncState>, max
     body
 }
 
-pub fn get_item_body(ids: &[ItemId], shape_name: &str, max_body: u64) -> Value {
+/// Свойство `Reply-To` письма, которого нет в именованных формах (`ItemPart` и т. п.): запрашивается
+/// через `AdditionalProperties` поверх `ShapeName` (§ 5j).
+pub const REPLY_TO_FIELD: &str = "message:ReplyTo";
+
+/// `GetItem` писем в именованной форме `shape_name` (`ItemPart`, `MailListItem`,
+/// `ItemNormalizedBody`). `with_reply_to` добавляет к форме свойство `message:ReplyTo`
+/// (`AdditionalProperties` действуют вместе с `ShapeName`, см. § 5j).
+pub fn get_item_body(ids: &[ItemId], shape_name: &str, max_body: u64, with_reply_to: bool) -> Value {
+    let mut shape = json!({
+        "__type": "ItemResponseShape:#Exchange",
+        "BaseShape": "IdOnly",
+        "FilterHtmlContent": true,
+        "BlockExternalImagesIfSenderUntrusted": true,
+        "MaximumBodySize": max_body,
+        "MaximumRecipientsToReturn": 200
+    });
+    if with_reply_to {
+        shape["AdditionalProperties"] = json!([property_uri(REPLY_TO_FIELD)]);
+    }
     json!({
         "__type": "GetItemRequest:#Exchange",
-        "ItemShape": {
-            "__type": "ItemResponseShape:#Exchange",
-            "BaseShape": "IdOnly",
-            "FilterHtmlContent": true,
-            "BlockExternalImagesIfSenderUntrusted": true,
-            "MaximumBodySize": max_body,
-            "MaximumRecipientsToReturn": 200
-        },
+        "ItemShape": shape,
         "ItemIds": ids.iter().map(item_id_json).collect::<Vec<_>>(),
         "ShapeName": shape_name,
     })
@@ -229,6 +240,63 @@ pub fn delete_item_body(ids: &[ItemId], delete_type: &str) -> Value {
         "SuppressReadReceipts": true,
         "ReturnMovedItemIds": true,
     })
+}
+
+// ---------------------------------------------------------------------------
+// Тела операций с папками (см. docs/protocol-owa-json.md § 5j)
+
+/// Класс создаваемых папок: почтовая.
+pub const MAIL_FOLDER_CLASS: &str = "IPF.Note";
+
+/// `CreateFolder` одной почтовой папки `display_name` внутри `parent`
+/// (`ParentFolderId{BaseFolderId}`, как `TargetFolderId` у `MoveItem`).
+pub fn create_folder_body(parent: &FolderRef, display_name: &str) -> Value {
+    json!({
+        "__type": "CreateFolderRequest:#Exchange",
+        "ParentFolderId": target_folder_json(parent),
+        "Folders": [ { "__type": "Folder:#Exchange", "DisplayName": display_name, "FolderClass": MAIL_FOLDER_CLASS } ],
+    })
+}
+
+/// `UpdateFolder` с одним `SetFolderField` поля `folder:DisplayName`.
+pub fn rename_folder_body(id: &FolderId, display_name: &str) -> Value {
+    json!({
+        "__type": "UpdateFolderRequest:#Exchange",
+        "FolderChanges": [ {
+            "__type": "FolderChange:#Exchange",
+            "FolderId": folder_ref_json(&FolderRef::Id(id.clone())),
+            "Updates": [ {
+                "__type": "SetFolderField:#Exchange",
+                "Path": property_uri("folder:DisplayName"),
+                "Folder": { "__type": "Folder:#Exchange", "DisplayName": display_name }
+            } ]
+        } ],
+    })
+}
+
+/// `MoveFolder` папки в `parent` (`ToFolderId{BaseFolderId}`).
+pub fn move_folder_body(id: &FolderId, parent: &FolderRef) -> Value {
+    json!({
+        "__type": "MoveFolderRequest:#Exchange",
+        "ToFolderId": target_folder_json(parent),
+        "FolderIds": [ folder_ref_json(&FolderRef::Id(id.clone())) ],
+    })
+}
+
+/// `DeleteFolder`: `delete_type` — `MoveToDeletedItems` (папка станет подпапкой «Удалённых») или
+/// `HardDelete` (навсегда вместе с содержимым).
+pub fn delete_folder_body(id: &FolderId, delete_type: &str) -> Value {
+    json!({
+        "__type": "DeleteFolderRequest:#Exchange",
+        "FolderIds": [ folder_ref_json(&FolderRef::Id(id.clone())) ],
+        "DeleteType": delete_type,
+    })
+}
+
+/// Идентификатор папки из сообщения ответа `CreateFolder`/`UpdateFolder`/`MoveFolder`:
+/// `Folders[0].FolderId`. Нет — `None` (у `DeleteFolder` папок в ответе нет).
+pub fn parse_written_folder_id(msg: &Value) -> Option<FolderId> {
+    msg.pointer("/Folders/0/FolderId").and_then(parse_folder_id)
 }
 
 // ---------------------------------------------------------------------------
@@ -1140,6 +1208,8 @@ pub fn parse_message_full(v: &Value) -> Option<MessageFull> {
         to: parse_participants(v.get("ToRecipients")),
         cc: parse_participants(v.get("CcRecipients")),
         bcc: parse_participants(v.get("BccRecipients")),
+        // `message:ReplyTo` — массив адресов той же формы, что получатели; нет ключа — пусто.
+        reply_to: parse_participants(v.get("ReplyTo")),
         body,
         attachments,
     })
@@ -1383,6 +1453,21 @@ pub fn message_error(msg: &Value) -> Option<(String, String)> {
     Some((str_of(msg, "ResponseCode").unwrap_or("Unknown").to_string(), str_of(msg, "MessageText").unwrap_or("").to_string()))
 }
 
+/// Код ответа — отказ по свойству или форме запроса (`ErrorInvalidPropertyRequest`,
+/// `ErrorInvalidPropertySet`, `ErrorInvalidShape`…), а не по элементу или сессии.
+pub fn is_property_code(code: &str) -> bool {
+    code.contains("Property") || code.contains("Shape")
+}
+
+/// Все сообщения ответа — отказы по свойству или форме (`is_property_code`) при HTTP 200: так
+/// сервер отвергает форму запроса целиком, по каждому элементу. Пустой ответ, хотя бы одно
+/// успешное сообщение или отказ с другим кодом (`ErrorItemNotFound`) — `false`: это отказы по
+/// элементам, а не по форме.
+pub fn all_property_rejections(v: &Value) -> bool {
+    let msgs = response_messages(v);
+    !msgs.is_empty() && msgs.iter().all(|m| message_error(m).is_some_and(|(code, _)| is_property_code(&code)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1429,8 +1514,98 @@ mod tests {
           "Attachments":[{"AttachmentId":{"Id":"att1"},"Name":"a.pdf","ContentType":"application/pdf","Size":10,"IsInline":false}]}"#).unwrap();
         let m = parse_message_full(&v).unwrap();
         assert_eq!(m.to.len(), 1);
+        assert!(m.reply_to.is_empty(), "без ключа ReplyTo список пуст");
         assert_eq!(m.attachments[0].name.as_deref(), Some("a.pdf"));
         assert_eq!(m.body.unwrap().unique_body.as_deref(), Some("<p>x</p>"));
+        // ReplyTo — массив адресов той же формы, что получатели (с MailboxType, как отдаёт OWA JSON).
+        let v: Value = serde_json::from_str(r#"{"ItemId":{"Id":"A"},"From":{"Mailbox":{"Name":"Список","EmailAddress":"list@x.ru","RoutingType":"SMTP"}},
+          "ReplyTo":[{"Name":"Владелец","EmailAddress":"owner@x.ru","RoutingType":"SMTP","MailboxType":"OneOff"}],
+          "ToRecipients":[]}"#).unwrap();
+        let m = parse_message_full(&v).unwrap();
+        assert_eq!(m.reply_to, vec![Participant { name: Some("Владелец".into()), email: Some("owner@x.ru".into()), routing_type: Some("SMTP".into()) }]);
+        assert_eq!(m.effective_reply_to().len(), 1);
+        let v: Value = serde_json::from_str(r#"{"ItemId":{"Id":"A"},"ReplyTo":[]}"#).unwrap();
+        assert!(parse_message_full(&v).unwrap().reply_to.is_empty(), "пустой массив — пусто");
+    }
+
+    #[test]
+    fn property_rejections_cover_whole_batch_only() {
+        let resp = |items: &str| -> Value { serde_json::from_str(&format!(r#"{{"Body":{{"ResponseMessages":{{"Items":[{items}]}}}}}}"#)).unwrap() };
+        let prop = r#"{"__type":"GetItemResponseMessage:#Exchange","ResponseClass":"Error","ResponseCode":"ErrorInvalidPropertyRequest","MessageText":"The property message:ReplyTo…","Items":[]}"#;
+        let shape = r#"{"ResponseClass":"Error","ResponseCode":"ErrorInvalidShape","MessageText":""}"#;
+        let not_found = r#"{"ResponseClass":"Error","ResponseCode":"ErrorItemNotFound","MessageText":"…"}"#;
+        let ok = r#"{"ResponseClass":"Success","ResponseCode":"NoError","Items":[{"ItemId":{"Id":"A"}}]}"#;
+        assert!(all_property_rejections(&resp(&format!("{prop},{prop}"))), "отказ по свойству в каждом сообщении — форма отвергнута");
+        assert!(all_property_rejections(&resp(&format!("{prop},{shape}"))));
+        assert!(!all_property_rejections(&resp(&format!("{prop},{ok}"))), "хоть одно успешное — форма принята");
+        assert!(!all_property_rejections(&resp(&format!("{prop},{not_found}"))), "смешанная пачка — отказы по элементам");
+        assert!(!all_property_rejections(&resp(&format!("{not_found},{not_found}"))));
+        assert!(!all_property_rejections(&resp("")), "пустой ответ — не отказ по форме");
+        assert!(!all_property_rejections(&json!({"Body": {}})));
+        assert!(is_property_code("ErrorInvalidPropertySet"));
+        assert!(!is_property_code("ErrorServerBusy"));
+    }
+
+    #[test]
+    fn get_item_body_exact_with_and_without_reply_to() {
+        let s = serde_json::to_string(&get_item_body(&ids()[..1], "ItemPart", 2_097_152, true)).unwrap();
+        assert_eq!(
+            s,
+            r#"{"__type":"GetItemRequest:#Exchange","ItemShape":{"__type":"ItemResponseShape:#Exchange","BaseShape":"IdOnly","FilterHtmlContent":true,"BlockExternalImagesIfSenderUntrusted":true,"MaximumBodySize":2097152,"MaximumRecipientsToReturn":200,"AdditionalProperties":[{"__type":"PropertyUri:#Exchange","FieldURI":"message:ReplyTo"}]},"ItemIds":[{"__type":"ItemId:#Exchange","Id":"A","ChangeKey":"ck1"}],"ShapeName":"ItemPart"}"#
+        );
+        let s = serde_json::to_string(&get_item_body(&ids(), "MailListItem", 4096, false)).unwrap();
+        assert_eq!(
+            s,
+            r#"{"__type":"GetItemRequest:#Exchange","ItemShape":{"__type":"ItemResponseShape:#Exchange","BaseShape":"IdOnly","FilterHtmlContent":true,"BlockExternalImagesIfSenderUntrusted":true,"MaximumBodySize":4096,"MaximumRecipientsToReturn":200},"ItemIds":[{"__type":"ItemId:#Exchange","Id":"A","ChangeKey":"ck1"},{"__type":"ItemId:#Exchange","Id":"B"}],"ShapeName":"MailListItem"}"#,
+            "без Reply-To форма прежняя, снятая с сервера"
+        );
+    }
+
+    fn folder_id() -> FolderId {
+        FolderId { id: "F1".into(), change_key: Some("fck".into()) }
+    }
+
+    #[test]
+    fn create_folder_body_exact() {
+        let s = serde_json::to_string(&create_folder_body(&FolderRef::Distinguished(DistinguishedFolder::MsgFolderRoot), "AIOWA тест")).unwrap();
+        assert_eq!(
+            s,
+            r#"{"__type":"CreateFolderRequest:#Exchange","ParentFolderId":{"__type":"TargetFolderId:#Exchange","BaseFolderId":{"__type":"DistinguishedFolderId:#Exchange","Id":"msgfolderroot"}},"Folders":[{"__type":"Folder:#Exchange","DisplayName":"AIOWA тест","FolderClass":"IPF.Note"}]}"#
+        );
+        let s = serde_json::to_string(&create_folder_body(&FolderRef::Id(folder_id()), "Подпапка")).unwrap();
+        assert!(s.contains(r#""ParentFolderId":{"__type":"TargetFolderId:#Exchange","BaseFolderId":{"__type":"FolderId:#Exchange","Id":"F1","ChangeKey":"fck"}}"#), "{s}");
+        let env = envelope("CreateFolder", V_2017, "UTC", create_folder_body(&FolderRef::Id(folder_id()), "x"));
+        assert!(serde_json::to_string(&env).unwrap().starts_with(r#"{"__type":"CreateFolderJsonRequest:#Exchange","Header":{"__type":"JsonRequestHeaders:#Exchange""#));
+    }
+
+    #[test]
+    fn rename_move_delete_folder_bodies_exact() {
+        let s = serde_json::to_string(&rename_folder_body(&folder_id(), "AIOWA тест 2")).unwrap();
+        assert_eq!(
+            s,
+            r#"{"__type":"UpdateFolderRequest:#Exchange","FolderChanges":[{"__type":"FolderChange:#Exchange","FolderId":{"__type":"FolderId:#Exchange","Id":"F1","ChangeKey":"fck"},"Updates":[{"__type":"SetFolderField:#Exchange","Path":{"__type":"PropertyUri:#Exchange","FieldURI":"folder:DisplayName"},"Folder":{"__type":"Folder:#Exchange","DisplayName":"AIOWA тест 2"}}]}]}"#
+        );
+        let s = serde_json::to_string(&move_folder_body(&FolderId { id: "F1".into(), change_key: None }, &FolderRef::Distinguished(DistinguishedFolder::Inbox))).unwrap();
+        assert_eq!(
+            s,
+            r#"{"__type":"MoveFolderRequest:#Exchange","ToFolderId":{"__type":"TargetFolderId:#Exchange","BaseFolderId":{"__type":"DistinguishedFolderId:#Exchange","Id":"inbox"}},"FolderIds":[{"__type":"FolderId:#Exchange","Id":"F1"}]}"#
+        );
+        let s = serde_json::to_string(&delete_folder_body(&folder_id(), "HardDelete")).unwrap();
+        assert_eq!(s, r#"{"__type":"DeleteFolderRequest:#Exchange","FolderIds":[{"__type":"FolderId:#Exchange","Id":"F1","ChangeKey":"fck"}],"DeleteType":"HardDelete"}"#);
+        assert!(serde_json::to_string(&delete_folder_body(&folder_id(), "MoveToDeletedItems")).unwrap().ends_with(r#""DeleteType":"MoveToDeletedItems"}"#));
+    }
+
+    #[test]
+    fn parses_written_folder_id() {
+        let v: Value = serde_json::from_str(r#"{"Body":{"ResponseMessages":{"Items":[{"__type":"FolderInfoResponseMessage:#Exchange","ResponseClass":"Success","ResponseCode":"NoError","Folders":[{"__type":"Folder:#Exchange","FolderId":{"__type":"FolderId:#Exchange","Id":"NEW","ChangeKey":"nck"}}]}]}}}"#).unwrap();
+        let msgs = response_messages(&v);
+        assert_eq!(parse_written_folder_id(msgs[0]), Some(FolderId { id: "NEW".into(), change_key: Some("nck".into()) }));
+        assert!(message_error(msgs[0]).is_none());
+        // DeleteFolder: успех без Folders; отказ — ResponseClass Error с кодом.
+        let v: Value = serde_json::from_str(r#"{"Body":{"ResponseMessages":{"Items":[{"__type":"DeleteFolderResponseMessage:#Exchange","ResponseClass":"Success","ResponseCode":"NoError"}]}}}"#).unwrap();
+        assert_eq!(parse_written_folder_id(response_messages(&v)[0]), None);
+        let v: Value = serde_json::from_str(r#"{"Body":{"ResponseMessages":{"Items":[{"__type":"FolderInfoResponseMessage:#Exchange","ResponseClass":"Error","ResponseCode":"ErrorFolderExists","MessageText":"Папка с таким именем уже есть","Folders":[]}]}}}"#).unwrap();
+        assert_eq!(message_error(response_messages(&v)[0]), Some(("ErrorFolderExists".into(), "Папка с таким именем уже есть".into())));
     }
 
     fn ids() -> Vec<ItemId> {

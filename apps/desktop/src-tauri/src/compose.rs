@@ -15,7 +15,7 @@
 
 use crate::ondemand::{describe_transport, timed_out};
 use crate::sync::SyncState;
-use crate::{build_message, err, AppState, CmdResult, ComposeRecipientDto, InlineMap, MessageDto, RecipientDto};
+use crate::{build_message, err, AppState, CmdResult, ComposeRecipientDto, InlineMap, MessageDto, ParticipantDto, RecipientDto};
 use aiowa_core::{AccountId, ComposeKind, Importance, OutgoingAttachment, OutgoingMessage, Participant};
 use aiowa_store::Store;
 use aiowa_transport::MailTransport;
@@ -188,19 +188,27 @@ fn compose_recipient(name: Option<&str>, email: Option<&str>) -> Option<ComposeR
 /// и без повторов (без учёта регистра). Если после исключения своих адресов в «Кому» никого не
 /// осталось (ответ на собственное письмо), туда возвращается отправитель. Для нового письма и
 /// пересылки — пусто.
-pub(crate) fn reply_recipients(kind: ComposeKindDto, from_name: Option<&str>, from_email: Option<&str>, recipients: &[RecipientDto], own: &[String]) -> (Vec<ComposeRecipientDto>, Vec<ComposeRecipientDto>) {
-    let sender = compose_recipient(from_name, from_email);
+///
+/// `reply_to` — адреса `Reply-To` письма, уже отфильтрованные (`MessageDto::reply_to`: только
+/// если заголовок есть и отличается от отправителя): тогда вместо отправителя в «Кому» идут они,
+/// как делают OWA и Outlook; сам отправитель в «ответить всем» не добавляется.
+pub(crate) fn reply_recipients(kind: ComposeKindDto, from_name: Option<&str>, from_email: Option<&str>, reply_to: &[ParticipantDto], recipients: &[RecipientDto], own: &[String]) -> (Vec<ComposeRecipientDto>, Vec<ComposeRecipientDto>) {
+    let senders: Vec<ComposeRecipientDto> = if reply_to.is_empty() {
+        compose_recipient(from_name, from_email).into_iter().collect()
+    } else {
+        reply_to.iter().filter_map(|p| compose_recipient(p.name.as_deref(), p.email.as_deref())).collect()
+    };
     match kind {
         ComposeKindDto::New | ComposeKindDto::Forward => (vec![], vec![]),
-        ComposeKindDto::Reply => (sender.into_iter().collect(), vec![]),
+        ComposeKindDto::Reply => (senders, vec![]),
         ComposeKindDto::ReplyAll => {
             let mut seen: HashSet<String> = own.iter().map(|a| a.trim().to_lowercase()).collect();
             let mut pick = |r: Option<ComposeRecipientDto>| r.filter(|r| seen.insert(r.email.to_lowercase()));
-            let mut to: Vec<ComposeRecipientDto> = pick(sender.clone()).into_iter().collect();
+            let mut to: Vec<ComposeRecipientDto> = senders.iter().cloned().filter_map(|s| pick(Some(s))).collect();
             to.extend(recipients.iter().filter(|r| r.kind == 1).filter_map(|r| pick(compose_recipient(r.name.as_deref(), r.email.as_deref()))));
             let cc: Vec<ComposeRecipientDto> = recipients.iter().filter(|r| r.kind == 2).filter_map(|r| pick(compose_recipient(r.name.as_deref(), r.email.as_deref()))).collect();
             if to.is_empty() {
-                to.extend(sender);
+                to.extend(senders);
             }
             (to, cc)
         }
@@ -418,7 +426,7 @@ pub(crate) async fn compose_context(kind: ComposeKindDto, item_pk: Option<i64>, 
     })
     .await
     .map_err(err)??;
-    let (to, cc) = reply_recipients(kind, original.from_name.as_deref(), original.from_email.as_deref(), &original.recipients, &own_addresses);
+    let (to, cc) = reply_recipients(kind, original.from_name.as_deref(), original.from_email.as_deref(), &original.reply_to, &original.recipients, &own_addresses);
     let subject = subject_with_prefix(kind, original.subject.as_deref());
     Ok(ComposeContext { kind, reference_item_pk: Some(pk), to, cc, subject, original: Some(original), own_addresses, signature })
 }
@@ -597,31 +605,63 @@ mod tests {
             r(2, Some("Анна"), Some("a@y.ru")),
             r(3, Some("Скрытый"), Some("hidden@y.ru")),
         ];
-        let (to, cc) = reply_recipients(ComposeKindDto::ReplyAll, Some("Анна"), Some("a@y.ru"), &recipients, &own);
+        let (to, cc) = reply_recipients(ComposeKindDto::ReplyAll, Some("Анна"), Some("a@y.ru"), &[], &recipients, &own);
         assert_eq!(emails(&to), vec!["a@y.ru", "b@y.ru"], "отправитель, затем «Кому» без своих, повторов и EX");
         assert_eq!(emails(&cc), vec!["v@z.ru"], "«Копия» без своих и без тех, кто уже в «Кому»; скрытые не возвращаются");
         assert_eq!(to[0].name.as_deref(), Some("Анна"));
         assert_eq!(to[1].name.as_deref(), Some("Борис"));
 
-        let (to, cc) = reply_recipients(ComposeKindDto::Reply, Some("Анна"), Some("a@y.ru"), &recipients, &own);
+        let (to, cc) = reply_recipients(ComposeKindDto::Reply, Some("Анна"), Some("a@y.ru"), &[], &recipients, &own);
         assert_eq!(emails(&to), vec!["a@y.ru"]);
         assert!(cc.is_empty());
 
         // Ответ всем на собственное письмо: отправитель исключён, остальные остаются.
-        let (to, _) = reply_recipients(ComposeKindDto::ReplyAll, None, Some("ME@x.ru"), &recipients, &own);
+        let (to, _) = reply_recipients(ComposeKindDto::ReplyAll, None, Some("ME@x.ru"), &[], &recipients, &own);
         assert_eq!(emails(&to), vec!["b@y.ru"]);
         // Если кроме своих адресов никого нет — отправитель возвращается в «Кому».
         let only_me = [r(1, None, Some("alias@x.ru"))];
-        let (to, _) = reply_recipients(ComposeKindDto::ReplyAll, None, Some("me@x.ru"), &only_me, &own);
+        let (to, _) = reply_recipients(ComposeKindDto::ReplyAll, None, Some("me@x.ru"), &[], &only_me, &own);
         assert_eq!(emails(&to), vec!["me@x.ru"]);
 
         // Имя, совпадающее с адресом, не дублируется в чипе.
-        let (to, _) = reply_recipients(ComposeKindDto::Reply, Some("a@y.ru"), Some("a@y.ru"), &[], &own);
+        let (to, _) = reply_recipients(ComposeKindDto::Reply, Some("a@y.ru"), Some("a@y.ru"), &[], &[], &own);
         assert_eq!(to[0].name, None);
 
-        assert_eq!(reply_recipients(ComposeKindDto::Forward, Some("Анна"), Some("a@y.ru"), &recipients, &own), (vec![], vec![]));
-        assert_eq!(reply_recipients(ComposeKindDto::New, Some("Анна"), Some("a@y.ru"), &recipients, &own), (vec![], vec![]));
-        assert_eq!(reply_recipients(ComposeKindDto::Reply, Some("Без адреса"), None, &recipients, &own), (vec![], vec![]));
+        assert_eq!(reply_recipients(ComposeKindDto::Forward, Some("Анна"), Some("a@y.ru"), &[], &recipients, &own), (vec![], vec![]));
+        assert_eq!(reply_recipients(ComposeKindDto::New, Some("Анна"), Some("a@y.ru"), &[], &recipients, &own), (vec![], vec![]));
+        assert_eq!(reply_recipients(ComposeKindDto::Reply, Some("Без адреса"), None, &[], &recipients, &own), (vec![], vec![]));
+    }
+
+    #[test]
+    fn reply_to_replaces_sender() {
+        let own = vec!["me@x.ru".to_string()];
+        let p = |name: Option<&str>, email: &str| ParticipantDto { name: name.map(String::from), email: Some(email.into()) };
+        let reply_to = [p(Some("Владелец списка"), "owner@list.ru"), p(None, "help@list.ru")];
+        let recipients = [r(1, Some("Я"), Some("me@x.ru")), r(1, Some("Борис"), Some("b@y.ru")), r(2, Some("Вера"), Some("v@z.ru"))];
+
+        // «Ответить»: все адреса Reply-To вместо отправителя.
+        let (to, cc) = reply_recipients(ComposeKindDto::Reply, Some("Рассылка"), Some("list@list.ru"), &reply_to, &recipients, &own);
+        assert_eq!(emails(&to), vec!["owner@list.ru", "help@list.ru"]);
+        assert_eq!(to[0].name.as_deref(), Some("Владелец списка"));
+        assert!(cc.is_empty());
+
+        // «Ответить всем»: Reply-To, затем «Кому» без своих; отправитель рассылки не добавляется.
+        let (to, cc) = reply_recipients(ComposeKindDto::ReplyAll, Some("Рассылка"), Some("list@list.ru"), &reply_to, &recipients, &own);
+        assert_eq!(emails(&to), vec!["owner@list.ru", "help@list.ru", "b@y.ru"]);
+        assert_eq!(emails(&cc), vec!["v@z.ru"]);
+
+        // Reply-To без SMTP-адреса (EX или пусто) отбрасывается; если никого не осталось — пусто, как и у отправителя без адреса.
+        let bad = [p(Some("Устаревший"), "/o=Org/ou=Exchange/cn=Recipients/cn=old"), ParticipantDto { name: Some("Без адреса".into()), email: None }];
+        let (to, _) = reply_recipients(ComposeKindDto::Reply, Some("Анна"), Some("a@y.ru"), &bad, &recipients, &own);
+        assert!(to.is_empty(), "Reply-To есть, но без годных адресов: отправитель не подставляется (заголовок просил не ему)");
+
+        // Повтор Reply-To в «Кому» оригинала не дублируется.
+        let dup = [r(1, Some("Владелец"), Some("OWNER@list.ru"))];
+        let (to, _) = reply_recipients(ComposeKindDto::ReplyAll, None, Some("list@list.ru"), &reply_to[..1], &dup, &own);
+        assert_eq!(emails(&to), vec!["owner@list.ru"]);
+
+        // Пересылка и новое письмо Reply-To не трогают.
+        assert_eq!(reply_recipients(ComposeKindDto::Forward, None, Some("list@list.ru"), &reply_to, &recipients, &own), (vec![], vec![]));
     }
 
     #[test]

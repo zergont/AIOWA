@@ -38,9 +38,11 @@ use tracing::warn;
 mod calendar;
 mod calendar_write;
 mod compose;
+mod folders;
 mod notify;
 mod ondemand;
 mod reminders;
+mod staged;
 mod sync;
 mod write;
 
@@ -98,8 +100,8 @@ struct AccountDto {
     db_path: String,
 }
 
-#[derive(Serialize)]
-struct FolderDto {
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct FolderDto {
     folder_pk: i64,
     parent_pk: Option<i64>,
     name: String,
@@ -107,6 +109,23 @@ struct FolderDto {
     total: i64,
     unread: i64,
     is_mail: bool,
+}
+
+/// DTO папок из строк базы: родитель ищется по идентификатору сервера среди тех же строк
+/// (корень ящика `msgfolderroot` в базе не хранится, поэтому у папок верхнего уровня `parent_pk = None`).
+pub(crate) fn folder_dtos(list: &[(i64, aiowa_core::Folder)]) -> Vec<FolderDto> {
+    let by_server: HashMap<&str, i64> = list.iter().map(|(pk, f)| (f.id.id.as_str(), *pk)).collect();
+    list.iter()
+        .map(|(pk, f)| FolderDto {
+            folder_pk: *pk,
+            parent_pk: f.parent_id.as_ref().and_then(|p| by_server.get(p.id.as_str()).copied()),
+            name: f.display_name.clone(),
+            distinguished: f.distinguished.clone(),
+            total: f.total_count,
+            unread: f.unread_count,
+            is_mail: f.is_mail(),
+        })
+        .collect()
 }
 
 #[derive(Serialize)]
@@ -128,6 +147,13 @@ struct RecipientDto {
     kind: i64,
     name: Option<String>,
     email: Option<String>,
+}
+
+/// Участник без вида получателя: адрес `Reply-To` письма.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct ParticipantDto {
+    pub(crate) name: Option<String>,
+    pub(crate) email: Option<String>,
 }
 
 /// Получатель исходящего письма (композер): без вида, адрес обязателен. В обе стороны — в
@@ -178,6 +204,9 @@ pub(crate) struct MessageDto {
     /// Класс элемента Exchange (`IPM.Note`, приглашение `IPM.Schedule.Meeting.Request`, отмена
     /// `…Canceled`, ответ участника `…Resp.Pos`/`Neg`/`Tent`): по нему окно узнаёт письмо о встрече.
     item_class: Option<String>,
+    /// Адреса `Reply-To`, если заголовок есть и отличается от отправителя: ответ уходит сюда, а
+    /// карточка показывает «Ответ на: …». Пусто, если заголовка нет или он совпадает с `From`.
+    pub(crate) reply_to: Vec<ParticipantDto>,
 }
 
 /// Ключ состояния письма для `conversation_key`: по нему окно решает, перечитывать ли беседу.
@@ -350,6 +379,7 @@ pub(crate) fn build_message(store: &Store, h: MessageHead) -> CmdResult<MessageD
         .into_iter()
         .map(|a| AttachmentDto { attachment_pk: a.attachment_pk, name: a.name, content_type: a.content_type, size: a.size, is_inline: a.is_inline, cached: a.local_path.is_some(), content_id: a.content_id })
         .collect();
+    let reply_to = effective_reply_to(h.from_name.as_deref(), h.from_email.as_deref(), &h.reply_to);
     Ok(MessageDto {
         item_pk: h.item_pk,
         folder_pk: h.folder_pk,
@@ -373,7 +403,15 @@ pub(crate) fn build_message(store: &Store, h: MessageHead) -> CmdResult<MessageD
         recipients,
         attachments,
         item_class: h.item_class,
+        reply_to,
     })
+}
+
+/// Адреса `Reply-To` для показа и ответа: только если заголовок есть и хотя бы один адрес в нём
+/// отличается от отправителя (`aiowa_core::effective_reply_to`); иначе пусто — отвечать отправителю.
+pub(crate) fn effective_reply_to(from_name: Option<&str>, from_email: Option<&str>, reply_to: &[aiowa_core::Participant]) -> Vec<ParticipantDto> {
+    let from = from_email.map(|e| aiowa_core::Participant { name: from_name.map(String::from), email: Some(e.to_string()), routing_type: None });
+    aiowa_core::effective_reply_to(from.as_ref(), reply_to).into_iter().map(|p| ParticipantDto { name: p.name, email: p.email }).collect()
 }
 
 #[tauri::command]
@@ -384,19 +422,7 @@ fn account_info(state: State<'_, AppState>) -> AccountDto {
 #[tauri::command]
 fn folders(state: State<'_, AppState>) -> CmdResult<Vec<FolderDto>> {
     let list = state.store.list_folders(state.account).map_err(err)?;
-    let by_server: HashMap<&str, i64> = list.iter().map(|(pk, f)| (f.id.id.as_str(), *pk)).collect();
-    Ok(list
-        .iter()
-        .map(|(pk, f)| FolderDto {
-            folder_pk: *pk,
-            parent_pk: f.parent_id.as_ref().and_then(|p| by_server.get(p.id.as_str()).copied()),
-            name: f.display_name.clone(),
-            distinguished: f.distinguished.clone(),
-            total: f.total_count,
-            unread: f.unread_count,
-            is_mail: f.is_mail(),
-        })
-        .collect())
+    Ok(folder_dtos(&list))
 }
 
 #[tauri::command]
@@ -494,6 +520,7 @@ pub fn run() {
         .manage(reminders_state.clone())
         .manage(ondemand::OnDemand::default())
         .manage(write::WriteState::default())
+        .manage(staged::StagedState::default())
         .manage(compose::ComposeState::default())
         .manage(calendar::CalendarState::default())
         .manage(calendar_write::CalendarWriteState::default())
@@ -539,6 +566,12 @@ pub fn run() {
             write::items_move,
             write::items_delete,
             write::conversation_item_pks,
+            staged::items_stage,
+            staged::items_undo,
+            staged::items_commit,
+            folders::folder_create,
+            folders::folder_rename,
+            folders::folder_delete,
             compose::compose_context,
             compose::compose_send,
             compose::compose_save_draft,
@@ -566,12 +599,14 @@ pub fn run() {
         ])
         .build(tauri::generate_context!())
         .expect("ошибка запуска приложения");
-    app.run(move |_app, event| {
-        // Сессия на сервере одна на процесс: при выходе закрыть канал уведомлений, остановить
-        // синхронизацию и выйти из сессии, иначе сервер накапливает сессии до MapiExceptionSessionLimit.
+    app.run(move |app, event| {
+        // Сессия на сервере одна на процесс: при выходе закрыть канал уведомлений, отправить на
+        // сервер отложенные действия (окно отмены ещё не истекло), остановить синхронизацию и
+        // выйти из сессии, иначе сервер накапливает сессии до MapiExceptionSessionLimit.
         if let tauri::RunEvent::Exit = event {
             reminders_state.shutdown();
             notify_state.shutdown();
+            staged::commit_all_blocking(app);
             sync_state.shutdown();
         }
     });
