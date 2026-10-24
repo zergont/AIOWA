@@ -30,13 +30,47 @@
   },
   "bundle": {
     "active": true,
-    "targets": ["nsis"],
+    "targets": [
+      "nsis"
+    ],
+    "publisher": "AIOWA",
+    "copyright": "© 2026 AIOWA",
+    "category": "Productivity",
+    "shortDescription": "Почта и календарь Exchange через Outlook Web Access",
+    "longDescription": "Настольный клиент Exchange 2019 через OWA: офлайн-база писем с поиском, вложения, ответы и пересылка, календарь и встречи, адресная книга организации, мгновенные уведомления.",
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
       "icons/128x128@2x.png",
       "icons/icon.icns",
       "icons/icon.ico"
-    ]
+    ],
+    "windows": {
+      "webviewInstallMode": {
+        "type": "embedBootstrapper",
+        "silent": true
+      },
+      "signCommand": {
+        "cmd": "powershell.exe",
+        "args": [
+          "-NoProfile",
+          "-NonInteractive",
+          "-ExecutionPolicy",
+          "Bypass",
+          "-File",
+          "scripts/sign.ps1",
+          "%1"
+        ]
+      },
+      "nsis": {
+        "installMode": "currentUser",
+        "languages": [
+          "Russian"
+        ],
+        "displayLanguageSelector": false,
+        "installerIcon": "icons/icon.ico",
+        "compression": "lzma"
+      }
+    }
   }
 }

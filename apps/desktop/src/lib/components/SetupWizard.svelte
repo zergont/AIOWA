@@ -2,6 +2,7 @@
   import { onDestroy, tick, untrack } from "svelte";
   import { api, errorMessage, type AppMode, type LoginTest } from "../api";
   import { BODY_DAYS_CHOICES, loginHint, owaUrl, parseHost } from "../setup";
+  import Logo from "./Logo.svelte";
 
   /**
    * Мастер первого запуска: приложение поднялось без учётной записи (режим "setup"), почты ещё нет.
@@ -177,7 +178,7 @@
 <main class="setup" aria-labelledby="{uid}-title">
   <div class="card" aria-busy={busy}>
     <header class="head">
-      <span class="brand-mark" aria-hidden="true"></span>
+      <Logo size={32} />
       <div>
         <h1 class="title" id="{uid}-title">Подключение к почте</h1>
         <p class="caption sub">AIOWA работает с Exchange через Outlook Web Access</p>
@@ -349,13 +350,6 @@
     display: flex;
     align-items: center;
     gap: var(--space-3);
-  }
-  .brand-mark {
-    flex: none;
-    width: 32px;
-    height: 32px;
-    border-radius: 8px;
-    background: linear-gradient(135deg, var(--accent), var(--accent-hover));
   }
   .title {
     margin: 0;

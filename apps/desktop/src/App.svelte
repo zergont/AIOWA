@@ -13,6 +13,7 @@
   import ReadingPane from "./lib/components/ReadingPane.svelte";
   import SearchResults from "./lib/components/SearchResults.svelte";
   import StatusBar from "./lib/components/StatusBar.svelte";
+  import Logo from "./lib/components/Logo.svelte";
   import Composer, { type CloseReason } from "./lib/components/Composer.svelte";
   import ConfirmPopover from "./lib/components/ConfirmPopover.svelte";
   import CalendarView from "./lib/components/CalendarView.svelte";
@@ -1414,7 +1415,7 @@
 <div class="shell" class:dragging style="--list-width: {listWidth}px">
   <header class="topbar">
     <div class="brand">
-      <span class="brand-mark" aria-hidden="true"></span>
+      <Logo size={20} />
       <span class="brand-name">AIOWA</span>
     </div>
     <div class="segmented sections" role="tablist" aria-label="Разделы">
@@ -1592,12 +1593,6 @@
     display: flex;
     align-items: center;
     gap: var(--space-2);
-  }
-  .brand-mark {
-    width: 20px;
-    height: 20px;
-    border-radius: 6px;
-    background: linear-gradient(135deg, var(--accent), var(--accent-hover));
   }
   .brand-name {
     font: var(--text-body-strong);
