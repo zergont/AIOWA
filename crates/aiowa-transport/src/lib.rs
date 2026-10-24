@@ -6,8 +6,8 @@
 
 use aiowa_core::{FolderChanges, FolderId, FolderRef, ItemChanges, ItemId, MessageFull, Participant, SyncState};
 pub use aiowa_core::{
-    Attendee, CalendarEvent, CalendarEventDetails, CalendarItemChanges, CalendarItemType, ComposeKind, DraftContent, FreeBusy, MeetingMessageKind, MeetingRequestInfo, MeetingResponse, NewCalendarItem,
-    OutgoingAttachment, OutgoingMessage, ResponseType, Signature,
+    Attendee, CalendarEvent, CalendarEventDetails, CalendarItemChanges, CalendarItemType, ComposeKind, DirectoryPerson, DraftContent, FreeBusy, MeetingMessageKind, MeetingRequestInfo, MeetingResponse,
+    NewCalendarItem, OutgoingAttachment, OutgoingMessage, PersonKind, ResponseType, Signature,
 };
 use jiff::Timestamp;
 use secrecy::SecretString;
@@ -425,6 +425,27 @@ pub trait MailTransport: Send + Sync {
     /// Письмо о встрече (`GetItem` по письму-приглашению, отмене или ответу) с полями встречи:
     /// вид по `ItemClass`, время и место, организатор, свой ответ, устарело ли, связанное событие.
     async fn get_meeting_request(&self, id: &ItemId) -> Result<MeetingRequestInfo>;
+
+    /// Поиск по справочнику организации (`FindPeople` по папке `directory`): до `max` записей по
+    /// началу слов имени или адреса, в порядке сервера. Пустой запрос — пустой ответ без вызова.
+    /// У записей есть имя, адрес, вид, компания и (если сервер принял дополнительные свойства)
+    /// должность, офис и телефоны; отдела нет — его даёт `resolve_names` с полными данными.
+    /// Отказ сервера по операции — `Server`/`Protocol`; вызывающий может перейти на
+    /// `resolve_names`.
+    async fn find_people(&self, query: &str, max: usize) -> Result<Vec<DirectoryPerson>>;
+
+    /// Разрешение имени по справочнику (`ResolveNames`, `SearchScope: ActiveDirectory`):
+    /// `full_contact` — с данными контакта (должность, отдел, телефоны). Ничего не найдено
+    /// (`ErrorNameResolutionNoResults`) — пустой список; несколько совпадений
+    /// (`ErrorNameResolutionMultipleResults`, класс `Warning`) — успех со списком (сервер отдаёт
+    /// до 100).
+    async fn resolve_names(&self, query: &str, full_contact: bool) -> Result<Vec<DirectoryPerson>>;
+
+    /// Участники списка рассылки (`ExpandDL` по SMTP-адресу списка), один уровень: вложенные
+    /// списки приходят записями вида `DistributionList`. Не список или нет доступа — `Server`.
+    /// Внимание: Exchange 2019 через OWA JSON отвечает на форму EWS HTTP 500 (`Protocol`,
+    /// docs/protocol-owa-json.md § 5l) — вызывающий показывает ошибку.
+    async fn expand_dl(&self, email: &str) -> Result<Vec<DirectoryPerson>>;
 
     /// Подписаться на уведомления (`SubscribeToNotification`). Результат той же длины и порядка,
     /// что `subs`; отказ по одной подписке — `created: false` с текстом, `Err` — отказ вызова.

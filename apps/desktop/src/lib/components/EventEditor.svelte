@@ -21,8 +21,13 @@
     /** Событие сохранено: родитель перечитывает окно и выделяет его. */
     onsaved: (ev: CalendarEvent) => void;
     onclose: () => void;
+    /**
+     * Раздел календаря на экране. Скрытый (ушли в почту) редактор остаётся открытым, но клавиши
+     * окна не трогает: Ctrl+Enter письма не должен сохранять встречу и рассылать приглашения.
+     */
+    visible?: boolean;
   }
-  let { draft, onsaved, onclose }: Props = $props();
+  let { draft, onsaved, onclose, visible = true }: Props = $props();
 
   // Экземпляр мог быть уничтожен, пока шёл запрос: его итог тогда никому не нужен.
   let alive = true;
@@ -249,8 +254,8 @@
   }
 
   function onKey(e: KeyboardEvent) {
-    // У всплывающих окон внутри свой Esc.
-    if (confirmCancel || askUpdates) return;
+    // У всплывающих окон внутри свой Esc; скрытый редактор клавиш не слушает.
+    if (!visible || confirmCancel || askUpdates) return;
     if ((e.ctrlKey || e.metaKey) && e.key === "Enter") {
       e.preventDefault();
       void save();

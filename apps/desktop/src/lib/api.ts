@@ -307,6 +307,53 @@ export interface RecipientSuggestion {
   weight: number;
 }
 
+// --- справочник организации ----------------------------------------------------------------
+// Бэкенд ищет сначала в кэше справочника (локальная база), затем на сервере (FindPeople, при отказе —
+// ResolveNames) и складывает найденное в кэш. Поля, которых справочник не дал, приходят null или
+// отсутствуют вовсе: окно не полагается ни на одно из них, кроме адреса.
+
+/** Вид записи справочника: почтовый ящик, список рассылки, контакт, переговорная, прочее. */
+export type DirectoryKind = "mailbox" | "list" | "contact" | "room" | "other";
+
+export interface DirectoryPerson {
+  name?: string | null;
+  email?: string | null;
+  kind: DirectoryKind;
+  title?: string | null;
+  department?: string | null;
+  company?: string | null;
+  office?: string | null;
+  business_phone?: string | null;
+  mobile_phone?: string | null;
+}
+
+/** Поиск по справочнику: найденное, взято ли оно из кэша, и текст отказа сервера (кэш при отказе всё равно отдаётся). */
+export interface DirectorySearch {
+  people: DirectoryPerson[];
+  from_cache: boolean;
+  error?: string | null;
+}
+
+/** Переписка с адресом по локальной базе: писем от него, писем ему и время последнего. */
+export interface ContactLocal {
+  messages_from: number;
+  messages_to: number;
+  last_ms?: number | null;
+}
+
+/** Карточка контакта: запись справочника (null — не нашлась), из кэша ли она, отказ сервера и переписка. */
+export interface ContactCard {
+  person: DirectoryPerson | null;
+  from_cache: boolean;
+  error?: string | null;
+  local?: ContactLocal | null;
+}
+
+/** Запись справочника — список рассылки: его можно развернуть в участников. */
+export function isDirectoryList(p: Pick<DirectoryPerson, "kind"> | null | undefined): boolean {
+  return p?.kind === "list";
+}
+
 export interface PickedFile {
   path: string;
   name: string;
@@ -558,6 +605,18 @@ export const api = {
   composeDiscardDraft: (draftServerId: string) => invoke<void>("compose_discard_draft", { draftServerId }),
   /** Подсказки адресатов по началу адреса или слову имени. */
   recipientsSuggest: (prefix: string, limit?: number) => invoke<RecipientSuggestion[]>("recipients_suggest", { prefix, limit: limit ?? null }),
+  /**
+   * Поиск по справочнику организации: сервер с таймаутом 10 с (повтор запроса за 10 минут — его же
+   * ответ из базы); `cacheOnly` — сразу и без сервера, кэш справочника на время, пока ищет сервер.
+   * Запрос короче 2 символов — пусто.
+   */
+  directorySearch: (query: string, limit?: number, cacheOnly = false) => invoke<DirectorySearch>("directory_search", { query, limit: limit ?? null, cacheOnly }),
+  /** Карточка контакта: справочник (кэш или сервер; `refresh` — заново с сервера) и счётчики переписки. */
+  contactCard: (email: string, refresh = false) => invoke<ContactCard>("contact_card", { email, refresh }),
+  /** Участники списка рассылки (ExpandDL на сервере). */
+  directoryExpand: (email: string) => invoke<DirectoryPerson[]>("directory_expand", { email }),
+  /** Что умеет справочник на этом сервере: раскрытие списков рассылки бывает не реализовано (§ 5l). */
+  directoryCapabilities: () => invoke<{ can_expand: boolean }>("directory_capabilities"),
   ownAddresses: () => invoke<string[]>("own_addresses"),
   signatureGet: () => invoke<SignatureDto>("signature_get"),
   signatureSet: (html: string, autoAdd: boolean) => invoke<void>("signature_set", { html, autoAdd }),

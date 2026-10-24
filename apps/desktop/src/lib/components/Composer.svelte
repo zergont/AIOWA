@@ -173,6 +173,8 @@
     root?.scrollIntoView({ block: "start" });
     // Ответу и черновику с адресатом нужен текст, остальным — адресат.
     if (ctx.kind === "reply" || ctx.kind === "reply_all" || (ctx.draft && to.length)) editor?.focus();
+    // Новое письмо с адресатом заранее («Написать письмо» из карточки контакта): дальше — тема.
+    else if (ctx.kind === "new" && !ctx.draft && to.length && !subject) document.getElementById(`${uid}-subject`)?.focus();
     else document.getElementById(`${uid}-to`)?.focus();
     void loadOriginal();
   });

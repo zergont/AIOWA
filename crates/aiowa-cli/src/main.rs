@@ -1,18 +1,19 @@
 //! `aiowa`: консольная утилита этапа 1. Вход, папки, синхронизация в локальную базу,
 //! список бесед, поиск с операторами, вложения, операции записи (прочитано, флаг, перенос, удаление),
 //! папки (создание, переименование, удаление, живая проверка), отправка письма, подпись из OWA,
-//! подсказки адресов, календарь (окно событий, одно событие, создание, изменение и удаление события,
-//! письмо о встрече), проверка поля Reply-To, живая проверка черновиков (создание, чтение,
-//! изменение, удаление вложения, удаление).
+//! подсказки адресов, справочник организации (FindPeople, ResolveNames, ExpandDL), календарь
+//! (окно событий, одно событие, создание, изменение и удаление события, письмо о встрече),
+//! проверка поля Reply-To, живая проверка черновиков (создание, чтение, изменение, удаление
+//! вложения, удаление).
 //! Пароль хранится в диспетчере учётных данных Windows и не передаётся аргументом.
 
 use aiowa_core::{
-    AccountId, CalendarItemChanges, CalendarItemType, ComposeKind, DraftContent, FolderChange, FolderId, FolderRef, FreeBusy, Importance, ItemId, NewCalendarItem, OutgoingAttachment, OutgoingMessage,
-    Participant, RecipientKind, SyncState,
+    AccountId, CalendarItemChanges, CalendarItemType, ComposeKind, DirectoryPerson, DraftContent, FolderChange, FolderId, FolderRef, FreeBusy, Importance, ItemId, NewCalendarItem, OutgoingAttachment, OutgoingMessage,
+    Participant, PersonKind, RecipientKind, SyncState,
 };
 use aiowa_store::{AttachmentTodo, CalendarRow, Store};
 use aiowa_sync::{Engine, FolderSelection, SyncOptions};
-use aiowa_transport::{new_guid, Credentials, DeleteMode, MailTransport, NotificationEvent, NotificationKind, SubscriptionRequest, WriteResult};
+use aiowa_transport::{new_guid, Credentials, DeleteMode, MailTransport, NotificationEvent, NotificationKind, SubscriptionRequest, TransportError, WriteResult};
 use aiowa_transport_owa::{OwaConfig, OwaTransport};
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand};
@@ -265,6 +266,40 @@ enum Cmd {
         prefix: String,
         #[arg(long, default_value_t = 10)]
         limit: usize,
+    },
+    /// Справочник организации (только чтение): FindPeople по запросу, с --resolve ещё ResolveNames,
+    /// с --expand — ExpandDL. Печатает только счётчики, ключи полей, коды и длительности, без
+    /// значений; найденное пишется в кэш справочника локальной базы
+    Directory {
+        /// Строка поиска (в вывод не печатается); без неё — первое слово имени владельца ящика из
+        /// «Отправленных» локальной базы
+        #[arg(long)]
+        query: Option<String>,
+        /// Также ResolveNames по запросу (с полными данными и без) и по адресу первой найденной
+        /// записи (как карточка контакта)
+        #[arg(long)]
+        resolve: bool,
+        /// ExpandDL по адресу списка рассылки; `first` — первый список из результатов поиска, а если
+        /// его нет — первый из частых получателей локальной базы, который ResolveNames назвал списком
+        #[arg(long)]
+        expand: Option<String>,
+        /// Повторить поиск по первым трём буквам запроса
+        #[arg(long)]
+        prefix3: bool,
+        /// Сколько записей просить у FindPeople
+        #[arg(long, default_value_t = 25)]
+        max: usize,
+        /// Проверить дополнительные свойства записи FindPeople (`persona:Title` и др., по одному и
+        /// вместе) и форму `ContactDataShape: Default` у ResolveNames
+        #[arg(long)]
+        probe_shapes: bool,
+        /// Сколько кандидатов в списки рассылки из локальной базы проверять ResolveNames
+        #[arg(long, default_value_t = 5)]
+        dl_candidates: usize,
+        /// Дополнительные запросы FindPeople для поиска списков рассылки (печатаются только
+        /// счётчики); можно повторять
+        #[arg(long)]
+        dl_query: Vec<String>,
     },
     /// Календарь: события окна с сервера (FindItem с CalendarView) в кэш локальной базы и сводка
     /// без тем и имён; с --details N — GetItem по N-му событию списка (только чтение)
@@ -1477,6 +1512,488 @@ fn default_db_path(host: &str, user: &str) -> PathBuf {
     base.join("AIOWA").join(host).join(safe_user).join("mail.db")
 }
 
+// ---------------------------------------------------------------------------
+// Справочник организации (`aiowa directory`, § 5l): только чтение, без значений в выводе
+
+/// Код ошибки транспорта без текста сервера (текст может повторять запрос или имя).
+fn transport_error_code(e: &TransportError) -> String {
+    match e {
+        TransportError::Server { code, .. } => code.clone(),
+        // Текст отказа сервера (FaultMessage) — с маской на всём, что похоже на адрес.
+        TransportError::Protocol { op, status, raw } => {
+            let masked: Vec<&str> = raw.split_whitespace().map(|w| if w.contains('@') { "<адрес>" } else { w }).collect();
+            format!("{op}: HTTP {status}: {}", truncate(&masked.join(" "), 200))
+        }
+        TransportError::Throttled { retry_after } => format!("Throttled {retry_after:?}"),
+        TransportError::Network(_) => "Network".into(),
+        TransportError::AuthFailed(_) => "AuthFailed".into(),
+        other => other.to_string(),
+    }
+}
+
+/// Сводка записей справочника без значений: сколько записей с каждым полем и виды.
+fn describe_people(people: &[DirectoryPerson]) -> String {
+    let n = |f: &dyn Fn(&DirectoryPerson) -> bool| people.iter().filter(|p| f(p)).count();
+    let mut kinds: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+    for p in people {
+        *kinds.entry(p.kind.key()).or_default() += 1;
+    }
+    let kinds: Vec<String> = kinds.into_iter().map(|(k, c)| format!("{k} {c}")).collect();
+    format!(
+        "записей {}: SMTP {}, имя {}, должность {}, отдел {}, компания {}, офис {}, рабочий тел. {}, мобильный {}, псевдоним {}; виды: {}",
+        people.len(),
+        n(&|p| p.email_key().is_some()),
+        n(&|p| p.display_name.is_some()),
+        n(&|p| p.title.is_some()),
+        n(&|p| p.department.is_some()),
+        n(&|p| p.company.is_some()),
+        n(&|p| p.office.is_some()),
+        n(&|p| p.business_phone.is_some()),
+        n(&|p| p.mobile_phone.is_some()),
+        n(&|p| p.alias.is_some()),
+        if kinds.is_empty() { "нет".to_string() } else { kinds.join(", ") }
+    )
+}
+
+/// Ключи объектов с числом объектов, где ключ есть: `Ключ×N, …`.
+fn keys_line(items: &[serde_json::Value]) -> String {
+    let keys = aiowa_transport_owa::protocol::key_union(items);
+    if keys.is_empty() {
+        return "нет".into();
+    }
+    keys.iter().map(|(k, n)| format!("{k}×{n}")).collect::<Vec<_>>().join(", ")
+}
+
+/// Вложенные объекты `key` записей массива (для ключей `EmailAddress`, `Mailbox`, `Contact`).
+fn nested(items: &[serde_json::Value], key: &str) -> Vec<serde_json::Value> {
+    items.iter().filter_map(|v| v.get(key)).filter(|v| v.is_object()).cloned().collect()
+}
+
+/// Латиница для слова кириллицы (упрощённо): чтобы узнать фамилию в имени по адресу.
+fn translit(word: &str) -> String {
+    let mut out = String::new();
+    for c in word.to_lowercase().chars() {
+        if c.is_ascii_alphabetic() {
+            out.push(c);
+            continue;
+        }
+        out.push_str(match c {
+            'а' => "a",
+            'б' => "b",
+            'в' => "v",
+            'г' => "g",
+            'д' => "d",
+            'е' | 'ё' | 'э' => "e",
+            'ж' => "zh",
+            'з' => "z",
+            'и' | 'й' => "i",
+            'к' => "k",
+            'л' => "l",
+            'м' => "m",
+            'н' => "n",
+            'о' => "o",
+            'п' => "p",
+            'р' => "r",
+            'с' => "s",
+            'т' => "t",
+            'у' => "u",
+            'ф' => "f",
+            'х' => "kh",
+            'ц' => "ts",
+            'ч' => "ch",
+            'ш' => "sh",
+            'щ' => "sch",
+            'ы' => "y",
+            'ю' => "yu",
+            'я' => "ya",
+            _ => "",
+        });
+    }
+    out
+}
+
+/// Скалярные поля объекта без значений строк: `Ключ=str(N)`, числа и признаки как есть.
+fn scalar_fields(v: &serde_json::Value) -> String {
+    v.as_object()
+        .map(|o| o.iter().filter(|(_, x)| !x.is_array() && !x.is_object()).map(|(k, x)| format!("{k}={}", if x.is_string() { aiowa_transport_owa::protocol::json_shape(x, 0) } else { x.to_string() })).collect::<Vec<_>>().join(", "))
+        .unwrap_or_default()
+}
+
+/// Фамилия владельца ящика для живой проверки: слово имени из «Отправленных» (три буквы и
+/// длиннее), чья латиница дольше всех совпадает с началом собственного адреса; при равенстве —
+/// первое. Возвращает слово и описание выбора без значений.
+fn owner_surname(store: &Store, account: AccountId) -> Result<(String, String)> {
+    let name = store.own_display_name(account)?.ok_or_else(|| anyhow!("имени владельца нет в «Отправленных» локальной базы: задайте --query"))?;
+    let local = store.own_addresses(account)?.first().and_then(|a| a.split('@').next().map(str::to_string)).unwrap_or_default();
+    let words: Vec<&str> = name.split(|c: char| c.is_whitespace() || c == ',').filter(|w| w.chars().filter(|c| c.is_alphabetic()).count() >= 3).collect();
+    let common = |w: &str| translit(w).chars().zip(local.chars()).take_while(|(a, b)| a == b).count();
+    let (index, word) = words.iter().enumerate().max_by(|a, b| common(a.1).cmp(&common(b.1)).then(b.0.cmp(&a.0))).ok_or_else(|| anyhow!("в имени владельца нет слов длиннее двух букв: задайте --query"))?;
+    let how = format!("слово {} из {} имени владельца из «Отправленных», {} символов, совпадение с адресом {} букв", index + 1, words.len(), word.chars().count(), common(word));
+    Ok((word.to_string(), how))
+}
+
+/// Один поиск `FindPeople` с печатью формы ответа без значений; найденное — в кэш.
+async fn directory_find(t: &OwaTransport, store: &Store, account: AccountId, label: &str, query: &str, max: usize) -> Vec<DirectoryPerson> {
+    use aiowa_transport_owa::protocol;
+    let started = std::time::Instant::now();
+    let v = match t.find_people_value(query, max).await {
+        Ok(v) => v,
+        Err(e) => {
+            println!("FindPeople ({label}, {} символов): отказ {} за {} мс", query.chars().count(), transport_error_code(&e), started.elapsed().as_millis());
+            return Vec::new();
+        }
+    };
+    let ms = started.elapsed().as_millis();
+    let body = v.get("Body").cloned().unwrap_or_default();
+    println!("FindPeople ({label}, {} символов, max {max}): {ms} мс, ответ {} байт", query.chars().count(), v.to_string().len());
+    println!("  Body: ключи [{}]; ResponseClass {}, ResponseCode {}", body.as_object().map(|o| o.keys().cloned().collect::<Vec<_>>().join(", ")).unwrap_or_default(), protocol::str_of(&body, "ResponseClass").unwrap_or("?"), protocol::str_of(&body, "ResponseCode").unwrap_or("?"));
+    for key in ["TotalNumberOfPeopleInView", "FirstMatchingRowIndex", "FirstLoadedRowIndex"] {
+        if let Some(n) = body.get(key) {
+            println!("  {key}: {n}");
+        }
+    }
+    let people_raw = protocol::find_people_array(&v).cloned().unwrap_or_default();
+    let array_key = ["ResultSet", "People", "Personas"].into_iter().find(|k| body.get(*k).is_some_and(serde_json::Value::is_array)).unwrap_or("нет в Body");
+    println!("  записи (массив {array_key}): {}; ключи: {}", people_raw.len(), keys_line(&people_raw));
+    println!("  записи[].EmailAddress: ключи: {}", keys_line(&nested(&people_raw, "EmailAddress")));
+    for key in ["EmailAddresses", "Titles", "Departments", "OfficeLocations", "BusinessPhoneNumbers", "MobilePhones", "PhoneNumber", "CompanyNames"] {
+        if let Some(x) = people_raw.iter().find_map(|p| p.get(key)) {
+            println!("  форма {key}: {}", protocol::json_shape(x, 3));
+        }
+    }
+    let persona_types: std::collections::BTreeMap<String, usize> = people_raw.iter().fold(Default::default(), |mut m, p| {
+        *m.entry(protocol::str_of(p, "PersonaType").or_else(|| protocol::str_of(p, "PersonaTypeString")).unwrap_or("нет").to_string()).or_default() += 1;
+        m
+    });
+    let mailbox_types: std::collections::BTreeMap<String, usize> = people_raw.iter().fold(Default::default(), |mut m, p| {
+        *m.entry(p.pointer("/EmailAddress/MailboxType").and_then(serde_json::Value::as_str).unwrap_or("нет").to_string()).or_default() += 1;
+        m
+    });
+    println!("  PersonaType(String): {persona_types:?}; EmailAddress.MailboxType: {mailbox_types:?}");
+    if let Some(first) = people_raw.first() {
+        println!("  форма первой записи: {}", protocol::json_shape(first, 4));
+    }
+    match OwaTransport::find_people_result(&v, max) {
+        Ok(people) => {
+            println!("  разобрано: {}", describe_people(&people));
+            match store.upsert_directory_people(account, &people) {
+                Ok(n) => println!("  в кэш справочника записано {n}"),
+                Err(e) => println!("  кэш справочника: ошибка {e}"),
+            }
+            people
+        }
+        Err(e) => {
+            println!("  разбор: отказ {}", transport_error_code(&e));
+            Vec::new()
+        }
+    }
+}
+
+/// `ResolveNames` с печатью формы ответа без значений; найденное — в кэш.
+async fn directory_resolve(t: &OwaTransport, store: &Store, account: AccountId, label: &str, query: &str, full: bool) -> Vec<DirectoryPerson> {
+    use aiowa_transport_owa::protocol;
+    let started = std::time::Instant::now();
+    let v = match t.resolve_names_value(query, full).await {
+        Ok(v) => v,
+        Err(e) => {
+            println!("ResolveNames ({label}, полные данные: {full}): отказ {} за {} мс", transport_error_code(&e), started.elapsed().as_millis());
+            return Vec::new();
+        }
+    };
+    let ms = started.elapsed().as_millis();
+    let msgs = protocol::response_messages(&v);
+    let msg = msgs.first().map(|m| (*m).clone()).unwrap_or_default();
+    println!(
+        "ResolveNames ({label}, {} символов, полные данные: {full}): {ms} мс, ответ {} байт; сообщение {} {} {}",
+        query.chars().count(),
+        v.to_string().len(),
+        protocol::str_of(&msg, "__type").unwrap_or("без __type"),
+        protocol::str_of(&msg, "ResponseClass").unwrap_or("?"),
+        protocol::str_of(&msg, "ResponseCode").unwrap_or("?")
+    );
+    println!("  ключи сообщения: [{}]", msg.as_object().map(|o| o.keys().cloned().collect::<Vec<_>>().join(", ")).unwrap_or_default());
+    if let Some(set) = msg.get("ResolutionSet") {
+        println!("  ResolutionSet: {} [{}]", if set.is_array() { "массив" } else { "объект" }, scalar_fields(set));
+    }
+    let res = protocol::resolutions_array(&msg).cloned().unwrap_or_default();
+    println!("  Resolutions: {}; ключи: {}", res.len(), keys_line(&res));
+    println!("  Mailbox: ключи: {}", keys_line(&nested(&res, "Mailbox")));
+    let contacts = nested(&res, "Contact");
+    println!("  Contact: ключи: {}", keys_line(&contacts));
+    let mailbox_types: std::collections::BTreeMap<String, usize> = res.iter().fold(Default::default(), |mut m, r| {
+        *m.entry(r.pointer("/Mailbox/MailboxType").and_then(serde_json::Value::as_str).unwrap_or("нет").to_string()).or_default() += 1;
+        m
+    });
+    println!("  Mailbox.MailboxType: {mailbox_types:?}");
+    if let Some(c) = contacts.first() {
+        for key in ["PhoneNumbers", "EmailAddresses", "PhysicalAddresses", "ContactSource", "Manager", "DirectReports"] {
+            if let Some(x) = c.get(key) {
+                println!("  форма Contact.{key}: {}", protocol::json_shape(x, 3));
+            }
+        }
+        let phone_keys: Vec<String> = c.get("PhoneNumbers").map(|p| match p {
+            serde_json::Value::Array(a) => a.iter().filter_map(|e| protocol::str_of(e, "Key").map(String::from)).collect(),
+            serde_json::Value::Object(o) => o.keys().cloned().collect(),
+            _ => vec![],
+        }).unwrap_or_default();
+        if !phone_keys.is_empty() {
+            println!("  виды телефонов первой записи: {}", phone_keys.join(", "));
+        }
+    }
+    // Сколько записей с непустым телефоном каждого вида (только счётчики).
+    let mut filled: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    for c in &contacts {
+        if let Some(a) = c.get("PhoneNumbers").and_then(serde_json::Value::as_array) {
+            for e in a {
+                let non_empty = e.get("PhoneNumber").or_else(|| e.get("Value")).and_then(serde_json::Value::as_str).is_some_and(|s| !s.trim().is_empty());
+                *filled.entry(protocol::str_of(e, "Key").unwrap_or("?").to_string()).or_default() += usize::from(non_empty);
+            }
+        }
+    }
+    if !filled.is_empty() {
+        println!("  непустые телефоны по видам (из {} записей): {filled:?}", contacts.len());
+    }
+    let filled_fields: Vec<String> = ["JobTitle", "Department", "CompanyName", "OfficeLocation", "Alias", "Manager", "Notes"]
+        .iter()
+        .map(|k| format!("{k} {}", contacts.iter().filter(|c| c.get(*k).and_then(serde_json::Value::as_str).is_some_and(|s| !s.trim().is_empty())).count()))
+        .collect();
+    if !contacts.is_empty() {
+        println!("  непустые поля Contact: {}", filled_fields.join(", "));
+    }
+    match OwaTransport::resolve_names_result(&v) {
+        Ok(people) => {
+            println!("  разобрано: {}", describe_people(&people));
+            match store.upsert_directory_people(account, &people) {
+                Ok(n) => println!("  в кэш справочника записано {n}"),
+                Err(e) => println!("  кэш справочника: ошибка {e}"),
+            }
+            people
+        }
+        Err(e) => {
+            println!("  разбор: отказ {}", transport_error_code(&e));
+            Vec::new()
+        }
+    }
+}
+
+/// Кандидаты в списки рассылки из локальной базы: частые получатели «Кому» и «Копии», от которых
+/// нет ни одного письма (адреса не печатаются).
+fn dl_candidates(store: &Store, account: AccountId, n: usize) -> Result<Vec<String>> {
+    let sql = format!(
+        "SELECT lower(r.email) AS e, COUNT(*) AS n FROM recipients r JOIN items i ON i.item_pk = r.item_pk
+          WHERE i.account_id = {a} AND r.kind IN (1, 2) AND r.email LIKE '%@%'
+            AND NOT EXISTS (SELECT 1 FROM items x WHERE x.account_id = {a} AND lower(x.from_email) = lower(r.email))
+          GROUP BY e ORDER BY n DESC LIMIT {n}",
+        a = account.0
+    );
+    Ok(store.debug_query(&sql)?.into_iter().skip(1).filter_map(|line| line.split('\t').next().map(String::from)).collect())
+}
+
+/// Свойства записи `FindPeople`, которые проверяет `--probe-shapes`: по одному и вместе.
+const PERSONA_PROBE_FIELDS: &[&str] = &["persona:Title", "persona:Department", "persona:OfficeLocations", "persona:BusinessPhoneNumbers", "persona:MobilePhones", "persona:Alias", "persona:PersonaType"];
+
+/// Проверка форм справочника (`--probe-shapes`): какие `AdditionalProperties` записи `FindPeople`
+/// сервер принимает и под какими ключами отдаёт, и сколько весит `ContactDataShape: Default`
+/// у `ResolveNames` против `AllProperties`. Печатаются только коды, ключи, счётчики и длины.
+async fn directory_probe_shapes(t: &OwaTransport, query: &str) {
+    use aiowa_transport_owa::protocol;
+    let base = match t.call("FindPeople", protocol::V_2017, protocol::find_people_body(query, 5)).await {
+        Ok(v) => v,
+        Err(e) => {
+            println!("Проба форм: базовый FindPeople отказ {}", transport_error_code(&e));
+            return;
+        }
+    };
+    let base_keys: std::collections::BTreeSet<String> = protocol::find_people_array(&base).map(|a| protocol::key_union(a).into_iter().map(|(k, _)| k).collect()).unwrap_or_default();
+    let mut accepted: Vec<&str> = Vec::new();
+    println!("Проба AdditionalProperties у FindPeople (3 буквы, max 5; базовых ключей {}):", base_keys.len());
+    for &f in PERSONA_PROBE_FIELDS {
+        if probe_persona_fields(t, query, &base_keys, &[f], f).await {
+            accepted.push(f);
+        }
+    }
+    if accepted.len() > 1 {
+        probe_persona_fields(t, query, &base_keys, &accepted, "все принятые вместе").await;
+    }
+    for shape in ["Default", "AllProperties"] {
+        let started = std::time::Instant::now();
+        match t.call("ResolveNames", protocol::V_2017, protocol::resolve_names_body_shaped(query, Some(shape))).await {
+            Ok(v) => {
+                let ms = started.elapsed().as_millis();
+                let msgs = protocol::response_messages(&v);
+                let msg = msgs.first().map(|m| (*m).clone()).unwrap_or_default();
+                let res = protocol::resolutions_array(&msg).cloned().unwrap_or_default();
+                println!("ResolveNames ContactDataShape {shape}: {ms} мс, ответ {} байт, {} {}, записей {}; Contact: {}", v.to_string().len(), protocol::str_of(&msg, "ResponseClass").unwrap_or("?"), protocol::str_of(&msg, "ResponseCode").unwrap_or("?"), res.len(), keys_line(&nested(&res, "Contact")));
+            }
+            Err(e) => println!("ResolveNames ContactDataShape {shape}: отказ {} за {} мс", transport_error_code(&e), started.elapsed().as_millis()),
+        }
+    }
+}
+
+/// Один `FindPeople` с `AdditionalProperties` `fields`: принят ли, какие ключи добавились к
+/// базовым `base_keys` и их форма (без значений).
+async fn probe_persona_fields(t: &OwaTransport, query: &str, base_keys: &std::collections::BTreeSet<String>, fields: &[&str], label: &str) -> bool {
+    use aiowa_transport_owa::protocol;
+    let started = std::time::Instant::now();
+    let v = match t.call("FindPeople", protocol::V_2017, protocol::find_people_body_with(query, 5, fields)).await {
+        Ok(v) => v,
+        Err(e) => {
+            println!("  {label}: отказ {} за {} мс", transport_error_code(&e), started.elapsed().as_millis());
+            return false;
+        }
+    };
+    let ms = started.elapsed().as_millis();
+    if let Some((code, _)) = protocol::body_error(&v) {
+        println!("  {label}: отказ в ответе {code} за {ms} мс");
+        return false;
+    }
+    let arr = protocol::find_people_array(&v).cloned().unwrap_or_default();
+    let new_keys: Vec<(String, usize)> = protocol::key_union(&arr).into_iter().filter(|(k, _)| !base_keys.contains(k)).collect();
+    let listed: Vec<String> = new_keys
+        .iter()
+        .map(|(k, n)| format!("{k}×{n} (непусто {})", arr.iter().filter(|p| p.get(k).is_some_and(|x| !x.is_null() && x != "" && x.as_array().is_none_or(|a| !a.is_empty()))).count()))
+        .collect();
+    println!("  {label}: принято, {ms} мс, записей {}, новые ключи [{}]", arr.len(), listed.join(", "));
+    for (k, _) in &new_keys {
+        if let Some(x) = arr.iter().find_map(|p| p.get(k).filter(|x| !x.is_null())) {
+            println!("    форма {k}: {}", protocol::json_shape(x, 3));
+        }
+    }
+    true
+}
+
+/// Параметры `aiowa directory`.
+struct DirectoryOpts<'a> {
+    query: &'a str,
+    resolve: bool,
+    expand: Option<&'a str>,
+    prefix3: bool,
+    max: usize,
+    probe_shapes: bool,
+    dl_candidates: usize,
+    dl_queries: &'a [String],
+}
+
+/// Живая проверка справочника одной сессией (`aiowa directory`): только чтение.
+async fn directory_flow(t: &OwaTransport, store: &Store, account: AccountId, opts: &DirectoryOpts<'_>) -> Result<()> {
+    use aiowa_transport_owa::protocol;
+    let DirectoryOpts { query, resolve, expand, prefix3, max, .. } = *opts;
+    let mut found = directory_find(t, store, account, "запрос", query, max).await;
+    let short: String = query.chars().take(3).collect();
+    if prefix3 && short.chars().count() == 3 {
+        found.extend(directory_find(t, store, account, "три буквы", &short, max).await);
+    }
+    for (i, q) in opts.dl_queries.iter().enumerate() {
+        let people = match t.find_people(q, max).await {
+            Ok(p) => p,
+            Err(e) => {
+                println!("FindPeople (поиск списков, запрос {}): отказ {}", i + 1, transport_error_code(&e));
+                continue;
+            }
+        };
+        println!("FindPeople (поиск списков, запрос {}, {} символов): {}", i + 1, q.chars().count(), describe_people(&people));
+        found.extend(people);
+    }
+    if opts.probe_shapes {
+        directory_probe_shapes(t, if short.chars().count() == 3 { &short } else { query }).await;
+    }
+    if resolve {
+        found.extend(directory_resolve(t, store, account, "запрос", query, true).await);
+        directory_resolve(t, store, account, "запрос", query, false).await;
+        if prefix3 && short.chars().count() == 3 {
+            found.extend(directory_resolve(t, store, account, "три буквы", &short, true).await);
+        }
+        // Как карточка контакта: ResolveNames по адресу первой найденной записи ящика.
+        if let Some(email) = found.iter().find(|p| p.kind == PersonKind::Mailbox).and_then(|p| p.email_key()) {
+            let started = std::time::Instant::now();
+            match t.resolve_names(&email, true).await {
+                Ok(people) => println!("ResolveNames по адресу первой записи (трейт): {} мс, {}", started.elapsed().as_millis(), describe_people(&people)),
+                Err(e) => println!("ResolveNames по адресу первой записи (трейт): отказ {} за {} мс", transport_error_code(&e), started.elapsed().as_millis()),
+            }
+            match store.contact_local_stats(account, &email) {
+                Ok(s) => println!("Переписка с этим адресом по локальной базе: писем от него {}, ему {}, последнее {}", s.messages_from, s.messages_to, if s.last_ms.is_some() { "есть" } else { "нет" }),
+                Err(e) => println!("Переписка по локальной базе: ошибка {e}"),
+            }
+        }
+    }
+    if let Some(target) = expand {
+        let email = if target.eq_ignore_ascii_case("first") {
+            match found.iter().find(|p| p.kind.is_list()).and_then(|p| p.email_key()) {
+                Some(e) => {
+                    println!("ExpandDL: первый список рассылки из результатов");
+                    Some(e)
+                }
+                None => {
+                    println!("ExpandDL: списков рассылки с SMTP-адресом в результатах нет; кандидаты из локальной базы (частые получатели, которые сами не писали)");
+                    let mut chosen = None;
+                    for (i, cand) in dl_candidates(store, account, opts.dl_candidates)?.iter().enumerate() {
+                        let started = std::time::Instant::now();
+                        match t.resolve_names(cand, false).await {
+                            Ok(people) => {
+                                let kinds: Vec<&str> = people.iter().map(|p| p.kind.key()).collect();
+                                println!("  кандидат {}: ResolveNames {} мс, записей {}, виды [{}]", i + 1, started.elapsed().as_millis(), people.len(), kinds.join(", "));
+                                if people.len() == 1 && people[0].kind.is_list() {
+                                    chosen = people[0].email_key();
+                                    break;
+                                }
+                            }
+                            Err(e) => println!("  кандидат {}: отказ {} за {} мс", i + 1, transport_error_code(&e), started.elapsed().as_millis()),
+                        }
+                    }
+                    if chosen.is_none() {
+                        println!("ExpandDL: список рассылки не найден, пропущено");
+                    }
+                    chosen
+                }
+            }
+        } else {
+            Some(target.to_string())
+        };
+        if let Some(email) = email {
+            let started = std::time::Instant::now();
+            match t.expand_dl_value(&email).await {
+                Ok(v) => {
+                    let ms = started.elapsed().as_millis();
+                    let msgs = protocol::response_messages(&v);
+                    let msg = msgs.first().map(|m| (*m).clone()).unwrap_or_default();
+                    println!(
+                        "ExpandDL: {ms} мс, ответ {} байт; сообщение {} {} {}",
+                        v.to_string().len(),
+                        protocol::str_of(&msg, "__type").unwrap_or("без __type"),
+                        protocol::str_of(&msg, "ResponseClass").unwrap_or("?"),
+                        protocol::str_of(&msg, "ResponseCode").unwrap_or("?")
+                    );
+                    println!("  ключи сообщения: [{}]", msg.as_object().map(|o| o.keys().cloned().collect::<Vec<_>>().join(", ")).unwrap_or_default());
+                    if let Some(dl) = msg.get("DLExpansion") {
+                        println!("  DLExpansion: {} [{}]", if dl.is_array() { "массив" } else { "объект" }, scalar_fields(dl));
+                    }
+                    let members = protocol::dl_expansion_array(&msg).cloned().unwrap_or_default();
+                    println!("  участники: {}; ключи: {}", members.len(), keys_line(&members));
+                    match OwaTransport::expand_dl_result(&v) {
+                        Ok(people) => {
+                            println!("  разобрано: {}", describe_people(&people));
+                            if let Ok(n) = store.upsert_directory_people(account, &people) {
+                                println!("  в кэш справочника записано {n}");
+                            }
+                        }
+                        Err(e) => println!("  разбор: отказ {}", transport_error_code(&e)),
+                    }
+                }
+                Err(e) => println!("ExpandDL: отказ {} за {} мс", transport_error_code(&e), started.elapsed().as_millis()),
+            }
+        }
+    }
+    for (label, q) in [("запрос", query.to_string()), ("три буквы", short.clone())] {
+        if label == "три буквы" && !prefix3 {
+            continue;
+        }
+        let started = std::time::Instant::now();
+        let cached = store.directory_search_cached(account, &q, 50)?;
+        println!("Кэш справочника ({label}): {} записей за {} мкс", cached.len(), started.elapsed().as_micros());
+    }
+    Ok(())
+}
+
 async fn connect(cli: &Cli) -> Result<OwaTransport> {
     let password = load_password(&cli.user)?;
     let creds = Credentials { host: cli.host.clone(), user: cli.user.clone(), password };
@@ -2032,6 +2549,26 @@ async fn real_main() -> Result<()> {
             for r in rows {
                 println!("{:>6}  {}  {}", r.weight, pad(r.name.as_deref().unwrap_or(""), 30), r.email);
             }
+        }
+        Cmd::Directory { query, resolve, expand, prefix3, max, probe_shapes, dl_candidates, dl_query } => {
+            let store = Store::open(&db_path)?;
+            let account = store.account(&cli.host, &cli.user)?;
+            let query = match query.as_deref().map(str::trim).filter(|q| !q.is_empty()) {
+                Some(q) => {
+                    println!("Запрос из аргумента: {} символов", q.chars().count());
+                    q.to_string()
+                }
+                None => {
+                    let (word, how) = owner_surname(&store, account)?;
+                    println!("Запрос: {how}");
+                    word
+                }
+            };
+            let t = connect(&cli).await?;
+            let opts = DirectoryOpts { query: &query, resolve: *resolve, expand: expand.as_deref(), prefix3: *prefix3, max: *max, probe_shapes: *probe_shapes, dl_candidates: *dl_candidates, dl_queries: dl_query };
+            let result = directory_flow(&t, &store, account, &opts).await;
+            t.logoff().await.ok();
+            result?;
         }
         Cmd::Calendar { from, to, details, offline, probe } => {
             let start = local_midnight(from)?;

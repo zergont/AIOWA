@@ -24,6 +24,10 @@
 //! ответ на приглашение по событию и по письму, сведения о письме-приглашении. Напоминания
 //! (`reminders.rs`): планировщик раз в 30 с смотрит кэш событий, шлёт окну событие `reminder`
 //! и тост; «закрыть» и «отложить» хранятся в базе.
+//!
+//! Справочник организации (`directory.rs`): поиск адресатов (кэш справочника в базе, затем
+//! `FindPeople` на сервере с кэшем запросов на 10 минут), карточка контакта (`ResolveNames` с
+//! полными данными и счётчики переписки по базе) и участники списка рассылки (`ExpandDL`).
 
 use aiowa_core::{AccountId, BodyType};
 use aiowa_store::ui::{ConversationCursor, MessageHead};
@@ -42,6 +46,7 @@ use tracing::warn;
 mod calendar;
 mod calendar_write;
 mod compose;
+mod directory;
 mod folders;
 mod notify;
 mod ondemand;
@@ -555,6 +560,7 @@ pub fn run() {
         .manage(compose::ComposeState::default())
         .manage(calendar::CalendarState::default())
         .manage(calendar_write::CalendarWriteState::default())
+        .manage(directory::DirectoryState::default())
         .manage(CloseState::default())
         // Окно из конфигурации к этому моменту уже создано: заголовок «AIOWA (N)» и значок
         // непрочитанных выставляются по базе сразу, не дожидаясь первой удачной синхронизации.
@@ -616,6 +622,10 @@ pub fn run() {
             compose::signature_set,
             compose::signature_import_owa,
             compose::attachments_pick,
+            directory::directory_search,
+            directory::contact_card,
+            directory::directory_expand,
+            directory::directory_capabilities,
             calendar::calendar_events,
             calendar::calendar_event_details,
             calendar_write::calendar_create,

@@ -262,6 +262,23 @@ impl MailTransport for Fake {
         Err(TransportError::Server { code: "ErrorItemNotFound".into(), message: format!("нет письма {}", id.id) })
     }
 
+    async fn find_people(&self, query: &str, max: usize) -> TResult<Vec<DirectoryPerson>> {
+        let q = query.trim().to_lowercase();
+        Ok(fake_directory().into_iter().filter(|p| !q.is_empty() && (p.display_name.as_deref().unwrap_or("").to_lowercase().split_whitespace().any(|w| w.starts_with(&q)) || p.email.as_deref().unwrap_or("").starts_with(&q))).take(max).collect())
+    }
+
+    async fn resolve_names(&self, query: &str, _full_contact: bool) -> TResult<Vec<DirectoryPerson>> {
+        self.find_people(query, 100).await
+    }
+
+    async fn expand_dl(&self, email: &str) -> TResult<Vec<DirectoryPerson>> {
+        if email.eq_ignore_ascii_case("all@fake.ru") {
+            Ok(fake_directory().into_iter().filter(|p| p.kind == PersonKind::Mailbox).collect())
+        } else {
+            Err(TransportError::Server { code: "ErrorNameResolutionNoResults".into(), message: "не список".into() })
+        }
+    }
+
     async fn subscribe_notifications(&self, subs: &[SubscriptionRequest]) -> TResult<Vec<SubscriptionResult>> {
         Ok(subs.iter().map(|s| SubscriptionResult { id: s.id.clone(), created: true, error: None }).collect())
     }
@@ -282,6 +299,15 @@ impl MailTransport for Fake {
     fn server_info(&self) -> ServerInfo {
         ServerInfo { host: "fake".into(), build: Some("15.2.0.0".into()) }
     }
+}
+
+/// Справочник фейкового сервера: человек, список рассылки и переговорная.
+fn fake_directory() -> Vec<DirectoryPerson> {
+    vec![
+        DirectoryPerson { display_name: Some("Вася Пупкин".into()), email: Some("vasya@fake.ru".into()), kind: PersonKind::Mailbox, title: Some("Инженер".into()), ..Default::default() },
+        DirectoryPerson { display_name: Some("Все сотрудники".into()), email: Some("all@fake.ru".into()), kind: PersonKind::DistributionList, ..Default::default() },
+        DirectoryPerson { display_name: Some("Переговорная 1".into()), email: Some("room1@fake.ru".into()), kind: PersonKind::Room, ..Default::default() },
+    ]
 }
 
 fn test_store(tag: &str) -> Arc<Store> {

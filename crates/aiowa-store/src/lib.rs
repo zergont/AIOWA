@@ -9,6 +9,7 @@
 //! Календарь кэшируется окнами (`calendar`): окно перечитывается с сервера целиком.
 
 pub mod calendar;
+pub mod directory;
 pub mod query;
 pub mod schema;
 pub mod text;
@@ -27,6 +28,7 @@ use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
 pub use calendar::{reminder_state_key, CachedTimeZone, CalendarRow, ReminderMark, ReminderRow, ReminderState, OWA_TIME_ZONE_KEY, OWA_TIME_ZONE_TTL_MS};
+pub use directory::ContactLocalStats;
 pub use schema::{FETCH_FAILED, TEXT_FAILED, TEXT_OK, TEXT_PENDING, TEXT_UNSUPPORTED};
 
 #[derive(Debug, thiserror::Error)]

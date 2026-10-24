@@ -419,6 +419,128 @@ pub struct Signature {
 }
 
 // ---------------------------------------------------------------------------
+// Справочник организации
+
+/// Вид записи справочника: ящик человека, список рассылки, внешний почтовый контакт,
+/// переговорная (ресурс) или прочее (общая папка, группа, не определено).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+pub enum PersonKind {
+    Mailbox,
+    DistributionList,
+    Contact,
+    Room,
+    #[default]
+    Other,
+}
+
+impl PersonKind {
+    /// Ключ для интерфейса и базы: `mailbox`, `list`, `contact`, `room`, `other`.
+    pub const fn key(self) -> &'static str {
+        match self {
+            Self::Mailbox => "mailbox",
+            Self::DistributionList => "list",
+            Self::Contact => "contact",
+            Self::Room => "room",
+            Self::Other => "other",
+        }
+    }
+
+    /// Разбирает ключ `key` (и имя варианта без учёта регистра); неизвестное — `Other`.
+    pub fn from_key(s: &str) -> Self {
+        match s.to_ascii_lowercase().as_str() {
+            "mailbox" => Self::Mailbox,
+            "list" | "distributionlist" => Self::DistributionList,
+            "contact" => Self::Contact,
+            "room" => Self::Room,
+            _ => Self::Other,
+        }
+    }
+
+    /// По `MailboxType` адреса EWS: `Mailbox`/`LinkedMailbox` — ящик, `PublicDL`/`PrivateDL` —
+    /// список, `Contact`/`OneOff` — внешний адрес, `PublicFolder`/`GroupMailbox` — прочее;
+    /// `Unknown`, пусто или незнакомое значение — `None` (вид решают другие признаки).
+    pub fn from_mailbox_type(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "mailbox" | "linkedmailbox" => Some(Self::Mailbox),
+            "publicdl" | "privatedl" => Some(Self::DistributionList),
+            "contact" | "oneoff" => Some(Self::Contact),
+            "publicfolder" | "groupmailbox" => Some(Self::Other),
+            _ => None,
+        }
+    }
+
+    /// По `PersonaType` записи `FindPeople`: `DistributionList` — список, `Room`/`Equipment` —
+    /// ресурс, `Group`/`PublicFolder` — прочее. `Person` и незнакомое — `None`: человек бывает и
+    /// ящиком, и внешним контактом, это решает `MailboxType` адреса.
+    pub fn from_persona_type(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "distributionlist" | "dl" => Some(Self::DistributionList),
+            "room" | "equipment" | "resource" => Some(Self::Room),
+            "group" | "moderngroup" | "publicfolder" => Some(Self::Other),
+            _ => None,
+        }
+    }
+
+    pub const fn is_list(self) -> bool {
+        matches!(self, Self::DistributionList)
+    }
+}
+
+/// Запись справочника организации (`FindPeople`, `ResolveNames`, `ExpandDL`): поля как их отдал
+/// сервер, пустые строки сведены к `None`. Персональные данные: в журналы не пишутся.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct DirectoryPerson {
+    pub display_name: Option<String>,
+    /// SMTP-адрес (у устаревших записей сервер может отдать адрес `EX` без `@`).
+    pub email: Option<String>,
+    pub kind: PersonKind,
+    pub title: Option<String>,
+    pub department: Option<String>,
+    pub company: Option<String>,
+    pub office: Option<String>,
+    pub business_phone: Option<String>,
+    pub mobile_phone: Option<String>,
+    pub alias: Option<String>,
+}
+
+impl DirectoryPerson {
+    /// Адрес в нижнем регистре без пробелов по краям — ключ кэша справочника; `None`, если
+    /// адреса нет или он не похож на SMTP (нет `@` между непустыми частями).
+    pub fn email_key(&self) -> Option<String> {
+        let e = self.email.as_deref()?.trim();
+        let (local, domain) = e.split_once('@')?;
+        if local.is_empty() || domain.is_empty() {
+            return None;
+        }
+        Some(e.to_lowercase())
+    }
+
+    /// Поля, которые мог не отдать один вид запроса (`FindPeople` без телефонов), дополняются из
+    /// `older`: заполненное в `self` остаётся, пустое берётся из старой записи. Вид `Other`
+    /// уступает определённому виду старой записи.
+    pub fn merged_with(mut self, older: &DirectoryPerson) -> Self {
+        fn fill(slot: &mut Option<String>, old: &Option<String>) {
+            if slot.is_none() {
+                slot.clone_from(old);
+            }
+        }
+        fill(&mut self.display_name, &older.display_name);
+        fill(&mut self.email, &older.email);
+        fill(&mut self.title, &older.title);
+        fill(&mut self.department, &older.department);
+        fill(&mut self.company, &older.company);
+        fill(&mut self.office, &older.office);
+        fill(&mut self.business_phone, &older.business_phone);
+        fill(&mut self.mobile_phone, &older.mobile_phone);
+        fill(&mut self.alias, &older.alias);
+        if self.kind == PersonKind::Other {
+            self.kind = older.kind;
+        }
+        self
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Календарь
 
 /// Занятость по событию (`calendar:LegacyFreeBusyStatus`).
@@ -857,6 +979,41 @@ mod tests {
             assert_eq!(DistinguishedFolder::parse(d.as_str()), Some(d));
         }
         assert_eq!(DistinguishedFolder::parse("nope"), None);
+    }
+
+    #[test]
+    fn person_kind_keys_and_server_types() {
+        for k in [PersonKind::Mailbox, PersonKind::DistributionList, PersonKind::Contact, PersonKind::Room, PersonKind::Other] {
+            assert_eq!(PersonKind::from_key(k.key()), k);
+        }
+        assert_eq!(PersonKind::from_key("DistributionList"), PersonKind::DistributionList);
+        assert_eq!(PersonKind::from_key("что-то"), PersonKind::Other);
+        assert_eq!(PersonKind::from_mailbox_type("PublicDL"), Some(PersonKind::DistributionList));
+        assert_eq!(PersonKind::from_mailbox_type("PrivateDL"), Some(PersonKind::DistributionList));
+        assert_eq!(PersonKind::from_mailbox_type("Mailbox"), Some(PersonKind::Mailbox));
+        assert_eq!(PersonKind::from_mailbox_type("Contact"), Some(PersonKind::Contact));
+        assert_eq!(PersonKind::from_mailbox_type("Unknown"), None);
+        assert_eq!(PersonKind::from_persona_type("DistributionList"), Some(PersonKind::DistributionList));
+        assert_eq!(PersonKind::from_persona_type("Room"), Some(PersonKind::Room));
+        assert_eq!(PersonKind::from_persona_type("ModernGroup"), Some(PersonKind::Other));
+        assert_eq!(PersonKind::from_persona_type("Person"), None);
+        assert!(PersonKind::DistributionList.is_list() && !PersonKind::Mailbox.is_list());
+    }
+
+    #[test]
+    fn directory_person_email_key_and_merge() {
+        let p = DirectoryPerson { email: Some(" Ivan.Petrov@X.RU ".into()), ..Default::default() };
+        assert_eq!(p.email_key().as_deref(), Some("ivan.petrov@x.ru"));
+        assert_eq!(DirectoryPerson { email: Some("/o=Org/cn=ivan".into()), ..Default::default() }.email_key(), None, "адрес EX не ключ");
+        assert_eq!(DirectoryPerson { email: Some("@x.ru".into()), ..Default::default() }.email_key(), None);
+        assert_eq!(DirectoryPerson::default().email_key(), None);
+        let old = DirectoryPerson { display_name: Some("Старое".into()), email: Some("a@x.ru".into()), kind: PersonKind::Mailbox, mobile_phone: Some("+7 900".into()), title: Some("Инженер".into()), ..Default::default() };
+        let new = DirectoryPerson { display_name: Some("Новое".into()), email: Some("a@x.ru".into()), title: Some("Ведущий инженер".into()), ..Default::default() };
+        let m = new.merged_with(&old);
+        assert_eq!(m.display_name.as_deref(), Some("Новое"), "новое значение побеждает");
+        assert_eq!(m.title.as_deref(), Some("Ведущий инженер"));
+        assert_eq!(m.mobile_phone.as_deref(), Some("+7 900"), "пустое поле дополняется из старой записи");
+        assert_eq!(m.kind, PersonKind::Mailbox, "вид Other уступает старому");
     }
 
     #[test]

@@ -9,7 +9,7 @@ pub mod notify;
 pub mod protocol;
 
 use aiowa_core::{
-    CalendarEvent, CalendarEventDetails, CalendarItemChanges, ComposeKind, DraftContent, FolderChanges, FolderId, FolderRef, ItemChanges, ItemId, MeetingRequestInfo, MeetingResponse, NewCalendarItem,
+    CalendarEvent, CalendarEventDetails, CalendarItemChanges, ComposeKind, DirectoryPerson, DraftContent, FolderChanges, FolderId, FolderRef, ItemChanges, ItemId, MeetingRequestInfo, MeetingResponse, NewCalendarItem,
     OutgoingAttachment, OutgoingMessage, Signature, SyncState,
 };
 use aiowa_transport::{
@@ -103,6 +103,9 @@ struct Inner {
     folder_version: AtomicU8,
     /// Какую форму `SubscribeToNotification` принял сервер (`SubscribeForm::code`, 0 не известно).
     subscribe_form: AtomicU8,
+    /// Сервер отверг дополнительные свойства записи `FindPeople` (`protocol::PERSONA_EXTRA_FIELDS`):
+    /// поиск по справочнику идёт формой `Default` без них до конца жизни транспорта.
+    persona_extra_rejected: AtomicBool,
     /// Подписки текущей сессии: вид по идентификатору, чтобы разбирать события потока.
     subscriptions: RwLock<HashMap<String, NotificationKind>>,
     /// Подписки потеряны при повторном входе, а вызывающий об этом ещё не знает: следующий
@@ -234,6 +237,7 @@ impl OwaTransport {
             reply_to_mode: AtomicU8::new(REPLY_TO_UNKNOWN),
             folder_version: AtomicU8::new(FOLDER_VERSION_UNKNOWN),
             subscribe_form: AtomicU8::new(0),
+            persona_extra_rejected: AtomicBool::new(false),
             subscriptions: RwLock::new(HashMap::new()),
             subscriptions_stale: AtomicBool::new(false),
             pending_counter: AtomicU64::new(0),
@@ -1158,6 +1162,105 @@ fn server_error(code: String, message: String, msg: &Value) -> TransportError {
     TransportError::Server { code, message }
 }
 
+/// Справочник организации (§ 5l): ответы как есть (`*_value`) — для CLI, который печатает их
+/// форму без значений, — и их разбор (`*_result`), которым пользуются и методы трейта.
+impl OwaTransport {
+    /// Операция справочника: схема `V2017_08_18`, при отказе по форме (HTTP 500) — `Exchange2013`.
+    async fn directory_call(&self, op: &str, body: Value) -> Result<Value> {
+        match self.call(op, protocol::V_2017, body.clone()).await {
+            Err(e) if is_shape_rejection(&e) => {
+                debug!(op, kind = error_kind(&e), "справочник: схема V2017_08_18 отвергнута, повтор с Exchange2013");
+                self.call(op, protocol::V_2013, body).await
+            }
+            other => other,
+        }
+    }
+
+    /// Ответ `FindPeople` по справочнику целиком. Сначала с дополнительными свойствами записи
+    /// (`protocol::PERSONA_EXTRA_FIELDS`: должность, офис, телефоны — в форме `Default` их нет);
+    /// отказ по ним (`ErrorInvalidArgument` или код свойства в `Body`, HTTP 500) — повтор формой
+    /// `Default`, и отказ запоминается до конца жизни транспорта.
+    pub async fn find_people_value(&self, query: &str, max: usize) -> Result<Value> {
+        let plain = protocol::find_people_body(query, max);
+        if self.inner.persona_extra_rejected.load(Ordering::Relaxed) {
+            return self.directory_call("FindPeople", plain).await;
+        }
+        match self.directory_call("FindPeople", protocol::find_people_body_with(query, max, protocol::PERSONA_EXTRA_FIELDS)).await {
+            Ok(v) => match protocol::body_error(&v) {
+                Some((code, _)) if code == "ErrorInvalidArgument" || protocol::is_property_code(&code) => {
+                    debug!(code, "FindPeople: дополнительные свойства записи отвергнуты, повтор формой Default");
+                }
+                _ => return Ok(v),
+            },
+            Err(e) if is_shape_rejection(&e) => debug!(kind = error_kind(&e), "FindPeople: форма с дополнительными свойствами отвергнута, повтор формой Default"),
+            Err(e) => return Err(e),
+        }
+        let v = self.directory_call("FindPeople", plain).await?;
+        if protocol::body_error(&v).is_none() {
+            self.inner.persona_extra_rejected.store(true, Ordering::Relaxed);
+        }
+        Ok(v)
+    }
+
+    /// Ответ `ResolveNames` целиком.
+    pub async fn resolve_names_value(&self, query: &str, full_contact: bool) -> Result<Value> {
+        self.directory_call("ResolveNames", protocol::resolve_names_body(query, full_contact)).await
+    }
+
+    /// Ответ `ExpandDL` целиком.
+    pub async fn expand_dl_value(&self, email: &str) -> Result<Value> {
+        self.directory_call("ExpandDL", protocol::expand_dl_body(email)).await
+    }
+
+    /// Записи из ответа `FindPeople` (не больше `max`). Отказ уровня `Body` или первого сообщения
+    /// `ResponseMessages` — `Server`; успешный ответ без `People` — пустой список.
+    pub fn find_people_result(v: &Value, max: usize) -> Result<Vec<DirectoryPerson>> {
+        if let Some((code, message)) = protocol::body_error(v) {
+            return Err(server_error(code, message, v.get("Body").unwrap_or(v)));
+        }
+        if let Some(first) = protocol::response_messages(v).first()
+            && let Some((code, message)) = protocol::message_error(first)
+        {
+            return Err(server_error(code, message, first));
+        }
+        let Some(arr) = protocol::find_people_array(v) else {
+            debug!(shape = %protocol::json_shape(v, 3), "FindPeople: в ответе нет People");
+            return Ok(Vec::new());
+        };
+        let mut people: Vec<DirectoryPerson> = arr.iter().filter_map(protocol::parse_persona).collect();
+        people.truncate(max);
+        let keys: Vec<String> = protocol::key_union(arr).into_iter().map(|(k, n)| format!("{k}:{n}")).collect();
+        let total = v.pointer("/Body/TotalNumberOfPeopleInView").and_then(Value::as_i64);
+        debug!(entries = arr.len(), parsed = people.len(), ?total, ?keys, "FindPeople: записи справочника");
+        Ok(people)
+    }
+
+    /// Записи из ответа `ResolveNames` (`protocol::parse_resolve_names` по первому сообщению):
+    /// ничего не найдено — пусто, несколько совпадений — список, иной отказ — `Server`.
+    pub fn resolve_names_result(v: &Value) -> Result<Vec<DirectoryPerson>> {
+        let msgs = protocol::response_messages(v);
+        let Some(msg) = msgs.first() else {
+            if let Some((code, message)) = protocol::body_error(v) {
+                return Err(server_error(code, message, v.get("Body").unwrap_or(v)));
+            }
+            return Err(TransportError::Protocol { op: "ResolveNames".into(), status: 200, raw: format!("нет ResponseMessages: {}", protocol::json_shape(v, 3)) });
+        };
+        let people = protocol::parse_resolve_names(msg).map_err(|(code, message)| server_error(code, message, msg))?;
+        let keys: Vec<String> = protocol::resolutions_array(msg).map(|a| protocol::key_union(a).into_iter().map(|(k, n)| format!("{k}:{n}")).collect()).unwrap_or_default();
+        debug!(code = protocol::str_of(msg, "ResponseCode").unwrap_or("?"), parsed = people.len(), ?keys, "ResolveNames: записи справочника");
+        Ok(people)
+    }
+
+    /// Участники из ответа `ExpandDL`; отказ сервера (не список, нет доступа) — `Server`.
+    pub fn expand_dl_result(v: &Value) -> Result<Vec<DirectoryPerson>> {
+        let msg = Self::first_message("ExpandDL", v)?;
+        let people = protocol::parse_expand_dl(&msg);
+        let total = msg.pointer("/DLExpansion/TotalItemsInView").and_then(Value::as_i64);
+        debug!(parsed = people.len(), ?total, "ExpandDL: участники списка");
+        Ok(people)
+    }
+}
+
 #[async_trait]
 impl MailTransport for OwaTransport {
     async fn sync_folder_hierarchy(&self, state: Option<&SyncState>) -> Result<FolderChanges> {
@@ -1594,6 +1697,42 @@ impl MailTransport for OwaTransport {
         Ok(info)
     }
 
+    async fn find_people(&self, query: &str, max: usize) -> Result<Vec<DirectoryPerson>> {
+        let query = query.trim();
+        if query.is_empty() || max == 0 {
+            return Ok(Vec::new());
+        }
+        let started = Instant::now();
+        let v = self.find_people_value(query, max).await?;
+        let people = Self::find_people_result(&v, max)?;
+        debug!(query_len = query.chars().count(), found = people.len(), ms = started.elapsed().as_millis(), "FindPeople");
+        Ok(people)
+    }
+
+    async fn resolve_names(&self, query: &str, full_contact: bool) -> Result<Vec<DirectoryPerson>> {
+        let query = query.trim();
+        if query.is_empty() {
+            return Ok(Vec::new());
+        }
+        let started = Instant::now();
+        let v = self.resolve_names_value(query, full_contact).await?;
+        let people = Self::resolve_names_result(&v)?;
+        debug!(query_len = query.chars().count(), full_contact, found = people.len(), ms = started.elapsed().as_millis(), "ResolveNames");
+        Ok(people)
+    }
+
+    async fn expand_dl(&self, email: &str) -> Result<Vec<DirectoryPerson>> {
+        let email = email.trim();
+        if email.is_empty() {
+            return Ok(Vec::new());
+        }
+        let started = Instant::now();
+        let v = self.expand_dl_value(email).await?;
+        let people = Self::expand_dl_result(&v)?;
+        debug!(members = people.len(), ms = started.elapsed().as_millis(), "ExpandDL");
+        Ok(people)
+    }
+
     /// `SubscribeToNotification` через `call_raw` с подбором формы (один раз на сессию): форма
     /// браузерной OWA, при отказе сервера по форме (HTTP 500 или ни одной созданной подписки)
     /// — запасные. Созданные подписки запоминаются для разбора событий потока.
@@ -1761,6 +1900,35 @@ mod tests {
         fail_rest(&mut full, &ids, &TransportError::SessionExpired);
         assert_eq!(full.len(), ids.len(), "после полного ответа ничего не добавляется");
         assert_eq!(error_kind(&TransportError::Network(Box::new(std::io::Error::other("x")))), "Network");
+    }
+
+    /// Разбор ответов справочника: успех, отказ уровня `Body` и сообщения, «ничего не найдено»,
+    /// «несколько совпадений», ответ без `ResponseMessages`.
+    #[test]
+    fn directory_results_map_server_errors() {
+        use serde_json::json;
+        let ok = json!({"Body": {"ResponseClass": "Success", "ResponseCode": "NoError", "People": [
+            {"DisplayName": "А", "EmailAddress": {"EmailAddress": "a@x.ru"}}, {"DisplayName": "Б", "EmailAddress": {"EmailAddress": "b@x.ru"}}]}});
+        assert_eq!(OwaTransport::find_people_result(&ok, 1).unwrap().len(), 1, "не больше max");
+        assert!(OwaTransport::find_people_result(&json!({"Body": {"ResponseClass": "Success", "ResponseCode": "NoError"}}), 5).unwrap().is_empty(), "без People — пусто");
+        let rejected = json!({"Body": {"ResponseClass": "Error", "ResponseCode": "ErrorInvalidRequest", "MessageText": "x"}});
+        assert!(matches!(OwaTransport::find_people_result(&rejected, 5), Err(TransportError::Server { code, .. }) if code == "ErrorInvalidRequest"));
+        let in_message = json!({"Body": {"ResponseMessages": {"Items": [{"ResponseClass": "Error", "ResponseCode": "ErrorServerBusy"}]}}});
+        assert!(matches!(OwaTransport::find_people_result(&in_message, 5), Err(TransportError::Throttled { .. })));
+
+        let none = json!({"Body": {"ResponseMessages": {"Items": [{"ResponseClass": "Error", "ResponseCode": "ErrorNameResolutionNoResults"}]}}});
+        assert!(OwaTransport::resolve_names_result(&none).unwrap().is_empty());
+        let many = json!({"Body": {"ResponseMessages": {"Items": [{"ResponseClass": "Warning", "ResponseCode": "ErrorNameResolutionMultipleResults",
+            "ResolutionSet": {"Resolutions": [{"Mailbox": {"Name": "А", "EmailAddress": "a@x.ru"}}, {"Mailbox": {"Name": "Б", "EmailAddress": "b@x.ru"}}]}}]}}});
+        assert_eq!(OwaTransport::resolve_names_result(&many).unwrap().len(), 2);
+        let denied = json!({"Body": {"ResponseMessages": {"Items": [{"ResponseClass": "Error", "ResponseCode": "ErrorAccessDenied"}]}}});
+        assert!(matches!(OwaTransport::resolve_names_result(&denied), Err(TransportError::Server { code, .. }) if code == "ErrorAccessDenied"));
+        assert!(matches!(OwaTransport::resolve_names_result(&json!({"Body": {}})), Err(TransportError::Protocol { .. })));
+
+        let dl = json!({"Body": {"ResponseMessages": {"Items": [{"ResponseClass": "Success", "ResponseCode": "NoError", "DLExpansion": {"Mailbox": [{"Name": "А", "EmailAddress": "a@x.ru", "MailboxType": "Mailbox"}]}}]}}});
+        assert_eq!(OwaTransport::expand_dl_result(&dl).unwrap().len(), 1);
+        let not_dl = json!({"Body": {"ResponseMessages": {"Items": [{"ResponseClass": "Error", "ResponseCode": "ErrorNameResolutionNoResults"}]}}});
+        assert!(matches!(OwaTransport::expand_dl_result(&not_dl), Err(TransportError::Server { .. })));
     }
 
     #[test]

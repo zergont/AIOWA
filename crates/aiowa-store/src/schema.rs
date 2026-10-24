@@ -4,6 +4,7 @@
 //! Версия 3 (итерация 2): кэш и текст вложений, беседы с агрегатами по папкам,
 //! колонка `attachment_text` в индексе и нормализация ё→е функцией `fts_norm`.
 //! Версия 4 (этап 4): кэш событий календаря и окна, которые уже забирали с сервера.
+//! Версия 5: кэш справочника организации и индексы адресов без учёта регистра (карточка контакта).
 
 use crate::text;
 use rusqlite::functions::FunctionFlags;
@@ -11,7 +12,7 @@ use rusqlite::types::ValueRef;
 use rusqlite::Connection;
 use tracing::info;
 
-pub const CURRENT_VERSION: i64 = 4;
+pub const CURRENT_VERSION: i64 = 5;
 
 /// Состояния текста вложения (`attachments.text_state`).
 pub const TEXT_PENDING: i64 = 0;
@@ -288,6 +289,25 @@ CREATE TABLE IF NOT EXISTS calendar_ranges (
 CREATE INDEX IF NOT EXISTS calendar_ranges_account ON calendar_ranges(account_id, start_at);
 "#;
 
+/// Версия 5: кэш справочника организации. `directory_people` — записи `FindPeople`/`ResolveNames`/
+/// `ExpandDL` по SMTP-адресу в нижнем регистре; имя и вид (`mailbox`, `list`, `contact`, `room`,
+/// `other`) — колонками, остальные поля (должность, отдел, компания, офис, телефоны, псевдоним) —
+/// объектом JSON. Индексы по адресу без учёта регистра нужны счётчикам переписки карточки
+/// контакта (`Store::contact_local_stats`): без них — полный проход по `items`.
+const V5_TABLES: &str = r#"
+CREATE TABLE IF NOT EXISTS directory_people (
+  account_id   INTEGER NOT NULL REFERENCES accounts(account_id),
+  email        TEXT NOT NULL,
+  display_name TEXT,
+  kind         TEXT NOT NULL DEFAULT 'other',
+  json         TEXT NOT NULL DEFAULT '{}',
+  fetched_at   INTEGER NOT NULL,
+  PRIMARY KEY (account_id, email)
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS items_from_lower ON items(account_id, lower(from_email));
+CREATE INDEX IF NOT EXISTS recipients_email_lower ON recipients(lower(email));
+"#;
+
 pub const FTS_COLUMNS: &str = "subject, from_name, from_email, recipients, unique_text, attachment_text";
 
 /// Удаляет строку из индекса по текущим значениям источника. Вызывать ДО изменения
@@ -409,6 +429,23 @@ pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
         }
         info!("схема базы обновлена до версии 4: кэш календаря");
     }
+    if version < 5 {
+        let started = std::time::Instant::now();
+        conn.execute_batch("BEGIN IMMEDIATE;")?;
+        let result = (|| -> rusqlite::Result<()> {
+            conn.execute_batch(V5_TABLES)?;
+            conn.pragma_update(None, "user_version", 5)?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => conn.execute_batch("COMMIT;")?,
+            Err(e) => {
+                let _ = conn.execute_batch("ROLLBACK;");
+                return Err(e);
+            }
+        }
+        info!(elapsed_s = started.elapsed().as_secs_f32(), "схема базы обновлена до версии 5: кэш справочника");
+    }
     Ok(())
 }
 
@@ -495,5 +532,28 @@ mod tests {
         assert_eq!(n, 0);
         let n: i64 = conn.query_row("SELECT COUNT(*) FROM calendar_ranges", [], |r| r.get(0)).unwrap();
         assert_eq!(n, 0);
+        // И версия 5: кэш справочника пуст.
+        let n: i64 = conn.query_row("SELECT COUNT(*) FROM directory_people", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn migrates_v4_database_to_directory_cache_idempotently() {
+        // База версии 4 (таблицы v5 уже частично есть, как после прерванной миграции): повторное
+        // применение не падает, версия растёт, индексы адресов без учёта регистра используются.
+        let conn = Connection::open_in_memory().unwrap();
+        register_functions(&conn).unwrap();
+        migrate(&conn).unwrap();
+        conn.pragma_update(None, "user_version", 4).unwrap();
+        migrate(&conn).unwrap();
+        migrate(&conn).unwrap();
+        let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(v, 5);
+        let plan: String = conn
+            .query_row("EXPLAIN QUERY PLAN SELECT COUNT(*) FROM items WHERE account_id = 1 AND lower(from_email) = 'a@x.ru'", [], |r| r.get::<_, String>(3))
+            .unwrap();
+        assert!(plan.contains("items_from_lower"), "{plan}");
+        let plan: String = conn.query_row("EXPLAIN QUERY PLAN SELECT item_pk FROM recipients WHERE lower(email) = 'a@x.ru'", [], |r| r.get::<_, String>(3)).unwrap();
+        assert!(plan.contains("recipients_email_lower"), "{plan}");
     }
 }

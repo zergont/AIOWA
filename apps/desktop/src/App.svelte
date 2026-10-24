@@ -1,9 +1,12 @@
 <script lang="ts">
   import { onMount, tick } from "svelte";
-  import { api, conversationKeyOf, conversationsText, errorMessage, messageNeedsFetch, messagesKey, newMailSender, onCalendarChanged, onCloseRequested, onFoldersChanged, onItemsChanged, onNewMail, onNotifyStatus, onReminder, onSyncProgress, onWriteFailed, type AccountInfo, type ComposeContext, type ComposeKind, type Conversation, type Folder, type ItemsChanged, type Message, type NewMail, type NotifyStatus, type ReminderDto, type SearchHit, type StageAction, type StagedDto, type SyncStatus, type WriteReport } from "./lib/api";
+  import { api, conversationKeyOf, conversationsText, errorMessage, messageNeedsFetch, messagesKey, newMailSender, onCalendarChanged, onCloseRequested, onFoldersChanged, onItemsChanged, onNewMail, onNotifyStatus, onReminder, onSyncProgress, onWriteFailed, type AccountInfo, type ComposeContext, type ComposeKind, type ComposeRecipient, type Conversation, type Folder, type ItemsChanged, type Message, type NewMail, type NotifyStatus, type ReminderDto, type SearchHit, type StageAction, type StagedDto, type SyncStatus, type WriteReport } from "./lib/api";
   import { ICON, failureText, findArchiveFolder, type DragPayload, type ItemAction } from "./lib/actions";
-  import { type Anchor } from "./lib/popover";
+  import { focusBack, type Anchor } from "./lib/popover";
   import { printMessage } from "./lib/print";
+  import { mergeRecipients, sameEmail } from "./lib/addresses";
+  import { loadDirectoryCaps, provideContactCard, type ContactRef } from "./lib/contact";
+  import ContactCard from "./lib/components/ContactCard.svelte";
   import ChoicePopover from "./lib/components/ChoicePopover.svelte";
   import FolderTree from "./lib/components/FolderTree.svelte";
   import ConversationList from "./lib/components/ConversationList.svelte";
@@ -208,8 +211,9 @@
    * Открыть композер. Один за раз: если текущий с правками — спросить, прежде чем заменить, тем же
    * выбором, что у «Отменить» в композере (сохранить черновик, закрыть без сохранения, удалить,
    * вернуться). `conversationPk` — беседа исходного письма (композер ответа стоит над её карточками).
+   * `to` — адресаты нового письма заранее («Написать письмо» из карточки контакта).
    */
-  function openCompose(kind: ComposeKind, itemPk: number | null, conversationPk: number | null, draft = false) {
+  function openCompose(kind: ComposeKind, itemPk: number | null, conversationPk: number | null, draft = false, to: ComposeRecipient[] = []) {
     // Композер живёт в области чтения почты: из календаря сначала возвращаемся туда.
     section = "mail";
     if (compose && composerBusy) {
@@ -221,11 +225,11 @@
       void tick().then(async () => {
         const reason = composerRef ? await composerRef.askClose() : "cancel";
         // null — пользователь вернулся к письму; иначе композер уже закрыт (closeCompose).
-        if (reason != null) void loadCompose(kind, itemPk, conversationPk, draft);
+        if (reason != null) void loadCompose(kind, itemPk, conversationPk, draft, to);
       });
       return;
     }
-    void loadCompose(kind, itemPk, conversationPk, draft);
+    void loadCompose(kind, itemPk, conversationPk, draft, to);
   }
 
   /** Открыть существующий черновик в композере (кнопка на карточке, двойной клик и Enter в «Черновиках»). */
@@ -255,12 +259,12 @@
     return composerBusy === "send" ? "Подожди: письмо отправляется" : "Подожди: черновик сохраняется";
   }
 
-  async function loadCompose(kind: ComposeKind, itemPk: number | null, conversationPk: number | null, draft = false) {
+  async function loadCompose(kind: ComposeKind, itemPk: number | null, conversationPk: number | null, draft = false, to: ComposeRecipient[] = []) {
     if (composeLoading || composerBusy) return;
     composeLoading = draft ? "draft" : "compose";
     try {
       const ctx = draft && itemPk != null ? await api.composeOpenDraft(itemPk) : await api.composeContext(kind, itemPk);
-      compose = ctx;
+      compose = to.length ? { ...ctx, to: mergeRecipients(ctx.to, to) } : ctx;
       composeConversationPk = kind === "new" ? null : conversationPk;
       composerDirty = false;
     } catch (e) {
@@ -940,6 +944,45 @@
     searchHits = null;
   }
 
+  // --- карточка контакта ------------------------------------------------------------------
+  // Одна на окно: её открывают имена в карточке письма и чипы адресатов (композер, приглашение)
+  // через контекст. Повторное открытие с того же якоря закрывает её; фокус возвращается якорю.
+
+  let contact = $state<{ who: ContactRef; anchor: HTMLElement; blocked: string | null } | null>(null);
+
+  provideContactCard((who, anchor) => {
+    if (contact && contact.anchor === anchor && sameEmail(contact.who.email, who.email)) {
+      closeContact();
+      return;
+    }
+    // Чип в модальном окне (редактор встречи): «Написать письмо» и «Найти письма» ушли бы в почту,
+    // а окно осталось бы открытым за кадром со своими клавишами (Ctrl+Enter — сохранить и разослать).
+    const blocked = anchor.closest('[aria-modal="true"]') ? "Сначала закройте окно, из которого открыта карточка" : null;
+    contact = { who, anchor, blocked };
+  });
+
+  function closeContact(returnFocus = true) {
+    const anchor = contact?.anchor;
+    contact = null;
+    if (returnFocus) focusBack(anchor);
+  }
+
+  /** «Написать письмо» из карточки: новое письмо этому адресату (фокус заберёт композер). */
+  function composeToContact(to: ComposeRecipient) {
+    if (contact?.blocked) return;
+    closeContact(false);
+    openCompose("new", null, null, false, [to]);
+  }
+
+  /** «Найти письма» из карточки: поиск в почте по отправителю. */
+  function searchContact(email: string) {
+    if (contact?.blocked) return;
+    closeContact();
+    section = "mail";
+    query = `от:${email}`;
+    onQueryInput();
+  }
+
   // --- синхронизация ---------------------------------------------------------
 
   let lastSyncAttempt = 0;
@@ -1121,8 +1164,9 @@
     const is = (code: string, key: string) => e.code === code || e.key.toLowerCase() === key;
     // Открыто модальное окно (предпросмотр вложения, вопрос, редактор встречи): клавиши приложения
     // не должны действовать на письмо под ним. Свои клавиши (Esc, стрелки, Tab) окна ловят сами.
-    // Перезагрузку и печать окна целиком всё равно гасим.
-    if (document.querySelector('[aria-modal="true"]')) {
+    // Перезагрузку и печать окна целиком всё равно гасим. Считается только видимое окно: редактор
+    // встречи в скрытом разделе календаря (display: none) клавиши почты не держит.
+    if (Array.from(document.querySelectorAll('[aria-modal="true"]')).some((el) => el.getClientRects().length > 0)) {
       if (e.key === "F5" || (ctrl && !e.altKey && (is("KeyR", "r") || is("KeyP", "p")))) e.preventDefault();
       return;
     }
@@ -1237,6 +1281,7 @@
         unlistenWriteFailed = await onWriteFailed((ev) => (error = ev.message));
         unlistenClose = await onCloseRequested(onCloseRequest);
         account = await api.accountInfo();
+        void loadDirectoryCaps();
         await loadFolders();
         syncStatus = await api.syncStatus();
         wasRunning = syncStatus.running;
@@ -1359,6 +1404,11 @@
 
   <ReminderBanner {reminders} onopen={openReminder} ondismiss={(pk) => void dismissReminder(pk)} onsnooze={(pk, min) => void snoozeReminder(pk, min)} ondismissall={() => void dismissAllReminders()} />
 
+  {#if contact}
+    {#key contact}
+      <ContactCard who={contact.who} anchor={contact.anchor} actionsBlocked={contact.blocked} onclose={() => closeContact()} oncompose={composeToContact} onsearch={searchContact} />
+    {/key}
+  {/if}
 
   {#if closeRequest}
     <ConfirmPopover anchor={closeRequest} align="start" title="Закрыть окно?" text={composerBusy ? "Отправка или сохранение ещё идёт: письмо может не уйти, черновик — не сохраниться." : "Набранное письмо будет потеряно."} confirmLabel="Закрыть" onconfirm={confirmClose} oncancel={() => (closeRequest = null)} />

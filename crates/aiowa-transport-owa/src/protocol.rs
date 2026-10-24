@@ -4,8 +4,8 @@
 
 use aiowa_core::{
     response_from_item_class, AttachmentMeta, Attendee, BodyType, CalendarEvent, CalendarEventDetails, CalendarItemChanges, CalendarItemType, ComposeKind, ConversationId, DistinguishedFolder,
-    DraftContent, FlagStatus, Folder, FolderChange, FolderId, FolderRef, FreeBusy, Importance, ItemChange, ItemId, MeetingMessageKind, MeetingRequestInfo, MeetingResponse, MessageBody, MessageFull,
-    MessageMeta, NewCalendarItem, OutgoingAttachment, OutgoingMessage, Participant, ResponseType, Signature, SyncState,
+    DirectoryPerson, DraftContent, FlagStatus, Folder, FolderChange, FolderId, FolderRef, FreeBusy, Importance, ItemChange, ItemId, MeetingMessageKind, MeetingRequestInfo, MeetingResponse, MessageBody, MessageFull,
+    MessageMeta, NewCalendarItem, OutgoingAttachment, OutgoingMessage, Participant, PersonKind, ResponseType, Signature, SyncState,
 };
 use aiowa_transport::WriteResult;
 use base64::prelude::*;
@@ -1210,6 +1210,296 @@ pub fn recurrence_text(rec: &Value) -> Option<String> {
 }
 
 // ---------------------------------------------------------------------------
+// Справочник организации (см. docs/protocol-owa-json.md § 5l)
+
+/// `FindPeople` по известной папке `directory` (глобальный список адресов): первая страница
+/// `IndexedPageView` до `max` записей, форма `Default`, без разрешения разовых адресов и без
+/// индекса подсказок (как автодополнение браузерной OWA при поиске по справочнику).
+pub fn find_people_body(query: &str, max: usize) -> Value {
+    json!({
+        "__type": "FindPeopleRequest:#Exchange",
+        "IndexedPageItemView": { "__type": "IndexedPageView:#Exchange", "BasePoint": "Beginning", "Offset": 0, "MaxEntriesReturned": max },
+        "QueryString": query,
+        "ParentFolderId": { "__type": "TargetFolderId:#Exchange", "BaseFolderId": { "__type": "DistinguishedFolderId:#Exchange", "Id": "directory" } },
+        "PersonaShape": { "__type": "PersonaResponseShape:#Exchange", "BaseShape": "Default" },
+        "ShouldResolveOneOffEmailAddress": false,
+        "SearchPeopleSuggestionIndex": false
+    })
+}
+
+/// Дополнительные свойства записи `FindPeople` для подсказок: в форме `Default` нет должности,
+/// офиса и телефонов. Сервер (Exchange 2019) принимает их и отдаёт под ключами `Title` (строка),
+/// `OfficeLocationsArray`, `BusinessPhoneNumbersArray`, `MobilePhonesArray` (атрибутированные
+/// значения); `persona:Department` отвергает (`ErrorInvalidArgument`), поэтому его здесь нет (§ 5l).
+pub const PERSONA_EXTRA_FIELDS: &[&str] = &["persona:Title", "persona:OfficeLocations", "persona:BusinessPhoneNumbers", "persona:MobilePhones"];
+
+/// `find_people_body` с дополнительными свойствами записи: `AdditionalProperties` формы
+/// `PersonaShape` (`PropertyUri` с именами `persona:*`, например `persona:Title`).
+pub fn find_people_body_with(query: &str, max: usize, additional: &[&str]) -> Value {
+    let mut v = find_people_body(query, max);
+    if !additional.is_empty() {
+        v["PersonaShape"]["AdditionalProperties"] = Value::Array(additional.iter().map(|f| property_uri(f)).collect());
+    }
+    v
+}
+
+/// `ResolveNames` по справочнику (`SearchScope: ActiveDirectory`). `full_contact` — с данными
+/// контакта (`ReturnFullContactData: true` и `ContactDataShape: AllProperties`: должность,
+/// отдел, телефоны), иначе только адрес (`Mailbox`).
+pub fn resolve_names_body(query: &str, full_contact: bool) -> Value {
+    resolve_names_body_shaped(query, full_contact.then_some("AllProperties"))
+}
+
+/// `ResolveNames` с выбранной формой данных контакта: `Some(форма)` — `ReturnFullContactData: true`
+/// и `ContactDataShape` (`IdOnly`, `Default`, `AllProperties`), `None` — только адрес.
+pub fn resolve_names_body_shaped(query: &str, contact_shape: Option<&str>) -> Value {
+    let mut v = json!({
+        "__type": "ResolveNamesRequest:#Exchange",
+        "UnresolvedEntry": query,
+        "ReturnFullContactData": contact_shape.is_some(),
+        "SearchScope": "ActiveDirectory"
+    });
+    if let Some(shape) = contact_shape {
+        v["ContactDataShape"] = json!(shape);
+    }
+    v
+}
+
+/// `ExpandDL` списка рассылки по SMTP-адресу.
+pub fn expand_dl_body(email: &str) -> Value {
+    json!({
+        "__type": "ExpandDLRequest:#Exchange",
+        "Mailbox": { "__type": "EmailAddress:#Exchange", "EmailAddress": email, "RoutingType": "SMTP" }
+    })
+}
+
+/// Строка значения поля справочника в любой из форм OWA: строка; атрибутированное значение
+/// `Persona` `{ "Value": … }`; массив таких значений (первое непустое); телефон `{ "Number": … }`;
+/// адрес `{ "EmailAddress": … }`. Пустое или пробельное — `None`.
+fn loose_text(v: &Value) -> Option<String> {
+    match v {
+        Value::String(s) => {
+            let t = s.trim();
+            (!t.is_empty()).then(|| t.to_string())
+        }
+        Value::Array(a) => a.iter().find_map(loose_text),
+        Value::Object(o) => ["Value", "Number", "EmailAddress", "DisplayName", "Name"].iter().find_map(|k| o.get(*k).and_then(loose_text)),
+        _ => None,
+    }
+}
+
+/// Первое непустое значение из ключей `keys` (в порядке перечисления).
+fn first_text(v: &Value, keys: &[&str]) -> Option<String> {
+    keys.iter().find_map(|k| v.get(*k).and_then(loose_text))
+}
+
+/// Адрес, похожий на SMTP: без префикса `SMTP:`, с `@` между непустыми частями, без пробелов и
+/// без другого префикса вида (`SIP:`, `X500:` — адреса не почты).
+fn smtp_like(s: &str) -> Option<String> {
+    let t = s.trim();
+    let t = t.strip_prefix("SMTP:").or_else(|| t.strip_prefix("smtp:")).unwrap_or(t);
+    let (local, domain) = t.split_once('@')?;
+    (!local.is_empty() && !domain.is_empty() && !t.contains(char::is_whitespace) && !local.contains(':')).then(|| t.to_string())
+}
+
+/// Первый SMTP-адрес среди строк значения (словарь `EmailAddresses` контакта, массив адресов
+/// `Persona`): обход массивов и объектов на глубину до четырёх уровней.
+fn first_smtp(v: Option<&Value>) -> Option<String> {
+    fn walk(v: &Value, depth: usize) -> Option<String> {
+        match v {
+            Value::String(s) => smtp_like(s),
+            Value::Array(a) if depth > 0 => a.iter().find_map(|x| walk(x, depth - 1)),
+            Value::Object(o) if depth > 0 => {
+                // Сначала основной член адреса, затем остальные (ключи словаря, имена).
+                o.get("EmailAddress").or_else(|| o.get("Value")).and_then(|x| walk(x, depth - 1)).or_else(|| o.values().find_map(|x| walk(x, depth - 1)))
+            }
+            _ => None,
+        }
+    }
+    walk(v?, 4)
+}
+
+/// Телефон одного из видов `kinds` (без учёта регистра) в любой из форм OWA: массив
+/// `{ Key, PhoneNumber }` (словарь `PhoneNumbers` контакта `ResolveNames`, § 5l; пустые значения
+/// пропускаются) или `{ Key, Value }`, объект
+/// `{ "BusinessPhone": "…" }`, телефон `{ Number, Type }` (`Persona.PhoneNumber`) и массив
+/// атрибутированных `{ Value: { Number, Type } }`. Пустой `kinds` — телефон любого вида.
+fn phone_of(v: Option<&Value>, kinds: &[&str]) -> Option<String> {
+    let matches = |k: Option<&str>| kinds.is_empty() || k.is_some_and(|k| kinds.iter().any(|w| w.eq_ignore_ascii_case(k)));
+    match v? {
+        Value::Array(a) => a.iter().find_map(|e| phone_of(Some(e), kinds)),
+        Value::Object(o) => {
+            if let Some(inner) = o.get("Value").filter(|x| x.is_object()) {
+                return phone_of(Some(inner), kinds);
+            }
+            if o.contains_key("Key") || o.contains_key("Number") || o.contains_key("PhoneNumber") || o.contains_key("Type") {
+                let kind = o.get("Key").or_else(|| o.get("Type")).and_then(Value::as_str);
+                return if matches(kind) { o.get("Number").or_else(|| o.get("PhoneNumber")).or_else(|| o.get("Value")).and_then(loose_text) } else { None };
+            }
+            o.iter().find(|(k, _)| matches(Some(k.as_str()))).and_then(|(_, x)| loose_text(x))
+        }
+        Value::String(s) if kinds.is_empty() => {
+            let t = s.trim();
+            (!t.is_empty()).then(|| t.to_string())
+        }
+        _ => None,
+    }
+}
+
+const BUSINESS_PHONE_KINDS: &[&str] = &["BusinessPhone", "Business", "BusinessPhone2", "Work"];
+const MOBILE_PHONE_KINDS: &[&str] = &["MobilePhone", "Mobile", "Cellular"];
+
+/// Запись `FindPeople` (`Persona`). Адрес — `EmailAddress.EmailAddress`, при адресе `EX` — первый
+/// SMTP из `EmailAddresses`; вид — по `PersonaType` или `PersonaTypeString` (так в форме `Default`
+/// Exchange 2019: `Person`, `DistributionList`, `Room`), иначе по `EmailAddress.MailboxType`, иначе
+/// человек с адресом — ящик. Без имени и адреса — `None`.
+pub fn parse_persona(v: &Value) -> Option<DirectoryPerson> {
+    let addr = v.get("EmailAddress").filter(|a| a.is_object());
+    let primary = addr.and_then(|a| str_of(a, "EmailAddress"));
+    let email = primary.and_then(smtp_like).or_else(|| first_smtp(v.get("EmailAddresses"))).or_else(|| primary.map(|p| p.trim().to_string()).filter(|p| !p.is_empty()));
+    let display_name = first_text(v, &["DisplayName", "DisplayNameFirstLast", "FileAs"]).or_else(|| addr.and_then(|a| first_text(a, &["Name"])));
+    if display_name.is_none() && email.is_none() {
+        return None;
+    }
+    let persona_type = str_of(v, "PersonaType").or_else(|| str_of(v, "PersonaTypeString")).unwrap_or("");
+    let kind = PersonKind::from_persona_type(persona_type)
+        .or_else(|| addr.and_then(|a| str_of(a, "MailboxType")).and_then(PersonKind::from_mailbox_type))
+        .unwrap_or(if email.is_some() && (persona_type.is_empty() || persona_type.eq_ignore_ascii_case("Person")) { PersonKind::Mailbox } else { PersonKind::Other });
+    Some(DirectoryPerson {
+        display_name,
+        email,
+        kind,
+        title: first_text(v, &["Title", "JobTitle", "Titles", "TitlesArray"]),
+        department: first_text(v, &["Department", "Departments", "DepartmentsArray"]),
+        company: first_text(v, &["CompanyName", "CompanyNames", "CompanyNamesArray", "Company"]),
+        office: first_text(v, &["OfficeLocation", "OfficeLocations", "OfficeLocationsArray", "Office"]),
+        business_phone: first_text(v, &["BusinessPhoneNumber", "BusinessPhone"])
+            .or_else(|| phone_of(v.get("BusinessPhoneNumbersArray").or_else(|| v.get("BusinessPhoneNumbers")), &[]))
+            .or_else(|| phone_of(v.get("PhoneNumber"), BUSINESS_PHONE_KINDS))
+            .or_else(|| phone_of(v.get("PhoneNumbers"), BUSINESS_PHONE_KINDS)),
+        mobile_phone: first_text(v, &["MobilePhone"])
+            .or_else(|| phone_of(v.get("MobilePhonesArray").or_else(|| v.get("MobilePhones")), &[]))
+            .or_else(|| phone_of(v.get("PhoneNumber"), MOBILE_PHONE_KINDS))
+            .or_else(|| phone_of(v.get("PhoneNumbers"), MOBILE_PHONE_KINDS)),
+        alias: first_text(v, &["Alias"]),
+    })
+}
+
+/// Массив записей `FindPeople`: `ResultSet` в `Body` (так отвечает Exchange 2019 по папке
+/// `directory`: ответ без `ResponseMessages`, как у `FindConversation`, § 5l); терпимо к `People`,
+/// `Personas` и к первому сообщению `ResponseMessages`.
+pub fn find_people_array(v: &Value) -> Option<&Vec<Value>> {
+    fn people(m: &Value) -> Option<&Vec<Value>> {
+        ["ResultSet", "People", "Personas"].iter().find_map(|k| m.get(*k).and_then(Value::as_array))
+    }
+    people(v.get("Body").unwrap_or(v)).or_else(|| v.pointer("/Body/ResponseMessages/Items/0").and_then(people))
+}
+
+/// Записи ответа `FindPeople` в порядке сервера (без имени и адреса пропускаются).
+pub fn parse_find_people(v: &Value) -> Vec<DirectoryPerson> {
+    find_people_array(v).map(|a| a.iter().filter_map(parse_persona).collect()).unwrap_or_default()
+}
+
+/// Код и текст ошибки уровня `Body` (ответ без `ResponseMessages`, как у `FindPeople` и
+/// `FindConversation`), если `Body.ResponseClass` не `Success`.
+pub fn body_error(v: &Value) -> Option<(String, String)> {
+    let body = v.get("Body")?;
+    body.get("ResponseClass")?;
+    message_error(body)
+}
+
+/// Запись `ResolveNames`: `Mailbox { Name, EmailAddress, RoutingType, MailboxType }` и при полных
+/// данных `Contact { DisplayName, JobTitle, Department, CompanyName, OfficeLocation,
+/// PhoneNumbers, EmailAddresses, Alias }`. Адрес `EX` заменяется первым SMTP из
+/// `Contact.EmailAddresses`. Без имени и адреса — `None`.
+pub fn parse_resolution(v: &Value) -> Option<DirectoryPerson> {
+    let null = Value::Null;
+    let mbx = v.get("Mailbox").filter(|m| m.is_object()).unwrap_or(&null);
+    let contact = v.get("Contact").filter(|c| c.is_object()).unwrap_or(&null);
+    let primary = str_of(mbx, "EmailAddress");
+    let email = primary.and_then(smtp_like).or_else(|| first_smtp(contact.get("EmailAddresses"))).or_else(|| primary.map(|p| p.trim().to_string()).filter(|p| !p.is_empty()));
+    let display_name = first_text(contact, &["DisplayName"]).or_else(|| first_text(mbx, &["Name"]));
+    if display_name.is_none() && email.is_none() {
+        return None;
+    }
+    let kind = str_of(mbx, "MailboxType").and_then(PersonKind::from_mailbox_type).unwrap_or(PersonKind::Other);
+    Some(DirectoryPerson {
+        display_name,
+        email,
+        kind,
+        title: first_text(contact, &["JobTitle", "Title"]),
+        department: first_text(contact, &["Department"]),
+        company: first_text(contact, &["CompanyName", "Company"]),
+        office: first_text(contact, &["OfficeLocation", "Office"]),
+        business_phone: phone_of(contact.get("PhoneNumbers"), BUSINESS_PHONE_KINDS).or_else(|| first_text(contact, &["BusinessPhone"])),
+        mobile_phone: phone_of(contact.get("PhoneNumbers"), MOBILE_PHONE_KINDS).or_else(|| first_text(contact, &["MobilePhone"])),
+        alias: first_text(contact, &["Alias"]).or_else(|| first_text(mbx, &["Alias"])),
+    })
+}
+
+/// Массив разрешений из сообщения `ResolveNames`: `ResolutionSet.Resolutions` (терпимо к
+/// `Resolution`, `Items` и к `ResolutionSet` массивом).
+pub fn resolutions_array(msg: &Value) -> Option<&Vec<Value>> {
+    let set = msg.get("ResolutionSet")?;
+    set.as_array().or_else(|| ["Resolutions", "Resolution", "Items"].iter().find_map(|k| set.get(*k).and_then(Value::as_array)))
+}
+
+/// Итог `ResolveNames` по сообщению ответа: записи `ResolutionSet`. `ErrorNameResolutionNoResults`
+/// — пусто; `ErrorNameResolutionMultipleResults` (класс `Warning`) — успех со списком; другой
+/// отказ — `Err((код, текст))`.
+pub fn parse_resolve_names(msg: &Value) -> std::result::Result<Vec<DirectoryPerson>, (String, String)> {
+    if let Some((code, message)) = message_error(msg) {
+        match code.as_str() {
+            "ErrorNameResolutionNoResults" => return Ok(Vec::new()),
+            "ErrorNameResolutionMultipleResults" => {}
+            _ if resolutions_array(msg).is_some_and(|a| !a.is_empty()) && str_of(msg, "ResponseClass") == Some("Warning") => {}
+            _ => return Err((code, message)),
+        }
+    }
+    Ok(resolutions_array(msg).map(|a| a.iter().filter_map(parse_resolution).collect()).unwrap_or_default())
+}
+
+/// Массив участников из сообщения `ExpandDL`: `DLExpansion.Mailbox` (терпимо к `Mailboxes`,
+/// `Items` и к `DLExpansion` массивом).
+pub fn dl_expansion_array(msg: &Value) -> Option<&Vec<Value>> {
+    let set = msg.get("DLExpansion")?;
+    set.as_array().or_else(|| ["Mailbox", "Mailboxes", "Items"].iter().find_map(|k| set.get(*k).and_then(Value::as_array)))
+}
+
+/// Участник списка из `ExpandDL`: адрес той же формы, что получатель письма
+/// (`{ Name, EmailAddress, RoutingType, MailboxType }`), вид — по `MailboxType`.
+pub fn parse_dl_member(v: &Value) -> Option<DirectoryPerson> {
+    let m = v.get("Mailbox").filter(|m| m.is_object()).unwrap_or(v);
+    let primary = str_of(m, "EmailAddress");
+    let email = primary.and_then(smtp_like).or_else(|| primary.map(|p| p.trim().to_string()).filter(|p| !p.is_empty()));
+    let display_name = first_text(m, &["Name", "DisplayName"]);
+    if display_name.is_none() && email.is_none() {
+        return None;
+    }
+    let kind = str_of(m, "MailboxType").and_then(PersonKind::from_mailbox_type).unwrap_or(PersonKind::Other);
+    Some(DirectoryPerson { display_name, email, kind, ..Default::default() })
+}
+
+/// Участники списка из сообщения ответа `ExpandDL` в порядке сервера.
+pub fn parse_expand_dl(msg: &Value) -> Vec<DirectoryPerson> {
+    dl_expansion_array(msg).map(|a| a.iter().filter_map(parse_dl_member).collect()).unwrap_or_default()
+}
+
+/// Объединение ключей объектов массива с числом объектов, где ключ есть, по алфавиту: форма
+/// записей ответа без значений (для журнала и документации протокола).
+pub fn key_union(items: &[Value]) -> Vec<(String, usize)> {
+    let mut map: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    for item in items {
+        if let Some(o) = item.as_object() {
+            for k in o.keys() {
+                *map.entry(k.clone()).or_default() += 1;
+            }
+        }
+    }
+    map.into_iter().collect()
+}
+
+// ---------------------------------------------------------------------------
 // Разбор ответов
 
 pub fn str_of<'a>(v: &'a Value, key: &str) -> Option<&'a str> {
@@ -2373,5 +2663,151 @@ mod tests {
         let out = parse_write_results(&response_messages(&v), &ids());
         assert!(matches!(&out[0], WriteResult::Failed { code, .. } if code == "NoResponse"), "{out:?}");
         assert_eq!(out[1], WriteResult::Ok { id: ItemId { id: "B".into(), change_key: Some("k2".into()) } });
+    }
+
+    #[test]
+    fn find_people_body_exact() {
+        assert_eq!(
+            serde_json::to_string(&find_people_body("Пет", 25)).unwrap(),
+            r#"{"__type":"FindPeopleRequest:#Exchange","IndexedPageItemView":{"__type":"IndexedPageView:#Exchange","BasePoint":"Beginning","Offset":0,"MaxEntriesReturned":25},"QueryString":"Пет","ParentFolderId":{"__type":"TargetFolderId:#Exchange","BaseFolderId":{"__type":"DistinguishedFolderId:#Exchange","Id":"directory"}},"PersonaShape":{"__type":"PersonaResponseShape:#Exchange","BaseShape":"Default"},"ShouldResolveOneOffEmailAddress":false,"SearchPeopleSuggestionIndex":false}"#
+        );
+        let env = envelope("FindPeople", V_2017, "UTC", find_people_body("x", 5));
+        assert!(serde_json::to_string(&env).unwrap().starts_with(r#"{"__type":"FindPeopleJsonRequest:#Exchange","Header":{"__type":"JsonRequestHeaders:#Exchange""#));
+        let s = serde_json::to_string(&find_people_body_with("x", 5, &["persona:Title", "persona:Department"])).unwrap();
+        assert!(
+            s.contains(r#""PersonaShape":{"__type":"PersonaResponseShape:#Exchange","BaseShape":"Default","AdditionalProperties":[{"__type":"PropertyUri:#Exchange","FieldURI":"persona:Title"},{"__type":"PropertyUri:#Exchange","FieldURI":"persona:Department"}]},"ShouldResolveOneOffEmailAddress""#),
+            "{s}"
+        );
+        assert_eq!(find_people_body_with("x", 5, &[]), find_people_body("x", 5));
+        assert!(serde_json::to_string(&resolve_names_body_shaped("x", Some("Default"))).unwrap().ends_with(r#""ReturnFullContactData":true,"SearchScope":"ActiveDirectory","ContactDataShape":"Default"}"#));
+    }
+
+    #[test]
+    fn resolve_names_and_expand_dl_bodies_exact() {
+        assert_eq!(
+            serde_json::to_string(&resolve_names_body("ivan@x.ru", true)).unwrap(),
+            r#"{"__type":"ResolveNamesRequest:#Exchange","UnresolvedEntry":"ivan@x.ru","ReturnFullContactData":true,"SearchScope":"ActiveDirectory","ContactDataShape":"AllProperties"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&resolve_names_body("Иван", false)).unwrap(),
+            r#"{"__type":"ResolveNamesRequest:#Exchange","UnresolvedEntry":"Иван","ReturnFullContactData":false,"SearchScope":"ActiveDirectory"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&expand_dl_body("all@x.ru")).unwrap(),
+            r#"{"__type":"ExpandDLRequest:#Exchange","Mailbox":{"__type":"EmailAddress:#Exchange","EmailAddress":"all@x.ru","RoutingType":"SMTP"}}"#
+        );
+    }
+
+    #[test]
+    fn parses_find_people_forms() {
+        // Форма Exchange 2019: ResultSet в Body без ResponseMessages; значения строками и атрибутированными массивами.
+        let v: Value = serde_json::from_str(r#"{"Body":{"ResponseClass":"Success","ResponseCode":"NoError","ResultSet":[
+            {"__type":"Persona:#Exchange","PersonaType":"Person","DisplayName":"Петров Иван","EmailAddress":{"Name":"Петров Иван","EmailAddress":"Ivan.Petrov@x.ru","RoutingType":"SMTP","MailboxType":"Mailbox"},
+             "Title":"Инженер","Department":"ИТ","CompanyName":"ООО Х","OfficeLocations":[{"Value":"к. 101","Attributions":["a"]}],
+             "BusinessPhoneNumbers":[{"Value":{"Number":"+7 495 000","Type":"Business"},"Attributions":["a"]}],"MobilePhones":[{"Value":{"Number":"+7 900 000","Type":"Mobile"}}],"Alias":"ipetrov"},
+            {"PersonaTypeString":"DistributionList","DisplayName":"Все сотрудники","EmailAddress":{"EmailAddress":"all@x.ru","RoutingType":"SMTP","MailboxType":"PublicDL"}},
+            {"PersonaType":"Room","DisplayName":"Переговорная 1","EmailAddress":{"EmailAddress":"room1@x.ru","MailboxType":"Mailbox"}},
+            {"PersonaType":"Person","DisplayName":"Старый адрес","EmailAddress":{"EmailAddress":"/o=Org/cn=old","RoutingType":"EX"},"EmailAddresses":[{"Name":"x","EmailAddress":"old@x.ru","RoutingType":"SMTP"}],"PhoneNumber":{"Number":"+7 901","Type":"Mobile"}},
+            {"PersonaType":"Person","EmailAddress":{"EmailAddress":"/o=Org/cn=noname","RoutingType":"EX"}},
+            {"PersonaType":"Person"}
+        ],"TotalNumberOfPeopleInView":6}}"#).unwrap();
+        assert!(body_error(&v).is_none());
+        let p = parse_find_people(&v);
+        assert_eq!(p.len(), 5, "запись без имени и адреса пропущена: {p:?}");
+        assert_eq!(p[0].display_name.as_deref(), Some("Петров Иван"));
+        assert_eq!(p[0].email.as_deref(), Some("Ivan.Petrov@x.ru"));
+        assert_eq!(p[0].kind, PersonKind::Mailbox);
+        assert_eq!((p[0].title.as_deref(), p[0].department.as_deref(), p[0].company.as_deref(), p[0].office.as_deref()), (Some("Инженер"), Some("ИТ"), Some("ООО Х"), Some("к. 101")));
+        assert_eq!(p[0].business_phone.as_deref(), Some("+7 495 000"));
+        assert_eq!(p[0].mobile_phone.as_deref(), Some("+7 900 000"));
+        assert_eq!(p[0].alias.as_deref(), Some("ipetrov"));
+        assert_eq!(p[1].kind, PersonKind::DistributionList);
+        assert_eq!(p[2].kind, PersonKind::Room, "PersonaType главнее MailboxType");
+        assert_eq!(p[3].email.as_deref(), Some("old@x.ru"), "адрес EX заменён SMTP из EmailAddresses");
+        assert_eq!(p[3].mobile_phone.as_deref(), Some("+7 901"));
+        assert_eq!(p[3].business_phone, None, "мобильный не считается рабочим");
+        assert_eq!(p[4].email.as_deref(), Some("/o=Org/cn=noname"), "без SMTP остаётся адрес EX");
+        assert_eq!(p[4].email_key(), None);
+        // Дополнительные свойства PERSONA_EXTRA_FIELDS в форме Exchange 2019: Title строкой,
+        // *Array — атрибутированные значения, телефоны с NormalizedNumber.
+        let v: Value = serde_json::from_str(r#"{"Body":{"ResponseClass":"Success","ResponseCode":"NoError","ResultSet":[
+            {"PersonaId":{"Id":"P1"},"PersonaTypeString":"Person","DisplayName":"Сидоров Пётр","EmailAddress":{"Name":"Сидоров Пётр","EmailAddress":"p@x.ru","RoutingType":"SMTP","MailboxType":"Mailbox"},
+             "CompanyName":"ООО Х","WorkCity":"Город","Title":"Начальник","OfficeLocationsArray":[{"Value":"к. 5","Attributions":["0"]}],
+             "BusinessPhoneNumbersArray":[{"Value":{"Number":"1234","Type":"Business","NormalizedNumber":"1234"},"Attributions":["0"]}],
+             "MobilePhonesArray":[{"Value":{"Number":"+7 999","Type":"Mobile","NormalizedNumber":"7999"},"Attributions":["0"]}]}
+        ]}}"#).unwrap();
+        let p = parse_find_people(&v);
+        assert_eq!(p.len(), 1);
+        assert_eq!((p[0].title.as_deref(), p[0].office.as_deref(), p[0].company.as_deref()), (Some("Начальник"), Some("к. 5"), Some("ООО Х")));
+        assert_eq!((p[0].business_phone.as_deref(), p[0].mobile_phone.as_deref()), (Some("1234"), Some("+7 999")));
+        assert_eq!((p[0].kind, p[0].department.as_deref()), (PersonKind::Mailbox, None), "WorkCity — не офис и не отдел");
+        // Та же выдача в первом сообщении ResponseMessages.
+        let v: Value = serde_json::from_str(r#"{"Body":{"ResponseMessages":{"Items":[{"ResponseClass":"Success","ResponseCode":"NoError","People":[{"DisplayName":"А","EmailAddress":{"EmailAddress":"a@x.ru"}}]}]}}}"#).unwrap();
+        assert_eq!(parse_find_people(&v).len(), 1);
+        // Отказ уровня Body.
+        let v: Value = serde_json::from_str(r#"{"Body":{"ResponseClass":"Error","ResponseCode":"ErrorInvalidRequest","MessageText":"bad"}}"#).unwrap();
+        assert_eq!(body_error(&v), Some(("ErrorInvalidRequest".into(), "bad".into())));
+        assert!(parse_find_people(&v).is_empty());
+        assert!(body_error(&json!({"Body": {"ResponseMessages": {}}})).is_none(), "без ResponseClass в Body ошибки уровня Body нет");
+    }
+
+    #[test]
+    fn parses_resolve_names_forms() {
+        let msg: Value = serde_json::from_str(r#"{"__type":"ResolveNamesResponseMessage:#Exchange","ResponseClass":"Warning","ResponseCode":"ErrorNameResolutionMultipleResults","MessageText":"Multiple results were found.",
+          "ResolutionSet":{"TotalItemsInView":2,"IncludesLastItemInRange":true,"Resolutions":[
+            {"Mailbox":{"Name":"Петров Иван","EmailAddress":"ivan@x.ru","RoutingType":"SMTP","MailboxType":"Mailbox"},
+             "Contact":{"DisplayName":"Петров Иван Сергеевич","JobTitle":"Инженер","Department":"ИТ","CompanyName":"ООО Х","OfficeLocation":"к. 101",
+                        "PhoneNumbers":[{"Key":"AssistantPhone","PhoneNumber":""},{"Key":"BusinessPhone","PhoneNumber":"+7 495 000"},{"Key":"HomePhone","PhoneNumber":"дом"},{"Key":"MobilePhone","PhoneNumber":"+7 900 000"}],
+                        "EmailAddresses":[{"Key":"EmailAddress1","EmailAddress":"SMTP:ivan@x.ru"}],"ContactSource":"ActiveDirectory"}},
+            {"Mailbox":{"Name":"Список","EmailAddress":"/o=Org/cn=list","RoutingType":"EX","MailboxType":"PublicDL"},
+             "Contact":{"EmailAddresses":{"EmailAddress1":"smtp:list@x.ru"},"PhoneNumbers":{"BusinessPhone":"+7 495 111"}}}
+          ]}}"#).unwrap();
+        let p = parse_resolve_names(&msg).unwrap();
+        assert_eq!(p.len(), 2, "несколько совпадений — успех со списком");
+        assert_eq!(p[0].display_name.as_deref(), Some("Петров Иван Сергеевич"), "имя контакта главнее имени ящика");
+        assert_eq!(p[0].email.as_deref(), Some("ivan@x.ru"));
+        assert_eq!(p[0].kind, PersonKind::Mailbox);
+        assert_eq!((p[0].title.as_deref(), p[0].department.as_deref(), p[0].company.as_deref(), p[0].office.as_deref()), (Some("Инженер"), Some("ИТ"), Some("ООО Х"), Some("к. 101")));
+        assert_eq!(p[0].business_phone.as_deref(), Some("+7 495 000"));
+        assert_eq!(p[0].mobile_phone.as_deref(), Some("+7 900 000"));
+        assert_eq!(p[1].email.as_deref(), Some("list@x.ru"), "EX заменён SMTP из словаря без префикса smtp:");
+        assert_eq!(p[1].kind, PersonKind::DistributionList);
+        assert_eq!(p[1].display_name.as_deref(), Some("Список"));
+        assert_eq!(p[1].business_phone.as_deref(), Some("+7 495 111"), "словарь телефонов объектом");
+        // Одно совпадение: Success; ResolutionSet массивом и Resolution вместо Resolutions.
+        let msg: Value = serde_json::from_str(r#"{"ResponseClass":"Success","ResponseCode":"NoError","ResolutionSet":{"Resolution":[{"Mailbox":{"Name":"А","EmailAddress":"a@x.ru","MailboxType":"Contact"}}]}}"#).unwrap();
+        let p = parse_resolve_names(&msg).unwrap();
+        assert_eq!(p.len(), 1);
+        assert_eq!(p[0].kind, PersonKind::Contact);
+        let msg: Value = serde_json::from_str(r#"{"ResponseClass":"Success","ResponseCode":"NoError","ResolutionSet":[{"Mailbox":{"EmailAddress":"b@x.ru"}}]}"#).unwrap();
+        assert_eq!(parse_resolve_names(&msg).unwrap()[0].kind, PersonKind::Other);
+        // Адрес EX: из словаря EmailAddresses берётся SMTP, а не SIP или X500.
+        let msg: Value = serde_json::from_str(r#"{"ResponseClass":"Success","ResponseCode":"NoError","ResolutionSet":{"Resolutions":[{"Mailbox":{"Name":"В","EmailAddress":"/o=Org/cn=v","RoutingType":"EX","MailboxType":"Mailbox"},
+            "Contact":{"EmailAddresses":[{"Key":"EmailAddress1","EmailAddress":"SIP:v@x.ru"},{"Key":"EmailAddress2","EmailAddress":"X500:/o=Org/cn=v"},{"Key":"EmailAddress3","EmailAddress":"SMTP:v.smtp@x.ru"}]}}]}}"#).unwrap();
+        assert_eq!(parse_resolve_names(&msg).unwrap()[0].email.as_deref(), Some("v.smtp@x.ru"));
+        // Ничего не найдено — пусто; другой отказ — ошибка с кодом.
+        let msg: Value = serde_json::from_str(r#"{"ResponseClass":"Error","ResponseCode":"ErrorNameResolutionNoResults","MessageText":"No results were found."}"#).unwrap();
+        assert_eq!(parse_resolve_names(&msg), Ok(vec![]));
+        let msg: Value = serde_json::from_str(r#"{"ResponseClass":"Error","ResponseCode":"ErrorAccessDenied","MessageText":"нет"}"#).unwrap();
+        assert_eq!(parse_resolve_names(&msg), Err(("ErrorAccessDenied".into(), "нет".into())));
+    }
+
+    #[test]
+    fn parses_expand_dl_forms() {
+        let msg: Value = serde_json::from_str(r#"{"ResponseClass":"Success","ResponseCode":"NoError","DLExpansion":{"TotalItemsInView":3,"IncludesLastItemInRange":true,"Mailbox":[
+            {"Name":"Петров Иван","EmailAddress":"ivan@x.ru","RoutingType":"SMTP","MailboxType":"Mailbox"},
+            {"Name":"Вложенный список","EmailAddress":"sub@x.ru","RoutingType":"SMTP","MailboxType":"PublicDL"},
+            {"Name":"Внешний","EmailAddress":"ext@y.com","RoutingType":"SMTP","MailboxType":"Contact"},
+            {"RoutingType":"SMTP"}
+        ]}}"#).unwrap();
+        let p = parse_expand_dl(&msg);
+        assert_eq!(p.len(), 3);
+        assert_eq!((p[0].kind, p[1].kind, p[2].kind), (PersonKind::Mailbox, PersonKind::DistributionList, PersonKind::Contact));
+        assert_eq!(p[1].email.as_deref(), Some("sub@x.ru"));
+        let msg: Value = serde_json::from_str(r#"{"DLExpansion":{"Mailboxes":[{"Mailbox":{"Name":"А","EmailAddress":"a@x.ru"}}]}}"#).unwrap();
+        assert_eq!(parse_expand_dl(&msg).len(), 1, "терпимо к Mailboxes и вложенному Mailbox");
+        assert!(parse_expand_dl(&json!({"ResponseClass": "Success"})).is_empty());
+        let keys = key_union(&[json!({"A": 1, "B": 2}), json!({"B": 3}), json!("x")]);
+        assert_eq!(keys, vec![("A".to_string(), 1), ("B".to_string(), 2)]);
     }
 }

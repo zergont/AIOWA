@@ -115,14 +115,14 @@ X-OWA-UrlPostData: <JSON запроса в URL-кодировке>   — при 
 | `FindItem` | при старте, календарь, напоминания | форма с `CalendarPageView` снята клиентом, § 5g |
 | `GetCalendarView` | календарь, листание месяца | `Body {CalendarId: TargetFolderId{BaseFolderId: FolderId{Id, ChangeKey}}, RangeStart, RangeEnd}` (локальное время без зоны, зона в `Header.TimeZoneContext`), `RequestServerVersion: V2017_08_18`; ответ `Body {ResponseClass, ResponseCode, Items[]}` |
 | `GetCalendarFolders`, `GetReminders` | старт, календарь | формы не сняты |
-| `FindPeople` | старт (избранные контакты), автодополнение | форма не снята |
+| `FindPeople` | старт (избранные контакты), автодополнение | по справочнику (`directory`) снято клиентом, § 5l: записи в `Body.ResultSet` |
 | `SubscribeToNotification` | старт и смена папки | `subscriptionData[{SubscriptionId, Parameters{NotificationType:"RowNotification", FolderId}}]`; ответ `[{SubscriptionId, SuccessfullyCreated, SubscriptionExists, ErrorInfo}]`. Типы: `RowNotification` (строки папки), `SuiteNotification` (не поддерживается без Broker), календарные. Точная форма и проверенные клиентом типы — § 5h, поток событий — § 4 |
 | `UpdateUserConfiguration` | OWA сама пишет настройки (`FrequentlyUsedFolders`) | операция записи, клиенту не нужна |
 | `GetExtensibilityContext` | старт | в ответе `EwsUrl: https://{host}/EWS/Exchange.asmx` и `RestUrl` — EWS доступен как резервный канал |
 | `GetPresence`, `ResetPresence`, `InstantMessageSignIn` | Lync | клиенту не нужны |
 | `GetFavorites`, `GetAllowedOptions`, `GetUserVoiceData`, `GetUnseenLightningIds` | старт | второстепенны |
 
-Не наблюдалось в этой сессии (проверяется в Rust-спайке напрямую): `SyncFolderItems`, `SyncFolderHierarchy`, `MarkAllItemsAsRead`, `CreateItem`, `UpdateItem`, `GetAttachment`. Позже сняты клиентом: `SyncFolderItems`/`SyncFolderHierarchy`/`GetItem` (§ 5b'), `GetFileAttachment` (§ 5), `UpdateItem` (§ 5e), `CreateItem`/`CreateAttachment`/`SendItem`/`GetUserConfiguration` (§ 5f), `FindItem` с `CalendarView` и `GetItem` события (§ 5g), `CreateFolder`/`UpdateFolder`/`DeleteFolder` и `message:ReplyTo` поверх `ShapeName` (§ 5j).
+Не наблюдалось в этой сессии (проверяется в Rust-спайке напрямую): `SyncFolderItems`, `SyncFolderHierarchy`, `MarkAllItemsAsRead`, `CreateItem`, `UpdateItem`, `GetAttachment`. Позже сняты клиентом: `SyncFolderItems`/`SyncFolderHierarchy`/`GetItem` (§ 5b'), `GetFileAttachment` (§ 5), `UpdateItem` (§ 5e), `CreateItem`/`CreateAttachment`/`SendItem`/`GetUserConfiguration` (§ 5f), `FindItem` с `CalendarView` и `GetItem` события (§ 5g), `CreateFolder`/`UpdateFolder`/`DeleteFolder` и `message:ReplyTo` поверх `ShapeName` (§ 5j), `FindPeople`/`ResolveNames` по справочнику (§ 5l; `ExpandDL` в форме EWS сервер отвергает).
 
 ## 4. Канал уведомлений
 
@@ -702,6 +702,87 @@ X-OWA-CANARY: <канарейка>          — дублируется заго�
 **Инлайновые картинки в черновике ответа.** Проверено черновиком `ReplyToItem` (без отправки, затем удалён навсегда) на письмо с одной картинкой `cid:` в теле: сервер **копирует инлайновые вложения оригинала в черновик ответа с теми же `ContentId`** (после синхронизации «Черновиков» у черновика одно инлайновое вложение, `ContentId` совпал, картинка подставилась в тело). Поэтому клиентская цитата при `UpdateItem` черновика ответа ссылается на `cid:` оригинала и картинки остаются на месте; цитата берётся из полного тела оригинала (`GetItem` формой `ItemNormalizedBody`, кэш в `ComposeState`), без полного или с обрезанным телом обновление черновика ответа отказывает, а не уходит без истории.
 
 «Черновики» входят в набор синхронизации по умолчанию (`drafts` убран из `SERVICE_FOLDERS`): черновики со вложениями проходят обычный путь `SyncFolderItems` → `GetItem` тел → вложения, строка получает `is_draft = 1`.
+
+## 5l. Справочник организации: `FindPeople`, `ResolveNames`, `ExpandDL` (клиент `aiowa`, 24.10.2026)
+
+Снято тремя запусками `aiowa directory` на рабочем ящике (только чтение, каждый — одна сессия с `logoff`). Запросы — фамилия владельца ящика (слово имени из «Отправленных» локальной базы, 7 символов; выбрано по совпадению латиницы с адресом) и её первые три буквы; списки рассылки искались запросами FindPeople по общим словам и среди частых получателей локальной базы. В вывод не печатались значения: только ключи, счётчики, коды, длины строк и длительности. Все операции — обычный `service.svc`, `__type` первым ключом, `RequestServerVersion: V2017_08_18`; ответы 160–330 мс.
+
+| Запрос | Время | Ответ | Итог |
+|---|---|---|---|
+| `FindPeople` форма `Default`, фамилия, max 25 | 160–200 мс | 2,8 КБ | 2 записи |
+| `FindPeople` форма `Default`, три буквы | 161–164 мс | 5,2 КБ | 4 записи |
+| `FindPeople` с `AdditionalProperties` (по одному, вместе) | 157–171 мс | — | см. таблицу свойств |
+| `ResolveNames` фамилия, `AllProperties` | 196–325 мс | 7,3 КБ | 2 записи, `Success`/`NoError` |
+| `ResolveNames` фамилия, без данных контакта | 162–163 мс | 0,7 КБ | 2 записи (только `Mailbox`) |
+| `ResolveNames` три буквы, `AllProperties` / `Default` | 204–218 / 173 мс | 19,4 / 5,4 КБ | 4 записи |
+| `ResolveNames` по SMTP-адресу записи (как карточка контакта) | 180–204 мс | — | 1 запись, все поля |
+| `ResolveNames` по адресу кандидата в списки | 158–196 мс | — | список (`MailboxType` `PublicDL` или `PrivateDL`) — 12-й из кандидатов, у остальных `Mailbox` или 0 записей |
+| `ExpandDL` по адресу списка | 318 мс | — | **HTTP 500** (обе версии схемы) |
+
+**`FindPeople` по справочнику** (`protocol::find_people_body`):
+
+```json
+{ "__type": "FindPeopleRequest:#Exchange",
+  "IndexedPageItemView": { "__type": "IndexedPageView:#Exchange", "BasePoint": "Beginning", "Offset": 0, "MaxEntriesReturned": 25 },
+  "QueryString": "…",
+  "ParentFolderId": { "__type": "TargetFolderId:#Exchange",
+      "BaseFolderId": { "__type": "DistinguishedFolderId:#Exchange", "Id": "directory" } },
+  "PersonaShape": { "__type": "PersonaResponseShape:#Exchange", "BaseShape": "Default" },
+  "ShouldResolveOneOffEmailAddress": false, "SearchPeopleSuggestionIndex": false }
+```
+
+Ответ **без `ResponseMessages`** (как у `FindConversation`): `Body { ResponseCode, ResponseClass, FirstLoadedRowIndex, FirstMatchingRowIndex, ResultSet[], TotalNumberOfFavoritesInView, TotalNumberOfPeopleInView }`. Записи лежат в **`ResultSet`** (не `People`); **`TotalNumberOfPeopleInView` равен 0 и при непустом `ResultSet`** — на счётчик полагаться нельзя. Поиск идёт по началу слов имени: три буквы фамилии нашли те же записи, что `ResolveNames` по ним же. Запрос по общему слову без совпадений — `Success` с пустым `ResultSet`.
+
+Запись (`Persona`) формы `Default` — 27 ключей: `PersonaId { Id }`, **`PersonaTypeString`** (`Person`; ключа `PersonaType` нет), `CreationTimeString`, `DisplayName`, `DisplayNameFirstLast`, `DisplayNameLastFirst`, `FileAs` (пусто), `GivenName`, `Surname`, `CompanyName`, `EmailAddress { Name, EmailAddress, RoutingType: "SMTP", MailboxType: "Mailbox" }`, `EmailAddresses [ { Name, EmailAddress, RoutingType, MailboxType } ]`, `ImAddress`, `WorkCity`, `RelevanceScore` (число), `ADObjectId` (guid), `MapiSendRichInfo` (признак) и всегда `null`: `ItemLinkIds`, `IsBusinessContact`, `AttributedIsBusinessContact`, `SourceMailboxGuids`, `LastContactedDate`, `MapiEntryId`, `MapiEmailAddress`, `MapiAddressType`, `MapiSearchKey`, `MapiTransmittableDisplayName`. **Должности, отдела, офиса и телефонов в форме `Default` нет.**
+
+`AdditionalProperties` в `PersonaShape` (`[ { "__type": "PropertyUri:#Exchange", "FieldURI": "persona:…" } ]`, проверено по одному на трёх буквах):
+
+| Свойство | Итог | Ключ в записи |
+|---|---|---|
+| `persona:Title` | принято | `Title` — строка, у всех 4 записей |
+| `persona:Department` | **отказ** `ErrorInvalidArgument` в `Body` (HTTP 200) | — |
+| `persona:OfficeLocations` | принято | `OfficeLocationsArray: [ { Value, Attributions: [ "…" ] } ]` |
+| `persona:BusinessPhoneNumbers` | принято | `BusinessPhoneNumbersArray: [ { Value: { Number, Type: "Business", NormalizedNumber }, Attributions } ]` |
+| `persona:MobilePhones` | принято | ключа нет (у найденных мобильных нет); ожидается `MobilePhonesArray` той же формы |
+| `persona:Alias`, `persona:PersonaType` | приняты | новых ключей нет |
+
+Все шесть принятых вместе — принято (171 мс), три новых ключа у всех записей. Клиент поэтому ищет с `AdditionalProperties` = `persona:Title`, `persona:OfficeLocations`, `persona:BusinessPhoneNumbers`, `persona:MobilePhones` (`protocol::PERSONA_EXTRA_FIELDS`, `find_people_body_with`); именно эта четвёрка отдельно не отправлялась (это подмножество принятой шестёрки). Отказ по свойствам (`ErrorInvalidArgument` или код свойства в `Body`, HTTP 500) — повтор формой `Default`, отказ запоминается в транспорте (`OwaTransport::find_people_value`). Отдела у записей `FindPeople` нет: его даёт `ResolveNames` (карточка контакта кладёт полную запись в кэш, а слияние в кэше не стирает отдел при следующем поиске).
+
+Разбор (`protocol::parse_persona`, терпимый): массив — `ResultSet`, затем `People`, `Personas`, первое сообщение `ResponseMessages`; адрес — `EmailAddress.EmailAddress`, при адресе `EX` — первый SMTP из `EmailAddresses`; вид — `PersonaType`/`PersonaTypeString` (`DistributionList` — список, `Room`/`Equipment` — ресурс), иначе `EmailAddress.MailboxType` (`PublicDL`/`PrivateDL` — список, `Contact`/`OneOff` — внешний), иначе человек с адресом — ящик; поля — строкой, атрибутированным `{ Value }` или массивом таких значений (`*Array`). `WorkCity` не считается офисом. Записи без имени и адреса пропускаются. Списков рассылки и переговорных в выдаче `FindPeople` на этом ящике не встретилось: значения `PersonaTypeString` для них (ожидаются `DistributionList`, `Room`) не проверены.
+
+**`ResolveNames`** (`protocol::resolve_names_body`; без полных данных — `ReturnFullContactData: false` и без `ContactDataShape`):
+
+```json
+{ "__type": "ResolveNamesRequest:#Exchange", "UnresolvedEntry": "…",
+  "ReturnFullContactData": true, "SearchScope": "ActiveDirectory", "ContactDataShape": "AllProperties" }
+```
+
+Ответ — обычный `ResponseMessages`, сообщение `{ "__type": "ResolveNamesResponseMessage:#Exchange", ResponseCode, ResponseClass, ResolutionSet: { IncludesLastItemInRange, TotalItemsInView, Resolutions: [ { Mailbox, Contact } ] } }`. **Несколько совпадений (2 и 4) пришли как `Success`/`NoError`**, а не `Warning`/`ErrorNameResolutionMultipleResults`, как описывает EWS; клиент принимает обе формы, `ErrorNameResolutionNoResults` — пустой список (`protocol::parse_resolve_names`). `Mailbox { Name, EmailAddress, RoutingType: "SMTP", MailboxType: "Mailbox" }`.
+
+`Contact` с `AllProperties` — 24 ключа: `Alias`, `AssistantName`, `CompanyName`, `ContactSource` (`ActiveDirectory`), `Culture`, `Department`, `DirectReports` (у части: массив адресов `{ Name, EmailAddress, RoutingType, MailboxType }`), `DirectoryId`, `DisplayName`, `EmailAddresses`, `GivenName`, `HasPicture`, `Initials`, `JobTitle`, `MSExchangeCertificate`, `Manager` (строка — имя), `ManagerMailbox`, `Notes`, `OfficeLocation`, `PhoneNumbers`, `Photo`, `PhysicalAddresses`, `Surname`, `UserSMIMECertificate`. Словари — массивами пар:
+
+```json
+"PhoneNumbers":   [ { "Key": "AssistantPhone", "PhoneNumber": "" }, … ],
+"EmailAddresses": [ { "Key": "EmailAddress1", "EmailAddress": "…" }, … ],
+"PhysicalAddresses": [ { "Key": "Business", "Street": "", "City": "…", "State": "", "CountryOrRegion": "…", "PostalCode": "" } ]
+```
+
+`PhoneNumbers` — всегда шесть видов (`AssistantPhone`, `BusinessFax`, `BusinessPhone`, `HomePhone`, `MobilePhone`, `Pager`), пустой — пустой строкой: **значение под ключом `PhoneNumber`, а не `Value`**. Заполненность на 4 записях: `BusinessPhone` 4, `MobilePhone` и остальные 0; `JobTitle`, `Department`, `CompanyName`, `OfficeLocation`, `Alias` — у всех, `Manager` — у трёх, `Notes` — ни у кого. `EmailAddresses` — три пары; значения длиннее адреса (с префиксом вида адреса), клиент берёт из них только `SMTP:` (не `SIP:`/`X500:`), и только если адрес `Mailbox` не SMTP. Большая часть объёма `AllProperties` — сертификаты и фото: та же выдача с **`ContactDataShape: "Default"`** — 5,4 КБ против 19,4 КБ, 15 ключей (нет `Alias`, `Notes`, `Photo`, `HasPicture`, `DirectoryId`, `DirectReports`, `ManagerMailbox`, сертификатов), должность, отдел, офис и телефоны на месте (`protocol::resolve_names_body_shaped`). Карточка контакта запрашивает одну запись, поэтому клиент оставляет `AllProperties`.
+
+Разбор (`protocol::parse_resolution`): имя — `Contact.DisplayName`, иначе `Mailbox.Name`; вид — по `Mailbox.MailboxType`; должность `JobTitle`, отдел `Department`, компания `CompanyName`, офис `OfficeLocation`, телефоны — `PhoneNumbers` по ключам `BusinessPhone`/`MobilePhone` (пустые пропускаются), псевдоним `Alias`.
+
+**`ExpandDL`** (`protocol::expand_dl_body`):
+
+```json
+{ "__type": "ExpandDLRequest:#Exchange",
+  "Mailbox": { "__type": "EmailAddress:#Exchange", "EmailAddress": "…", "RoutingType": "SMTP" } }
+```
+
+По адресу списка (`ResolveNames` по нему дал одну запись с `MailboxType` списка) сервер ответил **HTTP 500 и на `V2017_08_18`, и на повтор с `Exchange2013`** (318 мс на оба). Текст отказа (`FaultMessage`) в том запуске не печатался; теперь `aiowa directory --expand first` печатает его с маской на адресах. **Форма `ExpandDL` для OWA JSON не найдена — открытый вопрос**: трейтовый `expand_dl` отдаёт `Protocol` (HTTP 500), интерфейс должен показать ошибку. Ожидаемый ответ по схеме EWS — сообщение с `DLExpansion { Mailbox: [ { Name, EmailAddress, RoutingType, MailboxType } ], TotalItemsInView, IncludesLastItemInRange }`; разбор (`protocol::parse_expand_dl`) терпим к `Mailboxes`/`Items` и покрыт юнит-тестом.
+
+**Кэш справочника** (схема версии 5, `crates/aiowa-store/src/directory.rs`): таблица `directory_people (account_id, email PK — SMTP в нижнем регистре, display_name, kind, json, fetched_at)`, `kind` — `mailbox`/`list`/`contact`/`room`/`other`, остальные поля — объектом JSON. `Store::upsert_directory_people` сливает запись со старой (заполненные поля новой побеждают, пустые берутся из старой: выдача `FindPeople` без отдела не стирает отдел из `ResolveNames`), `replace_directory_person` заменяет целиком; `directory_person` — по адресу без учёта регистра; `directory_search_cached` — по началу слов имени и адреса без учёта регистра и ё (0,2–0,8 мс). Миграция добавляет и индексы `items(account_id, lower(from_email))` и `recipients(lower(email))` для счётчиков переписки карточки (`Store::contact_local_stats`: писем от адреса, писем владельца ему из «Отправленных» или с собственного адреса, последнее); на тестовой базе (154 тыс. писем) миграция заняла 0,38 с.
+
+CLI: `aiowa directory [--query Q] [--resolve] [--prefix3] [--expand first|АДРЕС] [--max N] [--probe-shapes] [--dl-candidates N] [--dl-query Q …]` — без `--query` ищет фамилию владельца; печатает только счётчики, ключи, коды и длительности и пишет найденное в кэш справочника.
 
 ## 6. Что это значит для клиента
 

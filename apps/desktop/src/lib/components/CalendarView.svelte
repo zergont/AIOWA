@@ -288,7 +288,7 @@
   </div>
 
   {#if editor}
-    <EventEditor draft={editor} onsaved={onSaved} onclose={() => (editor = null)} />
+    <EventEditor draft={editor} {visible} onsaved={onSaved} onclose={() => (editor = null)} />
   {/if}
 </div>
 

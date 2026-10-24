@@ -3,6 +3,7 @@
   import { api, errorMessage, formatSize, fullDate, isInlinePicture, isPreviewable, listDate, meetingKindOf, messageNeedsFetch, personLabel, senderResponseOf, type Attachment, type ComposeKind, type Folder, type MeetingInfo, type MeetingResponse, type Message, type ResponseType } from "../api";
   import { COMPOSE_ACTIONS, ICON, type ItemAction } from "../actions";
   import { meetingWhen } from "../calendar";
+  import { contactCardOpener } from "../contact";
   import { focusBack } from "../popover";
   import { printMessage } from "../print";
   import FolderPicker from "./FolderPicker.svelte";
@@ -41,16 +42,27 @@
   /** Черновик: по признаку письма или по папке — у него вместо панели действий «Открыть черновик». */
   const isDraft = $derived(message.is_draft || (draftsFolderPk != null && message.folder_pk === draftsFolderPk));
 
-  const to = $derived(message.recipients.filter((r) => r.kind === 1).map((r) => personLabel(r.name, r.email)));
-  const cc = $derived(message.recipients.filter((r) => r.kind === 2).map((r) => personLabel(r.name, r.email)));
+  const to = $derived(message.recipients.filter((r) => r.kind === 1 && personLabel(r.name, r.email)));
+  const cc = $derived(message.recipients.filter((r) => r.kind === 2 && personLabel(r.name, r.email)));
   /** Адреса Reply-To, отличные от отправителя: ответ уйдёт им, карточка это показывает. */
   const replyTo = $derived.by(() => {
     const from = (message.from_email ?? "").trim().toLowerCase();
-    return (message.reply_to ?? [])
-      .filter((p) => (p.email ?? "").trim().toLowerCase() !== from || !p.email)
-      .map((p) => personLabel(p.name, p.email))
-      .filter(Boolean);
+    return (message.reply_to ?? []).filter((p) => ((p.email ?? "").trim().toLowerCase() !== from || !p.email) && personLabel(p.name, p.email));
   });
+
+  // --- карточка контакта ------------------------------------------------------
+  // Имя отправителя и получатели развёрнутого письма открывают карточку контакта (её держит App).
+  // У свёрнутого письма заголовок целиком — кнопка «развернуть», имена в нём не кликаются.
+
+  const openContact = contactCardOpener();
+
+  function showContact(e: MouseEvent, name: string | null, email: string | null) {
+    // Щелчок по имени не должен сворачивать письмо.
+    e.stopPropagation();
+    const addr = (email ?? "").trim();
+    if (!openContact || !addr) return;
+    openContact({ name: name?.trim() || null, email: addr }, e.currentTarget as HTMLElement);
+  }
   const inArchive = $derived(archiveFolderPk != null && message.folder_pk === archiveFolderPk);
   // В списке файлов всё, кроме инлайновых картинок: те уже стоят в теле письма.
   const files = $derived(message.attachments.filter((a) => !isInlinePicture(a)));
@@ -429,6 +441,11 @@
     }
   }
 
+  /** Получатели строкой: подсказка у строки «Кому», которая обрезается многоточием. */
+  function peopleText(list: { name: string | null; email: string | null }[]): string {
+    return list.map((p) => personLabel(p.name, p.email)).join(", ");
+  }
+
   function initials(name: string | null, email: string | null): string {
     const s = (name || email || "?").trim();
     const parts = s.split(/\s+/).filter(Boolean);
@@ -436,21 +453,31 @@
   }
 </script>
 
+<!-- Люди через запятую; с адресом — кнопка карточки контакта. В одну строку: иначе лишние пробелы перед запятыми. -->
+{#snippet people(list: { name: string | null; email: string | null }[])}
+  {#each list as p, i (i)}{#if i}{", "}{/if}{#if openContact && p.email}<button type="button" class="person" onclick={(e) => showContact(e, p.name, p.email)} aria-haspopup="dialog" title={p.name ? `${p.email} — карточка контакта` : "Карточка контакта"}>{personLabel(p.name, p.email)}</button>{:else}{personLabel(p.name, p.email)}{/if}{/each}
+{/snippet}
+
 <article class="card" class:expanded class:unread={!message.is_read} class:flagged={message.is_flagged} bind:this={cardEl}>
   <div class="head">
-    <div class="head-main" onclick={ontoggle} role="button" tabindex="0" onkeydown={(e) => (e.key === "Enter" || e.key === " ") && ontoggle()} aria-expanded={expanded}>
+    <!-- Клавиши имён (Enter, пробел) не должны сворачивать письмо: реагируем только на сам заголовок. -->
+    <div class="head-main" onclick={ontoggle} role="button" tabindex="0" onkeydown={(e) => e.target === e.currentTarget && (e.key === "Enter" || e.key === " ") && ontoggle()} aria-expanded={expanded}>
       <div class="avatar" aria-hidden="true">{initials(message.from_name, message.from_email)}</div>
       <div class="who">
         <div class="from">
-          <span class="name">{personLabel(message.from_name, message.from_email) || "(без отправителя)"}</span>
+          {#if expanded && openContact && message.from_email}
+            <button type="button" class="name person" onclick={(e) => showContact(e, message.from_name, message.from_email)} aria-haspopup="dialog" title="Карточка контакта">{personLabel(message.from_name, message.from_email)}</button>
+          {:else}
+            <span class="name">{personLabel(message.from_name, message.from_email) || "(без отправителя)"}</span>
+          {/if}
           {#if message.from_name && message.from_email}<span class="email caption">{message.from_email}</span>{/if}
           {#if message.importance === "High"}<span class="badge high">важное</span>{/if}
           {#if message.is_draft}<span class="badge">черновик</span>{/if}
         </div>
         {#if expanded}
-          {#if replyTo.length}<div class="line caption reply-to" title="Ответ уйдёт по адресу из заголовка Reply-To, а не отправителю">Ответ на: {replyTo.join(", ")}</div>{/if}
-          <div class="line caption">Кому: {to.length ? to.join(", ") : message.display_to || "—"}</div>
-          {#if cc.length}<div class="line caption">Копия: {cc.join(", ")}</div>{/if}
+          {#if replyTo.length}<div class="line caption reply-to" title="Ответ уйдёт по адресу из заголовка Reply-To, а не отправителю">Ответ на: {@render people(replyTo)}</div>{/if}
+          <div class="line caption" title={to.length ? peopleText(to) : undefined}>Кому: {#if to.length}{@render people(to)}{:else}{message.display_to || "—"}{/if}</div>
+          {#if cc.length}<div class="line caption" title={peopleText(cc)}>Копия: {@render people(cc)}</div>{/if}
         {:else}
           <div class="line caption preview">{message.preview || ""}</div>
         {/if}
@@ -740,6 +767,25 @@
   .email {
     user-select: text;
   }
+  /* Имя, открывающее карточку контакта: выглядит как текст, по наведению — как ссылка. */
+  .person {
+    font: inherit;
+    color: inherit;
+    padding: 0;
+    border-radius: 2px;
+    max-width: 100%;
+    vertical-align: baseline;
+  }
+  .name.person {
+    font: var(--text-body-strong);
+  }
+  .person:hover {
+    color: var(--accent);
+    text-decoration: underline;
+  }
+  .person:focus-visible {
+    outline-offset: 0;
+  }
   .badge {
     font: var(--text-caption);
     border: 1px solid var(--stroke-2);
@@ -758,6 +804,12 @@
     text-overflow: ellipsis;
     white-space: nowrap;
     user-select: text;
+  }
+  /* Имя в фокусе с клавиатуры: строка раскрывается целиком — край строки не срезает рамку фокуса,
+     и строка не остаётся прокрученной вбок к имени за многоточием (без подписи «Кому:»). */
+  .line:has(.person:focus-visible) {
+    overflow: visible;
+    white-space: normal;
   }
   .reply-to {
     color: var(--fg-2);
