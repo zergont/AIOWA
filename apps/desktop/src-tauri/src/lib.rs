@@ -28,6 +28,14 @@
 //! Справочник организации (`directory.rs`): поиск адресатов (кэш справочника в базе, затем
 //! `FindPeople` на сервере с кэшем запросов на 10 минут), карточка контакта (`ResolveNames` с
 //! полными данными и счётчики переписки по базе) и участники списка рассылки (`ExpandDL`).
+//!
+//! Учётная запись при старте (`config.rs`): переменные `AIOWA_HOST`/`AIOWA_USER` (режим
+//! разработки) → `%APPDATA%\AIOWA\config.json` → режим первого запуска. В нём нет базы и
+//! состояний почты: управляется только `SetupState` и состояния без базы, окно показывает мастер
+//! (`setup.rs`), команды почты отвечают ошибкой invoke «state not managed». Мастер пишет конфиг и
+//! перезапускает процесс — тот поднимается в режиме почты. База учётной записи не открылась —
+//! тоже мастер, с текстом ошибки (`app_mode().boot_error`), а не падение на каждом старте.
+//! Настройки окна (`settings.rs`) лежат в `sync_state` базы.
 
 use aiowa_core::{AccountId, BodyType};
 use aiowa_store::ui::{ConversationCursor, MessageHead};
@@ -37,21 +45,24 @@ use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tauri::{Emitter, Manager, State};
-use tracing::warn;
+use tracing::{error, info, warn};
 
 mod calendar;
 mod calendar_write;
 mod compose;
+mod config;
 mod directory;
 mod folders;
 mod notify;
 mod ondemand;
 mod preview;
 mod reminders;
+mod settings;
+mod setup;
 mod staged;
 mod sync;
 mod write;
@@ -517,43 +528,81 @@ fn search(state: State<'_, AppState>, query: String, limit: Option<usize>) -> Cm
     Ok(out)
 }
 
-fn default_db_path(host: &str, user: &str) -> PathBuf {
-    let base = std::env::var_os("LOCALAPPDATA").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
-    let safe_user: String = user.chars().map(|c| if c.is_alphanumeric() || c == '.' || c == '-' || c == '_' { c } else { '_' }).collect();
-    base.join("AIOWA").join(host).join(safe_user).join("mail.db")
+/// Состояния почты, которым нужна база: есть только в режиме почты.
+struct MailParts {
+    state: AppState,
+    sync: Arc<sync::SyncState>,
+    notify: Arc<notify::NotifyState>,
+    reminders: Arc<reminders::RemindersState>,
+}
+
+/// Фоновые службы почты для запуска в `setup` и остановки при выходе.
+#[derive(Clone)]
+struct MailServices {
+    sync: Arc<sync::SyncState>,
+    notify: Arc<notify::NotifyState>,
+    reminders: Arc<reminders::RemindersState>,
+}
+
+/// Открывает базу учётной записи и строит состояния почты. Блок мастера (`initial`) применяется
+/// к базе здесь, до первого чтения настроек. Ошибка — текст для окна: процесс не падает, а
+/// стартует мастером с этим текстом (иначе негодный путь в конфиге ронял бы каждый запуск).
+fn open_mail(boot: &config::MailBoot, config_dir: &Path) -> Result<MailParts, String> {
+    let store = Arc::new(Store::open(&boot.db_path).map_err(|e| format!("Не удалось открыть локальную базу {}: {e}", boot.db_path.display()))?);
+    let account = store.account(&boot.host, &boot.user).map_err(|e| format!("Не удалось прочитать учётную запись в базе {}: {e}", boot.db_path.display()))?;
+    if let Some(initial) = boot.initial {
+        settings::apply_initial(&store, account, config_dir, initial);
+    }
+    let sync = Arc::new(sync::SyncState::new(store.clone(), account, boot.host.clone(), boot.user.clone()));
+    let notify = Arc::new(notify::NotifyState::new(store.clone(), account, sync.clone()));
+    let reminders = Arc::new(reminders::RemindersState::new(store.clone(), account));
+    Ok(MailParts { state: AppState { store, account, host: boot.host.clone(), user: boot.user.clone() }, sync, notify, reminders })
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let _ = tracing_subscriber::fmt().with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"))).try_init();
-    let host = std::env::var("AIOWA_HOST").unwrap_or_default();
-    let user = std::env::var("AIOWA_USER").unwrap_or_default();
-    let db_path = std::env::var_os("AIOWA_DB").map(PathBuf::from).unwrap_or_else(|| default_db_path(&host, &user));
-    let store = Arc::new(Store::open(&db_path).expect("не удалось открыть локальную базу"));
-    let account = store.account(&host, &user).expect("учётная запись");
-    let sync_state = Arc::new(sync::SyncState::new(store.clone(), account, host.clone(), user.clone()));
-    let notify_state = Arc::new(notify::NotifyState::new(store.clone(), account, sync_state.clone()));
-    let reminders_state = Arc::new(reminders::RemindersState::new(store.clone(), account));
-    let state = AppState { store, account, host, user };
+    let config_dir = config::config_dir();
+    let env = config::EnvAccount::from_env();
+    // В режиме разработки (обе переменные заданы) конфиг не читается: файл не трогаем.
+    let cfg = if env.host.is_some() && env.user.is_some() { None } else { config::load(&config_dir) };
+    let (setup_state, mail) = match config::resolve(&env, cfg.as_ref()) {
+        config::Boot::Mail(boot) => {
+            info!(host = %boot.host, user = %boot.user, db = %boot.db_path.display(), dev_env = boot.dev_env, "старт в режиме почты");
+            match open_mail(&boot, &config_dir) {
+                Ok(parts) => (setup::SetupState::mail(&boot, config_dir), Some(parts)),
+                Err(e) => {
+                    error!(error = %e, "база не открылась: старт мастера с текстом ошибки");
+                    (setup::SetupState::boot_failed(&boot, config_dir, e), None)
+                }
+            }
+        }
+        config::Boot::Setup => {
+            info!(config = %config::config_path(&config_dir).display(), "учётная запись не настроена: старт мастера первого запуска");
+            (setup::SetupState::first_run(config_dir), None)
+        }
+    };
 
-    let app = tauri::Builder::default()
+    let mut builder = tauri::Builder::default()
         // Тосты Windows о новых письмах показывает канал уведомлений из Rust; команд плагина окно не зовёт.
         .plugin(tauri_plugin_notification::init())
         // Предпросмотр вложений: файл и база читаются не в потоке окна. Отдаются только файлы кэша
-        // вложений текущей учётной записи по числовому ключу (`preview::serve`).
+        // вложений текущей учётной записи по числовому ключу (`preview::serve`). В режиме первого
+        // запуска базы нет — 503.
         .register_asynchronous_uri_scheme_protocol(preview::SCHEME, |ctx, request, responder| {
             let app = ctx.app_handle().clone();
             let method = request.method().clone();
             let path = request.uri().path().to_string();
             tauri::async_runtime::spawn_blocking(move || {
-                let state = app.state::<AppState>();
-                responder.respond(preview::serve(&state.store, state.account, &method, &path));
+                let response = match app.try_state::<AppState>() {
+                    Some(state) => preview::serve(&state.store, state.account, &method, &path),
+                    None => preview::unavailable(),
+                };
+                responder.respond(response);
             });
         })
-        .manage(state)
-        .manage(sync_state.clone())
-        .manage(notify_state.clone())
-        .manage(reminders_state.clone())
+        .manage(setup_state)
+        // Состояния без базы — в обоих режимах (обработчик закрытия окна читает `CloseState`).
         .manage(ondemand::OnDemand::default())
         .manage(write::WriteState::default())
         .manage(staged::StagedState::default())
@@ -561,16 +610,27 @@ pub fn run() {
         .manage(calendar::CalendarState::default())
         .manage(calendar_write::CalendarWriteState::default())
         .manage(directory::DirectoryState::default())
-        .manage(CloseState::default())
+        .manage(CloseState::default());
+    let services = match mail {
+        Some(parts) => {
+            let services = MailServices { sync: parts.sync.clone(), notify: parts.notify.clone(), reminders: parts.reminders.clone() };
+            builder = builder.manage(parts.state).manage(parts.sync).manage(parts.notify).manage(parts.reminders);
+            Some(services)
+        }
+        None => None,
+    };
+
+    let app = builder
         // Окно из конфигурации к этому моменту уже создано: заголовок «AIOWA (N)» и значок
         // непрочитанных выставляются по базе сразу, не дожидаясь первой удачной синхронизации.
         // Планировщик напоминаний стартует здесь же: он читает только кэш, сети ему не нужно.
         .setup({
-            let notify = notify_state.clone();
-            let reminders = reminders_state.clone();
+            let services = services.clone();
             move |app| {
-                notify.refresh_unread(app.handle());
-                reminders.start(app.handle().clone());
+                if let Some(s) = &services {
+                    s.notify.refresh_unread(app.handle());
+                    s.reminders.start(app.handle().clone());
+                }
                 Ok(())
             }
         })
@@ -640,7 +700,16 @@ pub fn run() {
             notify::notify_status,
             notify::notify_set_toasts,
             window_close_guard,
-            window_close_confirmed
+            window_close_confirmed,
+            setup::app_mode,
+            setup::setup_normalize_host,
+            setup::setup_test_login,
+            setup::setup_save,
+            settings::settings_get,
+            settings::settings_set,
+            settings::settings_change_password,
+            settings::settings_forget_account,
+            settings::settings_open_data_dir
         ])
         .build(tauri::generate_context!())
         .expect("ошибка запуска приложения");
@@ -648,11 +717,15 @@ pub fn run() {
         // Сессия на сервере одна на процесс: при выходе закрыть канал уведомлений, отправить на
         // сервер отложенные действия (окно отмены ещё не истекло), остановить синхронизацию и
         // выйти из сессии, иначе сервер накапливает сессии до MapiExceptionSessionLimit.
-        if let tauri::RunEvent::Exit = event {
-            reminders_state.shutdown();
-            notify_state.shutdown();
+        // В режиме первого запуска останавливать нечего. Перезапуск после мастера и «Забыть
+        // учётную запись» идёт через этот же выход (`AppHandle::request_restart`).
+        if let tauri::RunEvent::Exit = event
+            && let Some(s) = &services
+        {
+            s.reminders.shutdown();
+            s.notify.shutdown();
             staged::commit_all_blocking(app);
-            sync_state.shutdown();
+            s.sync.shutdown();
         }
     });
 }

@@ -6,6 +6,7 @@
   import { contactCardOpener } from "../contact";
   import { focusBack } from "../popover";
   import { printMessage } from "../print";
+  import { prefs } from "../settings.svelte";
   import FolderPicker from "./FolderPicker.svelte";
   import ConfirmPopover from "./ConfirmPopover.svelte";
   import ChoicePopover from "./ChoicePopover.svelte";
@@ -149,7 +150,8 @@
   }
 
   // --- автопометка прочитанным --------------------------------------------------
-  // Непрочитанное письмо, развёрнутое и видимое 1,5 с, помечается прочитанным (как в OWA).
+  // Непрочитанное письмо, развёрнутое и видимое заданное в настройках время (по умолчанию 1,5 с),
+  // помечается прочитанным (как в OWA); задержка 0 — автопометка выключена.
   // Делается один раз на карточку: если пользователь вернул «непрочитано» (кнопкой карточки, меню
   // списка или из другого клиента), таймер не повторяется. Идёт «тихо»: отказ (нет связи, нет
   // пароля) только в консоль — это не действие пользователя, а строка состояния уже показывает
@@ -160,7 +162,6 @@
   let autoMarked = false;
   // Нужно именно начальное значение: дальше его ведёт эффект автопометки.
   let lastRead = untrack(() => message.is_read);
-  const AUTO_READ_MS = 1500;
 
   async function autoRead() {
     autoMarked = true;
@@ -187,14 +188,16 @@
   $effect(() => {
     const read = message.is_read;
     // Переход «прочитано → непрочитано» при живой карточке — ручная пометка извне (меню списка,
-    // другой клиент): автопометку не повторяем, иначе через 1,5 с она отменила бы действие.
+    // другой клиент): автопометку не повторяем, иначе через пару секунд она отменила бы действие.
     if (lastRead && !read) autoMarked = true;
     lastRead = read;
-    if (!expanded || !onScreen || read || autoMarked) return;
+    // Задержку читаем до выходов: смена настройки перезапускает отсчёт у открытых карточек.
+    const delay = prefs.autoReadMs;
+    if (!delay || !expanded || !onScreen || read || autoMarked) return;
     const t = setTimeout(() => {
       if (document.visibilityState !== "visible" || autoMarked || busy) return;
       void autoRead();
-    }, AUTO_READ_MS);
+    }, delay);
     return () => clearTimeout(t);
   });
 

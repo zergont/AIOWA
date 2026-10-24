@@ -2,7 +2,8 @@
 //! одна синхронизация одновременно, ход отправляется в окно событием `sync-progress`.
 //!
 //! Пароль берётся из диспетчера учётных данных Windows (служба `AIOWA`, ключ = логин),
-//! как в `aiowa set-password`; формы ввода пароля в окне нет.
+//! как в `aiowa set-password`; задаётся мастером первого запуска и «Сменить пароль…» в настройках
+//! (`setup.rs`, `settings.rs`). Глубина тел, квота кэша и лимит вложения — из настроек окна.
 
 use aiowa_core::AccountId;
 use aiowa_store::Store;
@@ -17,7 +18,7 @@ use std::time::Duration;
 use tauri::{AppHandle, Emitter, Manager};
 use tracing::{info, warn};
 
-const KEYRING_SERVICE: &str = "AIOWA";
+pub(crate) const KEYRING_SERVICE: &str = "AIOWA";
 /// Ключ в `sync_state` с временем последней успешной синхронизации из окна (мс UTC).
 const LAST_OK_KEY: &str = "desktop.last_sync_ok_ms";
 /// Сколько ждать завершения текущей пачки при выходе, прежде чем выйти из сессии.
@@ -198,7 +199,7 @@ fn now_ms() -> i64 {
 
 fn load_password(user: &str) -> Result<SecretString, String> {
     let entry = keyring::Entry::new(KEYRING_SERVICE, user).map_err(|e| format!("keyring: {e}"))?;
-    let pw = entry.get_password().map_err(|e| format!("пароль для {user} не найден в диспетчере учётных данных ({e}); выполните в консоли: aiowa set-password"))?;
+    let pw = entry.get_password().map_err(|e| format!("пароль для {user} не найден в диспетчере учётных данных ({e}); задайте его в настройках или выполните aiowa set-password"))?;
     Ok(SecretString::from(pw))
 }
 
@@ -216,7 +217,7 @@ pub(crate) enum ConnectError {
 impl std::fmt::Display for ConnectError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ConnectError::NoPassword => f.write_str("Нет сохранённого пароля: выполните aiowa set-password"),
+            ConnectError::NoPassword => f.write_str("Нет сохранённого пароля: задайте его в настройках («Сменить пароль…»)"),
             ConnectError::Closing => f.write_str("Приложение закрывается"),
             // Текст про отклонённый вход уже начинается со слова «Вход»; остальным нужен контекст.
             ConnectError::Connect(e @ TransportError::AuthFailed(_)) => f.write_str(&crate::ondemand::describe_transport(e)),
@@ -387,6 +388,19 @@ impl SyncState {
         self.invalidate_on_generation(e, None).await;
     }
 
+    /// Сбрасывает транспорт процесса безусловно (пароль сменился): сессия закрывается на сервере,
+    /// следующее обращение войдёт заново уже с новым паролем. Синхронизация, идущая на старой
+    /// сессии, закончится ошибкой; следующий запуск войдёт заново.
+    pub(crate) async fn reset_transport(&self) {
+        // Вход, который идёт прямо сейчас, — ещё со старым паролем: дождаться его и сбросить тоже.
+        let _connecting = self.connect_lock.lock().await;
+        let old = self.lock().transport.take();
+        if let Some(t) = old {
+            info!("транспорт сброшен после смены пароля");
+            let _ = tokio::time::timeout(LOGOFF_TIMEOUT, t.logoff()).await;
+        }
+    }
+
     /// То же, но только если транспорт процесса всё ещё поколения `generation`: иначе ошибка
     /// пришла от уже заменённой сессии, и текущую трогать нельзя.
     pub(crate) async fn invalidate_on_generation(&self, e: &TransportError, generation: Option<u64>) {
@@ -494,13 +508,17 @@ impl SyncState {
                 };
             }
         };
+        // Настройки окна: глубина тел (если окно не передало свою), квота кэша и лимит вложения.
+        let prefs = crate::settings::Prefs::load(&self.store, self.account);
         let opts = SyncOptions {
             folders,
             body_days: match days {
                 Some(0) => None,
                 Some(d) => Some(d),
-                None => SyncOptions::default().body_days,
+                None => prefs.body_window(),
             },
+            max_attachment_bytes: prefs.max_attachment_bytes(),
+            attachment_cache_bytes: prefs.attachment_cache_bytes(),
             ..SyncOptions::default()
         };
         engine.run(&opts).await.map_err(Self::failed)

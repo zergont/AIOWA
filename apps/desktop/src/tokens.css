@@ -116,7 +116,13 @@
   }
 }
 
+/* Явный выбор темы в настройках: родные элементы (полосы прокрутки, списки, флажки) — в ту же тему. */
+:root[data-theme="light"] {
+  color-scheme: light;
+}
+
 :root[data-theme="dark"] {
+  color-scheme: dark;
   --bg-base: #202020;
   --bg-layer: #282828;
   --bg-layer-alt: #2c2c2c;
@@ -138,6 +144,12 @@
   --accent-pressed: #4cc2ff;
   --accent-soft: rgba(96, 205, 255, 0.14);
   --unread: #60cdff;
+  --danger: #ff99a4;
+  --warning: #fce100;
+  --success: #6ccb5f;
+  --shadow-2: 0 1px 2px rgba(0, 0, 0, 0.5), 0 0 2px rgba(0, 0, 0, 0.3);
+  --shadow-8: 0 4px 8px rgba(0, 0, 0, 0.5), 0 0 2px rgba(0, 0, 0, 0.3);
+  --shadow-16: 0 8px 16px rgba(0, 0, 0, 0.5), 0 0 2px rgba(0, 0, 0, 0.3);
   --cal-oof: #b4a0ff;
   --cal-oof-soft: rgba(180, 160, 255, 0.2);
   --cal-weekend: rgba(255, 255, 255, 0.025);

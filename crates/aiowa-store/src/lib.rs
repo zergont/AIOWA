@@ -356,6 +356,27 @@ pub fn mark_from_internet(path: &Path) -> std::io::Result<()> {
     }
 }
 
+/// Имя каталога из адреса сервера или логина: всё, кроме букв, цифр, `.`, `-` и `_`, заменяется
+/// на `_` (двоеточие порта, скобки IPv6, `\` и `@` логина в имени каталога Windows недопустимы
+/// или нежелательны): `mail.x.ru:8443` → `mail.x.ru_8443`. Обычное имя сервера не меняется.
+/// Пустая строка и строка из одних точек (`.`, `..`) — тоже `_`: путь не должен уходить выше.
+pub fn safe_path_component(s: &str) -> String {
+    let out: String = s.chars().map(|c| if c.is_alphanumeric() || matches!(c, '.' | '-' | '_') { c } else { '_' }).collect();
+    if out.chars().all(|c| c == '.') { "_".repeat(out.len().max(1)) } else { out }
+}
+
+/// Путь к базе учётной записи под каталогом `base`: `<base>\AIOWA\<host>\<user>\mail.db`.
+pub fn db_path_under(base: &Path, host: &str, user: &str) -> PathBuf {
+    base.join("AIOWA").join(safe_path_component(host)).join(safe_path_component(user)).join("mail.db")
+}
+
+/// Путь к базе по умолчанию: `%LOCALAPPDATA%\AIOWA\<host>\<user>\mail.db`. Один для CLI и окна,
+/// чтобы оба открывали одну и ту же базу.
+pub fn default_db_path(host: &str, user: &str) -> PathBuf {
+    let base = std::env::var_os("LOCALAPPDATA").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
+    db_path_under(&base, host, user)
+}
+
 /// Имя файла для кэша: без символов, запрещённых в Windows, и не длиннее 120 символов.
 pub fn safe_file_name(name: &str) -> String {
     let cleaned: String = name
@@ -397,6 +418,26 @@ impl Store {
     /// Каталог кэша вложений рядом с базой.
     pub fn attachments_dir(&self) -> &Path {
         &self.attachments_dir
+    }
+
+    /// Место на диске под кэш вложений, байт: файлы в каталоге кэша (нет каталога — 0).
+    pub fn attachment_cache_bytes(&self) -> u64 {
+        let Ok(entries) = std::fs::read_dir(&self.attachments_dir) else { return 0 };
+        entries.filter_map(|e| e.ok()).filter_map(|e| e.metadata().ok()).filter(|m| m.is_file()).map(|m| m.len()).sum()
+    }
+
+    /// Размер базы на диске, байт: файл базы и журналы `-wal` и `-shm` рядом с ним.
+    pub fn disk_size_bytes(&self) -> u64 {
+        let base = self.path.as_os_str().to_owned();
+        ["", "-wal", "-shm"]
+            .iter()
+            .filter_map(|suffix| {
+                let mut p = base.clone();
+                p.push(suffix);
+                std::fs::metadata(PathBuf::from(p)).ok()
+            })
+            .map(|m| m.len())
+            .sum()
     }
 
     fn with_conn<T>(&self, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
@@ -2373,6 +2414,8 @@ mod tests {
         let path = s.save_attachment(&todo[0], b"%PDF fake", Some("application/pdf"), AttachmentText::Extracted("Поставка шлёпанцев в количестве 40 пар".into())).unwrap();
         assert!(path.exists());
         assert!(path.starts_with(s.attachments_dir()));
+        assert_eq!(s.attachment_cache_bytes(), b"%PDF fake".len() as u64, "кэш — это файлы каталога вложений");
+        assert!(s.disk_size_bytes() >= std::fs::metadata(s.path()).unwrap().len());
         assert!(s.attachments_to_fetch(acc, fpk, None, i64::MAX, 10).unwrap().iter().all(|t| t.server_id != "att1"));
 
         let hits = s.search(acc, "шлепанц", 10).unwrap();
@@ -2756,5 +2799,34 @@ mod tests {
         assert_eq!(safe_file_name("a/b\\c:d*e?.pdf"), "a_b_c_d_e_.pdf");
         assert_eq!(safe_file_name(""), "attachment");
         assert_eq!(safe_file_name("x".repeat(200).as_str()).chars().count(), 120);
+    }
+
+    #[test]
+    fn db_path_components_are_valid_directory_names() {
+        // Обычные имена не меняются: прежние базы остаются на своих местах.
+        assert_eq!(safe_path_component("mail.x.ru"), "mail.x.ru");
+        assert_eq!(safe_path_component("xn--80a1acny.xn--p1ai"), "xn--80a1acny.xn--p1ai");
+        assert_eq!(safe_path_component("ivanov@x.ru"), "ivanov_x.ru");
+        assert_eq!(safe_path_component("CORP\\ivanov"), "CORP_ivanov");
+        // Порт и IPv6 — без двоеточий и скобок.
+        assert_eq!(safe_path_component("mail.x.ru:8443"), "mail.x.ru_8443");
+        assert_eq!(safe_path_component("[::1]"), "___1_");
+        assert_eq!(safe_path_component("[::1]:8443"), "___1__8443");
+        // Путь не уходит выше каталога AIOWA.
+        assert_eq!(safe_path_component(".."), "__");
+        assert_eq!(safe_path_component("."), "_");
+        assert_eq!(safe_path_component(""), "_");
+
+        let base = std::env::temp_dir().join(format!("aiowa-store-dbpath-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        for (host, user) in [("mail.x.ru:8443", "ivanov@x.ru"), ("[::1]", "CORP\\ivanov"), ("10.0.0.5:444", "..")] {
+            let path = db_path_under(&base, host, user);
+            assert!(path.starts_with(base.join("AIOWA")), "{}", path.display());
+            let host_dir = path.parent().and_then(Path::parent).and_then(Path::file_name).unwrap().to_string_lossy().into_owned();
+            assert!(!host_dir.contains([':', '[', ']']), "{host_dir}");
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        }
+        assert_eq!(db_path_under(&base, "mail.x.ru", "ivanov@x.ru"), base.join("AIOWA").join("mail.x.ru").join("ivanov_x.ru").join("mail.db"));
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

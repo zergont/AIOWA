@@ -1506,10 +1506,9 @@ fn load_password(user: &str) -> Result<SecretString> {
     Ok(SecretString::from(pw))
 }
 
+/// Тот же путь, что у окна: хост и логин очищены до допустимых имён каталогов (`host:port` → `host_port`).
 fn default_db_path(host: &str, user: &str) -> PathBuf {
-    let base = std::env::var_os("LOCALAPPDATA").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
-    let safe_user: String = user.chars().map(|c| if c.is_alphanumeric() || c == '.' || c == '-' || c == '_' { c } else { '_' }).collect();
-    base.join("AIOWA").join(host).join(safe_user).join("mail.db")
+    aiowa_store::default_db_path(host, user)
 }
 
 // ---------------------------------------------------------------------------

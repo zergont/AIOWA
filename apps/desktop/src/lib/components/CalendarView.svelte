@@ -215,9 +215,16 @@
     return el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement || el instanceof HTMLSelectElement || el instanceof HTMLIFrameElement || (el instanceof HTMLElement && el.isContentEditable);
   }
 
+  /** Видимое модальное окно поверх календаря (настройки, вопрос, предпросмотр) — как в App.onKeydown. */
+  function modalOpen(): boolean {
+    return Array.from(document.querySelectorAll('[aria-modal="true"]')).some((el) => el.getClientRects().length > 0);
+  }
+
   function onKeydown(e: KeyboardEvent) {
     // Открытый редактор ловит свои клавиши сам (Esc, Ctrl+Enter), сетка в это время молчит.
-    if (!visible || editor || e.ctrlKey || e.metaKey || e.altKey || inEditable()) return;
+    // Под модальным окном (например, настройками) — тоже: ни листания, ни новой встречи, и Esc
+    // закрывает только окно, не снимая выбор события.
+    if (!visible || editor || e.ctrlKey || e.metaKey || e.altKey || inEditable() || modalOpen()) return;
     if (e.key === "ArrowLeft") shift(-1);
     else if (e.key === "ArrowRight") shift(1);
     else if (e.key === "Escape") {

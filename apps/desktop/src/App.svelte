@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount, tick } from "svelte";
+  import { onMount, tick, untrack } from "svelte";
   import { api, conversationKeyOf, conversationsText, errorMessage, messageNeedsFetch, messagesKey, newMailSender, onCalendarChanged, onCloseRequested, onFoldersChanged, onItemsChanged, onNewMail, onNotifyStatus, onReminder, onSyncProgress, onWriteFailed, type AccountInfo, type ComposeContext, type ComposeKind, type ComposeRecipient, type Conversation, type Folder, type ItemsChanged, type Message, type NewMail, type NotifyStatus, type ReminderDto, type SearchHit, type StageAction, type StagedDto, type SyncStatus, type WriteReport } from "./lib/api";
   import { ICON, failureText, findArchiveFolder, type DragPayload, type ItemAction } from "./lib/actions";
   import { focusBack, type Anchor } from "./lib/popover";
@@ -18,7 +18,18 @@
   import CalendarView from "./lib/components/CalendarView.svelte";
   import MiniMonth from "./lib/components/MiniMonth.svelte";
   import ReminderBanner from "./lib/components/ReminderBanner.svelte";
+  import Settings from "./lib/components/Settings.svelte";
   import { addDays, sameDay, startOfDay, viewRange, type CalendarViewKind } from "./lib/calendar";
+  import { loadSettings, prefs, syncEveryMs as syncPeriodMs } from "./lib/settings.svelte";
+
+  interface Props {
+    /**
+     * Запустить синхронизацию при старте окна. false — первый старт после мастера со снятой
+     * галочкой «Начать синхронизацию сразу»: окно ждёт, пока пользователь запустит её сам.
+     */
+    autoSync?: boolean;
+  }
+  let { autoSync = true }: Props = $props();
 
   let account = $state<AccountInfo | null>(null);
   let folders = $state<Folder[]>([]);
@@ -369,11 +380,14 @@
   }
 
   const PAGE = 100;
-  /** Период автосинхронизации при видимом окне, пока канал уведомлений не подключён. */
-  const SYNC_EVERY_MS = 2 * 60_000;
-  /** При открытом канале изменения приходят от сервера сразу; таймер остаётся страховкой. */
-  const SYNC_EVERY_LIVE_MS = 10 * 60_000;
-  const syncEveryMs = $derived(notify?.connected ? SYNC_EVERY_LIVE_MS : SYNC_EVERY_MS);
+  /**
+   * Период автосинхронизации при видимом окне — из настроек (по умолчанию 2 минуты). При открытом
+   * канале уведомлений изменения приходят от сервера сразу, таймер остаётся страховкой: не чаще
+   * раза в 10 минут.
+   */
+  const syncEveryMs = $derived(syncPeriodMs(notify?.connected ?? false, prefs.syncIntervalMin));
+  /** Первый старт без «Начать синхронизацию сразу»: таймер молчит, пока синхронизацию не запустят вручную. */
+  let syncHeld = untrack(() => !autoSync);
 
   async function loadFolders() {
     folders = await api.folders();
@@ -996,8 +1010,9 @@
     }
   }
 
-  /** Все почтовые папки (кнопка «Обновить», автозапуск, таймер). */
+  /** Все почтовые папки (кнопка «Обновить», «Синхронизировать сейчас», автозапуск, таймер). */
   function startSync() {
+    syncHeld = false;
     return launchSync();
   }
 
@@ -1018,8 +1033,9 @@
     }
   }
 
-  /** Раз в 2 минуты (при открытом канале уведомлений — в 10) при видимом окне; не запускает повторно, пока идёт предыдущая. */
+  /** Раз в интервал из настроек (при открытом канале уведомлений — не чаще 10 минут) при видимом окне; не запускает повторно, пока идёт предыдущая. */
   function syncTick() {
+    if (syncHeld) return;
     if (document.visibilityState !== "visible") return;
     if (syncStatus?.running) return;
     if (Date.now() - lastSyncAttempt < syncEveryMs) return;
@@ -1121,17 +1137,60 @@
 
   /** Переключатель тостов: окно меняется сразу, итог придёт событием notify-status; при отказе — перечитать состояние. */
   async function setToasts(enabled: boolean) {
+    const prev = prefs.toasts;
     if (notify) notify = { ...notify, toasts_enabled: enabled };
+    prefs.toasts = enabled;
     try {
       await api.notifySetToasts(enabled);
     } catch (e) {
       error = errorMessage(e);
+      prefs.toasts = prev;
       try {
         notify = await api.notifyStatus();
       } catch {
         /* команды ещё нет — состояние остаётся как было */
       }
     }
+  }
+
+  /** Тосты для переключателя в строке состояния: канал знает точно, до его ответа — настройки. */
+  const toastsOn = $derived(notify?.toasts_enabled ?? prefs.toasts);
+
+  // --- окно настроек ----------------------------------------------------------------------
+
+  let settingsOpen = $state(false);
+  let settingsBtn = $state<HTMLButtonElement | null>(null);
+
+  /**
+   * Куда вернуть фокус после настроек: туда, где он был до открытия (Ctrl+, из редактора письма —
+   * обратно в текст, с прежним положением курсора). Открыли кнопкой — там окажется сама шестерёнка.
+   */
+  let settingsReturn: { el: HTMLElement; range: Range | null } | null = null;
+
+  function openSettings() {
+    const a = document.activeElement;
+    if (a instanceof HTMLElement && a !== document.body) {
+      const sel = window.getSelection();
+      const r = a.isContentEditable && sel && sel.rangeCount > 0 ? sel.getRangeAt(0) : null;
+      settingsReturn = { el: a, range: r && a.contains(r.commonAncestorContainer) ? r.cloneRange() : null };
+    } else settingsReturn = null;
+    settingsOpen = true;
+  }
+
+  function closeSettings() {
+    settingsOpen = false;
+    const back = settingsReturn;
+    settingsReturn = null;
+    void tick().then(() => {
+      // Прежний элемент исчез или скрыт — на шестерёнку.
+      if (!back || !back.el.isConnected || back.el.getClientRects().length === 0) return focusBack(settingsBtn);
+      focusBack(back.el);
+      if (back.range && document.activeElement === back.el) {
+        const sel = window.getSelection();
+        sel?.removeAllRanges();
+        sel?.addRange(back.range);
+      }
+    });
   }
 
   /** После синхронизации: перечитать папки, текущий список и открытую беседу, не сбивая выбор. */
@@ -1168,6 +1227,12 @@
     // встречи в скрытом разделе календаря (display: none) клавиши почты не держит.
     if (Array.from(document.querySelectorAll('[aria-modal="true"]')).some((el) => el.getClientRects().length > 0)) {
       if (e.key === "F5" || (ctrl && !e.altKey && (is("KeyR", "r") || is("KeyP", "p")))) e.preventDefault();
+      return;
+    }
+    // Ctrl+, — настройки, откуда угодно (и из редактора письма: набранное остаётся под окном).
+    if (ctrl && !e.shiftKey && !e.altKey && is("Comma", ",")) {
+      e.preventDefault();
+      openSettings();
       return;
     }
     if (ctrl && e.shiftKey && !e.altKey && (e.code === "Digit1" || e.code === "Digit2")) {
@@ -1239,6 +1304,9 @@
     let unlistenFolders: (() => void) | undefined;
     let unlistenWriteFailed: (() => void) | undefined;
     let wasRunning = false;
+    // Настройки окна (тема, задержка автопометки, интервал таймера, тосты) — первым делом:
+    // тема прошлого запуска уже стоит из localStorage, здесь она сверяется с базой.
+    void loadSettings();
     const timer = setInterval(syncTick, 15_000);
     const nearTimer = setInterval(() => void refreshNearWindow(), NEAR_REFRESH_MS);
     const nearFirst = setTimeout(() => void refreshNearWindow(), NEAR_FIRST_DELAY_MS);
@@ -1262,7 +1330,7 @@
         unlisten = await onSyncProgress((s) => {
           syncStatus = s;
           if (wasRunning && !s.running) {
-            // Пауза в 2 минуты отсчитывается от конца прогона, а не от его начала:
+            // Пауза таймера (интервал из настроек) отсчитывается от конца прогона, а не от его начала:
             // после долгой первой синхронизации следующая не должна стартовать сразу.
             lastSyncAttempt = Date.now();
             void refreshAfterSync().then(finishPendingNewMail);
@@ -1285,8 +1353,10 @@
         await loadFolders();
         syncStatus = await api.syncStatus();
         wasRunning = syncStatus.running;
-        // Автозапуск при старте: окно сначала показывает базу, потом тянет новое.
-        void startSync();
+        // Автозапуск при старте: окно сначала показывает базу, потом тянет новое. Первый старт
+        // после мастера со снятой галочкой «Начать синхронизацию сразу» — ждём кнопки «Обновить».
+        if (!syncHeld) void startSync();
+        else showNotice("Синхронизация не запущена: нажмите «Обновить», когда будете готовы");
       } catch (e) {
         error = errorMessage(e);
       }
@@ -1360,8 +1430,13 @@
       <input id="search-input" type="search" placeholder="Поиск в почте: тема, текст, от:имя, вложение:" bind:value={query} oninput={onQueryInput} autocomplete="off" spellcheck="false" />
       <kbd class="search-kbd">Ctrl K</kbd>
     </div>
-    <div class="account caption">
-      {#if account}{account.user}{/if}
+    <div class="top-right">
+      <div class="account caption">
+        {#if account}{account.user}{/if}
+      </div>
+      <button class="settings-btn" bind:this={settingsBtn} onclick={openSettings} aria-label="Настройки" aria-haspopup="dialog" aria-expanded={settingsOpen} title="Настройки (Ctrl+,)">
+        <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path d={ICON.settings} fill="none" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round" /></svg>
+      </button>
     </div>
   </header>
 
@@ -1395,8 +1470,12 @@
   {/if}
 
   <footer class="status" aria-label="Состояние синхронизации">
-    <StatusBar status={syncStatus} notice={composeLoading === "draft" ? "Открываю черновик…" : notice} {notify} newMail={newMail ? newMailSender(newMail) : null} onrefresh={startSync} oncancel={cancelSync} ontoasts={setToasts} onnewmail={openNewMail} undo={staged} onundo={() => void undoStaged()} />
+    <StatusBar status={syncStatus} notice={composeLoading === "draft" ? "Открываю черновик…" : notice} {notify} toastsEnabled={toastsOn} syncEveryMin={Math.round(syncEveryMs / 60_000)} newMail={newMail ? newMailSender(newMail) : null} onrefresh={startSync} oncancel={cancelSync} ontoasts={setToasts} onnewmail={openNewMail} undo={staged} onundo={() => void undoStaged()} />
   </footer>
+
+  {#if settingsOpen}
+    <Settings syncing={syncStatus?.running ?? false} onsync={() => void startSync()} unsavedDraft={closeGuard} onclose={closeSettings} />
+  {/if}
 
   {#if archivePrompt}
     <ChoicePopover anchor={archivePrompt.anchor} align="start" title="Папки «Архив» нет. Создать?" text="Папка появится в корне ящика, и письма переедут в неё." options={[{ id: "create", label: "Создать папку «Архив»", primary: true }]} onpick={() => void createArchiveAndResume()} oncancel={() => (archivePrompt = null)} />
@@ -1447,10 +1526,48 @@
     grid-template-columns: calc(var(--nav-width) - var(--space-4)) auto auto 1fr auto;
     align-items: center;
     gap: var(--space-4);
-    padding: 0 var(--space-4) 0 var(--space-3);
+    padding: 0 var(--space-3) 0 var(--space-3);
   }
   .sections {
     justify-self: start;
+  }
+  /* Учётная запись и шестерёнка — всегда в последней колонке (поиск в календаре спрятан, и без
+     явной колонки блок съехал бы влево). */
+  .top-right {
+    grid-column: 5;
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    min-width: 0;
+  }
+  .account {
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .settings-btn {
+    flex: none;
+    width: var(--control-height);
+    height: var(--control-height);
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: var(--radius-control);
+    color: var(--fg-2);
+    transition:
+      background var(--dur-fast) var(--ease-in),
+      color var(--dur-fast) var(--ease-in);
+  }
+  .settings-btn:hover {
+    background: var(--bg-hover);
+    color: var(--fg-1);
+  }
+  .settings-btn:active {
+    background: var(--bg-pressed);
+  }
+  .settings-btn[aria-expanded="true"] {
+    background: var(--bg-selected);
+    color: var(--fg-1);
   }
   .new-mail {
     display: inline-flex;

@@ -12,6 +12,10 @@
     newMail?: string | null;
     onrefresh: () => void;
     oncancel: () => void;
+    /** Тосты включены: канал уведомлений или настройки (пока канал не ответил); null — по каналу. */
+    toastsEnabled?: boolean | null;
+    /** Текущий период синхронизации по таймеру, минут (для подсказки индикатора канала). */
+    syncEveryMin?: number;
     /** Переключатель тостов Windows о новых письмах. */
     ontoasts?: (enabled: boolean) => void;
     /** Клик по строке «Новое письмо»: открыть его во «Входящих». */
@@ -24,7 +28,7 @@
     undo?: { id: string; text: string; sinceMs: number; untilMs: number } | null;
     onundo?: () => void;
   }
-  let { status, notice = null, notify = null, newMail = null, onrefresh, oncancel, ontoasts, onnewmail, undo = null, onundo }: Props = $props();
+  let { status, notice = null, notify = null, toastsEnabled = null, syncEveryMin = 2, newMail = null, onrefresh, oncancel, ontoasts, onnewmail, undo = null, onundo }: Props = $props();
 
   const STAGES: Record<SyncStage, string> = {
     login: "Вход на сервер",
@@ -92,17 +96,18 @@
   // --- канал уведомлений -------------------------------------------------------------------
 
   const live = $derived(notify?.connected ?? false);
-  const toasts = $derived(notify?.toasts_enabled ?? true);
+  const toasts = $derived(toastsEnabled ?? notify?.toasts_enabled ?? true);
 
   /** Подсказка индикатора: с какого времени канал открыт, последнее событие, ошибка. */
   const channelTitle = $derived.by(() => {
-    if (!notify) return "Канал уведомлений ещё не запущен: обновление по таймеру";
+    if (!notify) return `Канал уведомлений ещё не запущен: обновление по таймеру раз в ${syncEveryMin} мин`;
     const lines: string[] = [];
     if (notify.connected) {
       lines.push(notify.since_ms != null ? `Канал уведомлений открыт ${when(notify.since_ms)}` : "Канал уведомлений открыт");
       lines.push(`Подписок: ${notify.subscriptions}`);
+      lines.push(`Страховочная синхронизация раз в ${syncEveryMin} мин`);
     } else {
-      lines.push("Канал уведомлений не подключён: обновление по таймеру раз в 2 минуты");
+      lines.push(`Канал уведомлений не подключён: обновление по таймеру раз в ${syncEveryMin} мин`);
     }
     if (notify.last_event_ms != null) lines.push(`Последнее событие ${when(notify.last_event_ms)}`);
     if (notify.error) lines.push(`Ошибка: ${notify.error}`);

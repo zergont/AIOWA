@@ -113,6 +113,11 @@ fn builder(status: StatusCode) -> tauri::http::response::Builder {
     Response::builder().status(status).header(header::CACHE_CONTROL, "no-store").header(header::X_CONTENT_TYPE_OPTIONS, "nosniff").header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
 }
 
+/// Ответ протокола в режиме первого запуска: базы ещё нет.
+pub(crate) fn unavailable() -> Response<Vec<u8>> {
+    bare(StatusCode::SERVICE_UNAVAILABLE)
+}
+
 /// Ответ без файла: пустое тело и общие заголовки безопасности.
 fn bare(status: StatusCode) -> Response<Vec<u8>> {
     builder(status).header(header::CONTENT_TYPE, "text/plain; charset=utf-8").body(Vec::new()).expect("статус и заголовки заданы константами")

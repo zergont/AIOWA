@@ -539,6 +539,84 @@ export interface NewMail {
   folder_pk: number | null;
 }
 
+// --- режим приложения, мастер первого запуска, настройки --------------------------------------
+// Без учётной записи бэкенд стартует в режиме "setup": состояние почты не создаётся, окно показывает
+// только мастер. Мастер проверяет вход, сохраняет пароль и config.json и перезапускает приложение.
+
+/** Ответ `app_mode`: в каком режиме поднялось приложение и откуда взялась учётная запись. */
+export interface AppMode {
+  mode: "setup" | "mail";
+  /** Хост и логин текущей учётной записи (в режиме setup — null). */
+  host: string | null;
+  user: string | null;
+  /** Путь к config.json (показывается в мастере). */
+  config_path: string;
+  /** Учётная запись взята из переменных AIOWA_HOST/AIOWA_USER (режим разработки). */
+  dev_env: boolean;
+  /**
+   * Запускать синхронизацию при старте окна: false только на первом старте после мастера со снятой
+   * галочкой «Начать синхронизацию сразу». Нет поля (старый бэкенд) — запускать.
+   */
+  autostart_sync?: boolean;
+  /**
+   * Режим "setup" не из-за отсутствия учётной записи, а потому что база не открылась (например,
+   * негодный db_path в config.json): текст ошибки для мастера. Нет поля или null — обычный первый запуск.
+   */
+  boot_error?: string | null;
+}
+
+/** Итог пробного входа (`setup_test_login`): ошибка уже по-русски. */
+export interface LoginTest {
+  ok: boolean;
+  server_version: string | null;
+  /** Почтовых папок в ящике, если запрос иерархии прошёл. */
+  folders: number | null;
+  error: string | null;
+  /** Адрес сервера после нормализации (host[:port]), с которым шла проверка. */
+  host?: string | null;
+}
+
+export type Theme = "system" | "light" | "dark";
+
+/** Ответ `settings_get`; изменяемые поля меняются через `settings_set` по одному или пачкой. */
+export interface Settings {
+  host: string;
+  user: string;
+  /** Глубина загрузки тел писем при синхронизации, дней; 0 — все. */
+  body_days: number;
+  /** Задержка автопометки прочитанным, мс; 0 — выключена. */
+  auto_read_ms: number;
+  /** Тосты Windows о новых письмах (тот же ключ, что у переключателя в строке состояния). */
+  toasts: boolean;
+  theme: Theme;
+  /** Интервал страховочной синхронизации, минут (при живом канале — не чаще раза в 10 минут). */
+  sync_interval_min: number;
+  /** Квота кэша вложений на диске, МБ. */
+  attachment_cache_mb: number;
+  /** Вложения больше этого размера синхронизация не скачивает (только по клику), МБ. */
+  max_attachment_mb: number;
+  db_path: string;
+  db_size_bytes: number;
+  cache_size_bytes: number;
+  /** Пароль лежит в диспетчере учётных данных Windows. */
+  password_saved: boolean;
+  /** Учётная запись из переменных AIOWA_HOST/AIOWA_USER: «забыть» её из окна нельзя. */
+  dev_env?: boolean;
+  config_path?: string;
+}
+
+/** Изменяемые поля настроек; `settings_set` принимает любое их подмножество. */
+export type SettingsPatch = Partial<Pick<Settings, "body_days" | "auto_read_ms" | "toasts" | "theme" | "sync_interval_min" | "attachment_cache_mb" | "max_attachment_mb">>;
+
+/** Допустимые диапазоны числовых настроек (те же проверяет бэкенд в `settings_set`). */
+export const SETTINGS_LIMITS = {
+  body_days: { min: 0, max: 3650 },
+  auto_read_ms: { min: 0, max: 10_000 },
+  sync_interval_min: { min: 1, max: 120 },
+  attachment_cache_mb: { min: 100, max: 102_400 },
+  max_attachment_mb: { min: 1, max: 200 },
+} as const;
+
 export const api = {
   accountInfo: () => invoke<AccountInfo>("account_info"),
   folders: () => invoke<Folder[]>("folders"),
@@ -664,6 +742,25 @@ export const api = {
   notifyStatus: () => invoke<NotifyStatus>("notify_status"),
   /** Включить или выключить тосты Windows о новых письмах; новое состояние придёт событием `notify-status`. */
   notifySetToasts: (enabled: boolean) => invoke<void>("notify_set_toasts", { enabled }),
+
+  // --- режим, мастер первого запуска (работают в обоих режимах) ----------------------------
+  /** Старый бэкенд без этой команды — считать режимом "mail". */
+  appMode: () => invoke<AppMode>("app_mode"),
+  /** Пробный вход с этим паролем: ничего не сохраняет. */
+  setupTestLogin: (host: string, user: string, password: string) => invoke<LoginTest>("setup_test_login", { host, user, password }),
+  /** Сохранить пароль и config.json и перезапустить приложение: ответ может не успеть прийти. */
+  setupSave: (host: string, user: string, password: string, bodyDays: number, startSync: boolean) => invoke<void>("setup_save", { host, user, password, bodyDays, startSync }),
+
+  // --- настройки (режим mail) ----------------------------------------------------------------
+  settingsGet: () => invoke<Settings>("settings_get"),
+  /** Частичное обновление; бэкенд может вернуть свежие настройки целиком или ничего. */
+  settingsSet: (patch: SettingsPatch) => invoke<Settings | null | void>("settings_set", { patch }),
+  /** Проверить вход с новым паролем и при успехе сохранить его; при отказе пароль не меняется. */
+  settingsChangePassword: (password: string) => invoke<void>("settings_change_password", { password }),
+  /** Удалить пароль и учётную запись из конфига (база остаётся на диске) и перезапуститься в мастер. */
+  settingsForgetAccount: () => invoke<void>("settings_forget_account"),
+  /** Открыть каталог базы в Проводнике. */
+  settingsOpenDataDir: () => invoke<void>("settings_open_data_dir"),
 };
 
 /** Подписка на запрос закрытия окна (крестик, Alt+F4) при поднятом windowCloseGuard. Возвращает функцию отписки. */
@@ -704,6 +801,11 @@ export function onNewMail(cb: (mail: NewMail) => void): Promise<UnlistenFn> {
 /** Подписка на изменения в календаре на сервере (без подробностей: окно перечитывает текущий период). */
 export function onCalendarChanged(cb: () => void): Promise<UnlistenFn> {
   return listen<void>("calendar-changed", () => cb());
+}
+
+/** Подписка на изменение настроек (свежий снимок после settings_set). Возвращает функцию отписки. */
+export function onSettingsChanged(cb: (s: Settings) => void): Promise<UnlistenFn> {
+  return listen<Settings>("settings-changed", (e) => cb(e.payload));
 }
 
 /** Подписка на напоминания планировщика: пора показать события из списка. Возвращает функцию отписки. */

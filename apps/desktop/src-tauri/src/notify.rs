@@ -35,7 +35,7 @@ use tokio::sync::Notify;
 use tracing::{debug, info, warn};
 
 /// Ключ в `sync_state`: показывать ли тосты о новых письмах (`1`/`0`; нет ключа — показывать).
-const TOASTS_KEY: &str = "desktop.notify_toasts";
+pub(crate) const TOASTS_KEY: &str = "desktop.notify_toasts";
 /// Окно объединения событий по папкам перед запуском синхронизации.
 pub(crate) const DEBOUNCE: Duration = Duration::from_millis(1500);
 /// Пауза после ошибки канала: от первой до предельной, удваивается.

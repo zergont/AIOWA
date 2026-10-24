@@ -24,7 +24,7 @@ use tracing::{info, warn};
 const BODY_TIMEOUT: Duration = Duration::from_secs(60);
 /// Таймаут скачивания вложения по клику.
 const ATTACHMENT_TIMEOUT: Duration = Duration::from_secs(10 * 60);
-/// Лимит вложения, скачиваемого по клику.
+/// Лимит вложения, скачиваемого по клику (не меньше лимита синхронизации из настроек).
 const ATTACHMENT_MAX_BYTES: u64 = 200 * 1024 * 1024;
 
 /// Расширения, которые системное приложение не откроет, а выполнит (или откроет без защищённого
@@ -75,7 +75,7 @@ pub(crate) fn describe_transport(e: &TransportError) -> String {
     match e {
         TransportError::SessionExpired | TransportError::CsrfRejected => "Сессия истекла, повторите попытку".into(),
         TransportError::SessionLimit => "Сервер занят: исчерпан лимит сессий на ящик, повторите позже".into(),
-        TransportError::AuthFailed(_) => "Вход отклонён сервером: проверьте пароль (aiowa set-password)".into(),
+        TransportError::AuthFailed(_) => "Вход отклонён сервером: проверьте пароль (настройки → «Сменить пароль…»)".into(),
         TransportError::Throttled { .. } => "Сервер занят, повторите позже".into(),
         TransportError::Network(_) => "Нет связи с сервером".into(),
         TransportError::Protocol { status: 0, .. } => "Сервер ответил неожиданно".into(),
@@ -145,6 +145,11 @@ pub(crate) fn is_unsafe_to_open(name: Option<&str>) -> bool {
     name.and_then(extension_of).is_some_and(|ext| UNSAFE_EXTENSIONS.contains(&ext.as_str()))
 }
 
+/// Лимит вложения по клику: не меньше лимита синхронизации из настроек.
+fn click_limit(store: &Store, account: aiowa_core::AccountId) -> u64 {
+    ATTACHMENT_MAX_BYTES.max(crate::settings::Prefs::load(store, account).max_attachment_bytes())
+}
+
 /// Путь к файлу вложения в кэше: скачивает, если файла нет (один раз на вложение, повторный клик
 /// ждёт), и отмечает обращение для вытеснения по давности.
 pub(crate) async fn ensure_cached(state: &AppState, sync: &SyncState, od: &OnDemand, attachment_pk: i64) -> CmdResult<PathBuf> {
@@ -156,12 +161,13 @@ pub(crate) async fn ensure_cached(state: &AppState, sync: &SyncState, od: &OnDem
     let path = match row.local_path.clone().filter(|p| p.is_file()) {
         Some(p) => p,
         None => {
-            if row.size.is_some_and(|s| s as u64 > ATTACHMENT_MAX_BYTES) {
-                return Err(format!("Файл больше лимита {} МБ", ATTACHMENT_MAX_BYTES / (1024 * 1024)));
+            let limit = click_limit(store, state.account);
+            if row.size.is_some_and(|s| s as u64 > limit) {
+                return Err(format!("Файл больше лимита {} МБ", limit / (1024 * 1024)));
             }
             let engine = engine_for(state, sync).await?;
             let text_chars = SyncOptions::default().attachment_text_chars;
-            match tokio::time::timeout(ATTACHMENT_TIMEOUT, engine.fetch_one_attachment(&row.todo(), ATTACHMENT_MAX_BYTES, text_chars)).await {
+            match tokio::time::timeout(ATTACHMENT_TIMEOUT, engine.fetch_one_attachment(&row.todo(), limit, text_chars)).await {
                 Err(_) => return Err(timed_out(ATTACHMENT_TIMEOUT)),
                 Ok(Err(e)) => return Err(fail(sync, e).await),
                 Ok(Ok(f)) => {
