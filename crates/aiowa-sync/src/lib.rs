@@ -219,9 +219,7 @@ impl Engine {
 
     pub async fn run(&self, opts: &SyncOptions) -> Result<SyncReport> {
         let started = std::time::Instant::now();
-        let mut report = SyncReport::default();
-
-        report.folders_in_hierarchy = self.sync_hierarchy().await?;
+        let mut report = SyncReport { folders_in_hierarchy: self.sync_hierarchy().await?, ..Default::default() };
         let plan = self.plan_folders(&opts.folders)?;
         info!(folders = plan.len(), names = %plan.iter().map(|f| f.name.as_str()).collect::<Vec<_>>().join(", "), "папки к синхронизации");
 
@@ -362,7 +360,7 @@ impl Engine {
             processed += changes.changes.len() as u64;
             self.emit(SyncEvent::Progress { stage: SyncStage::Items, folder: Some(name.to_string()), done: processed, total: expected });
             info!(folder = name, page = pages, changes = changes.changes.len(), created = stats.created, updated = stats.updated, deleted = stats.deleted, read_flags = stats.read_flags, elapsed_s = started.elapsed().as_secs(), "пачка применена");
-            if pages as usize % opts.checkpoint_every == 0 {
+            if (pages as usize).is_multiple_of(opts.checkpoint_every) {
                 self.store.checkpoint()?;
             }
             if changes.includes_last {
@@ -450,10 +448,10 @@ impl Engine {
             done += stored as i64 + gone.len() as i64 + failed.len() as i64;
             self.emit(SyncEvent::Progress { stage: SyncStage::Bodies, folder: Some(name.to_string()), done: done as u64, total: Some(pending as u64) });
             batches += 1;
-            if batches % 10 == 0 {
+            if batches.is_multiple_of(10) {
                 info!(folder = name, done, pending, "тела: прогресс");
             }
-            if batches % opts.checkpoint_every == 0 {
+            if batches.is_multiple_of(opts.checkpoint_every) {
                 self.store.checkpoint()?;
             }
         }
@@ -495,7 +493,8 @@ impl Engine {
                     // По вложению поэлементны также слишком большой ответ и неожиданный ответ на запрос
                     // файла (например, не файловое вложение); сессия, вход и сеть — нет.
                     Err(SyncError::Transport(e)) if e.is_item_failure() || matches!(e, TransportError::TooLarge { .. }) || (matches!(e, TransportError::Protocol { .. }) && !e.is_retryable()) => {
-                        warn!(folder = name, attachment = todo.name.as_deref().unwrap_or("?"), error = %e, "вложение не скачано");
+                        // Имя файла — в предупреждении для окна, в журнал только ключ (политика журналов).
+                        warn!(folder = name, attachment_pk = todo.attachment_pk, error = %e, "вложение не скачано");
                         self.emit(SyncEvent::Warning { stage: SyncStage::Attachments, folder: Some(name.to_string()), message: format!("вложение «{}» не скачано: {e}", todo.name.as_deref().unwrap_or("?")) });
                         self.store.mark_attachment_failed(todo.attachment_pk, FETCH_FAILED)?;
                         report.attachments_failed += 1;

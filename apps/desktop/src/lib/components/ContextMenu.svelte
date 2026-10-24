@@ -13,6 +13,7 @@
 
 <script lang="ts">
   import { anchorRect, dismissOn, placePopup, type Anchor } from "../popover";
+  import { layer } from "../hotkeys";
 
   interface Props {
     items: MenuItem[];
@@ -78,7 +79,8 @@
   }
 </script>
 
-<div class="popup menu" role="menu" aria-label={label} tabindex="-1" bind:this={el} style="left: {pos.left}px; top: {pos.top}px" onkeydown={onKey} oncontextmenu={(e) => e.preventDefault()}>
+<!-- Меню — слой: пока оно открыто, глобальные клавиши (E, Ctrl+R, Ctrl+Enter композера) не действуют на то, что под ним. -->
+<div class="popup menu" role="menu" aria-label={label} tabindex="-1" bind:this={el} {@attach layer} style="left: {pos.left}px; top: {pos.top}px" onkeydown={onKey} oncontextmenu={(e) => e.preventDefault()}>
   {#each items as it (it.id)}
     {#if it.separator}<div class="sep" role="separator"></div>{/if}
     <button class="item" class:danger={it.danger} role="menuitem" tabindex="-1" disabled={it.disabled} onclick={() => onpick(it.id)}>

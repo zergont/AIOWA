@@ -1,6 +1,7 @@
 <script lang="ts">
   import { untrack } from "svelte";
   import { api, errorMessage, type SignatureDto } from "../api";
+  import { isTopLayer, layer } from "../hotkeys";
   import Editor from "./Editor.svelte";
 
   interface Props {
@@ -79,6 +80,8 @@
   }
 
   function onKey(e: KeyboardEvent) {
+    // Клавиши — только верхнему окну: под подписью открыты настройки или композер, у них свой Esc.
+    if (!isTopLayer(dialogEl)) return;
     if (e.key === "Escape" && !busy) {
       e.preventDefault();
       onclose();
@@ -91,7 +94,7 @@
 <svelte:window onkeydown={onKey} />
 
 <div class="overlay">
-  <div class="popup dialog" role="dialog" aria-modal="true" aria-labelledby="{uid}-title" aria-busy={busy != null} bind:this={dialogEl}>
+  <div class="popup dialog" role="dialog" aria-modal="true" aria-labelledby="{uid}-title" aria-busy={busy != null} bind:this={dialogEl} {@attach layer}>
     <h2 class="title" id="{uid}-title">Подпись</h2>
     <Editor bind:this={editor} bind:value={html} minHeight={120} disabled={busy != null} label="Текст подписи" />
     <label class="auto">

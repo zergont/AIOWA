@@ -1,4 +1,5 @@
 import type { ComposeKind, Conversation, Folder, WriteReport } from "./api";
+import { keysOf } from "./hotkeys";
 
 /**
  * Действие над письмами: одно и то же для карточки письма, беседы в списке и массового выбора.
@@ -44,11 +45,11 @@ export const ICON = {
     "M12.7 6.4L14.5 6.7L14.5 9.3L12.7 9.6L12.5 10.2L13.5 11.7L11.7 13.5L10.2 12.5L9.6 12.7L9.3 14.5L6.7 14.5L6.4 12.7L5.8 12.5L4.3 13.5L2.5 11.7L3.5 10.2L3.3 9.6L1.5 9.3L1.5 6.7L3.3 6.4L3.5 5.8L2.5 4.3L4.3 2.5L5.8 3.5L6.4 3.3L6.7 1.5L9.3 1.5L9.6 3.3L10.2 3.5L11.7 2.5L13.5 4.3L12.5 5.8ZM10.2 8a2.2 2.2 0 1 1-4.4 0a2.2 2.2 0 1 1 4.4 0Z",
 } as const;
 
-/** Действия композера над письмом: подписи, клавиши и значки — в том порядке, что в панели карточки и в меню. */
+/** Действия композера над письмом: подписи, клавиши (из таблицы lib/hotkeys.ts) и значки — в том порядке, что в панели карточки и в меню. */
 export const COMPOSE_ACTIONS: { kind: Exclude<ComposeKind, "new">; label: string; keys: string; icon: string }[] = [
-  { kind: "reply", label: "Ответить", keys: "Ctrl+R", icon: ICON.reply },
-  { kind: "reply_all", label: "Ответить всем", keys: "Ctrl+Shift+R", icon: ICON.replyAll },
-  { kind: "forward", label: "Переслать", keys: "Ctrl+Shift+F", icon: ICON.forward },
+  { kind: "reply", label: "Ответить", keys: keysOf("reply"), icon: ICON.reply },
+  { kind: "reply_all", label: "Ответить всем", keys: keysOf("reply-all"), icon: ICON.replyAll },
+  { kind: "forward", label: "Переслать", keys: keysOf("forward"), icon: ICON.forward },
 ];
 
 /** Заголовок композера по виду письма. */

@@ -57,6 +57,8 @@ mod compose;
 mod config;
 mod directory;
 mod folders;
+mod logging;
+mod navigation;
 mod notify;
 mod ondemand;
 mod preview;
@@ -559,9 +561,52 @@ fn open_mail(boot: &config::MailBoot, config_dir: &Path) -> Result<MailParts, St
     Ok(MailParts { state: AppState { store, account, host: boot.host.clone(), user: boot.user.clone() }, sync, notify, reminders })
 }
 
+/// Выключает браузерные клавиши WebView2 в главном окне (`AreBrowserAcceleratorKeysEnabled`):
+/// F5 и Ctrl+R (перезагрузка), Ctrl+F и F3 (поиск по странице), Ctrl+P (печать окна), F12 и
+/// Ctrl+Shift+C (DevTools). Обработчики окна гасят F5 и Ctrl+R сами, но пока фокус внутри
+/// PDF-предпросмотра (рамка с чужого источника `aiowa-att.localhost`), их keydown окно не видит, и
+/// браузер перезагружал бы окно вместе с набранным письмом.
+///
+/// Клавиши страницы это не отнимает. По документации WebView2 настройка выключает действия
+/// браузера по клавишам, а не сами события: правка и перемещение по тексту (Ctrl+C/V/X/A/Z,
+/// Home/End) остаются, событие хоста `AcceleratorKeyPressed` приходит для всех клавиш. Действие
+/// браузера выполняется после страницы, если та не сделала `preventDefault` (так окно и сейчас
+/// гасит F5 и Ctrl+R из JS); без него keydown приходит в JS как прежде. Поэтому Ctrl+R «ответить»,
+/// Ctrl+P «печать письма» (`window.print()` печатной рамки, а не клавиша браузера), Ctrl+K и
+/// Ctrl+N работают. Масштаб Ctrl+плюс/минус выключен и без этого (`zoomHotkeysEnabled` = false).
+///
+/// Вызывается из `setup` сразу после создания окна, в том же проходе главного потока: хост ещё не
+/// получил `NavigationStarting` первой загрузки, а изменения настроек до этого события WebView2
+/// применяет к этой же загрузке (после — только со следующей). В старых сборках WebView2 без
+/// `ICoreWebView2Settings3` интерфейса нет; это и любая другая ошибка уходят в журнал, окно
+/// работает с клавишами браузера.
+#[cfg(windows)]
+fn disable_browser_accelerator_keys(app: &tauri::AppHandle) {
+    use webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2Settings3;
+    use windows::core::Interface as _;
+
+    let Some(window) = app.get_webview_window("main") else {
+        warn!("главного окна нет: браузерные клавиши WebView2 не выключены");
+        return;
+    };
+    // Замыкание выполняется в главном потоке, где живёт контроллер WebView2.
+    let sent = window.with_webview(|wv| {
+        // SAFETY: вызовы COM на живом контроллере окна в его потоке; результаты проверяются.
+        let res = unsafe { wv.controller().CoreWebView2().and_then(|w| w.Settings()).and_then(|s| s.cast::<ICoreWebView2Settings3>()).and_then(|s| s.SetAreBrowserAcceleratorKeysEnabled(false)) };
+        match res {
+            Ok(()) => info!("браузерные клавиши WebView2 выключены"),
+            Err(e) => warn!(error = %e, "не удалось выключить браузерные клавиши WebView2"),
+        }
+    });
+    if let Err(e) = sent {
+        warn!(error = %e, "не удалось выключить браузерные клавиши WebView2: окно недоступно");
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let _ = tracing_subscriber::fmt().with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"))).try_init();
+    let log_dir = logging::init();
+    info!(version = env!("CARGO_PKG_VERSION"), logs = ?log_dir, "AIOWA запущен");
     let config_dir = config::config_dir();
     let env = config::EnvAccount::from_env();
     // В режиме разработки (обе переменные заданы) конфиг не читается: файл не трогаем.
@@ -595,6 +640,8 @@ pub fn run() {
                 let _ = w.set_focus();
             }
         }))
+        // Окно не уходит со страницы приложения: внешние адреса открываются в браузере.
+        .plugin(navigation::guard())
         // Тосты Windows о новых письмах показывает канал уведомлений из Rust; команд плагина окно не зовёт.
         .plugin(tauri_plugin_notification::init())
         // Предпросмотр вложений: файл и база читаются не в потоке окна. Отдаются только файлы кэша
@@ -604,9 +651,13 @@ pub fn run() {
             let app = ctx.app_handle().clone();
             let method = request.method().clone();
             let path = request.uri().path().to_string();
+            let origin = request.headers().get(tauri::http::header::ORIGIN).and_then(|v| v.to_str().ok()).map(str::to_owned);
             tauri::async_runtime::spawn_blocking(move || {
                 let response = match app.try_state::<AppState>() {
-                    Some(state) => preview::serve(&state.store, state.account, &method, &path),
+                    Some(state) => {
+                        let dev = if tauri::is_dev() { app.config().build.dev_url.as_ref().map(|u| u.origin().ascii_serialization()) } else { None };
+                        preview::serve(&state.store, state.account, &method, &path, preview::allowed_origin(origin.as_deref(), dev.as_deref()))
+                    }
                     None => preview::unavailable(),
                 };
                 responder.respond(response);
@@ -635,9 +686,12 @@ pub fn run() {
         // Окно из конфигурации к этому моменту уже создано: заголовок «AIOWA (N)» и значок
         // непрочитанных выставляются по базе сразу, не дожидаясь первой удачной синхронизации.
         // Планировщик напоминаний стартует здесь же: он читает только кэш, сети ему не нужно.
+        // Браузерные клавиши WebView2 выключаются здесь же, до первой загрузки страницы окна.
         .setup({
             let services = services.clone();
             move |app| {
+                #[cfg(windows)]
+                disable_browser_accelerator_keys(app.handle());
                 if let Some(s) = &services {
                     s.notify.refresh_unread(app.handle());
                     s.reminders.start(app.handle().clone());

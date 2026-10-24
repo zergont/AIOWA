@@ -5,11 +5,11 @@
 /// Убирает теги, скрипты и стили, раскрывает частые сущности, схлопывает пробелы.
 pub fn html_to_text(html: &str) -> String {
     let mut out = String::with_capacity(html.len() / 2);
-    let mut chars = html.char_indices().peekable();
+    let chars = html.char_indices();
     let lower = html.to_ascii_lowercase();
     let mut skip_until: Option<usize> = None;
 
-    while let Some((i, c)) = chars.next() {
+    for (i, c) in chars {
         if let Some(end) = skip_until {
             if i < end {
                 continue;

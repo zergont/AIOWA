@@ -5,6 +5,7 @@
   import { meetingWhen } from "../calendar";
   import { contactCardOpener } from "../contact";
   import { focusBack } from "../popover";
+  import { hint, keysOf } from "../hotkeys";
   import { printMessage } from "../print";
   import { prefs } from "../settings.svelte";
   import FolderPicker from "./FolderPicker.svelte";
@@ -499,7 +500,7 @@
 
     {#if expanded && isDraft}
       <div class="actions" role="toolbar" aria-label="Действия с черновиком">
-        <button class="act open-draft" onclick={() => onopendraft?.()} disabled={!onopendraft || draftOpening} aria-busy={draftOpening} title="Открыть черновик в композере (Enter в списке)">
+        <button class="act open-draft" onclick={() => onopendraft?.()} disabled={!onopendraft || draftOpening} aria-busy={draftOpening} title={`Открыть черновик в композере (${keysOf("list-open")} в списке)`}>
           {#if draftOpening}
             <span class="spinner" aria-hidden="true"></span>
             Открываю…
@@ -516,7 +517,7 @@
             <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path d={a.icon} fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round" /></svg>
           </button>
         {/each}
-        <button class="act" onclick={print} disabled={printing} aria-label="Печать" title="Печать (Ctrl+P)" aria-busy={printing}>
+        <button class="act" onclick={print} disabled={printing} aria-label="Печать" title={hint("Печать", "print")} aria-busy={printing}>
           {#if printing}
             <span class="spinner" aria-hidden="true"></span>
           {:else}

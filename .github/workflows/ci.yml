@@ -1,0 +1,66 @@
+# Проверки на каждый пуш и пулл-реквест: фронтенд (svelte-check, сборка), Rust (clippy без
+# предупреждений, приложение в продакшн-контексте Tauri, все тесты воркспейса, включая фейковый
+# Exchange). Сеть к настоящему серверу тестам не нужна. Windows: приложение только под неё
+# (WebView2, диспетчер учётных данных).
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  check:
+    name: Сборка и тесты (Windows)
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/desktop/package-lock.json
+
+      - name: Зависимости фронтенда
+        working-directory: apps/desktop
+        run: npm ci
+
+      - name: svelte-check и tsc
+        working-directory: apps/desktop
+        run: npm run check
+
+      # dist/ нужен шагу «Продакшн-контекст Tauri». clippy и тесты собирают dev-контекст: без фичи
+      # tauri/custom-protocol tauri::generate_context! при заданном devUrl фронтенд не встраивает и
+      # не применяет CSP окна (в dev окно грузится с Vite), так что встроенный dist и продакшн-CSP
+      # проверяет только тот шаг.
+      - name: Сборка фронтенда
+        working-directory: apps/desktop
+        run: npm run build
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      # Контекст как у `tauri build` (CLI сам включает tauri/custom-protocol): встраивание dist/,
+      # CSP из app.security.csp с dangerousDisableAssetCspModification. Без собранного dist/ падает.
+      - name: Продакшн-контекст Tauri
+        run: cargo check -p aiowa-desktop --locked --features tauri/custom-protocol
+
+      - name: Тесты
+        run: cargo test --workspace --locked

@@ -4,6 +4,7 @@
   import { adoptSettings, AUTO_READ_DEFAULT_MS, AUTO_READ_INSTANT_MS, saveSettings, SYNC_INTERVAL_LIVE_MIN } from "../settings.svelte";
   import { bodyDaysText, owaUrl } from "../setup";
   import { focusBack } from "../popover";
+  import { hint, isTopLayer, layer } from "../hotkeys";
   import SignatureDialog from "./SignatureDialog.svelte";
 
   /**
@@ -359,8 +360,10 @@
   }
 
   function onKey(e: KeyboardEvent) {
-    // Диалог подписи поверх настроек сам ловит Esc и Tab.
-    if (sigOpen) return;
+    // Поверх настроек другое окно — диалог подписи или вопрос о несохранённом письме (крестик окна
+    // при открытых настройках): Esc, Tab и Ctrl+, достаются ему, настройки под ним не закрываются
+    // и фокус к себе не забирают.
+    if (sigOpen || !isTopLayer(dialogEl)) return;
     if (e.key === "Escape") {
       e.preventDefault();
       if (forgetBusy || pwBusy) return;
@@ -391,11 +394,11 @@
 <svelte:window onkeydown={onKey} />
 
 <div class="overlay">
-  <div class="popup dialog" role="dialog" aria-modal="true" aria-labelledby="{uid}-title" aria-busy={locked} bind:this={dialogEl}>
+  <div class="popup dialog" role="dialog" aria-modal="true" aria-labelledby="{uid}-title" aria-busy={locked} bind:this={dialogEl} {@attach layer}>
     <header class="head">
       <h2 class="title" id="{uid}-title">Настройки</h2>
       <span class="status caption" class:error={status?.error} role="status" aria-live="polite">{status?.text ?? ""}</span>
-      <button class="close" onclick={close} aria-label="Закрыть настройки" title="Закрыть (Esc)" disabled={locked}>
+      <button class="close" onclick={close} aria-label="Закрыть настройки" title={hint("Закрыть", "settings-close")} disabled={locked}>
         <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path d="M4 4l8 8M12 4l-8 8" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" /></svg>
       </button>
     </header>

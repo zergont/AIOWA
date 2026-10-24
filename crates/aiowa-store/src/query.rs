@@ -245,12 +245,15 @@ mod tests {
 
     #[test]
     fn date_ranges() {
-        let (a, b) = parse_date_range("2026-10").unwrap();
-        assert_eq!(b - a, 31 * 86_400_000);
-        let (a, b) = parse_date_range("2025").unwrap();
-        assert_eq!(b - a, 365 * 86_400_000);
-        let (a, b) = parse_date_range("31.12.2026").unwrap();
-        assert_eq!(b - a, 86_400_000);
+        // Границы — полночь по системному поясу: в поясе с летним временем октябрь длиннее
+        // 31 суток на час, поэтому ожидания считаем в том же поясе, а не умножением суток.
+        let tz = TimeZone::system();
+        let ms = |y, m, d| Date::new(y, m, d).unwrap().to_zoned(tz.clone()).unwrap().timestamp().as_millisecond();
+        assert_eq!(parse_date_range("2026-10"), Some((ms(2026, 10, 1), ms(2026, 11, 1))));
+        assert_eq!(parse_date_range("12.2026"), Some((ms(2026, 12, 1), ms(2027, 1, 1))));
+        assert_eq!(parse_date_range("2025"), Some((ms(2025, 1, 1), ms(2026, 1, 1))));
+        assert_eq!(parse_date_range("31.12.2026"), Some((ms(2026, 12, 31), ms(2027, 1, 1))));
+        assert_eq!(parse_date_range("2026-03-29"), Some((ms(2026, 3, 29), ms(2026, 3, 30))));
         assert!(parse_date_range("вчера").is_none());
     }
 }

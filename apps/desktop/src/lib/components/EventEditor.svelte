@@ -4,6 +4,7 @@
   import { isValidEmail, mergeRecipients } from "../addresses";
   import { htmlToText } from "../html";
   import { focusBack } from "../popover";
+  import { hint, isTopLayer, layer } from "../hotkeys";
   import { DEFAULT_EVENT_MIN, FREE_BUSY_OPTIONS, REMINDER_OPTIONS, addDays, dateInputValue, parseDateTimeInputs, startOfDay, timeInputValue, type EventDraft } from "../calendar";
   import RecipientsInput from "./RecipientsInput.svelte";
   import Editor from "./Editor.svelte";
@@ -254,8 +255,10 @@
   }
 
   function onKey(e: KeyboardEvent) {
-    // У всплывающих окон внутри свой Esc; скрытый редактор клавиш не слушает.
-    if (!visible || confirmCancel || askUpdates) return;
+    // У всплывающих окон внутри свой Esc; скрытый редактор клавиш не слушает. Поверх редактора
+    // окно (карточка контакта с чипа участника, меню чипа): его Ctrl+Enter не сохраняет встречу
+    // и не рассылает приглашения, его Tab не уводит фокус в редактор.
+    if (!visible || confirmCancel || askUpdates || !isTopLayer(dialogEl)) return;
     if ((e.ctrlKey || e.metaKey) && e.key === "Enter") {
       e.preventDefault();
       void save();
@@ -276,7 +279,7 @@
 <svelte:window onkeydown={onKey} />
 
 <div class="overlay">
-  <div class="popup dialog" role="dialog" aria-modal="true" aria-labelledby="{uid}-title" aria-busy={busy} bind:this={dialogEl}>
+  <div class="popup dialog" role="dialog" aria-modal="true" aria-labelledby="{uid}-title" aria-busy={busy} bind:this={dialogEl} {@attach layer}>
     <h2 class="title" id="{uid}-title">{title}</h2>
 
     {#if draft.isOccurrence}
@@ -369,11 +372,11 @@
     </div>
 
     <div class="buttons">
-      <button class="btn primary" bind:this={saveBtn} onclick={() => save()} disabled={busy} title="Сохранить (Ctrl+Enter)" aria-haspopup={asksUpdates ? "dialog" : undefined} aria-expanded={askUpdates}>
+      <button class="btn primary" bind:this={saveBtn} onclick={() => save()} disabled={busy} title={hint("Сохранить", "event-save")} aria-haspopup={asksUpdates ? "dialog" : undefined} aria-expanded={askUpdates}>
         {#if busy}<span class="spinner" aria-hidden="true"></span>{/if}
         {saveLabel}
       </button>
-      <button class="btn" bind:this={cancelBtn} onclick={() => (confirmCancel ? keepEditing() : requestCancel())} disabled={busy} title="Отменить (Esc)" aria-haspopup="dialog" aria-expanded={confirmCancel}>Отменить</button>
+      <button class="btn" bind:this={cancelBtn} onclick={() => (confirmCancel ? keepEditing() : requestCancel())} disabled={busy} title={hint("Отменить", "event-cancel")} aria-haspopup="dialog" aria-expanded={confirmCancel}>Отменить</button>
       {#if busy}
         <span class="progress caption" aria-live="polite">{isNew ? "Создаю событие…" : "Сохраняю изменения…"}</span>
       {/if}

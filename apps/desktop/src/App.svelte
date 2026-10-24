@@ -3,6 +3,7 @@
   import { api, conversationKeyOf, conversationsText, errorMessage, messageNeedsFetch, messagesKey, newMailSender, onCalendarChanged, onCloseRequested, onFoldersChanged, onItemsChanged, onNewMail, onNotifyStatus, onReminder, onSyncProgress, onWriteFailed, type AccountInfo, type ComposeContext, type ComposeKind, type ComposeRecipient, type Conversation, type Folder, type ItemsChanged, type Message, type NewMail, type NotifyStatus, type ReminderDto, type SearchHit, type StageAction, type StagedDto, type SyncStatus, type WriteReport } from "./lib/api";
   import { ICON, failureText, findArchiveFolder, type DragPayload, type ItemAction } from "./lib/actions";
   import { focusBack, type Anchor } from "./lib/popover";
+  import { hint, keysOf, matchHotkey, preventBrowserKeys } from "./lib/hotkeys";
   import { printMessage } from "./lib/print";
   import { mergeRecipients, sameEmail } from "./lib/addresses";
   import { loadDirectoryCaps, provideContactCard, type ContactRef } from "./lib/contact";
@@ -77,6 +78,8 @@
   let calendarSelectedPk = $state<number | null>(null);
   /** Дни с событиями по загруженным окнам календаря — точки в мини-календаре. */
   let calendarEventDays = $state(new Set<number>());
+  /** Сетка календаря: ей App передаёт клавиши раздела (←, →, T, D, W, M, N, Esc). */
+  let calendarView = $state<ReturnType<typeof CalendarView> | null>(null);
 
   // --- напоминания о событиях -------------------------------------------------------------
   // Планировщик бэкенда шлёт событие `reminder` с полным актуальным списком (и когда он опустел);
@@ -374,12 +377,6 @@
     }
   }
 
-  /** Фокус в поле ввода или редакторе: клавиши-буквы с Ctrl там не наши. */
-  function inEditable(): boolean {
-    const el = document.activeElement;
-    return el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement || el instanceof HTMLIFrameElement || (el instanceof HTMLElement && el.isContentEditable);
-  }
-
   const PAGE = 100;
   /**
    * Период автосинхронизации при видимом окне — из настроек (по умолчанию 2 минуты). При открытом
@@ -401,6 +398,7 @@
     selected = null;
     selectedPks = new Set();
     messages = [];
+    cancelSearch();
     searchHits = null;
     loadingList = true;
     try {
@@ -935,26 +933,40 @@
   }
 
   let searchTimer: ReturnType<typeof setTimeout> | undefined;
-  function onQueryInput() {
+  /** Номер текущего поиска: ответ устаревшего запроса (поиск очищен, открыта папка, набран новый
+   *  текст) отбрасывается, иначе он вернул бы список результатов поверх уже показанного. */
+  let searchSeq = 0;
+
+  /** Отменить отложенный и идущий поиск: их ответы больше ничего не покажут. */
+  function cancelSearch() {
     clearTimeout(searchTimer);
+    searchSeq++;
+    searching = false;
+  }
+
+  function onQueryInput() {
+    cancelSearch();
     const q = query.trim();
     if (!q) {
       searchHits = null;
       return;
     }
+    const seq = searchSeq;
     searchTimer = setTimeout(async () => {
       searching = true;
       try {
-        searchHits = await api.search(q, 100);
+        const hits = await api.search(q, 100);
+        if (seq === searchSeq) searchHits = hits;
       } catch (e) {
-        error = errorMessage(e);
+        if (seq === searchSeq) error = errorMessage(e);
       } finally {
-        searching = false;
+        if (seq === searchSeq) searching = false;
       }
     }, 180);
   }
 
   function clearSearch() {
+    cancelSearch();
     query = "";
     searchHits = null;
   }
@@ -1218,79 +1230,77 @@
     }
   }
 
+  /**
+   * Глобальные клавиши — по таблице lib/hotkeys.ts. matchHotkey не вернёт клавишу, пока на экране
+   * слой (модальное окно, вопрос, выбор папки, меню): действия не должны трогать письмо или событие
+   * под ним, свои клавиши (Esc, стрелки, Tab) слой ловит сам; перезагрузку (F5, Ctrl+R) и печать
+   * окна целиком таблица гасит и тогда. Не вернёт и в поле ввода или редакторе, если клавиша там не
+   * действует, и в чужом разделе. Считается только видимый слой: редактор встречи в скрытом разделе
+   * календаря (display: none) клавиши почты не держит.
+   */
   function onKeydown(e: KeyboardEvent) {
-    const ctrl = e.ctrlKey || e.metaKey;
-    // По коду клавиши, а не по символу: в русской раскладке e.key даёт кириллицу.
-    const is = (code: string, key: string) => e.code === code || e.key.toLowerCase() === key;
-    // Открыто модальное окно (предпросмотр вложения, вопрос, редактор встречи): клавиши приложения
-    // не должны действовать на письмо под ним. Свои клавиши (Esc, стрелки, Tab) окна ловят сами.
-    // Перезагрузку и печать окна целиком всё равно гасим. Считается только видимое окно: редактор
-    // встречи в скрытом разделе календаря (display: none) клавиши почты не держит.
-    if (Array.from(document.querySelectorAll('[aria-modal="true"]')).some((el) => el.getClientRects().length > 0)) {
-      if (e.key === "F5" || (ctrl && !e.altKey && (is("KeyR", "r") || is("KeyP", "p")))) e.preventDefault();
-      return;
-    }
-    // Ctrl+, — настройки, откуда угодно (и из редактора письма: набранное остаётся под окном).
-    if (ctrl && !e.shiftKey && !e.altKey && is("Comma", ",")) {
-      e.preventDefault();
-      openSettings();
-      return;
-    }
-    if (ctrl && e.shiftKey && !e.altKey && (e.code === "Digit1" || e.code === "Digit2")) {
-      e.preventDefault();
-      if (e.code === "Digit1") section = "mail";
-      else showCalendar();
-      return;
-    }
-    if (ctrl && !e.shiftKey && !e.altKey && is("KeyK", "k")) {
-      e.preventDefault();
-      // Поле поиска спрятано в календаре: сначала показать почту, фокус — после обновления DOM.
-      section = "mail";
-      void tick().then(() => document.getElementById("search-input")?.focus());
-      return;
-    }
-    if (ctrl && !e.shiftKey && !e.altKey && is("KeyN", "n")) {
-      e.preventDefault();
-      openCompose("new", null, null);
-      return;
-    }
-    // Ctrl+Z вне полей ввода — откат последнего удаления, переноса или архива, пока окно отмены открыто.
-    if (ctrl && !e.shiftKey && !e.altKey && is("KeyZ", "z") && !inEditable()) {
-      if (staged) {
-        e.preventDefault();
-        void undoStaged();
+    const id = matchHotkey(e, section);
+    switch (id) {
+      case null:
+        return;
+      case "settings":
+        openSettings();
+        return;
+      case "section-mail":
+        section = "mail";
+        return;
+      case "section-calendar":
+        showCalendar();
+        return;
+      case "search":
+        // Поле поиска спрятано в календаре: сначала показать почту, фокус — после обновления DOM.
+        section = "mail";
+        void tick().then(() => document.getElementById("search-input")?.focus());
+        return;
+      case "new-mail":
+        openCompose("new", null, null);
+        return;
+      case "undo":
+        // Откат последнего удаления, переноса или архива, пока окно отмены открыто; иначе клавиша ничья.
+        if (staged) {
+          e.preventDefault();
+          void undoStaged();
+        }
+        return;
+      case "print":
+        // Печатаем развёрнутое письмо; печать окна целиком (со списками и панелями) не нужна нигде.
+        if (topExpandedPk != null) void printMessageByPk(topExpandedPk);
+        return;
+      case "reply":
+      case "reply-all":
+        if (topExpandedPk != null) composeFromMessage(topExpandedPk, id === "reply" ? "reply" : "reply_all");
+        return;
+      case "forward":
+        if (topExpandedPk != null) composeFromMessage(topExpandedPk, "forward");
+        return;
+      case "archive": {
+        // «В архив» для выбранных бесед; в списке клавишу обрабатывает он сам (и гасит событие).
+        if (e.defaultPrevented || searchHits !== null) return;
+        const targets = multiCount ? conversations.filter((c) => selectedPks.has(c.conversation_pk)) : selected ? [selected] : [];
+        if (targets.length && archiveFolder?.folder_pk !== selectedFolder?.folder_pk) {
+          e.preventDefault();
+          void onListAction(targets, { kind: "archive" }).catch((err) => (error = errorMessage(err)));
+        }
+        return;
       }
-      return;
-    }
-    // Ctrl+P: печатаем развёрнутое письмо; печать окна целиком (со списками и панелями) не нужна нигде.
-    if (ctrl && !e.shiftKey && !e.altKey && is("KeyP", "p")) {
-      e.preventDefault();
-      if (section === "mail" && !inEditable() && topExpandedPk != null) void printMessageByPk(topExpandedPk);
-      return;
-    }
-    // Перезагрузку окна (Ctrl+R, F5) гасим везде, даже в редакторе: она бы потеряла набранное письмо.
-    if (e.key === "F5" || (ctrl && !e.altKey && is("KeyR", "r"))) {
-      e.preventDefault();
-      if (e.key !== "F5" && section === "mail" && !inEditable() && topExpandedPk != null) composeFromMessage(topExpandedPk, e.shiftKey ? "reply_all" : "reply");
-      return;
-    }
-    if (ctrl && e.shiftKey && !e.altKey && is("KeyF", "f") && !inEditable()) {
-      e.preventDefault();
-      if (section === "mail" && topExpandedPk != null) composeFromMessage(topExpandedPk, "forward");
-      return;
-    }
-    // E вне полей ввода — «В архив» для выбранных бесед; в списке клавишу обрабатывает он сам (и гасит событие).
-    if (!ctrl && !e.altKey && !e.shiftKey && e.code === "KeyE" && !e.defaultPrevented && section === "mail" && searchHits === null && !inEditable()) {
-      const targets = multiCount ? conversations.filter((c) => selectedPks.has(c.conversation_pk)) : selected ? [selected] : [];
-      if (targets.length && archiveFolder?.folder_pk !== selectedFolder?.folder_pk) {
-        e.preventDefault();
-        void onListAction(targets, { kind: "archive" }).catch((err) => (error = errorMessage(err)));
-      }
-      return;
-    }
-    if (e.key === "Escape" && document.activeElement?.id === "search-input") {
-      clearSearch();
-      (document.activeElement as HTMLElement).blur();
+      case "search-clear":
+        if (document.activeElement?.id === "search-input") {
+          clearSearch();
+          (document.activeElement as HTMLElement).blur();
+        }
+        return;
+      case "reload":
+      case "print-window":
+        // Только гасятся: это сделала сама таблица.
+        return;
+      default:
+        // Клавиши календаря: раздел на экране, слоёв поверх нет.
+        if (calendarView?.hotkey(id)) e.preventDefault();
     }
   }
 
@@ -1402,7 +1412,8 @@
   }
 </script>
 
-<svelte:window onkeydown={onKeydown} />
+<!-- F5, Ctrl+R, Ctrl+P гасятся в фазе захвата: компонент, остановивший всплытие, их не пропустит. -->
+<svelte:window onkeydown={onKeydown} onkeydowncapture={preventBrowserKeys} />
 
 {#snippet composerSnippet()}
   {#key compose}
@@ -1419,23 +1430,23 @@
       <span class="brand-name">AIOWA</span>
     </div>
     <div class="segmented sections" role="tablist" aria-label="Разделы">
-      <button role="tab" aria-selected={section === "mail"} class:on={section === "mail"} onclick={() => (section = "mail")} title="Почта (Ctrl+Shift+1)">Почта</button>
-      <button role="tab" aria-selected={section === "calendar"} class:on={section === "calendar"} onclick={showCalendar} title="Календарь (Ctrl+Shift+2)">Календарь</button>
+      <button role="tab" aria-selected={section === "mail"} class:on={section === "mail"} onclick={() => (section = "mail")} title={hint("Почта", "section-mail")}>Почта</button>
+      <button role="tab" aria-selected={section === "calendar"} class:on={section === "calendar"} onclick={showCalendar} title={hint("Календарь", "section-calendar")}>Календарь</button>
     </div>
-    <button class="new-mail" onclick={() => openCompose("new", null, null)} title="Новое письмо (Ctrl+N)">
+    <button class="new-mail" onclick={() => openCompose("new", null, null)} title={hint("Новое письмо", "new-mail")}>
       <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path d={ICON.compose} fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" /></svg>
       Новое письмо
     </button>
     <div class="search" class:active={query.length > 0} class:off={section !== "mail"}>
       <svg class="search-icon" width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><circle cx="7" cy="7" r="4.5" fill="none" stroke="currentColor" stroke-width="1.4" /><path d="M10.5 10.5 14 14" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" /></svg>
       <input id="search-input" type="search" placeholder="Поиск в почте: тема, текст, от:имя, вложение:" bind:value={query} oninput={onQueryInput} autocomplete="off" spellcheck="false" />
-      <kbd class="search-kbd">Ctrl K</kbd>
+      <kbd class="search-kbd">{keysOf("search").replace("+", " ")}</kbd>
     </div>
     <div class="top-right">
       <div class="account caption">
         {#if account}{account.user}{/if}
       </div>
-      <button class="settings-btn" bind:this={settingsBtn} onclick={openSettings} aria-label="Настройки" aria-haspopup="dialog" aria-expanded={settingsOpen} title="Настройки (Ctrl+,)">
+      <button class="settings-btn" bind:this={settingsBtn} onclick={openSettings} aria-label="Настройки" aria-haspopup="dialog" aria-expanded={settingsOpen} title={hint("Настройки", "settings")}>
         <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path d={ICON.settings} fill="none" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round" /></svg>
       </button>
     </div>
@@ -1466,7 +1477,7 @@
 
   {#if calendarMounted}
     <section class="calendar" class:off={section !== "calendar"} aria-label="Календарь">
-      <CalendarView bind:anchor={calendarAnchor} bind:kind={calendarKind} visible={section === "calendar"} bind:selectedPk={calendarSelectedPk} bind:eventDays={calendarEventDays} />
+      <CalendarView bind:this={calendarView} bind:anchor={calendarAnchor} bind:kind={calendarKind} visible={section === "calendar"} bind:selectedPk={calendarSelectedPk} bind:eventDays={calendarEventDays} />
     </section>
   {/if}
 

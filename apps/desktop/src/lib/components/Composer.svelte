@@ -5,6 +5,7 @@
   import { isValidEmail, mergeRecipients } from "../addresses";
   import { cleanDraftHtml, htmlToText, restoreDraftHtml } from "../html";
   import { focusBack } from "../popover";
+  import { hint, layerOpen } from "../hotkeys";
   import RecipientsInput from "./RecipientsInput.svelte";
   import Editor from "./Editor.svelte";
   import BodyFrame from "./BodyFrame.svelte";
@@ -144,6 +145,30 @@
   let origError = $state<string | null>(null);
 
   let root = $state<HTMLElement | null>(null);
+
+  // Пока идёт отправка или сохранение, поля и кнопки выключены, и Chromium уводит с них фокус на
+  // body. Тогда клавиши окна (E, Ctrl+R, Ctrl+Z) сочли бы, что фокус вне композера, и сработали бы
+  // на беседу под ним. Поэтому на время занятости фокус переходит на сам композер — до того, как
+  // поля выключатся ($effect.pre), — а после возвращается туда, где был.
+  let focusBeforeBusy: HTMLElement | null = null;
+  $effect.pre(() => {
+    if (busy == null) return;
+    untrack(() => {
+      const ae = document.activeElement;
+      if (root && ae instanceof HTMLElement && ae !== root && root.contains(ae)) {
+        focusBeforeBusy = ae;
+        root.focus({ preventScroll: true });
+      }
+    });
+  });
+  $effect(() => {
+    if (busy != null) return;
+    untrack(() => {
+      const el = focusBeforeBusy;
+      focusBeforeBusy = null;
+      if (el?.isConnected && document.activeElement === root) el.focus({ preventScroll: true });
+    });
+  });
   let cancelBtn = $state<HTMLButtonElement | null>(null);
   let sigBtn = $state<HTMLButtonElement | null>(null);
   let editor = $state<ReturnType<typeof Editor> | null>(null);
@@ -543,11 +568,13 @@
 
   // --- клавиши: Ctrl+Enter — отправить, Ctrl+S — сохранить черновик, Esc — отменить ----------
   // Слушаем окно и проверяем, что событие пришло изнутри композера: у всплывающих окон внутри
-  // (подсказки адресатов, адрес ссылки) свой Esc, они его останавливают сами.
+  // (подсказки адресатов, адрес ссылки) свой Esc, они его останавливают сами. Пока на экране слой
+  // (подпись, вопрос об отмене, меню адресата, карточка контакта, настройки), клавиши — его:
+  // Ctrl+Enter в меню чипа не отправляет письмо.
 
   function onWindowKey(e: KeyboardEvent) {
     if (!root || !(e.target instanceof Node) || !root.contains(e.target)) return;
-    if (sigOpen || cancelAsk) return;
+    if (sigOpen || cancelAsk || layerOpen()) return;
     const ctrl = e.ctrlKey || e.metaKey;
     if (ctrl && e.key === "Enter") {
       e.preventDefault();
@@ -564,15 +591,15 @@
 
 <svelte:window onkeydown={onWindowKey} />
 
-<section class="composer" bind:this={root} aria-label={title} aria-busy={busy != null}>
+<section class="composer" bind:this={root} tabindex="-1" aria-label={title} aria-busy={busy != null}>
   <div class="bar">
     <span class="kind">{title}</span>
-    <button class="btn primary" onclick={send} disabled={busy != null} title="Отправить (Ctrl+Enter)">
+    <button class="btn primary" onclick={send} disabled={busy != null} title={hint("Отправить", "composer-send")}>
       <svg width="14" height="14" viewBox="0 0 16 16" aria-hidden="true"><path d="M2 8 14 2.5 11.5 14 8.5 9.5 2 8Zm6.5 1.5L12 5" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round" /></svg>
       Отправить
     </button>
-    <button class="btn" onclick={saveDraft} disabled={busy != null} title="Сохранить черновик на сервере (Ctrl+S)">Сохранить черновик</button>
-    <button class="btn" bind:this={cancelBtn} onclick={() => (cancelAsk ? keepWriting() : requestCancel())} disabled={busy != null} title="Отменить (Esc)" aria-haspopup="dialog" aria-expanded={cancelAsk}>Отменить</button>
+    <button class="btn" onclick={saveDraft} disabled={busy != null} title={hint("Сохранить черновик на сервере", "composer-save")}>Сохранить черновик</button>
+    <button class="btn" bind:this={cancelBtn} onclick={() => (cancelAsk ? keepWriting() : requestCancel())} disabled={busy != null} title={hint("Отменить", "composer-cancel")} aria-haspopup="dialog" aria-expanded={cancelAsk}>Отменить</button>
     {#if busy}
       <span class="progress caption" aria-live="polite">
         <span class="spinner" aria-hidden="true"></span>
@@ -714,6 +741,9 @@
 </section>
 
 <style>
+  .composer:focus {
+    outline: none;
+  }
   .composer {
     flex: none;
     display: flex;

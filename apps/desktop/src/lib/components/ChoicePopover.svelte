@@ -12,6 +12,7 @@
 
 <script lang="ts">
   import { anchorRect, anchorToggle, dismissOn, placePopup, type Anchor } from "../popover";
+  import { isTopLayer, layer } from "../hotkeys";
 
   /**
    * Вопрос с несколькими ответами у якоря (как ConfirmPopover, но вариантов больше двух):
@@ -41,17 +42,36 @@
     return dismissOn(el, oncancel, anchorToggle(anchor));
   });
 
+  /**
+   * Вопрос модальный: Tab и Shift+Tab ходят по кругу по его кнопкам. Модальные окна под ним свою
+   * ловушку Tab, пока вопрос сверху, не держат — без этой фокус ушёл бы за окна, вопрос закрылся
+   * бы по focusout, а Enter нажал бы кнопку фонового окна.
+   */
+  function trapTab(e: KeyboardEvent) {
+    e.preventDefault();
+    if (!el) return;
+    const items = Array.from(el.querySelectorAll<HTMLButtonElement>("button:not(:disabled)"));
+    if (!items.length) return;
+    const i = items.indexOf(document.activeElement as HTMLButtonElement);
+    const next = i < 0 ? (e.shiftKey ? items.length - 1 : 0) : (i + (e.shiftKey ? -1 : 1) + items.length) % items.length;
+    items[next].focus();
+  }
+
   function onKey(e: KeyboardEvent) {
+    // Esc и Tab — только у верхнего окна: вопрос, открытый поверх настроек, не закрывает и их.
+    if (!isTopLayer(el)) return;
     if (e.key === "Escape") {
       e.stopPropagation();
       oncancel();
+    } else if (e.key === "Tab" && !e.ctrlKey && !e.altKey && !e.metaKey) {
+      trapTab(e);
     }
   }
 </script>
 
 <svelte:window onkeydown={onKey} />
 
-<div class="popup choice" role="alertdialog" aria-modal="true" aria-labelledby="{uid}-title" aria-describedby={text ? `${uid}-text` : undefined} bind:this={el} style="left: {pos.left}px; top: {pos.top}px">
+<div class="popup choice" role="alertdialog" aria-modal="true" aria-labelledby="{uid}-title" aria-describedby={text ? `${uid}-text` : undefined} bind:this={el} {@attach layer} style="left: {pos.left}px; top: {pos.top}px">
   <p class="title" id="{uid}-title">{title}</p>
   {#if text}<p class="text caption" id="{uid}-text">{text}</p>{/if}
   <div class="buttons">

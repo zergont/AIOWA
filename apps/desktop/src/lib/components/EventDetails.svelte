@@ -3,6 +3,7 @@
   import { api, errorMessage, personLabel, type Attendee, type CalendarEvent, type CalendarEventDetails, type MeetingResponse } from "../api";
   import { FREE_BUSY_LABEL, MY_RESPONSE_LABEL, RESPONSE_LABEL, eventWhen, reminderLabel, sensitivityLabel } from "../calendar";
   import { focusBack } from "../popover";
+  import { hint } from "../hotkeys";
   import BodyFrame from "./BodyFrame.svelte";
   import ConfirmPopover from "./ConfirmPopover.svelte";
   import ChoicePopover from "./ChoicePopover.svelte";
@@ -191,7 +192,7 @@
       <button class="icon-btn" onclick={refresh} disabled={loading} aria-label="Обновить" title="Перечитать событие с сервера" aria-busy={loading}>
         <svg width="14" height="14" viewBox="0 0 16 16" aria-hidden="true"><path d="M13 8a5 5 0 1 1-1.5-3.6M13 2.5v3h-3" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" /></svg>
       </button>
-      <button class="icon-btn" onclick={onclose} aria-label="Закрыть" title="Закрыть (Esc)">
+      <button class="icon-btn" onclick={onclose} aria-label="Закрыть" title={hint("Закрыть", "cal-deselect")}>
         <svg width="14" height="14" viewBox="0 0 16 16" aria-hidden="true"><path d="m4 4 8 8M12 4l-8 8" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" /></svg>
       </button>
     </div>

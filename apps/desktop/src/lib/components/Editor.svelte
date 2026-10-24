@@ -1,6 +1,7 @@
 <script lang="ts">
   import { untrack } from "svelte";
   import { escapeHtml, normalizeLink, sanitizeHtml } from "../html";
+  import { hint } from "../hotkeys";
 
   interface Props {
     /** HTML редактора; двусторонняя привязка. */
@@ -164,9 +165,9 @@
 
 <div class="editor" class:disabled>
   <div class="toolbar" role="toolbar" aria-label="Форматирование" aria-controls="{uid}-text">
-    <button class="tb" class:on={fmt.bold} onmousedown={keepFocus} onclick={() => exec("bold")} {disabled} aria-label="Жирный" title="Жирный (Ctrl+B)" aria-pressed={fmt.bold}><span class="glyph b">Ж</span></button>
-    <button class="tb" class:on={fmt.italic} onmousedown={keepFocus} onclick={() => exec("italic")} {disabled} aria-label="Курсив" title="Курсив (Ctrl+I)" aria-pressed={fmt.italic}><span class="glyph i">К</span></button>
-    <button class="tb" class:on={fmt.underline} onmousedown={keepFocus} onclick={() => exec("underline")} {disabled} aria-label="Подчёркнутый" title="Подчёркнутый (Ctrl+U)" aria-pressed={fmt.underline}><span class="glyph u">Ч</span></button>
+    <button class="tb" class:on={fmt.bold} onmousedown={keepFocus} onclick={() => exec("bold")} {disabled} aria-label="Жирный" title={hint("Жирный", "editor-bold")} aria-pressed={fmt.bold}><span class="glyph b">Ж</span></button>
+    <button class="tb" class:on={fmt.italic} onmousedown={keepFocus} onclick={() => exec("italic")} {disabled} aria-label="Курсив" title={hint("Курсив", "editor-italic")} aria-pressed={fmt.italic}><span class="glyph i">К</span></button>
+    <button class="tb" class:on={fmt.underline} onmousedown={keepFocus} onclick={() => exec("underline")} {disabled} aria-label="Подчёркнутый" title={hint("Подчёркнутый", "editor-underline")} aria-pressed={fmt.underline}><span class="glyph u">Ч</span></button>
     <span class="sep" aria-hidden="true"></span>
     <button class="tb" class:on={fmt.ul} onmousedown={keepFocus} onclick={() => exec("insertUnorderedList")} {disabled} aria-label="Маркированный список" title="Маркированный список" aria-pressed={fmt.ul}>
       <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path d="M6 4h8M6 8h8M6 12h8" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" /><circle cx="3" cy="4" r="1" fill="currentColor" /><circle cx="3" cy="8" r="1" fill="currentColor" /><circle cx="3" cy="12" r="1" fill="currentColor" /></svg>
@@ -176,7 +177,7 @@
     </button>
     <span class="sep" aria-hidden="true"></span>
     <span class="link-wrap">
-      <button class="tb" onmousedown={keepFocus} onclick={openLink} {disabled} aria-label="Ссылка…" title="Ссылка (Ctrl+K)" aria-haspopup="dialog" aria-expanded={linkOpen}>
+      <button class="tb" onmousedown={keepFocus} onclick={openLink} {disabled} aria-label="Ссылка…" title={hint("Ссылка", "editor-link")} aria-haspopup="dialog" aria-expanded={linkOpen}>
         <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path d="M6.5 9.5a3 3 0 0 0 4.2 0l2-2a3 3 0 0 0-4.2-4.2l-1 1M9.5 6.5a3 3 0 0 0-4.2 0l-2 2a3 3 0 0 0 4.2 4.2l1-1" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" /></svg>
       </button>
       {#if linkOpen}

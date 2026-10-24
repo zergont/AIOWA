@@ -1,5 +1,6 @@
 <script lang="ts">
   import { api, errorMessage, formatSize, type Attachment, type PreviewDto } from "../api";
+  import { hint, isTopLayer, keysOf, layer } from "../hotkeys";
 
   /**
    * Предпросмотр вложений письма поверх области чтения: картинка, PDF, текст (в том числе HTML — как
@@ -140,6 +141,8 @@
   }
 
   function onKey(e: KeyboardEvent) {
+    // Окно слушает всё окно приложения: клавиши — только пока оно верхнее и на экране.
+    if (!isTopLayer(dialogEl)) return;
     switch (e.key) {
       case "Escape":
         e.preventDefault();
@@ -169,7 +172,7 @@
 
 <!-- Подложка только для мыши: закрытие с клавиатуры — Esc (обработчик окна выше), поэтому для читалок она «презентационная». -->
 <div class="overlay" role="presentation" onclick={onBackdrop}>
-  <div class="dialog" role="dialog" aria-modal="true" aria-labelledby="{uid}-title" aria-busy={loading} bind:this={dialogEl}>
+  <div class="dialog" role="dialog" aria-modal="true" aria-labelledby="{uid}-title" aria-busy={loading} bind:this={dialogEl} {@attach layer}>
     <header class="head">
       <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path d="M3 2.5h7l3 3v8H3v-11Zm7 0v3h3" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round" /></svg>
       <h2 class="title" id="{uid}-title" title={name}>{name}</h2>
@@ -188,7 +191,7 @@
         {#if actionBusy === "save"}<span class="spinner" aria-hidden="true"></span>{/if}
         Сохранить как…
       </button>
-      <button class="btn" bind:this={closeBtn} onclick={onclose} title="Закрыть (Esc; пока фокус внутри PDF — кнопкой)">Закрыть</button>
+      <button class="btn" bind:this={closeBtn} onclick={onclose} title={`Закрыть (${keysOf("preview-close")}; пока фокус внутри PDF — кнопкой)`}>Закрыть</button>
     </header>
 
     {#if status?.error}
@@ -202,10 +205,10 @@
 
     <div class="stage" class:paper={mode === "text" || mode === "pdf"} class:navs={files.length > 1}>
       {#if files.length > 1}
-        <button class="nav prev" onclick={() => go(-1)} disabled={!hasPrev} aria-label="Предыдущее вложение (←)" title="Предыдущее (←)">
+        <button class="nav prev" onclick={() => go(-1)} disabled={!hasPrev} aria-label={hint("Предыдущее вложение", "preview-prev")} title={hint("Предыдущее", "preview-prev")}>
           <svg width="20" height="20" viewBox="0 0 16 16" aria-hidden="true"><path d="M10 3 5 8l5 5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" /></svg>
         </button>
-        <button class="nav next" onclick={() => go(1)} disabled={!hasNext} aria-label="Следующее вложение (→)" title="Следующее (→)">
+        <button class="nav next" onclick={() => go(1)} disabled={!hasNext} aria-label={hint("Следующее вложение", "preview-next")} title={hint("Следующее", "preview-next")}>
           <svg width="20" height="20" viewBox="0 0 16 16" aria-hidden="true"><path d="m6 3 5 5-5 5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" /></svg>
         </button>
       {/if}

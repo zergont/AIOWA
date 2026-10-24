@@ -6,6 +6,7 @@
   import MonthGrid from "./MonthGrid.svelte";
   import EventDetails from "./EventDetails.svelte";
   import EventEditor from "./EventEditor.svelte";
+  import { hint, type CalendarHotkeyId } from "../hotkeys";
 
   interface Props {
     /** Якорный день: для вида «день» — сам день, для недель — любой день недели, для месяца — день его месяца. Меняется и отсюда (стрелки, «Сегодня»), и снаружи (мини-календарь). */
@@ -27,11 +28,11 @@
    * за каждый промелькнувший период — догружается только тот, на котором остановились.
    */
   const REFRESH_DELAY_MS = 250;
-  const KINDS: { kind: CalendarViewKind; label: string; keys: string }[] = [
-    { kind: "day", label: "День", keys: "D" },
-    { kind: "work", label: "Рабочая неделя", keys: "Shift+W" },
-    { kind: "week", label: "Неделя", keys: "W" },
-    { kind: "month", label: "Месяц", keys: "M" },
+  const KINDS: { kind: CalendarViewKind; label: string; hotkey: CalendarHotkeyId }[] = [
+    { kind: "day", label: "День", hotkey: "cal-day" },
+    { kind: "work", label: "Рабочая неделя", hotkey: "cal-work-week" },
+    { kind: "week", label: "Неделя", hotkey: "cal-week" },
+    { kind: "month", label: "Месяц", hotkey: "cal-month" },
   ];
 
   let events = $state<CalendarEvent[]>([]);
@@ -209,60 +210,67 @@
     refresh();
   }
 
-  /** Фокус в поле ввода или во фрейме: клавиши-буквы и стрелки там не наши. */
-  function inEditable(): boolean {
-    const el = document.activeElement;
-    return el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement || el instanceof HTMLSelectElement || el instanceof HTMLIFrameElement || (el instanceof HTMLElement && el.isContentEditable);
-  }
-
-  /** Видимое модальное окно поверх календаря (настройки, вопрос, предпросмотр) — как в App.onKeydown. */
-  function modalOpen(): boolean {
-    return Array.from(document.querySelectorAll('[aria-modal="true"]')).some((el) => el.getClientRects().length > 0);
-  }
-
-  function onKeydown(e: KeyboardEvent) {
+  /**
+   * Клавиша раздела из общей таблицы (lib/hotkeys.ts). Нажатие сопоставляет App.onKeydown: клавиша
+   * приходит, только когда раздел на экране, фокус не в поле ввода или фрейме и поверх нет слоя
+   * (настройки, вопрос, предпросмотр, редактор встречи) — под ним ни листания, ни новой встречи, и
+   * Esc закрывает только окно, не снимая выбор события. true — обработана: App гасит действие по умолчанию.
+   */
+  export function hotkey(id: CalendarHotkeyId): boolean {
     // Открытый редактор ловит свои клавиши сам (Esc, Ctrl+Enter), сетка в это время молчит.
-    // Под модальным окном (например, настройками) — тоже: ни листания, ни новой встречи, и Esc
-    // закрывает только окно, не снимая выбор события.
-    if (!visible || editor || e.ctrlKey || e.metaKey || e.altKey || inEditable() || modalOpen()) return;
-    if (e.key === "ArrowLeft") shift(-1);
-    else if (e.key === "ArrowRight") shift(1);
-    else if (e.key === "Escape") {
-      if (selectedPk == null) return;
-      selectedPk = null;
+    if (!visible || editor) return false;
+    switch (id) {
+      case "cal-prev":
+        shift(-1);
+        return true;
+      case "cal-next":
+        shift(1);
+        return true;
+      case "cal-deselect":
+        if (selectedPk == null) return false;
+        selectedPk = null;
+        return true;
+      case "cal-today":
+        goToday();
+        return true;
+      case "cal-day":
+        kind = "day";
+        return true;
+      case "cal-work-week":
+        kind = "work";
+        return true;
+      case "cal-week":
+        kind = "week";
+        return true;
+      case "cal-month":
+        kind = "month";
+        return true;
+      case "cal-new":
+        openNew();
+        return true;
     }
-    // По коду клавиши, а не по символу: в русской раскладке e.key даёт кириллицу.
-    else if (e.code === "KeyT") goToday();
-    else if (e.code === "KeyD") kind = "day";
-    else if (e.code === "KeyW") kind = e.shiftKey ? "work" : "week";
-    else if (e.code === "KeyM") kind = "month";
-    else if (e.code === "KeyN") openNew();
-    else return;
-    e.preventDefault();
   }
 </script>
 
-<svelte:window onkeydown={onKeydown} />
-
 <div class="cal">
   <div class="toolbar" role="toolbar" aria-label="Календарь">
-    <button class="btn primary" onclick={openNew} disabled={editor != null} title="Новая встреча (N); двойной клик по сетке — в выбранное время">
+    <button class="btn primary" onclick={openNew} disabled={editor != null} title={`${hint("Новая встреча", "cal-new")}; двойной клик по сетке — в выбранное время`}>
       <svg width="12" height="12" viewBox="0 0 16 16" aria-hidden="true"><path d="M8 3v10M3 8h10" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" /></svg>
       Новая встреча
     </button>
-    <button class="btn" onclick={goToday} title="Сегодня (T)">Сегодня</button>
+    <button class="btn" onclick={goToday} title={hint("Сегодня", "cal-today")}>Сегодня</button>
     <div class="arrows">
-      <button class="icon-btn" onclick={() => shift(-1)} aria-label="Предыдущий период" title="Назад (←)">
+      <button class="icon-btn" onclick={() => shift(-1)} aria-label="Предыдущий период" title={hint("Назад", "cal-prev")}>
         <svg width="12" height="12" viewBox="0 0 12 12" aria-hidden="true"><path d="M7.5 2.5 4 6l3.5 3.5" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" /></svg>
       </button>
-      <button class="icon-btn" onclick={() => shift(1)} aria-label="Следующий период" title="Вперёд (→)">
+      <button class="icon-btn" onclick={() => shift(1)} aria-label="Следующий период" title={hint("Вперёд", "cal-next")}>
         <svg width="12" height="12" viewBox="0 0 12 12" aria-hidden="true"><path d="M4.5 2.5 8 6l-3.5 3.5" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" /></svg>
       </button>
     </div>
     <h2 class="title" aria-live="polite">{title}</h2>
     <div class="segmented" role="group" aria-label="Вид">
       {#each KINDS as k (k.kind)}
-        <button class:on={kind === k.kind} aria-pressed={kind === k.kind} onclick={() => (kind = k.kind)} title="{k.label} ({k.keys})">{k.label}</button>
+        <button class:on={kind === k.kind} aria-pressed={kind === k.kind} onclick={() => (kind = k.kind)} title={hint(k.label, k.hotkey)}>{k.label}</button>
       {/each}
     </div>
     <span class="status caption" aria-live="polite">{statusText}</span>

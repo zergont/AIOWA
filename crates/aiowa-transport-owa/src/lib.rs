@@ -51,6 +51,11 @@ pub struct OwaConfig {
     /// Таймаут одного запроса `CreateAttachment`: файл до 25 МиБ в base64 на медленном канале
     /// не укладывается в общий `timeout`.
     pub upload_timeout: Duration,
+    /// Только для тестов: базовый URL сервера вместо `https://{Credentials::host}/`, например
+    /// `http://127.0.0.1:порт/` фейкового сервера OWA (`tests/common`). С ним клиент не берёт
+    /// системный прокси, чтобы тестовый трафик не уходил дальше петлевого адреса. `None` (по
+    /// умолчанию) — обычная работа по HTTPS.
+    pub base_url: Option<String>,
 }
 
 impl Default for OwaConfig {
@@ -64,6 +69,7 @@ impl Default for OwaConfig {
             max_body_size: 2_097_152,
             user_agent: format!("AIOWA/{}", env!("CARGO_PKG_VERSION")),
             upload_timeout: Duration::from_secs(600),
+            base_url: None,
         }
     }
 }
@@ -99,6 +105,11 @@ struct Inner {
     /// Принимает ли сервер `message:ReplyTo` в `AdditionalProperties` поверх `ShapeName` у
     /// `GetItem` писем (`REPLY_TO_*`): при отказе по форме тела запрашиваются без него.
     reply_to_mode: AtomicU8,
+    /// Сколько раз подряд `GetItem` с `message:ReplyTo` получил HTTP 500, а та же пачка без него
+    /// прошла. Отказ по форме признаётся на `REPLY_TO_STRIKES`-м разе: разовый сбой сервера не
+    /// должен отключать Reply-To до конца работы процесса (транспорт живёт столько же). Ответ 200
+    /// на запрос со свойством сбрасывает счёт; параллельные пачки одного сбоя — один удар.
+    reply_to_strikes: AtomicU8,
     /// Какую `RequestServerVersion` принял сервер для операций с папками (`FOLDER_VERSION_*`).
     folder_version: AtomicU8,
     /// Какую форму `SubscribeToNotification` принял сервер (`SubscribeForm::code`, 0 не известно).
@@ -122,6 +133,9 @@ struct Inner {
 const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(150);
 /// Общий предел одного цикла потока (сервер закрывает его примерно через 5–6 минут).
 const STREAM_TOTAL_TIMEOUT: Duration = Duration::from_secs(20 * 60);
+/// Таймаут попутного `logoff.owa` при повторном входе: исход не важен, а ждать общий таймаут
+/// под мьютексом входа и с занятым разрешением семафора дорого.
+const LOGOFF_TIMEOUT: Duration = Duration::from_secs(10);
 
 const ATTACHMENT_MODE_UNKNOWN: u8 = 0;
 const ATTACHMENT_MODE_GET: u8 = 1;
@@ -148,6 +162,8 @@ const DRAFT_SHAPE_NORMALIZED: u8 = 2;
 const REPLY_TO_UNKNOWN: u8 = 0;
 const REPLY_TO_ACCEPTED: u8 = 1;
 const REPLY_TO_REJECTED: u8 = 2;
+/// Сколько отказов HTTP 500 подряд (при успешном повторе без свойства) считать отказом по форме.
+const REPLY_TO_STRIKES: u8 = 2;
 
 /// Версия схемы операций с папками: сначала `V2017_08_18` (как у операций записи писем), при
 /// HTTP 500 на форму запроса — `Exchange2013` (как у `SyncFolderHierarchy`/`GetFolder`).
@@ -166,8 +182,25 @@ pub struct OwaTransport {
     inner: Arc<Inner>,
 }
 
-fn net(e: reqwest::Error) -> TransportError {
+fn net(mut e: reqwest::Error) -> TransportError {
+    // reqwest дописывает в текст ошибки адрес запроса, а в query бывает X-OWA-CANARY (значение
+    // cookie сессии, GetFileAttachment): в ошибку окна и журнал он не идёт, хост и путь остаются.
+    if let Some(u) = e.url_mut() {
+        u.set_query(None);
+    }
     TransportError::Network(Box::new(e))
+}
+
+/// Начало ответа, который не разобрался как JSON, — для текста ошибки. Похожее на JSON (обрезанный
+/// ответ с письмами) не показывается вовсе: в ошибку и журнал не должно попасть содержимое писем
+/// (политика журналов). Страница входа или ошибки IIS — показывается началом.
+fn non_json_excerpt(text: &str) -> String {
+    let t = text.trim_start();
+    if t.starts_with('{') || t.starts_with('[') {
+        "(похоже на JSON, не показывается)".into()
+    } else {
+        truncate(t, 160)
+    }
 }
 
 fn truncate(s: &str, n: usize) -> String {
@@ -206,16 +239,25 @@ impl OwaTransport {
     fn prepare(creds: Credentials, config: OwaConfig) -> Result<Self> {
         let jar = Arc::new(Jar::default());
         // Только HTTP/1.1: сервер работает на TLS 1.2 с CBC-шифром, а HTTP/2 поверх таких шифров запрещён.
-        let client = Client::builder()
+        let mut builder = Client::builder()
             .cookie_provider(jar.clone())
             .redirect(Policy::none())
             .user_agent(&config.user_agent)
             .http1_only()
             .connect_timeout(Duration::from_secs(10))
-            .timeout(config.timeout)
-            .build()
-            .map_err(net)?;
-        let base = Url::parse(&format!("https://{}/", creds.host)).map_err(|e| TransportError::Protocol { op: "config".into(), status: 0, raw: e.to_string() })?;
+            .timeout(config.timeout);
+        // Тестовый сервер на петлевом адресе: прямое соединение, без системного прокси.
+        if config.base_url.is_some() {
+            builder = builder.no_proxy();
+        }
+        let client = builder.build().map_err(net)?;
+        let base = match config.base_url.as_deref() {
+            // `join` относительных путей требует завершающего `/`.
+            Some(url) if url.ends_with('/') => Url::parse(url),
+            Some(url) => Url::parse(&format!("{url}/")),
+            None => Url::parse(&format!("https://{}/", creds.host)),
+        }
+        .map_err(|e| TransportError::Protocol { op: "config".into(), status: 0, raw: e.to_string() })?;
         let inner = Arc::new(Inner {
             client,
             jar,
@@ -235,6 +277,7 @@ impl OwaTransport {
             meeting_shape: AtomicU8::new(CALENDAR_SHAPE_UNKNOWN),
             draft_shape: AtomicU8::new(DRAFT_SHAPE_UNKNOWN),
             reply_to_mode: AtomicU8::new(REPLY_TO_UNKNOWN),
+            reply_to_strikes: AtomicU8::new(0),
             folder_version: AtomicU8::new(FOLDER_VERSION_UNKNOWN),
             subscribe_form: AtomicU8::new(0),
             persona_extra_rejected: AtomicBool::new(false),
@@ -355,7 +398,31 @@ impl OwaTransport {
             return Ok(());
         }
         warn!("сессия OWA истекла, повторный вход");
-        self.login().await
+        // Перед повторным входом — `logoff.owa` прежней сессии (§ 5c): при отказе CSRF она ещё
+        // жива и без этого висела бы до тайм-аута, занимая место в лимите сессий на ящик. Для
+        // истёкшей сессии запрос безвреден; его исход на вход не влияет.
+        self.logoff_quietly("прежняя сессия перед повторным входом").await;
+        self.login().await?;
+        // `logoff` мьютекс повторного входа не берёт: если он пришёл, пока шёл вход (защёлка
+        // проверена до сетевых запросов, а `login` безусловно ставит канарейку), новую сессию
+        // никто не отслеживает и не закроет — закрываем её здесь, вызывающему `SessionExpired`.
+        if self.inner.closed.load(Ordering::SeqCst) {
+            *self.inner.canary.write().expect("canary lock") = None;
+            self.logoff_quietly("сессия, открытая после logoff").await;
+            info!("logoff во время повторного входа: новая сессия закрыта");
+            return Err(TransportError::SessionExpired);
+        }
+        Ok(())
+    }
+
+    /// `logoff.owa` без интереса к исходу: короткий таймаут и без чтения тела ответа — запрос
+    /// идёт под мьютексом повторного входа и держит разрешение семафора.
+    async fn logoff_quietly(&self, context: &'static str) {
+        let url = self.inner.base.join("owa/logoff.owa").expect("url");
+        match self.inner.client.get(url).timeout(LOGOFF_TIMEOUT).send().await {
+            Ok(r) => debug!(status = %r.status(), context, "logoff.owa"),
+            Err(e) => debug!(error = %e, context, "logoff.owa не прошёл"),
+        }
     }
 
     /// Вызов операции `service.svc` с одной попыткой повторного входа.
@@ -440,7 +507,7 @@ impl OwaTransport {
             }
             return Err(TransportError::Protocol { op: op.into(), status: status.as_u16(), raw: truncate(&text, 300) });
         }
-        serde_json::from_str::<Value>(&text).map_err(|e| TransportError::Protocol { op: op.into(), status: status.as_u16(), raw: format!("не JSON ({e}): {}", truncate(&text, 200)) })
+        serde_json::from_str::<Value>(&text).map_err(|e| TransportError::Protocol { op: op.into(), status: status.as_u16(), raw: format!("не JSON ({e}), {} байт: {}", text.len(), non_json_excerpt(&text)) })
     }
 
     /// Скачивание файлового вложения с одной попыткой повторного входа.
@@ -467,7 +534,7 @@ impl OwaTransport {
             match self.get_file_attachment_get(id, max_bytes).await {
                 Ok(c) => {
                     if mode == ATTACHMENT_MODE_UNKNOWN {
-                        info!(content_type = c.content_type.as_deref().unwrap_or("?"), file_name = c.file_name.as_deref().unwrap_or("?"), bytes = c.bytes.len(), "вложения: сервер принимает GET service.svc/s/GetFileAttachment");
+                        info!(content_type = c.content_type.as_deref().unwrap_or("?"), bytes = c.bytes.len(), "вложения: сервер принимает GET service.svc/s/GetFileAttachment");
                     }
                     self.inner.attachment_mode.store(ATTACHMENT_MODE_GET, Ordering::Relaxed);
                     return Ok(c);
@@ -511,16 +578,22 @@ impl OwaTransport {
             let text = r.text().await.unwrap_or_default();
             return Err(TransportError::Protocol { op: "GetFileAttachment".into(), status: status.as_u16(), raw: truncate(&text, 300) });
         }
-        if content_type.as_deref().map(|c| c.to_ascii_lowercase().starts_with("text/html")).unwrap_or(false) {
+        // `text/html` без `Content-Disposition` файла — страница ошибки; HTML-вложение приходит
+        // с `attachment; filename=…`, как любой файл. Тело в ошибку и журнал не идёт целиком:
+        // только длина и начало, если оно не похоже на JSON (политика журналов).
+        let is_html = content_type.as_deref().map(|c| c.to_ascii_lowercase().starts_with("text/html")).unwrap_or(false);
+        let disposition = r.headers().get(CONTENT_DISPOSITION).and_then(|v| v.to_str().ok()).map(str::to_string);
+        let file_name = disposition.as_deref().and_then(parse_content_disposition_filename);
+        let is_file = file_name.is_some() || disposition.as_deref().is_some_and(|d| d.to_ascii_lowercase().contains("attachment"));
+        if is_html && !is_file {
             let text = r.text().await.unwrap_or_default();
-            return Err(TransportError::Protocol { op: "GetFileAttachment".into(), status: status.as_u16(), raw: format!("сервер вернул страницу вместо файла: {}", truncate(&text, 200)) });
+            return Err(TransportError::Protocol { op: "GetFileAttachment".into(), status: status.as_u16(), raw: format!("сервер вернул страницу вместо файла, {} байт: {}", text.len(), non_json_excerpt(&text)) });
         }
         if let Some(len) = r.headers().get(CONTENT_LENGTH).and_then(|v| v.to_str().ok()).and_then(|s| s.parse::<u64>().ok())
             && len > max_bytes
         {
             return Err(TransportError::TooLarge { limit: max_bytes });
         }
-        let file_name = r.headers().get(CONTENT_DISPOSITION).and_then(|v| v.to_str().ok()).and_then(parse_content_disposition_filename);
         let mut bytes: Vec<u8> = Vec::new();
         while let Some(chunk) = r.chunk().await.map_err(net)? {
             if bytes.len() as u64 + chunk.len() as u64 > max_bytes {
@@ -536,7 +609,7 @@ impl OwaTransport {
     async fn get_attachment_json(&self, id: &str, max_bytes: u64) -> Result<AttachmentContent> {
         let v = self.call_unpermitted("GetAttachment", protocol::V_2013, protocol::get_attachment_body(id)).await?;
         let msg = Self::first_message("GetAttachment", &v)?;
-        let att = msg.pointer("/Attachments/0").ok_or_else(|| TransportError::Protocol { op: "GetAttachment".into(), status: 200, raw: format!("нет Attachments: {}", truncate(&msg.to_string(), 200)) })?;
+        let att = msg.pointer("/Attachments/0").ok_or_else(|| TransportError::Protocol { op: "GetAttachment".into(), status: 200, raw: format!("нет Attachments: {}", protocol::json_shape(&msg, 2)) })?;
         let content = protocol::str_of(att, "Content").ok_or_else(|| TransportError::Protocol {
             op: "GetAttachment".into(),
             status: 200,
@@ -607,7 +680,7 @@ impl OwaTransport {
             if let Some(code) = v.pointer("/Body/ResponseCode").and_then(Value::as_str).filter(|c| *c != "NoError") {
                 return Err(TransportError::Server { code: code.to_string(), message: v.pointer("/Body/MessageText").and_then(Value::as_str).unwrap_or("").to_string() });
             }
-            return Err(TransportError::Protocol { op: op.into(), status: 200, raw: format!("нет ResponseMessages: {}", truncate(&v.to_string(), 200)) });
+            return Err(TransportError::Protocol { op: op.into(), status: 200, raw: format!("нет ResponseMessages: {}", protocol::json_shape(&v, 2)) });
         }
         let results = protocol::parse_write_results(&msgs, chunk);
         if results.iter().all(|r| !r.is_ok())
@@ -803,7 +876,7 @@ impl OwaTransport {
             };
             Self::log_shape("GetItem", &msg);
             let Some(item) = msg.pointer("/Items/0") else {
-                return Err(TransportError::Protocol { op: "GetItem".into(), status: 200, raw: format!("нет Items[0]: {}", truncate(&msg.to_string(), 200)) });
+                return Err(TransportError::Protocol { op: "GetItem".into(), status: 200, raw: format!("нет Items[0]: {}", protocol::json_shape(&msg, 2)) });
             };
             if known == CALENDAR_SHAPE_UNKNOWN {
                 info!(shape = ?shape, item_type = protocol::str_of(item, "__type").unwrap_or("?"), keys = item.as_object().map(|o| o.len()).unwrap_or(0), "GetItem письма о встрече: сервер принял форму");
@@ -943,33 +1016,63 @@ impl OwaTransport {
     /// успешное сообщение) тоже запоминается, а первый ответ с ней пишет в журнал, пришёл ли ключ
     /// `ReplyTo`. Смешанные отказы по элементам (`ErrorItemNotFound`) режим не меняют.
     async fn get_item_chunk(&self, chunk: &[ItemId], shape_name: &str, want_reply_to: bool) -> Result<Value> {
-        let mode = self.inner.reply_to_mode.load(Ordering::Relaxed);
+        let inner = &self.inner;
+        let mode = inner.reply_to_mode.load(Ordering::SeqCst);
         let with_reply_to = want_reply_to && mode != REPLY_TO_REJECTED;
-        let body = protocol::get_item_body(chunk, shape_name, self.inner.config.max_body_size, with_reply_to);
+        // Снимок счёта до запроса: параллельные пачки, упавшие от одного сбоя, видят одно и то же
+        // значение, и удар засчитывает только первая из них (`compare_exchange` от снимка).
+        let strikes_seen = inner.reply_to_strikes.load(Ordering::SeqCst);
+        let body = protocol::get_item_body(chunk, shape_name, inner.config.max_body_size, with_reply_to);
+        let without_reply_to = || protocol::get_item_body(chunk, shape_name, inner.config.max_body_size, false);
         match self.call("GetItem", protocol::V_2017, body).await {
             Ok(v) if with_reply_to && mode == REPLY_TO_UNKNOWN && protocol::all_property_rejections(&v) => {
                 let code = protocol::response_messages(&v).first().and_then(|m| protocol::message_error(m)).map(|(c, _)| c).unwrap_or_default();
-                warn!(code, items = chunk.len(), "GetItem: сервер отверг message:ReplyTo по каждому элементу, тела запрашиваются без Reply-To");
-                self.inner.reply_to_mode.store(REPLY_TO_REJECTED, Ordering::Relaxed);
-                self.call("GetItem", protocol::V_2017, protocol::get_item_body(chunk, shape_name, self.inner.config.max_body_size, false)).await
+                // Принятую параллельной пачкой форму отказ не перетирает.
+                if inner.reply_to_mode.compare_exchange(REPLY_TO_UNKNOWN, REPLY_TO_REJECTED, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+                    warn!(code, items = chunk.len(), "GetItem: сервер отверг message:ReplyTo по каждому элементу, тела запрашиваются без Reply-To");
+                }
+                self.call("GetItem", protocol::V_2017, without_reply_to()).await
             }
             Ok(v) => {
+                if with_reply_to {
+                    // Ответ на запрос со свойством без отказа по нему: «подряд» начинается заново.
+                    inner.reply_to_strikes.store(0, Ordering::SeqCst);
+                }
                 if with_reply_to && mode == REPLY_TO_UNKNOWN {
                     let msgs = protocol::response_messages(&v);
-                    if msgs.iter().any(|m| protocol::message_error(m).is_none()) {
+                    // Успешный ответ с message:ReplyTo — прямое доказательство, что сервер его принимает:
+                    // ACCEPTED ставится безусловно, в том числе поверх REJECTED от параллельных отказов.
+                    if msgs.iter().any(|m| protocol::message_error(m).is_none()) && inner.reply_to_mode.swap(REPLY_TO_ACCEPTED, Ordering::SeqCst) != REPLY_TO_ACCEPTED {
                         let first = msgs.first().and_then(|m| m.pointer("/Items/0").cloned());
                         let has_key = first.as_ref().map(|i| i.get("ReplyTo").is_some()).unwrap_or(false);
                         let reply_to_shape = first.as_ref().and_then(|i| i.get("ReplyTo")).map(|r| protocol::json_shape(r, 2)).unwrap_or_default();
                         info!(shape_name, has_key, reply_to_shape, "GetItem: сервер принял message:ReplyTo в AdditionalProperties поверх ShapeName");
-                        self.inner.reply_to_mode.store(REPLY_TO_ACCEPTED, Ordering::Relaxed);
                     }
                 }
                 Ok(v)
             }
             Err(e) if with_reply_to && mode == REPLY_TO_UNKNOWN && is_shape_rejection(&e) => {
-                warn!(error = %e, "GetItem: сервер отверг message:ReplyTo в AdditionalProperties, тела запрашиваются без Reply-To");
-                self.inner.reply_to_mode.store(REPLY_TO_REJECTED, Ordering::Relaxed);
-                self.call("GetItem", protocol::V_2017, protocol::get_item_body(chunk, shape_name, self.inner.config.max_body_size, false)).await
+                // Пачка без свойства — сразу. Отказом по форме 500 считается, только если без
+                // свойства сервер отвечает, а с ним — нет, `REPLY_TO_STRIKES` раз подряд.
+                let retry = self.call("GetItem", protocol::V_2017, without_reply_to()).await;
+                if retry.is_err() {
+                    // Без свойства тоже отказ — это сбой сервера, а не форма; наверх уходит ошибка повтора.
+                    warn!(error = %e, "GetItem с message:ReplyTo: HTTP 500, повтор без свойства тоже не прошёл");
+                    return retry;
+                }
+                let next = strikes_seen.saturating_add(1);
+                match inner.reply_to_strikes.compare_exchange(strikes_seen, next, Ordering::SeqCst, Ordering::SeqCst) {
+                    Ok(_) if next >= REPLY_TO_STRIKES => {
+                        if inner.reply_to_mode.compare_exchange(REPLY_TO_UNKNOWN, REPLY_TO_REJECTED, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+                            warn!(error = %e, strikes = next, "GetItem: сервер отверг message:ReplyTo в AdditionalProperties, тела запрашиваются без Reply-To");
+                        }
+                    }
+                    Ok(_) => info!(error = %e, strikes = next, "GetItem с message:ReplyTo: HTTP 500, без свойства пачка прошла; следующая пачка снова попробует с ним"),
+                    // Счёт изменился, пока шёл запрос: этот сбой уже засчитала параллельная пачка,
+                    // или между ними был успешный ответ — второго удара нет.
+                    Err(current) => debug!(error = %e, strikes = current, "GetItem с message:ReplyTo: HTTP 500 параллельной пачки, удар не засчитан повторно"),
+                }
+                retry
             }
             Err(e) => Err(e),
         }
@@ -1057,7 +1160,7 @@ impl OwaTransport {
                 }
                 return Ok(v["Body"].clone());
             }
-            return Err(TransportError::Protocol { op: op.into(), status: 200, raw: format!("нет ResponseMessages: {}", truncate(&v.to_string(), 200)) });
+            return Err(TransportError::Protocol { op: op.into(), status: 200, raw: format!("нет ResponseMessages: {}", protocol::json_shape(v, 2)) });
         };
         if let Some((code, message)) = protocol::message_error(first) {
             return Err(server_error(code, message, first));
@@ -1303,7 +1406,7 @@ impl MailTransport for OwaTransport {
             let v = self.get_item_chunk(chunk, shape_name, want_reply_to).await?;
             let msgs = protocol::response_messages(&v);
             if msgs.is_empty() {
-                return Err(TransportError::Protocol { op: "GetItem".into(), status: 200, raw: truncate(&v.to_string(), 200) });
+                return Err(TransportError::Protocol { op: "GetItem".into(), status: 200, raw: protocol::json_shape(&v, 2) });
             }
             // Сервер отвечает одним ResponseMessage на каждый id в порядке запроса. Если число не
             // сошлось, сопоставляем по ItemId и считаем отсутствующие отказом.
@@ -1382,7 +1485,7 @@ impl MailTransport for OwaTransport {
 
     async fn create_folder(&self, parent: &FolderRef, display_name: &str) -> Result<FolderId> {
         let m = self.folder_call("CreateFolder", protocol::create_folder_body(parent, display_name)).await?;
-        let id = protocol::parse_written_folder_id(&m).ok_or_else(|| TransportError::Protocol { op: "CreateFolder".into(), status: 200, raw: format!("нет Folders[0].FolderId: {}", truncate(&m.to_string(), 200)) })?;
+        let id = protocol::parse_written_folder_id(&m).ok_or_else(|| TransportError::Protocol { op: "CreateFolder".into(), status: 200, raw: format!("нет Folders[0].FolderId: {}", protocol::json_shape(&m, 2)) })?;
         debug!(name_len = display_name.chars().count(), id_len = id.id.len(), ck_len = id.change_key.as_deref().map(str::len), "папка создана");
         Ok(id)
     }
@@ -1412,7 +1515,7 @@ impl MailTransport for OwaTransport {
         let v = self.call("CreateItem", protocol::V_2017, protocol::create_item_body(kind, msg)).await?;
         let m = Self::first_message("CreateItem", &v)?;
         Self::log_shape("CreateItem", &m);
-        protocol::parse_created_item_id(&m).ok_or_else(|| TransportError::Protocol { op: "CreateItem".into(), status: 200, raw: format!("нет Items[0].ItemId: {}", truncate(&m.to_string(), 200)) })
+        protocol::parse_created_item_id(&m).ok_or_else(|| TransportError::Protocol { op: "CreateItem".into(), status: 200, raw: format!("нет Items[0].ItemId: {}", protocol::json_shape(&m, 2)) })
     }
 
     async fn add_attachments(&self, item: &ItemId, files: &[OutgoingAttachment]) -> Result<ItemId> {
@@ -1474,7 +1577,7 @@ impl MailTransport for OwaTransport {
             if let Some(code) = v.pointer("/Body/ResponseCode").and_then(Value::as_str).filter(|c| *c != "NoError") {
                 return Err(TransportError::Server { code: code.to_string(), message: v.pointer("/Body/MessageText").and_then(Value::as_str).unwrap_or("").to_string() });
             }
-            return Err(TransportError::Protocol { op: "DeleteAttachment".into(), status: 200, raw: format!("нет ResponseMessages: {}", truncate(&v.to_string(), 200)) });
+            return Err(TransportError::Protocol { op: "DeleteAttachment".into(), status: 200, raw: format!("нет ResponseMessages: {}", protocol::json_shape(&v, 2)) });
         }
         let mut root: Option<ItemId> = None;
         let mut first_err: Option<TransportError> = None;
@@ -1527,7 +1630,7 @@ impl MailTransport for OwaTransport {
             };
             Self::log_shape("GetItem", &msg);
             let Some(item) = msg.pointer("/Items/0") else {
-                return Err(TransportError::Protocol { op: "GetItem".into(), status: 200, raw: format!("нет Items[0]: {}", truncate(&msg.to_string(), 200)) });
+                return Err(TransportError::Protocol { op: "GetItem".into(), status: 200, raw: format!("нет Items[0]: {}", protocol::json_shape(&msg, 2)) });
             };
             let body_key = protocol::body_key_of(item);
             if body_key.is_none() && more {
@@ -1611,7 +1714,7 @@ impl MailTransport for OwaTransport {
             };
             Self::log_shape("GetItem", &msg);
             let Some(item) = msg.pointer("/Items/0") else {
-                return Err(TransportError::Protocol { op: "GetItem".into(), status: 200, raw: format!("нет Items[0]: {}", truncate(&msg.to_string(), 200)) });
+                return Err(TransportError::Protocol { op: "GetItem".into(), status: 200, raw: format!("нет Items[0]: {}", protocol::json_shape(&msg, 2)) });
             };
             let Some(details) = protocol::parse_calendar_details(item) else {
                 let keys: Vec<&str> = item.as_object().map(|o| o.keys().map(String::as_str).collect()).unwrap_or_default();
@@ -1661,7 +1764,7 @@ impl MailTransport for OwaTransport {
         let v = self.call_in_zone("CreateItem", protocol::V_2017, time_zone, body, None).await?;
         let m = Self::first_message("CreateItem", &v)?;
         Self::log_shape("CreateItem", &m);
-        let id = protocol::parse_created_item_id(&m).ok_or_else(|| TransportError::Protocol { op: "CreateItem".into(), status: 200, raw: format!("нет Items[0].ItemId: {}", truncate(&m.to_string(), 200)) })?;
+        let id = protocol::parse_created_item_id(&m).ok_or_else(|| TransportError::Protocol { op: "CreateItem".into(), status: 200, raw: format!("нет Items[0].ItemId: {}", protocol::json_shape(&m, 2)) })?;
         debug!(attendees = item.required.len() + item.optional.len(), all_day = item.is_all_day, reminder = ?item.reminder_minutes, zone = time_zone.is_some(), id_len = id.id.len(), ck_len = id.change_key.as_deref().map(str::len), "событие календаря создано");
         Ok(id)
     }
@@ -1938,5 +2041,24 @@ mod tests {
             TransportError::Throttled { retry_after } => assert_eq!(retry_after, Some(Duration::from_millis(2500))),
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn non_json_excerpt_hides_json_like_content() {
+        assert_eq!(non_json_excerpt("{\"Body\":{\"ResponseMessages\":{\"Items\":[{\"Subject\":\"секрет"), "(похоже на JSON, не показывается)");
+        assert_eq!(non_json_excerpt("  [1,2"), "(похоже на JSON, не показывается)");
+        assert_eq!(non_json_excerpt("<html>вход</html>"), "<html>вход</html>");
+        assert!(non_json_excerpt(&"x".repeat(500)).chars().count() <= 161);
+    }
+
+    #[tokio::test]
+    async fn network_error_text_hides_query() {
+        // Закрытый порт: reqwest вернёт ошибку соединения с адресом запроса в тексте.
+        let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let url = format!("http://127.0.0.1:{port}/owa/service.svc/s/GetFileAttachment?id=x&X-OWA-CANARY=SECRET-CANARY");
+        let e = reqwest::Client::builder().no_proxy().build().unwrap().get(&url).send().await.unwrap_err();
+        let text = net(e).to_string();
+        assert!(!text.contains("SECRET-CANARY") && !text.contains("X-OWA-CANARY"), "{text}");
+        assert!(text.contains("127.0.0.1") && text.contains("GetFileAttachment"), "хост и путь для диагностики остаются: {text}");
     }
 }

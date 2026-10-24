@@ -108,9 +108,19 @@ fn served_type(content_type: &str) -> &str {
 }
 
 fn builder(status: StatusCode) -> tauri::http::response::Builder {
-    // `*` нужен для fetch из окна: его origin (tauri.localhost или адрес dev-сервера) отличается от
-    // origin протокола. Отдаются только файлы кэша, а сторонних страниц в окне приложения нет.
-    Response::builder().status(status).header(header::CACHE_CONTROL, "no-store").header(header::X_CONTENT_TYPE_OPTIONS, "nosniff").header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+    Response::builder().status(status).header(header::CACHE_CONTROL, "no-store").header(header::X_CONTENT_TYPE_OPTIONS, "nosniff")
+}
+
+/// Источники самого окна: собранное приложение на Windows (`http://tauri.localhost`, с
+/// `useHttpsScheme` — https) и на других платформах (`tauri://localhost`).
+const APP_ORIGINS: &[&str] = &["http://tauri.localhost", "https://tauri.localhost", "tauri://localhost"];
+
+/// Источник, которому протокол разрешает читать ответ через `fetch` (текстовый предпросмотр):
+/// только окно приложения и, в разработке, dev-сервер. Картинкам и рамке PDF CORS не нужен.
+/// Любой другой источник (страница, на которую каким-то образом ушло бы окно) ответа не прочтёт.
+pub(crate) fn allowed_origin<'a>(origin: Option<&'a str>, dev_origin: Option<&str>) -> Option<&'a str> {
+    let o = origin?;
+    (APP_ORIGINS.contains(&o) || dev_origin.is_some_and(|d| d == o)).then_some(o)
 }
 
 /// Ответ протокола в режиме первого запуска: базы ещё нет.
@@ -124,7 +134,18 @@ fn bare(status: StatusCode) -> Response<Vec<u8>> {
 }
 
 /// Обработка запроса протокола. Блокирующая (диск и база): вызывать не из потока окна.
-pub(crate) fn serve(store: &Store, account: AccountId, method: &Method, path: &str) -> Response<Vec<u8>> {
+/// `origin` — уже проверенный `allowed_origin` источник запроса: ему ответ разрешён по CORS.
+pub(crate) fn serve(store: &Store, account: AccountId, method: &Method, path: &str, origin: Option<&str>) -> Response<Vec<u8>> {
+    let mut resp = serve_file(store, account, method, path);
+    let headers = resp.headers_mut();
+    headers.insert(header::VARY, header::HeaderValue::from_static("Origin"));
+    if let Some(value) = origin.and_then(|o| header::HeaderValue::from_str(o).ok()) {
+        headers.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, value);
+    }
+    resp
+}
+
+fn serve_file(store: &Store, account: AccountId, method: &Method, path: &str) -> Response<Vec<u8>> {
     if method == Method::OPTIONS {
         return builder(StatusCode::NO_CONTENT).header(header::ACCESS_CONTROL_ALLOW_METHODS, "GET, HEAD").body(Vec::new()).expect("статус и заголовки заданы константами");
     }
@@ -321,7 +342,7 @@ mod tests {
         store.save_attachment(&by("a-xml").todo(), xhtml, None, AttachmentText::Unsupported).unwrap();
         store.save_attachment(&by("a-xhtml").todo(), xhtml, Some("application/xhtml+xml"), AttachmentText::Unsupported).unwrap();
 
-        let get = |path: &str| serve(&store, acc, &Method::GET, path);
+        let get = |path: &str| serve(&store, acc, &Method::GET, path, Some("http://tauri.localhost"));
 
         // HTML отдаётся как текст; заголовки безопасности на месте.
         let r = get(&format!("/{}", by("a-html").attachment_pk));
@@ -334,6 +355,13 @@ mod tests {
         let disposition = h[header::CONTENT_DISPOSITION].to_str().unwrap();
         assert!(disposition.starts_with("inline; filename*=UTF-8''") && disposition.is_ascii(), "{disposition}");
         assert_eq!(h[header::CONTENT_SECURITY_POLICY], PREVIEW_POLICY);
+        assert_eq!(h[header::ACCESS_CONTROL_ALLOW_ORIGIN], "http://tauri.localhost");
+        assert_eq!(h[header::VARY], "Origin");
+        // Чужой или пустой источник: файл отдаётся (картинке и рамке CORS не нужен), но без
+        // разрешения читать его из скрипта.
+        let r = serve(&store, acc, &Method::GET, &format!("/{}", by("a-html").attachment_pk), None);
+        assert_eq!(r.status(), StatusCode::OK);
+        assert!(r.headers().get(header::ACCESS_CONTROL_ALLOW_ORIGIN).is_none());
 
         let r = get(&format!("/{}", by("a-png").attachment_pk));
         assert_eq!((r.status(), r.headers()[header::CONTENT_TYPE].to_str().unwrap()), (StatusCode::OK, "image/png"));
@@ -351,12 +379,25 @@ mod tests {
         // Не в кэше, чужой аккаунт, чужие ключи, не число и не тот метод — не файл.
         assert_eq!(get(&format!("/{}", by("a-none").attachment_pk)).status(), StatusCode::NOT_FOUND, "нет файла в кэше");
         let other = store.account("h", "другой").unwrap();
-        assert_eq!(serve(&store, other, &Method::GET, &format!("/{}", by("a-png").attachment_pk)).status(), StatusCode::NOT_FOUND, "вложение чужой учётной записи");
+        assert_eq!(serve(&store, other, &Method::GET, &format!("/{}", by("a-png").attachment_pk), None).status(), StatusCode::NOT_FOUND, "вложение чужой учётной записи");
         assert_eq!(get("/999999").status(), StatusCode::NOT_FOUND);
         assert_eq!(get("/abc").status(), StatusCode::NOT_FOUND);
         assert_eq!(get(&format!("/{}/../{}", by("a-png").attachment_pk, by("a-png").attachment_pk)).status(), StatusCode::NOT_FOUND);
-        assert_eq!(serve(&store, acc, &Method::POST, &format!("/{}", by("a-png").attachment_pk)).status(), StatusCode::METHOD_NOT_ALLOWED);
-        assert_eq!(serve(&store, acc, &Method::OPTIONS, "/1").status(), StatusCode::NO_CONTENT);
+        assert_eq!(serve(&store, acc, &Method::POST, &format!("/{}", by("a-png").attachment_pk), None).status(), StatusCode::METHOD_NOT_ALLOWED);
+        let pre = serve(&store, acc, &Method::OPTIONS, "/1", Some("http://tauri.localhost"));
+        assert_eq!(pre.status(), StatusCode::NO_CONTENT);
+        assert_eq!(pre.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN], "http://tauri.localhost");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cors_only_for_the_app_window() {
+        assert_eq!(allowed_origin(Some("http://tauri.localhost"), None), Some("http://tauri.localhost"));
+        assert_eq!(allowed_origin(Some("tauri://localhost"), None), Some("tauri://localhost"));
+        assert_eq!(allowed_origin(Some("http://localhost:5173"), Some("http://localhost:5173")), Some("http://localhost:5173"));
+        assert_eq!(allowed_origin(Some("http://localhost:5173"), None), None);
+        assert_eq!(allowed_origin(Some("https://evil.example"), Some("http://localhost:5173")), None);
+        assert_eq!(allowed_origin(Some("null"), None), None);
+        assert_eq!(allowed_origin(None, None), None);
     }
 }

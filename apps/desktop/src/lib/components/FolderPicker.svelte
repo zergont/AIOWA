@@ -1,6 +1,7 @@
 <script lang="ts">
   import type { Folder } from "../api";
   import { anchorRect, anchorToggle, dismissOn, placePopup, type Anchor } from "../popover";
+  import { isTopLayer, layer } from "../hotkeys";
 
   interface Props {
     folders: Folder[];
@@ -96,8 +97,13 @@
     if (selectable(r)) onpick(r.folder);
   }
 
-  /** Клавиши окна целиком (как у ConfirmPopover): Esc и стрелки работают, даже если фокус ушёл с поля фильтра на строку списка. */
+  /**
+   * Клавиши окна целиком (как у ConfirmPopover): Esc и стрелки работают, даже если фокус ушёл с поля
+   * фильтра на строку списка. Только пока окно на экране и верхнее: выбор, оставшийся открытым в
+   * спрятанном разделе почты, не переносит письма по Enter из календаря.
+   */
   function onKey(e: KeyboardEvent) {
+    if (!isTopLayer(el)) return;
     switch (e.key) {
       case "Escape":
         e.preventDefault();
@@ -156,7 +162,7 @@
 
 <svelte:window onkeydown={onKey} />
 
-<div class="popup picker" role="dialog" aria-label="Переместить в папку" bind:this={el} style="left: {pos.left}px; top: {pos.top}px">
+<div class="popup picker" role="dialog" aria-modal="true" aria-label="Переместить в папку" bind:this={el} {@attach layer} style="left: {pos.left}px; top: {pos.top}px">
   <input
     class="filter"
     type="text"

@@ -3,6 +3,7 @@
   import { errorMessage, type Folder } from "../api";
   import { DND_CONVERSATIONS, ICON, folderNameError, isInsideDeleted, readDragPayload, type DragPayload } from "../actions";
   import { focusBack, type Anchor } from "../popover";
+  import { layerOpen } from "../hotkeys";
   import ContextMenu, { type MenuItem } from "./ContextMenu.svelte";
   import ConfirmPopover from "./ConfirmPopover.svelte";
 
@@ -319,6 +320,8 @@
   }
 
   function onRowKey(e: KeyboardEvent, f: Folder) {
+    // Под открытым слоем (окно, вопрос, меню) строка папки клавиш не ловит: Delete не удаляет папку.
+    if (layerOpen()) return;
     if (e.key === "Enter") {
       onselect(f);
     } else if (e.key === "F2" && onrename) {

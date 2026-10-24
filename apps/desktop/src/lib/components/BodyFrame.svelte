@@ -1,5 +1,6 @@
 <script lang="ts">
   import { api, errorMessage, isExternalLink } from "../api";
+  import { layerOpen } from "../hotkeys";
 
   interface Props {
     /** Тело письма (HTML уже с data:-картинками вместо cid). */
@@ -52,10 +53,11 @@
   function onFrameKey(e: KeyboardEvent) {
     const ctrl = e.ctrlKey || e.metaKey;
     if (e.key === "F5" || (ctrl && !e.altKey && (e.code === "KeyR" || e.key.toLowerCase() === "r"))) e.preventDefault();
-    // Ctrl+P изнутри фрейма напечатал бы окно приложения целиком.
+    // Ctrl+P изнутри фрейма напечатал бы окно приложения целиком. Под открытым слоем (окно, вопрос)
+    // письмо не печатается, как и Ctrl+P в самом окне.
     if (ctrl && !e.altKey && !e.shiftKey && (e.code === "KeyP" || e.key.toLowerCase() === "p")) {
       e.preventDefault();
-      onprint?.();
+      if (!layerOpen()) onprint?.();
     }
   }
 

@@ -1,6 +1,7 @@
 <script lang="ts">
   import type { NotifyStatus, SyncStage, SyncStatus } from "../api";
   import { ICON } from "../actions";
+  import { hint } from "../hotkeys";
 
   interface Props {
     status: SyncStatus | null;
@@ -134,7 +135,7 @@
         <span class="undo">
           <span class="undo-text">{undo.text}</span>
           <span class="undo-dot" aria-hidden="true">·</span>
-          <button class="undo-btn" onclick={onundo} title="Отменить (Ctrl+Z)">
+          <button class="undo-btn" onclick={onundo} title={hint("Отменить", "undo")}>
             <svg width="12" height="12" viewBox="0 0 16 16" aria-hidden="true"><path d={ICON.undo} fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" /></svg>
             Отменить
           </button>

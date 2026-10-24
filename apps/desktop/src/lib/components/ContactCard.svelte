@@ -4,6 +4,7 @@
   import { ICON } from "../actions";
   import { CONTACT_ICON, KIND_LABEL, copyText, directoryLine, emailKey, expandSupported, initials, noteExpandError, rememberKinds, telHref, type ContactRef } from "../contact";
   import { anchorRect, dismissOn, placePopup } from "../popover";
+  import { hint, layer } from "../hotkeys";
 
   /**
    * Карточка контакта у имени в письме или у чипа адресата: сведения справочника организации
@@ -222,7 +223,7 @@
   onDestroy(() => clearTimeout(statusTimer));
 </script>
 
-<div class="popup contact" role="dialog" aria-modal="true" aria-labelledby="{uid}-name" aria-describedby={subtitle ? `${uid}-sub` : undefined} aria-busy={loading} tabindex="-1" bind:this={el} style="left: {pos.left}px; top: {pos.top}px" onkeydown={onKey}>
+<div class="popup contact" role="dialog" aria-modal="true" aria-labelledby="{uid}-name" aria-describedby={subtitle ? `${uid}-sub` : undefined} aria-busy={loading} tabindex="-1" bind:this={el} {@attach layer} style="left: {pos.left}px; top: {pos.top}px" onkeydown={onKey}>
   <div class="head">
     {#if trail.length}
       <button class="icon-btn" onclick={goBack} aria-label="Назад к «{trail[trail.length - 1].name || trail[trail.length - 1].email}»" title="Назад (Backspace)">
@@ -249,7 +250,7 @@
           <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path d={CONTACT_ICON.refresh} fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round" /></svg>
         {/if}
       </button>
-      <button class="icon-btn" onclick={onclose} aria-label="Закрыть" title="Закрыть (Esc)">
+      <button class="icon-btn" onclick={onclose} aria-label="Закрыть" title={hint("Закрыть", "contact-close")}>
         <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path d={ICON.close} fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" /></svg>
       </button>
     </div>

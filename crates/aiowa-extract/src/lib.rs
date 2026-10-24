@@ -168,7 +168,7 @@ fn spreadsheet(bytes: &[u8]) -> Result<String, String> {
         let range = match wb.worksheet_range(&name) {
             Ok(r) => r,
             Err(e) => {
-                tracing::debug!(sheet = %name, error = %e, "лист не прочитан");
+                tracing::debug!(error = %e, "лист не прочитан");
                 continue;
             }
         };

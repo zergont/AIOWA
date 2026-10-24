@@ -1024,7 +1024,7 @@ impl Store {
             AttachmentText::Failed(e) => (None, TEXT_FAILED, Some(e)),
         };
         if let Some(e) = err {
-            debug!(attachment_pk = todo.attachment_pk, name = %name, error = %e, "текст вложения не извлечён");
+            debug!(attachment_pk = todo.attachment_pk, error = %e, "текст вложения не извлечён");
         }
         let path_str = path.to_string_lossy().into_owned();
         self.with_tx(|tx| {
@@ -1329,7 +1329,7 @@ impl Store {
                 Ok(()) => true,
                 Err(_) if !Path::new(path).exists() => true,
                 Err(e) => {
-                    warn!(path, error = %e, "файл кэша не удалён");
+                    warn!(attachment_pk = *pk, error = %e, "файл кэша не удалён");
                     false
                 }
             };

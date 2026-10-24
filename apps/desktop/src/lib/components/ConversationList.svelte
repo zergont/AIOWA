@@ -3,6 +3,7 @@
   import { conversationsText, errorMessage, listDate, type ComposeKind, type Conversation, type Folder } from "../api";
   import { COMPOSE_ACTIONS, DND_CONVERSATIONS, ICON, conversationActionLabels, isDeletedFolder, type DragPayload, type ItemAction } from "../actions";
   import { focusBack, type Anchor } from "../popover";
+  import { hint, layerOpen } from "../hotkeys";
   import ContextMenu, { type MenuItem } from "./ContextMenu.svelte";
   import FolderPicker from "./FolderPicker.svelte";
   import ConfirmPopover from "./ConfirmPopover.svelte";
@@ -339,7 +340,9 @@
   // --- клавиатура ---------------------------------------------------------------------------------
 
   function onKey(e: KeyboardEvent) {
-    if (!conversations.length) return;
+    // Над списком открыт слой (окно, вопрос, выбор папки, меню): клавиши списка (Delete, E, стрелки)
+    // молчат, даже если фокус остался на списке, — действия не уходят на беседы под окном.
+    if (!conversations.length || layerOpen()) return;
     const ctrl = e.ctrlKey || e.metaKey;
     const plain = !ctrl && !e.altKey;
     const idx = indexOf(selected?.conversation_pk);
@@ -416,14 +419,14 @@
       <button class="act" onclick={bulkMove} aria-label={labels.move} title={labels.move} aria-haspopup="dialog" aria-expanded={picker !== null}>
         <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path d={ICON.move} fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round" /></svg>
       </button>
-      <button class="act" onclick={(e) => bulk(e, { kind: "archive" })} disabled={inArchive} aria-label={labels.archive} title={inArchive ? "Беседы уже в архиве" : `${labels.archive} (E)`}>
+      <button class="act" onclick={(e) => bulk(e, { kind: "archive" })} disabled={inArchive} aria-label={labels.archive} title={inArchive ? "Беседы уже в архиве" : hint(labels.archive, "archive")}>
         <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path d={ICON.archive} fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round" /></svg>
       </button>
-      <button class="act danger" onclick={(e) => bulk(e, { kind: "delete", permanent: false })} aria-label={labels.delete} title="{labels.delete} (Delete)">
+      <button class="act danger" onclick={(e) => bulk(e, { kind: "delete", permanent: false })} aria-label={labels.delete} title={hint(labels.delete, "list-delete")}>
         <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path d={ICON.delete} fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round" /></svg>
       </button>
       <span class="act-sep" aria-hidden="true"></span>
-      <button class="act" onclick={bulkCollapse} aria-label="Снять выбор" title="Снять выбор (Esc)">
+      <button class="act" onclick={bulkCollapse} aria-label="Снять выбор" title={hint("Снять выбор", "list-collapse")}>
         <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path d={ICON.close} fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" /></svg>
       </button>
     </span>
@@ -470,7 +473,7 @@
           draggable="true"
           onclick={(e) => onRowClick(e, c)}
           ondblclick={() => onRowDblClick(c)}
-          onkeydown={(e) => e.key === "Enter" && activate(c)}
+          onkeydown={(e) => e.key === "Enter" && !layerOpen() && activate(c)}
           oncontextmenu={(e) => onRowContextMenu(e, c)}
           ondragstart={(e) => onDragStart(e, c)}
         >
