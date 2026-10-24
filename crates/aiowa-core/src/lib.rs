@@ -495,6 +495,9 @@ pub struct CalendarEvent {
     pub sensitivity: Option<String>,
     pub has_attachments: bool,
     pub last_modified: Option<Timestamp>,
+    /// Минут до начала, если напоминание включено (`item:ReminderIsSet` и
+    /// `item:ReminderMinutesBeforeStart` запрашиваются и у `FindItem`).
+    pub reminder_minutes: Option<i64>,
 }
 
 /// Участник встречи с его ответом на приглашение.
@@ -516,6 +519,209 @@ pub struct CalendarEventDetails {
     pub reminder_minutes: Option<i64>,
     /// Человекочитаемое описание повторения (собирается клиентом из структуры `Recurrence`).
     pub recurrence_text: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Календарь: запись
+
+/// Новое событие для `CreateItem` (`CalendarItem` в папке `calendar`). Моменты в UTC; у события
+/// на весь день `start`/`end` — полуночи UTC календарных дат (`all_day_bound_utc`): это кодировка
+/// самих дат, не зависящая от пояса машины. Транспорт с поясом пользователя шлёт их как местные
+/// полуночи этих дат без зоны (`2026-10-26T00:00:00`) в контексте его пояса; без пояса — как
+/// полуночи UTC (тогда сервер хранит событие в поясе UTC). При непустых `required`/`optional`
+/// сервер рассылает приглашения.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NewCalendarItem {
+    pub subject: String,
+    pub start: Timestamp,
+    pub end: Timestamp,
+    pub is_all_day: bool,
+    pub location: Option<String>,
+    pub body_html: Option<String>,
+    pub required: Vec<Participant>,
+    pub optional: Vec<Participant>,
+    /// Минут до начала; `None` — без напоминания.
+    pub reminder_minutes: Option<i64>,
+    pub free_busy: FreeBusy,
+    /// Конфиденциальность `Private` вместо `Normal`.
+    pub sensitivity_private: bool,
+}
+
+impl NewCalendarItem {
+    /// Есть ли участники: тогда это встреча, и сервер рассылает приглашения.
+    pub fn has_attendees(&self) -> bool {
+        !self.required.is_empty() || !self.optional.is_empty()
+    }
+}
+
+/// Календарная дата границы события «весь день» в поясе `tz`: дата ближайшей к моменту полуночи.
+/// Момент может быть полуночью другого пояса (чужие события в кэше, см. § 5g документации:
+/// у пояса восточнее местного граница приходится на местный вечер предыдущего дня), поэтому
+/// берётся не дата момента, а дата ближайшей полуночи; верно, пока пояса расходятся меньше чем на
+/// 12 часов.
+pub fn all_day_date(t: Timestamp, tz: &jiff::tz::TimeZone) -> jiff::civil::Date {
+    let z = t.to_zoned(tz.clone());
+    let d = z.date();
+    if z.hour() >= 12 { d.tomorrow().unwrap_or(d) } else { d }
+}
+
+/// Граница события «весь день» для транспорта: полночь UTC календарной даты (`all_day_date`)
+/// момента `t` в поясе `tz`. Так дата кодируется моментом независимо от пояса машины; транспорт
+/// превращает её обратно в дату (`all_day_civil_date`) и шлёт серверу местную полночь пояса
+/// пользователя. Местная полночь как момент UTC (`…T21:00:00Z`) в контексте UTC сдвинула бы даты.
+pub fn all_day_bound_utc(t: Timestamp, tz: &jiff::tz::TimeZone) -> Timestamp {
+    all_day_date(t, tz).to_zoned(jiff::tz::TimeZone::UTC).map(|z| z.timestamp()).unwrap_or(t)
+}
+
+/// Календарная дата границы «весь день» из момента, как его хранит `NewCalendarItem` или
+/// `CalendarItemChanges`: дата ближайшей полуночи UTC. Точна для полуночей UTC
+/// (`all_day_bound_utc`) и терпима к местным полуночам любого пояса в пределах ±12 часов.
+pub fn all_day_civil_date(t: Timestamp) -> jiff::civil::Date {
+    all_day_date(t, &jiff::tz::TimeZone::UTC)
+}
+
+/// Изменения события для `UpdateItem`: `None` — поле не трогать. У `location` и `reminder_minutes`
+/// внутреннее `None` снимает значение (место — пустое `DisplayName`, напоминание — `ReminderIsSet:
+/// false`); пустой список участников убирает всех. У события на весь день вместе с `start`/`end`
+/// должен идти `is_all_day: Some(true)`: по нему транспорт шлёт границы местными полуночами дат
+/// (`all_day_civil_date`), а не моментами UTC.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct CalendarItemChanges {
+    pub subject: Option<String>,
+    pub start: Option<Timestamp>,
+    pub end: Option<Timestamp>,
+    pub is_all_day: Option<bool>,
+    pub location: Option<Option<String>>,
+    pub body_html: Option<String>,
+    pub required: Option<Vec<Participant>>,
+    pub optional: Option<Vec<Participant>>,
+    pub reminder_minutes: Option<Option<i64>>,
+    pub free_busy: Option<FreeBusy>,
+}
+
+impl CalendarItemChanges {
+    /// Ни одно поле не меняется: запрос к серверу не нужен.
+    pub fn is_empty(&self) -> bool {
+        self == &Self::default()
+    }
+}
+
+/// Ответ на приглашение (`AcceptItem`, `TentativelyAcceptItem`, `DeclineItem`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum MeetingResponse {
+    Accept,
+    Tentative,
+    Decline,
+}
+
+impl MeetingResponse {
+    /// Разбирает ключ интерфейса (`accept`, `tentative`, `decline`) без учёта регистра.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "accept" => Some(Self::Accept),
+            "tentative" => Some(Self::Tentative),
+            "decline" => Some(Self::Decline),
+            _ => None,
+        }
+    }
+    pub const fn key(self) -> &'static str {
+        match self {
+            Self::Accept => "accept",
+            Self::Tentative => "tentative",
+            Self::Decline => "decline",
+        }
+    }
+    /// Каким станет свой ответ (`MyResponseType`) после отправки.
+    pub const fn response_type(self) -> ResponseType {
+        match self {
+            Self::Accept => ResponseType::Accept,
+            Self::Tentative => ResponseType::Tentative,
+            Self::Decline => ResponseType::Decline,
+        }
+    }
+}
+
+/// Вид письма о встрече по `ItemClass`: приглашение (`IPM.Schedule.Meeting.Request`), отмена
+/// (`…Canceled`), ответ участника (`…Resp.Pos`/`Neg`/`Tent`) или другое (`…Notification.Forward`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+pub enum MeetingMessageKind {
+    Request,
+    Cancellation,
+    Response,
+    #[default]
+    Other,
+}
+
+impl MeetingMessageKind {
+    /// Префикс классов писем о встречах.
+    pub const CLASS_PREFIX: &'static str = "IPM.Schedule.Meeting.";
+
+    /// Вид по классу письма (без учёта регистра); не письмо о встрече — `Other`.
+    pub fn from_item_class(class: &str) -> Self {
+        let lower = class.trim().to_ascii_lowercase();
+        let Some(rest) = lower.strip_prefix(&Self::CLASS_PREFIX.to_ascii_lowercase()) else { return Self::Other };
+        if rest.starts_with("request") {
+            Self::Request
+        } else if rest.starts_with("canceled") || rest.starts_with("cancelled") {
+            Self::Cancellation
+        } else if rest.starts_with("resp.") {
+            Self::Response
+        } else {
+            Self::Other
+        }
+    }
+
+    /// Письмо о встрече вообще (любого вида, включая `Other` с префиксом класса).
+    pub fn is_meeting_class(class: &str) -> bool {
+        class.trim().to_ascii_lowercase().starts_with(&Self::CLASS_PREFIX.to_ascii_lowercase())
+    }
+
+    /// Ключ для интерфейса: `request`, `cancellation`, `response`, `other`.
+    pub const fn key(self) -> &'static str {
+        match self {
+            Self::Request => "request",
+            Self::Cancellation => "cancellation",
+            Self::Response => "response",
+            Self::Other => "other",
+        }
+    }
+}
+
+/// Ответ участника по классу его письма: `…Resp.Pos` — принял, `…Resp.Neg` — отклонил,
+/// `…Resp.Tent` — под вопросом.
+pub fn response_from_item_class(class: &str) -> Option<ResponseType> {
+    let lower = class.trim().to_ascii_lowercase();
+    let rest = lower.strip_prefix("ipm.schedule.meeting.resp.")?;
+    if rest.starts_with("pos") {
+        Some(ResponseType::Accept)
+    } else if rest.starts_with("neg") {
+        Some(ResponseType::Decline)
+    } else if rest.starts_with("tent") {
+        Some(ResponseType::Tentative)
+    } else {
+        None
+    }
+}
+
+/// Письмо о встрече (`GetItem` по письму-приглашению, отмене или ответу): время и место встречи,
+/// организатор, свой ответ, признак устаревшего приглашения, связанное событие календаря.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MeetingRequestInfo {
+    pub kind: MeetingMessageKind,
+    pub start: Option<Timestamp>,
+    pub end: Option<Timestamp>,
+    pub is_all_day: bool,
+    pub location: Option<String>,
+    pub organizer: Option<Participant>,
+    /// Свой ответ на приглашение (у ответов участников — `Unknown`).
+    pub my_response: ResponseType,
+    /// Приглашение устарело: встреча изменена или отменена позже.
+    pub is_out_of_date: bool,
+    /// Событие в календаре, созданное из этого письма (если сервер его сообщил).
+    pub associated_calendar_item: Option<ItemId>,
+    pub recurrence_text: Option<String>,
+    /// Ответ отправителя у письма-ответа (`Response`): принял, отклонил, под вопросом.
+    pub response_type_of_sender: Option<ResponseType>,
 }
 
 /// Изменение элемента, как его отдаёт `SyncFolderItems`.
@@ -585,6 +791,64 @@ mod tests {
             assert_eq!(ResponseType::parse(r.key()), r);
         }
         assert_eq!(ResponseType::parse(""), ResponseType::Unknown);
+    }
+
+    #[test]
+    fn meeting_message_kinds_and_responses() {
+        assert_eq!(MeetingMessageKind::from_item_class("IPM.Schedule.Meeting.Request"), MeetingMessageKind::Request);
+        assert_eq!(MeetingMessageKind::from_item_class("ipm.schedule.meeting.canceled"), MeetingMessageKind::Cancellation);
+        assert_eq!(MeetingMessageKind::from_item_class("IPM.Schedule.Meeting.Resp.Pos"), MeetingMessageKind::Response);
+        assert_eq!(MeetingMessageKind::from_item_class("IPM.Schedule.Meeting.Notification.Forward"), MeetingMessageKind::Other);
+        assert_eq!(MeetingMessageKind::from_item_class("IPM.Note"), MeetingMessageKind::Other);
+        assert!(MeetingMessageKind::is_meeting_class("IPM.Schedule.Meeting.Notification.Forward") && !MeetingMessageKind::is_meeting_class("IPM.Note"));
+        assert_eq!(MeetingMessageKind::Cancellation.key(), "cancellation");
+        assert_eq!(response_from_item_class("IPM.Schedule.Meeting.Resp.Pos"), Some(ResponseType::Accept));
+        assert_eq!(response_from_item_class("IPM.Schedule.Meeting.Resp.Neg"), Some(ResponseType::Decline));
+        assert_eq!(response_from_item_class("IPM.Schedule.Meeting.Resp.Tent"), Some(ResponseType::Tentative));
+        assert_eq!(response_from_item_class("IPM.Schedule.Meeting.Request"), None);
+        for r in [MeetingResponse::Accept, MeetingResponse::Tentative, MeetingResponse::Decline] {
+            assert_eq!(MeetingResponse::parse(r.key()), Some(r));
+            assert_eq!(MeetingResponse::parse(&r.key().to_ascii_uppercase()), Some(r));
+        }
+        assert_eq!(MeetingResponse::parse("maybe"), None);
+        assert_eq!(MeetingResponse::Tentative.response_type(), ResponseType::Tentative);
+        assert!(CalendarItemChanges::default().is_empty());
+        assert!(!CalendarItemChanges { location: Some(None), ..Default::default() }.is_empty());
+        let item = NewCalendarItem {
+            subject: "x".into(),
+            start: Timestamp::UNIX_EPOCH,
+            end: Timestamp::UNIX_EPOCH,
+            is_all_day: false,
+            location: None,
+            body_html: None,
+            required: vec![],
+            optional: vec![Participant { name: None, email: Some("o@x.ru".into()), routing_type: None }],
+            reminder_minutes: None,
+            free_busy: FreeBusy::Busy,
+            sensitivity_private: false,
+        };
+        assert!(item.has_attendees());
+        assert!(!NewCalendarItem { optional: vec![], ..item }.has_attendees());
+    }
+
+    #[test]
+    fn all_day_bounds_follow_nearest_local_midnight() {
+        let msk = jiff::tz::TimeZone::fixed(jiff::tz::Offset::constant(3));
+        let ts = |s: &str| s.parse::<Timestamp>().unwrap();
+        // Местная полночь 26.10 по МСК — 25.10 21:00Z: дата 26.10, на сервер — 26.10 00:00Z.
+        assert_eq!(all_day_date(ts("2026-10-25T21:00:00Z"), &msk), jiff::civil::date(2026, 10, 26));
+        assert_eq!(all_day_bound_utc(ts("2026-10-25T21:00:00Z"), &msk), ts("2026-10-26T00:00:00Z"));
+        // Полночь организатора из UTC+6 (25.10 18:00Z) по МСК — вечер 25.10: ближайшая полночь — 26.10.
+        assert_eq!(all_day_date(ts("2026-10-25T18:00:00Z"), &msk), jiff::civil::date(2026, 10, 26));
+        // Полночь организатора из UTC−5 (26.10 05:00Z) по МСК — утро 26.10: то же 26.10.
+        assert_eq!(all_day_date(ts("2026-10-26T05:00:00Z"), &msk), jiff::civil::date(2026, 10, 26));
+        // Полночь UTC уже в нужном виде: не меняется.
+        assert_eq!(all_day_bound_utc(ts("2026-10-26T00:00:00Z"), &msk), ts("2026-10-26T00:00:00Z"));
+        assert_eq!(all_day_bound_utc(ts("2026-10-26T00:00:00Z"), &jiff::tz::TimeZone::UTC), ts("2026-10-26T00:00:00Z"));
+        // Обратно в дату: полночь UTC — точно, местные полуночи МСК и UTC−5 — по ближайшей полуночи.
+        assert_eq!(all_day_civil_date(ts("2026-10-26T00:00:00Z")), jiff::civil::date(2026, 10, 26));
+        assert_eq!(all_day_civil_date(ts("2026-10-25T21:00:00Z")), jiff::civil::date(2026, 10, 26));
+        assert_eq!(all_day_civil_date(ts("2026-10-26T05:00:00Z")), jiff::civil::date(2026, 10, 26));
     }
 
     #[test]

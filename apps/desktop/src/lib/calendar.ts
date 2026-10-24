@@ -3,9 +3,9 @@
  * дат и времени, раскладка событий по дням и колонкам. Даты — местное время машины,
  * миллисекунды событий — UTC, как отдаёт бэкенд. Без зависимостей от DOM и Svelte.
  */
-import type { CalendarEvent, FreeBusy, ResponseType } from "./api";
+import type { CalendarEvent, CalendarEventDetails, EventParticipant, FreeBusy, FreeBusyChoice, ResponseType } from "./api";
 
-export type CalendarViewKind = "day" | "work" | "week";
+export type CalendarViewKind = "day" | "work" | "week" | "month";
 
 export const MINUTES_PER_DAY = 24 * 60;
 /** Минимальная длительность блока в раскладке: короткие события занимают место под одну строку текста. */
@@ -62,16 +62,28 @@ export interface ViewRange {
   days: Date[];
 }
 
-/** День — один день якоря; рабочая неделя — пн–пт недели якоря; неделя — пн–вс. */
+/** День — один день якоря; рабочая неделя — пн–пт недели якоря; неделя — пн–вс; месяц — 6 недель сетки месяца якоря. */
 export function viewRange(kind: CalendarViewKind, anchor: Date): ViewRange {
+  if (kind === "month") {
+    const days = monthGrid(anchor);
+    return { start: days[0], end: addDays(days[0], days.length), days };
+  }
   const first = kind === "day" ? startOfDay(anchor) : startOfWeek(anchor);
   const count = kind === "day" ? 1 : kind === "work" ? 5 : 7;
   const days = Array.from({ length: count }, (_, i) => addDays(first, i));
   return { start: first, end: addDays(first, count), days };
 }
 
-/** Соседний период: для дня — на день, для недель — на неделю (день недели якоря сохраняется). */
+/**
+ * Соседний период: для дня — на день, для недель — на неделю (день недели якоря сохраняется),
+ * для месяца — на месяц (число сохраняется, в коротком месяце — последнее).
+ */
 export function shiftAnchor(kind: CalendarViewKind, anchor: Date, dir: -1 | 1): Date {
+  if (kind === "month") {
+    const m = addMonths(anchor, dir);
+    const lastDate = new Date(m.getFullYear(), m.getMonth() + 1, 0).getDate();
+    return new Date(m.getFullYear(), m.getMonth(), Math.min(anchor.getDate(), lastDate));
+  }
   return addDays(startOfDay(anchor), kind === "day" ? dir : 7 * dir);
 }
 
@@ -229,6 +241,196 @@ export function nowPosition(now: Date, days: Date[]): { day: number; minutes: nu
   return day < 0 ? null : { day, minutes: minutesOfDay(now) };
 }
 
+/** Ключи местных дней, которые занимает событие: у «весь день» — по его дням, у остальных — от начала до конца. */
+export function eventDayKeys(ev: Pick<CalendarEvent, "start_ms" | "end_ms" | "is_all_day">): number[] {
+  const keys: number[] = [];
+  let d: Date;
+  let last: Date;
+  if (ev.is_all_day) {
+    const span = allDaySpan(ev);
+    d = span.first;
+    last = span.last;
+  } else {
+    const s = ev.start_ms;
+    const e = Math.max(ev.end_ms, s);
+    d = startOfDay(new Date(s));
+    // Конец ровно в полночь принадлежит предыдущему дню.
+    last = startOfDay(new Date(e > s && e === startOfDay(new Date(e)).getTime() ? e - 1 : e));
+  }
+  for (let i = 0; i < 62 && d.getTime() <= last.getTime(); i++, d = addDays(d, 1)) keys.push(dayKey(d));
+  return keys;
+}
+
+/**
+ * События по дням сетки месяца: «весь день» и многодневные — в каждом задетом дне, первыми;
+ * остальные — по началу. Отменённые остаются (их видно зачёркнутыми).
+ */
+export function eventsByDay(events: CalendarEvent[], days: Date[]): CalendarEvent[][] {
+  const index = new Map<number, number>();
+  days.forEach((d, i) => index.set(dayKey(d), i));
+  const out: CalendarEvent[][] = days.map(() => []);
+  const sorted = [...events].sort((a, b) => Number(b.is_all_day) - Number(a.is_all_day) || a.start_ms - b.start_ms || b.end_ms - a.end_ms);
+  for (const ev of sorted) {
+    for (const k of eventDayKeys(ev)) {
+      const i = index.get(k);
+      if (i !== undefined) out[i].push(ev);
+    }
+  }
+  return out;
+}
+
+// --- редактор события ------------------------------------------------------------------------
+
+/** Длительность нового события по умолчанию. */
+export const DEFAULT_EVENT_MIN = 30;
+
+/** Ближайшая граница получаса не раньше момента: начало нового события «сейчас». */
+export function nextSlot(d: Date, stepMin = 30): Date {
+  const ms = stepMin * 60_000;
+  return new Date(Math.ceil(d.getTime() / ms) * ms);
+}
+
+/** Значение для input type=date по местной дате: «2026-10-24». */
+export function dateInputValue(d: Date): string {
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+}
+
+/** Значение для input type=time по местному времени: «09:30». */
+export function timeInputValue(d: Date): string {
+  return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+}
+
+/** Местный момент из значений полей даты и времени; null — поле пустое или не разобралось. */
+export function parseDateTimeInputs(date: string, time: string | null): Date | null {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(date);
+  if (!m) return null;
+  let h = 0;
+  let min = 0;
+  if (time != null) {
+    const t = /^(\d{2}):(\d{2})/.exec(time);
+    if (!t) return null;
+    h = Number(t[1]);
+    min = Number(t[2]);
+  }
+  const d = new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]), h, min);
+  return Number.isNaN(d.getTime()) ? null : d;
+}
+
+/** Варианты напоминания в редакторе: null — без напоминания. */
+export const REMINDER_OPTIONS: { value: number | null; label: string }[] = [
+  { value: null, label: "Нет" },
+  { value: 0, label: "В момент начала" },
+  { value: 5, label: "За 5 минут" },
+  { value: 15, label: "За 15 минут" },
+  { value: 30, label: "За 30 минут" },
+  { value: 60, label: "За 1 час" },
+  { value: 1440, label: "За 1 день" },
+];
+
+/** Занятость, которую можно выбрать в редакторе. */
+export const FREE_BUSY_OPTIONS: { value: Exclude<FreeBusy, "no_data">; label: string }[] = [
+  { value: "busy", label: "Занят" },
+  { value: "free", label: "Свободен" },
+  { value: "tentative", label: "Под вопросом" },
+  { value: "oof", label: "Нет на месте" },
+  { value: "working_elsewhere", label: "Работаю в другом месте" },
+];
+
+/** Заготовка редактора: новое событие (`calendarPk` null) или правка существующего. Моменты — местные, как в запросе. */
+export interface EventDraft {
+  calendarPk: number | null;
+  subject: string;
+  /** У «весь день» — местная полночь первого дня и полночь после последнего. */
+  startMs: number;
+  endMs: number;
+  isAllDay: boolean;
+  location: string;
+  bodyHtml: string;
+  required: EventParticipant[];
+  optional: EventParticipant[];
+  reminderMinutes: number | null;
+  freeBusy: FreeBusyChoice;
+  isPrivate: boolean;
+  /** Я организатор (или событие без участников): обновления участникам рассылаю я. */
+  isOrganizer: boolean;
+  /** На сервере у встречи уже есть участники: при правке спросить, слать ли им обновление. */
+  hadAttendees: boolean;
+  /** Экземпляр повторяющейся встречи: правится именно он. */
+  isOccurrence: boolean;
+  /** Участники и описание в заготовке взяты из подробностей (а не пустые от незнания): пустые списки при правке значат «убрать». */
+  detailsKnown: boolean;
+}
+
+/** Заготовка нового события: со времени `start` на `DEFAULT_EVENT_MIN` минут или на весь день `start`. */
+export function newEventDraft(start: Date, allDay = false): EventDraft {
+  const s = allDay ? startOfDay(start) : start;
+  const e = allDay ? addDays(s, 1) : new Date(s.getTime() + DEFAULT_EVENT_MIN * 60_000);
+  return {
+    calendarPk: null,
+    subject: "",
+    startMs: s.getTime(),
+    endMs: e.getTime(),
+    isAllDay: allDay,
+    location: "",
+    bodyHtml: "",
+    required: [],
+    optional: [],
+    reminderMinutes: 15,
+    freeBusy: "busy",
+    isPrivate: false,
+    isOrganizer: true,
+    hadAttendees: false,
+    isOccurrence: false,
+    detailsKnown: true,
+  };
+}
+
+/** Заготовка правки по событию сетки и его подробностям (если уже загружены). */
+export function draftFromEvent(ev: CalendarEvent, details: CalendarEventDetails | null): EventDraft {
+  let startMs = ev.start_ms;
+  let endMs = Math.max(ev.end_ms, ev.start_ms);
+  if (ev.is_all_day) {
+    const { first, last } = allDaySpan(ev);
+    startMs = first.getTime();
+    endMs = addDays(last, 1).getTime();
+  }
+  const attendees = details?.attendees ?? [];
+  const people = (required: boolean): EventParticipant[] => attendees.filter((a) => a.required === required && a.email).map((a) => ({ name: a.name, email: a.email as string }));
+  const isOrganizer = !ev.is_meeting || ev.my_response === "organizer";
+  return {
+    calendarPk: ev.calendar_pk,
+    subject: ev.subject ?? "",
+    startMs,
+    endMs,
+    isAllDay: ev.is_all_day,
+    location: ev.location ?? "",
+    bodyHtml: details?.body_html ?? "",
+    required: people(true),
+    optional: people(false),
+    reminderMinutes: details?.reminder_minutes ?? ev.reminder_minutes ?? null,
+    freeBusy: ev.free_busy === "no_data" ? "busy" : ev.free_busy,
+    isPrivate: (ev.sensitivity ?? "").toLowerCase() === "private",
+    isOrganizer,
+    hadAttendees: details ? attendees.length > 0 : ev.is_meeting,
+    isOccurrence: ev.calendar_type === "occurrence" || ev.calendar_type === "exception",
+    detailsKnown: details != null,
+  };
+}
+
+/** «Приглашение: 24 октября 2026, 09:00–09:30 (30 мин)» — когда встреча по полям письма-приглашения. */
+export function meetingWhen(startMs: number | null, endMs: number | null, isAllDay: boolean): string | null {
+  if (startMs == null) return null;
+  return eventWhen({ start_ms: startMs, end_ms: endMs ?? startMs, is_all_day: isAllDay });
+}
+
+/** «через 15 мин», «сейчас», «началось 5 мин назад» — для напоминания. */
+export function reminderCountdown(startMs: number, now: number): string {
+  const diffMin = Math.round((startMs - now) / 60_000);
+  if (diffMin > 0) return `через ${formatDuration(diffMin * 60_000)}`;
+  if (diffMin === 0) return "сейчас";
+  return `началось ${formatDuration(-diffMin * 60_000)} назад`;
+}
+
 // --- форматы ru-RU ----------------------------------------------------------------------------
 
 const fmtWeekdayShort = new Intl.DateTimeFormat("ru-RU", { weekday: "short" });
@@ -276,9 +478,10 @@ export function dateRangeTitle(a: Date, b: Date): string {
   return `${fmtDayMonth.format(a)} ${a.getFullYear()} – ${fmtDayMonth.format(b)} ${b.getFullYear()}`;
 }
 
-/** Заголовок периода в панели календаря. */
-export function periodTitle(kind: CalendarViewKind, range: ViewRange): string {
+/** Заголовок периода в панели календаря; у месяца — месяц якоря (`anchor`), а не первый день сетки. */
+export function periodTitle(kind: CalendarViewKind, range: ViewRange, anchor?: Date): string {
   if (kind === "day") return dayLong(range.days[0]);
+  if (kind === "month") return monthTitle(anchor ?? range.days[Math.floor(range.days.length / 2)]);
   return dateRangeTitle(range.days[0], range.days[range.days.length - 1]);
 }
 

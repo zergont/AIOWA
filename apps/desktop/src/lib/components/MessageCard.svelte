@@ -1,10 +1,12 @@
 <script lang="ts">
   import { onDestroy, untrack } from "svelte";
-  import { api, errorMessage, formatSize, fullDate, isInlinePicture, listDate, messageNeedsFetch, personLabel, type Attachment, type ComposeKind, type Folder, type Message } from "../api";
+  import { api, errorMessage, formatSize, fullDate, isInlinePicture, listDate, meetingKindOf, messageNeedsFetch, personLabel, senderResponseOf, type Attachment, type ComposeKind, type Folder, type MeetingInfo, type MeetingResponse, type Message, type ResponseType } from "../api";
   import { COMPOSE_ACTIONS, ICON, type ItemAction } from "../actions";
+  import { meetingWhen } from "../calendar";
   import { focusBack } from "../popover";
   import FolderPicker from "./FolderPicker.svelte";
   import ConfirmPopover from "./ConfirmPopover.svelte";
+  import ChoicePopover from "./ChoicePopover.svelte";
   import BodyFrame from "./BodyFrame.svelte";
 
   interface Props {
@@ -21,8 +23,10 @@
     onaction: (action: ItemAction) => Promise<void>;
     /** Открыть композер: ответ, ответ всем или пересылка этого письма. */
     oncompose: (kind: ComposeKind) => void;
+    /** Дан ответ на приглашение или отменённая встреча убрана из календаря: родитель перечитывает беседу. */
+    onmeeting?: () => void;
   }
-  let { message, expanded, ontoggle, onfetch, folders, deletedFolderPk, onaction, oncompose }: Props = $props();
+  let { message, expanded, ontoggle, onfetch, folders, deletedFolderPk, onaction, oncompose, onmeeting }: Props = $props();
 
   const to = $derived(message.recipients.filter((r) => r.kind === 1).map((r) => personLabel(r.name, r.email)));
   const cc = $derived(message.recipients.filter((r) => r.kind === 2).map((r) => personLabel(r.name, r.email)));
@@ -222,6 +226,135 @@
     for (const t of savedTimers.values()) clearTimeout(t);
   });
 
+  // --- встреча: приглашение, отмена, ответ участника ----------------------------------------
+  // По классу письма карточка знает, что это письмо о встрече, а поля встречи (время, место,
+  // организатор, мой ответ) берёт у бэкенда (`meeting_info`, GetItem по письму) при первом
+  // развёртывании. Ответ уходит по письму (`meeting_respond`); после — сведения перечитываются.
+
+  const meetingKind = $derived(meetingKindOf(message.item_class));
+  let info = $state<MeetingInfo | null>(null);
+  let infoLoading = $state(false);
+  let infoError = $state<string | null>(null);
+  /** Сведения уже запрашивались для этого письма: автозапрос один, дальше — по кнопке. */
+  let infoTried = false;
+  let meetingBusy = $state(false);
+  let meetingError = $state<string | null>(null);
+  /** Отменённая встреча убрана из календаря отсюда. */
+  let removedFromCalendar = $state(false);
+  /** Открыт вопрос «отправить ответ?» для выбранного ответа; якорь — нажатая кнопка. */
+  let pendingResponse = $state<{ response: MeetingResponse; anchor: HTMLButtonElement } | null>(null);
+
+  const RESPONSES: { id: MeetingResponse; label: string; question: string }[] = [
+    { id: "accept", label: "Принять", question: "Принять приглашение?" },
+    { id: "tentative", label: "Под вопросом", question: "Ответить «под вопросом»?" },
+    { id: "decline", label: "Отклонить", question: "Отклонить приглашение?" },
+  ];
+
+  const MY_RESPONSE: Record<ResponseType, string> = {
+    unknown: "Без ответа",
+    organizer: "Вы организатор",
+    tentative: "Вы ответили «под вопросом»",
+    accept: "Вы приняли",
+    decline: "Вы отклонили",
+    no_response: "Без ответа",
+  };
+
+  /** Заголовок баннера; у ответа участника — кто и что ответил. */
+  const meetingTitle = $derived.by(() => {
+    switch (meetingKind) {
+      case "request":
+        return "Приглашение на встречу";
+      case "cancellation":
+        return "Встреча отменена";
+      case "response": {
+        const who = personLabel(message.from_name, message.from_email) || "Участник";
+        const resp = info?.sender_response ?? senderResponseOf(message.item_class);
+        const verb = resp === "accept" ? "принял(а) приглашение" : resp === "decline" ? "отклонил(а) приглашение" : resp === "tentative" ? "ответил(а) «под вопросом»" : "ответил(а) на приглашение";
+        return `${who} ${verb}`;
+      }
+      default:
+        return "Сообщение о встрече";
+    }
+  });
+  const meetingTime = $derived(info ? meetingWhen(info.start_ms, info.end_ms, info.is_all_day) : null);
+  const myResponseClass = $derived(info?.my_response === "accept" || info?.my_response === "organizer" ? "ok" : info?.my_response === "tentative" ? "maybe" : info?.my_response === "decline" ? "no" : "none");
+
+  async function loadInfo() {
+    if (infoLoading) return;
+    infoLoading = true;
+    infoError = null;
+    try {
+      info = await api.meetingInfo(message.item_pk);
+    } catch (e) {
+      infoError = errorMessage(e);
+    } finally {
+      infoLoading = false;
+    }
+  }
+
+  $effect(() => {
+    if (!expanded || !meetingKind) return;
+    untrack(() => {
+      if (infoTried) return;
+      infoTried = true;
+      void loadInfo();
+    });
+  });
+
+  /** Приглашение устарело (организатор прислал новое): ответ на него сервер отвергнет. */
+  const outOfDate = $derived(info?.is_out_of_date === true);
+
+  function askRespond(e: MouseEvent, response: MeetingResponse) {
+    if (meetingBusy || outOfDate) return;
+    if (pendingResponse?.response === response) {
+      closeRespond();
+      return;
+    }
+    pendingResponse = { response, anchor: e.currentTarget as HTMLButtonElement };
+  }
+  function closeRespond() {
+    const anchor = pendingResponse?.anchor;
+    pendingResponse = null;
+    focusBack(anchor);
+  }
+
+  async function respondNow(sendResponse: boolean) {
+    const p = pendingResponse;
+    closeRespond();
+    if (!p || meetingBusy) return;
+    meetingBusy = true;
+    meetingError = null;
+    try {
+      await api.meetingRespond(message.item_pk, p.response, sendResponse);
+      // Окно отвечает сразу, свежие сведения с сервера придут следом.
+      if (info) info = { ...info, my_response: p.response };
+      onmeeting?.();
+      void loadInfo();
+    } catch (e) {
+      meetingError = errorMessage(e);
+    } finally {
+      meetingBusy = false;
+    }
+  }
+
+  /** «Удалить из календаря» у отмены: связанное событие в «Удалённые». */
+  async function removeFromCalendar() {
+    const pk = info?.calendar_pk;
+    if (pk == null || meetingBusy) return;
+    meetingBusy = true;
+    meetingError = null;
+    try {
+      await api.calendarDelete(pk, false);
+      removedFromCalendar = true;
+      if (info) info = { ...info, calendar_pk: null, has_calendar_item: false };
+      onmeeting?.();
+    } catch (e) {
+      meetingError = errorMessage(e);
+    } finally {
+      meetingBusy = false;
+    }
+  }
+
   function initials(name: string | null, email: string | null): string {
     const s = (name || email || "?").trim();
     const parts = s.split(/\s+/).filter(Boolean);
@@ -294,6 +427,66 @@
       <span class="status-text">{actionError}</span>
       <button class="btn" onclick={() => (actionError = null)} aria-label="Скрыть сообщение об ошибке">Скрыть</button>
     </div>
+  {/if}
+
+  {#if expanded && meetingKind}
+    <section class="meeting kind-{meetingKind}" aria-label="Встреча" aria-busy={meetingBusy || infoLoading}>
+      <div class="meeting-head">
+        <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path d="M2.5 4h11v9.5h-11V4Zm0 3h11M5 2.5V5m6-2.5V5" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round" /></svg>
+        <span class="meeting-title">{meetingTitle}</span>
+        {#if info?.is_out_of_date}<span class="badge">устарело</span>{/if}
+        {#if info && meetingKind === "request"}
+          <span class="meeting-status {myResponseClass}">
+            <span class="dot" aria-hidden="true"></span>
+            {MY_RESPONSE[info.my_response]}
+          </span>
+        {/if}
+      </div>
+      {#if info}
+        <div class="meeting-facts caption">
+          {#if meetingTime}<div>{meetingTime}</div>{/if}
+          {#if info.location}<div>Где: {info.location}</div>{/if}
+          {#if info.organizer}<div>Организатор: {personLabel(info.organizer.name, info.organizer.email) || "—"}</div>{/if}
+          {#if info.recurrence_text}<div>{info.recurrence_text}</div>{/if}
+        </div>
+      {:else if infoLoading}
+        <div class="meeting-facts caption"><span class="spinner" aria-hidden="true"></span> Загружаю сведения о встрече…</div>
+      {:else if infoError}
+        <div class="meeting-msg failed" role="alert">
+          <span class="meeting-msg-text">{infoError}</span>
+          <button class="btn" onclick={loadInfo}>Повторить</button>
+        </div>
+      {/if}
+      {#if meetingKind === "request" && info?.my_response !== "organizer"}
+        <div class="meeting-actions" role="toolbar" aria-label="Ответ на приглашение">
+          {#each RESPONSES as r (r.id)}
+            <button class="mbtn {r.id}" class:on={info?.my_response === r.id} onclick={(e) => askRespond(e, r.id)} disabled={meetingBusy || infoLoading || outOfDate} aria-pressed={info?.my_response === r.id} aria-haspopup="dialog" aria-expanded={pendingResponse?.response === r.id} title={outOfDate ? "Приглашение устарело" : info?.my_response === r.id ? `Текущий ответ: ${r.label.toLowerCase()}` : r.question}>{r.label}</button>
+          {/each}
+          {#if meetingBusy}<span class="spinner" aria-hidden="true"></span>{/if}
+        </div>
+        {#if outOfDate}
+          <div class="meeting-facts caption">Приглашение устарело: организатор прислал обновление — ответьте из последнего приглашения или из календаря.</div>
+        {/if}
+      {:else if meetingKind === "cancellation"}
+        <div class="meeting-actions">
+          {#if removedFromCalendar}
+            <span class="caption">Удалено из календаря</span>
+          {:else if info?.calendar_pk != null}
+            <button class="mbtn" onclick={removeFromCalendar} disabled={meetingBusy}>Удалить из календаря</button>
+            {#if meetingBusy}<span class="spinner" aria-hidden="true"></span>{/if}
+          {/if}
+        </div>
+      {/if}
+      {#if meetingError}
+        <div class="meeting-msg failed" role="alert">
+          <span class="meeting-msg-text">{meetingError}</span>
+          <button class="btn" onclick={() => (meetingError = null)} aria-label="Скрыть сообщение об ошибке">Скрыть</button>
+        </div>
+      {/if}
+      {#if pendingResponse}
+        <ChoicePopover anchor={pendingResponse.anchor} align="start" title={RESPONSES.find((r) => r.id === pendingResponse?.response)?.question ?? ""} text="Организатор получит письмо с ответом, если его отправить." options={[{ id: "send", label: "Отправить ответ", primary: true }, { id: "nosend", label: "Не отправлять" }]} onpick={(id) => respondNow(id === "send")} oncancel={closeRespond} />
+      {/if}
+    </section>
   {/if}
 
   {#if expanded}
@@ -533,6 +726,130 @@
   }
   .action-error {
     border-top: 1px solid var(--stroke-1);
+  }
+
+  /* --- встреча: баннер приглашения, отмены, ответа --- */
+  .meeting {
+    margin: 0 var(--space-4) var(--space-3);
+    padding: var(--space-2) var(--space-3);
+    border: 1px solid var(--stroke-1);
+    border-left: 3px solid var(--accent);
+    border-radius: var(--radius-control);
+    background: var(--accent-soft);
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-1);
+  }
+  .meeting.kind-cancellation {
+    border-left-color: var(--danger);
+    background: var(--bg-layer);
+  }
+  .meeting.kind-response {
+    border-left-color: var(--fg-4);
+    background: var(--bg-layer);
+  }
+  .meeting-head {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    flex-wrap: wrap;
+    color: var(--fg-2);
+  }
+  .meeting-title {
+    font: var(--text-body-strong);
+    color: var(--fg-1);
+    user-select: text;
+  }
+  .meeting-status {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font: var(--text-caption);
+    color: var(--fg-2);
+  }
+  .meeting-status .dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--fg-4);
+  }
+  .meeting-status.ok .dot {
+    background: var(--success);
+  }
+  .meeting-status.maybe .dot {
+    background: var(--warning);
+  }
+  .meeting-status.no .dot {
+    background: var(--danger);
+  }
+  .meeting-status.none .dot {
+    background: transparent;
+    border: 1px solid var(--fg-4);
+  }
+  .meeting-facts {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    user-select: text;
+  }
+  .meeting-facts > div {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+  }
+  .meeting-actions {
+    display: flex;
+    align-items: center;
+    gap: var(--space-1);
+    margin-top: var(--space-1);
+  }
+  .mbtn {
+    height: 28px;
+    padding: 0 12px;
+    border: 1px solid var(--stroke-2);
+    border-radius: var(--radius-control);
+    background: var(--bg-layer-alt);
+    color: var(--fg-1);
+    white-space: nowrap;
+    transition: background var(--dur-fast) var(--ease-in);
+  }
+  .mbtn:hover:not(:disabled) {
+    background: var(--bg-hover);
+  }
+  .mbtn:active:not(:disabled) {
+    background: var(--bg-pressed);
+  }
+  .mbtn:disabled {
+    color: var(--fg-disabled);
+  }
+  .mbtn.on {
+    background: var(--accent-soft);
+    border-color: var(--accent);
+    color: var(--accent);
+  }
+  .mbtn.decline.on {
+    background: transparent;
+    border-color: var(--danger);
+    color: var(--danger);
+  }
+  .mbtn.tentative.on {
+    background: transparent;
+    border-color: var(--warning);
+    color: var(--warning);
+  }
+  .meeting-msg {
+    display: flex;
+    align-items: center;
+    gap: var(--space-3);
+    font: var(--text-caption);
+  }
+  .meeting-msg.failed {
+    color: var(--danger);
+  }
+  .meeting-msg-text {
+    flex: 1;
+    min-width: 0;
+    user-select: text;
   }
 
   /* --- вложения --- */

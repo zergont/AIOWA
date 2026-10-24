@@ -1,6 +1,6 @@
 <script lang="ts">
   import type { CalendarEvent } from "../api";
-  import { allDayBars, eventLabel, eventTone, eventWhen, hourLabel, isWeekend, nowPosition, sameDay, timedSegments, timeRange, weekdayShort } from "../calendar";
+  import { MINUTES_PER_DAY, allDayBars, eventLabel, eventTone, eventWhen, hourLabel, isWeekend, nowPosition, sameDay, timedSegments, timeRange, weekdayShort } from "../calendar";
 
   interface Props {
     /** Дни периода (местные полуночи), по колонке на день. */
@@ -10,8 +10,10 @@
     /** Текущее время: линия «сейчас» и подсветка сегодняшнего дня. */
     now: Date;
     onselect: (ev: CalendarEvent) => void;
+    /** Двойной клик по пустому месту: новое событие с этого момента (получас по клику) или на весь день. */
+    oncreate?: (startMs: number, allDay: boolean) => void;
   }
-  let { days, events, selectedPk, now, onselect }: Props = $props();
+  let { days, events, selectedPk, now, onselect, oncreate }: Props = $props();
 
   /** Высота часа в пикселях; та же величина уходит в стили как --hour (линии сетки). */
   const HOUR = 48;
@@ -45,6 +47,25 @@
   function tooltip(ev: CalendarEvent): string {
     return [ev.subject || "(без темы)", eventWhen(ev), ev.location, ev.is_cancelled ? "Отменена" : null].filter(Boolean).join("\n");
   }
+
+  /** Двойной клик по колонке дня мимо событий: начало — получас под курсором. */
+  function onColDblClick(e: MouseEvent, day: Date) {
+    if (!oncreate || (e.target instanceof Element && e.target.closest(".ev"))) return;
+    e.preventDefault();
+    const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+    const minutes = Math.floor(((e.clientY - rect.top) / HOUR) * 2) * 30;
+    const startMin = Math.max(0, Math.min(MINUTES_PER_DAY - 30, minutes));
+    oncreate(day.getTime() + startMin * 60_000, false);
+  }
+
+  /** Двойной клик по строке «весь день» мимо полос: событие на весь день под курсором. */
+  function onAllDayDblClick(e: MouseEvent) {
+    if (!oncreate || (e.target instanceof Element && e.target.closest(".ev"))) return;
+    e.preventDefault();
+    const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+    const i = Math.max(0, Math.min(days.length - 1, Math.floor(((e.clientX - rect.left) / rect.width) * days.length)));
+    oncreate(days[i].getTime(), true);
+  }
 </script>
 
 <div class="grid" style="--hour: {HOUR}px; --days: {days.length}">
@@ -60,7 +81,7 @@
 
   <div class="allday" style="--rows: {Math.max(1, allDay.rows)}">
     <div class="gutter caption">весь день</div>
-    <div class="allday-cells">
+    <div class="allday-cells" role="presentation" ondblclick={onAllDayDblClick}>
       {#each days as d, i (i)}
         <div class="allday-cell" class:today={sameDay(d, now)} class:weekend={isWeekend(d)} style="grid-column: {i + 1}"></div>
       {/each}
@@ -95,7 +116,7 @@
       </div>
       <div class="cols">
         {#each days as d, i (i)}
-          <div class="col" class:today={sameDay(d, now)} class:weekend={isWeekend(d)}>
+          <div class="col" class:today={sameDay(d, now)} class:weekend={isWeekend(d)} role="presentation" ondblclick={(e) => onColDblClick(e, d)}>
             {#each columns[i] as s (s.event.calendar_pk)}
               {@const h = height(s.startMin, s.endMin)}
               <button

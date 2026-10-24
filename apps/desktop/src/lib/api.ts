@@ -70,6 +70,11 @@ export interface Message {
   is_truncated: boolean;
   recipients: Recipient[];
   attachments: Attachment[];
+  /**
+   * Класс элемента Exchange (IPM.Note, IPM.Schedule.Meeting.Request, …Canceled, …Resp.Pos/Neg/Tent):
+   * по нему карточка узнаёт приглашение, отмену или ответ на встречу. Может отсутствовать в старом ответе.
+   */
+  item_class?: string | null;
 }
 
 /** Ключ состояния письма в беседе (без тел и картинок): для сравнения после синхронизации. */
@@ -241,6 +246,8 @@ export interface CalendarEvent {
   has_attachments: boolean;
   /** Подробности (тело, участники) уже в кэше. */
   has_details: boolean;
+  /** Напоминание за N минут до начала; null — без напоминания. Может отсутствовать в старом ответе. */
+  reminder_minutes?: number | null;
 }
 
 /** Ответ `calendar_events`: при ошибке сети — кэш (если есть) и текст ошибки по-русски. */
@@ -269,6 +276,85 @@ export interface CalendarEventDetails {
   from_cache: boolean;
   /** Обновить с сервера не удалось, показаны подробности из кэша. */
   error: string | null;
+}
+
+// --- календарь: запись, ответы на приглашения, напоминания ------------------------------------
+
+/** Занятость, которую можно задать событию (без `no_data`). */
+export type FreeBusyChoice = Exclude<FreeBusy, "no_data">;
+
+/** Участник в запросе на создание или правку события. */
+export interface EventParticipant {
+  name: string | null;
+  email: string;
+}
+
+/**
+ * Запрос `calendar_create` и `calendar_update`: для правки окно шлёт все поля, бэкенд сам
+ * сравнивает с кэшем и пишет на сервер только изменившиеся. Моменты — миллисекунды UTC;
+ * у «весь день» — местные полуночи первого дня и дня после последнего.
+ */
+export interface EventRequest {
+  /**
+   * Окно видело участников и описание (редактор открыт с подробностями): пустые `required`,
+   * `optional` и `body_html` значат «убрать». Без него бэкенд их не трогает.
+   */
+  details_known: boolean;
+  subject: string;
+  start_ms: number;
+  end_ms: number;
+  is_all_day: boolean;
+  location: string | null;
+  body_html: string | null;
+  required: EventParticipant[];
+  optional: EventParticipant[];
+  /** За сколько минут напоминать; null — без напоминания. */
+  reminder_minutes: number | null;
+  free_busy: FreeBusyChoice;
+  is_private: boolean;
+}
+
+export type MeetingResponse = "accept" | "tentative" | "decline";
+
+/** Вид письма о встрече: приглашение, отмена, ответ участника, прочее. */
+export type MeetingMessageKind = "request" | "cancellation" | "response" | "other";
+
+/** Ответ `meeting_info`: письмо-приглашение (отмена, ответ) с полями встречи, GetItem по письму. */
+export interface MeetingInfo {
+  kind: MeetingMessageKind;
+  start_ms: number | null;
+  end_ms: number | null;
+  is_all_day: boolean;
+  location: string | null;
+  organizer: CalendarPerson | null;
+  /** Мой ответ на приглашение (у письма с сервера). */
+  my_response: ResponseType;
+  /** Приглашение устарело: организатор прислал более новое. */
+  is_out_of_date: boolean;
+  /** Встреча уже есть в календаре. */
+  has_calendar_item: boolean;
+  recurrence_text: string | null;
+  /** Для ответа участника: что он ответил. */
+  sender_response: ResponseType | null;
+  /** Связанное событие в кэше календаря, если бэкенд его нашёл: для «Удалить из календаря». */
+  calendar_pk?: number | null;
+}
+
+/** Напоминание о событии: приходит событием `reminder` и ответом `reminders_pending`. */
+export interface ReminderDto {
+  calendar_pk: number;
+  subject: string | null;
+  start_ms: number;
+  end_ms: number;
+  is_all_day: boolean;
+  location: string | null;
+  /** Минут до начала на момент отправки; отрицательное — уже началось. */
+  minutes_left: number;
+}
+
+/** Событие `reminder`: напоминания, которые пора показать. */
+export interface ReminderEvent {
+  items: ReminderDto[];
 }
 
 // --- канал мгновенных уведомлений OWA ------------------------------------------------------
@@ -372,6 +458,26 @@ export const api = {
   /** Подробности события: тело, участники, напоминание, текст повторения; с `refresh` — перечитать с сервера. */
   calendarEventDetails: (calendarPk: number, refresh: boolean) => invoke<CalendarEventDetails>("calendar_event_details", { calendarPk, refresh }),
 
+  // --- календарь: запись -------------------------------------------------------------------
+  /** Создать событие; при участниках сервер сам рассылает приглашения. Возвращает событие из обновлённого кэша. */
+  calendarCreate: (req: EventRequest) => invoke<CalendarEvent>("calendar_create", { req }),
+  /** Изменить событие (у повторяющегося — именно этот экземпляр); `sendUpdates` — разослать обновление участникам. */
+  calendarUpdate: (calendarPk: number, req: EventRequest, sendUpdates: boolean) => invoke<CalendarEvent>("calendar_update", { calendarPk, req, sendUpdates }),
+  /** Удалить событие (в «Удалённые»); `sendCancellations` — разослать участникам отмену. */
+  calendarDelete: (calendarPk: number, sendCancellations: boolean) => invoke<void>("calendar_delete", { calendarPk, sendCancellations }),
+  /** Ответить на приглашение по событию календаря; `sendResponse` — отправить ответ организатору. */
+  calendarRespond: (calendarPk: number, response: MeetingResponse, sendResponse: boolean) => invoke<void>("calendar_respond", { calendarPk, response, sendResponse }),
+  /** Поля встречи из письма-приглашения (отмены, ответа): GetItem по письму, кэш в памяти бэкенда. */
+  meetingInfo: (itemPk: number) => invoke<MeetingInfo>("meeting_info", { itemPk }),
+  /** Ответить на приглашение по письму; после — события items-changed и calendar-changed. */
+  meetingRespond: (itemPk: number, response: MeetingResponse, sendResponse: boolean) => invoke<void>("meeting_respond", { itemPk, response, sendResponse }),
+
+  // --- напоминания -------------------------------------------------------------------------
+  /** Напоминания, которые пора показать (на старте окна). */
+  remindersPending: () => invoke<ReminderDto[]>("reminders_pending"),
+  reminderDismiss: (calendarPk: number) => invoke<void>("reminder_dismiss", { calendarPk }),
+  reminderSnooze: (calendarPk: number, minutes: number) => invoke<void>("reminder_snooze", { calendarPk, minutes }),
+
   // --- канал уведомлений -------------------------------------------------------------------
   notifyStatus: () => invoke<NotifyStatus>("notify_status"),
   /** Включить или выключить тосты Windows о новых письмах; новое состояние придёт событием `notify-status`. */
@@ -406,6 +512,33 @@ export function onNewMail(cb: (mail: NewMail) => void): Promise<UnlistenFn> {
 /** Подписка на изменения в календаре на сервере (без подробностей: окно перечитывает текущий период). */
 export function onCalendarChanged(cb: () => void): Promise<UnlistenFn> {
   return listen<void>("calendar-changed", () => cb());
+}
+
+/** Подписка на напоминания планировщика: пора показать события из списка. Возвращает функцию отписки. */
+export function onReminder(cb: (ev: ReminderEvent) => void): Promise<UnlistenFn> {
+  return listen<ReminderEvent>("reminder", (e) => cb(e.payload));
+}
+
+/**
+ * Вид письма о встрече по классу элемента: приглашение (IPM.Schedule.Meeting.Request), отмена
+ * (…Canceled), ответ участника (…Resp.Pos, …Resp.Neg, …Resp.Tent); null — обычное письмо.
+ */
+export function meetingKindOf(itemClass: string | null | undefined): MeetingMessageKind | null {
+  const c = (itemClass ?? "").toLowerCase();
+  if (!c.startsWith("ipm.schedule.meeting")) return null;
+  if (c.startsWith("ipm.schedule.meeting.request")) return "request";
+  if (c.startsWith("ipm.schedule.meeting.canceled") || c.startsWith("ipm.schedule.meeting.cancelled")) return "cancellation";
+  if (c.startsWith("ipm.schedule.meeting.resp")) return "response";
+  return "other";
+}
+
+/** Ответ участника по классу письма-ответа (…Resp.Pos/Neg/Tent); null — не ответ или класс незнаком. */
+export function senderResponseOf(itemClass: string | null | undefined): ResponseType | null {
+  const c = (itemClass ?? "").toLowerCase();
+  if (c.startsWith("ipm.schedule.meeting.resp.pos")) return "accept";
+  if (c.startsWith("ipm.schedule.meeting.resp.neg")) return "decline";
+  if (c.startsWith("ipm.schedule.meeting.resp.tent")) return "tentative";
+  return null;
 }
 
 /** Отправитель нового письма для строки состояния: имя, иначе адрес, иначе «(без отправителя)». */

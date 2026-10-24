@@ -23,8 +23,10 @@
     composerAlone?: boolean;
     /** Самое верхнее развёрнутое письмо (для клавиш ответа/пересылки); null, если беседа не показана. */
     topExpandedPk?: number | null;
+    /** С карточки дан ответ на приглашение (или отмена убрана из календаря): беседу стоит перечитать. */
+    onmeeting?: () => void;
   }
-  let { conversation, messages, loading, onfetch, folders, deletedFolderPk, onaction, oncompose, composer, composerAlone = false, topExpandedPk = $bindable(null) }: Props = $props();
+  let { conversation, messages, loading, onfetch, folders, deletedFolderPk, onaction, oncompose, composer, composerAlone = false, topExpandedPk = $bindable(null), onmeeting }: Props = $props();
 
   // Письма идут от новых к старым; самое свежее развёрнуто, остальные свёрнуты до заголовка.
   // Раскрытие пересчитывается только при смене беседы: точечная замена письма (догрузка тела)
@@ -108,7 +110,7 @@
           <div class="caption loading">Загрузка…</div>
         {/if}
         {#each messages as m (m.item_pk)}
-          <MessageCard message={m} expanded={expanded.has(m.item_pk)} ontoggle={() => toggle(m.item_pk)} {onfetch} {folders} {deletedFolderPk} onaction={(a) => onaction(m.item_pk, a)} oncompose={(kind) => oncompose(m.item_pk, kind)} />
+          <MessageCard message={m} expanded={expanded.has(m.item_pk)} ontoggle={() => toggle(m.item_pk)} {onfetch} {folders} {deletedFolderPk} onaction={(a) => onaction(m.item_pk, a)} oncompose={(kind) => oncompose(m.item_pk, kind)} {onmeeting} />
         {/each}
       {/if}
     </div>

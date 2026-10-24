@@ -5,7 +5,10 @@
 //! сессию, повторный вход и ограничение параллелизма.
 
 use aiowa_core::{FolderChanges, FolderId, FolderRef, ItemChanges, ItemId, MessageFull, Participant, SyncState};
-pub use aiowa_core::{Attendee, CalendarEvent, CalendarEventDetails, CalendarItemType, ComposeKind, FreeBusy, OutgoingAttachment, OutgoingMessage, ResponseType, Signature};
+pub use aiowa_core::{
+    Attendee, CalendarEvent, CalendarEventDetails, CalendarItemChanges, CalendarItemType, ComposeKind, FreeBusy, MeetingMessageKind, MeetingRequestInfo, MeetingResponse, NewCalendarItem, OutgoingAttachment,
+    OutgoingMessage, ResponseType, Signature,
+};
 use jiff::Timestamp;
 use secrecy::SecretString;
 use std::time::Duration;
@@ -341,6 +344,12 @@ pub trait MailTransport: Send + Sync {
     /// если подпись не задана.
     async fn user_signature(&self) -> Result<Option<Signature>>;
 
+    /// Часовой пояс пользователя из настроек OWA (ключ `timezone` словаря `OWA.UserOptions`):
+    /// идентификатор Windows, например `Russian Standard Time`; `None`, если не задан. Нужен
+    /// записи в календарь (`create_calendar_item`/`update_calendar_item`), чтобы событие легло в
+    /// пояс пользователя, как в браузерной OWA.
+    async fn user_time_zone(&self) -> Result<Option<String>>;
+
     /// События календаря в окне `[start, end)` (`FindItem` с `CalendarView` по папке `calendar`):
     /// повторяющиеся встречи приходят развёрнутыми в экземпляры. Моменты в UTC. Если сервер
     /// режет выдачу, реализация догружает остаток сама; порядок — по началу.
@@ -349,6 +358,36 @@ pub trait MailTransport: Send + Sync {
     /// Событие целиком (`GetItem`): тело HTML, участники с ответами, напоминание, повторение.
     /// Отказ сервера по элементу (например, `ErrorItemNotFound`) приходит как `Server`.
     async fn get_calendar_item(&self, id: &ItemId) -> Result<CalendarEventDetails>;
+
+    /// Создать событие в папке `calendar` (`CreateItem` с `CalendarItem`): при участниках сервер
+    /// рассылает приглашения (`SendMeetingInvitations: SendToAllAndSaveCopy`), без них —
+    /// `SendToNone`. `time_zone` — пояс пользователя (Windows-идентификатор из `user_time_zone`):
+    /// запрос уходит в контексте этого пояса, и границы «весь день» — местными полуночами дат;
+    /// без пояса контекст — UTC, и событие ляжет в пояс UTC. Возвращает идентификатор созданного
+    /// события (с `ChangeKey`).
+    async fn create_calendar_item(&self, item: &NewCalendarItem, time_zone: Option<&str>) -> Result<ItemId>;
+
+    /// Изменить только заполненные поля события (`UpdateItem` с `SetItemField`/`DeleteItemField`);
+    /// для экземпляра повторяющейся встречи правится именно экземпляр (его `ItemId`).
+    /// `send_updates` — разослать участникам обновление; `time_zone` — как у
+    /// `create_calendar_item` (границы «весь день» идут местными полуночами, когда в `changes`
+    /// `is_all_day: Some(true)`). Возвращает идентификатор с новым `ChangeKey`; пустые `changes` —
+    /// без запроса, прежний идентификатор.
+    async fn update_calendar_item(&self, id: &ItemId, changes: &CalendarItemChanges, send_updates: bool, time_zone: Option<&str>) -> Result<ItemId>;
+
+    /// Удалить событие в «Удалённые» (`DeleteItem` с `MoveToDeletedItems`); `send_cancellations` —
+    /// разослать участникам отмену (`SendMeetingCancellations`).
+    async fn delete_calendar_item(&self, id: &ItemId, send_cancellations: bool) -> Result<()>;
+
+    /// Ответить на приглашение (`CreateItem` с `AcceptItem`/`TentativelyAcceptItem`/`DeclineItem`
+    /// по `ReferenceItemId`): и для письма-приглашения, и для события календаря. `send_response`
+    /// — отправить ответ организатору (`SendAndSaveCopy`), иначе `SaveOnly`; `body_html` — текст
+    /// ответа.
+    async fn respond_to_meeting(&self, reference: &ItemId, response: MeetingResponse, send_response: bool, body_html: Option<&str>) -> Result<()>;
+
+    /// Письмо о встрече (`GetItem` по письму-приглашению, отмене или ответу) с полями встречи:
+    /// вид по `ItemClass`, время и место, организатор, свой ответ, устарело ли, связанное событие.
+    async fn get_meeting_request(&self, id: &ItemId) -> Result<MeetingRequestInfo>;
 
     /// Подписаться на уведомления (`SubscribeToNotification`). Результат той же длины и порядка,
     /// что `subs`; отказ по одной подписке — `created: false` с текстом, `Err` — отказ вызова.

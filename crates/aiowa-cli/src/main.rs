@@ -1,10 +1,11 @@
 //! `aiowa`: консольная утилита этапа 1. Вход, папки, синхронизация в локальную базу,
 //! список бесед, поиск с операторами, вложения, операции записи (прочитано, флаг, перенос, удаление),
-//! отправка письма, подпись из OWA, подсказки адресов, календарь (окно событий и одно событие).
+//! отправка письма, подпись из OWA, подсказки адресов, календарь (окно событий, одно событие,
+//! создание, изменение и удаление события, письмо о встрече).
 //! Пароль хранится в диспетчере учётных данных Windows и не передаётся аргументом.
 
-use aiowa_core::{CalendarItemType, ComposeKind, FolderChange, FolderId, FolderRef, Importance, ItemId, OutgoingAttachment, OutgoingMessage, Participant, SyncState};
-use aiowa_store::{AttachmentTodo, Store};
+use aiowa_core::{AccountId, CalendarItemChanges, CalendarItemType, ComposeKind, FolderChange, FolderId, FolderRef, FreeBusy, Importance, ItemId, NewCalendarItem, OutgoingAttachment, OutgoingMessage, Participant, SyncState};
+use aiowa_store::{AttachmentTodo, CalendarRow, Store};
 use aiowa_sync::{Engine, FolderSelection, SyncOptions};
 use aiowa_transport::{new_guid, Credentials, DeleteMode, MailTransport, NotificationEvent, NotificationKind, SubscriptionRequest, WriteResult};
 use aiowa_transport_owa::{OwaConfig, OwaTransport};
@@ -211,6 +212,123 @@ enum Cmd {
         #[arg(long)]
         probe: bool,
     },
+    /// Календарь: создать событие на сервере (CreateItem CalendarItem) и перечитать окно дня в кэш.
+    /// Без --yes-i-know только печатает план
+    CalendarCreate {
+        #[arg(long)]
+        subject: String,
+        /// Начало: YYYY-MM-DDTHH:MM местного времени (с --all-day — дата YYYY-MM-DD)
+        #[arg(long)]
+        start: String,
+        /// Конец (не включая): тот же формат; с --all-day — дата следующего дня
+        #[arg(long)]
+        end: String,
+        /// Событие на весь день: границы — местные полуночи
+        #[arg(long)]
+        all_day: bool,
+        #[arg(long)]
+        location: Option<String>,
+        /// Напоминание за N минут до начала; без флага — без напоминания
+        #[arg(long)]
+        reminder: Option<i64>,
+        /// Занятость: free, tentative, busy, oof, working_elsewhere
+        #[arg(long, default_value = "busy")]
+        free_busy: String,
+        /// Конфиденциальность Private
+        #[arg(long)]
+        private: bool,
+        /// Описание (обычный текст)
+        #[arg(long)]
+        body: Option<String>,
+        /// Обязательные участники: адреса через запятую, флаг можно повторять. Сервер разошлёт приглашения!
+        #[arg(long)]
+        required: Vec<String>,
+        /// Необязательные участники (так же)
+        #[arg(long)]
+        optional: Vec<String>,
+        /// Подтверждение: это запись в настоящий календарь
+        #[arg(long)]
+        yes_i_know: bool,
+    },
+    /// Календарь: изменить событие из кэша (UpdateItem по изменённым полям) и перечитать окна дней.
+    /// Без --yes-i-know только печатает план
+    CalendarUpdate {
+        /// calendar_pk события в кэше (см. `calendar --from --to`)
+        #[arg(long)]
+        calendar_pk: i64,
+        #[arg(long)]
+        subject: Option<String>,
+        /// Новое начало: YYYY-MM-DDTHH:MM местного времени (у события на весь день — дата)
+        #[arg(long)]
+        start: Option<String>,
+        #[arg(long)]
+        end: Option<String>,
+        #[arg(long)]
+        location: Option<String>,
+        /// Снять место
+        #[arg(long)]
+        clear_location: bool,
+        /// Напоминание за N минут
+        #[arg(long)]
+        reminder: Option<i64>,
+        /// Выключить напоминание
+        #[arg(long)]
+        no_reminder: bool,
+        /// Занятость: free, tentative, busy, oof, working_elsewhere
+        #[arg(long)]
+        free_busy: Option<String>,
+        /// Разослать участникам обновление (SendToAllAndSaveCopy); без флага — SendToNone
+        #[arg(long)]
+        send_updates: bool,
+        /// Подтверждение: это запись в настоящий календарь
+        #[arg(long)]
+        yes_i_know: bool,
+    },
+    /// Календарь: удалить событие из кэша на сервере (DeleteItem) и из кэша. Без --yes-i-know только печатает план
+    CalendarDelete {
+        #[arg(long)]
+        calendar_pk: i64,
+        /// Навсегда (HardDelete) вместо переноса в «Удалённые»
+        #[arg(long)]
+        permanent: bool,
+        /// Разослать участникам отмену (SendToAllAndSaveCopy); без флага — SendToNone. Только для своей встречи: у чужой сервер отправил бы организатору отказ
+        #[arg(long)]
+        send_cancellations: bool,
+        /// Подтверждение: это запись в настоящий календарь
+        #[arg(long)]
+        yes_i_know: bool,
+    },
+    /// Живая проверка записи в календарь одной сессией в поясе пользователя из OWA: создать
+    /// «[AIOWA] проверка календаря» без участников на 09:00–09:30 (или на весь день) с местом и
+    /// напоминанием 15 мин → FindItem дня → перенести на 10:00–10:45 (у всё-день — сменить тему) и
+    /// сменить место → FindItem → снять место → FindItem → удалить навсегда → FindItem. Без
+    /// --yes-i-know только печатает план
+    CalendarCheck {
+        /// Дата проверки YYYY-MM-DD; по умолчанию завтра
+        #[arg(long)]
+        date: Option<String>,
+        /// Событие на весь день указанной даты вместо 09:00–09:30
+        #[arg(long)]
+        all_day: bool,
+        /// После каждой записи — GetItem AllProperties с полями времени, поясов и места
+        /// (расширенное свойство PidLidLocation) тестового события
+        #[arg(long)]
+        probe: bool,
+        /// Подтверждение: это запись в настоящий календарь
+        #[arg(long)]
+        yes_i_know: bool,
+    },
+    /// Письмо о встрече (GetItem по письму-приглашению, отмене или ответу): вид, время, свой ответ,
+    /// связанное событие — только чтение, без тем и имён
+    MeetingInfo {
+        /// item_pk писем в локальной базе, через запятую
+        #[arg(long)]
+        item_pk: String,
+        /// Запросить то же письмо формой AllProperties и напечатать форму ответа без содержимого
+        /// (ключи и длины) — для документации протокола
+        #[arg(long)]
+        probe: bool,
+    },
     /// Канал уведомлений: подписаться (SubscribeToNotification), читать поток ev.owa2 заданное
     /// время и печатать типы событий и счётчики (без содержимого писем), затем завершить поток
     Notify {
@@ -283,21 +401,91 @@ async fn subscribe_and_report(t: &aiowa_transport_owa::OwaTransport, subs: &[Sub
     Ok(created)
 }
 
-/// Местная полночь даты `YYYY-MM-DD` как момент UTC.
+/// Местная полночь даты `YYYY-MM-DD` как момент UTC (границы окон календаря).
 fn local_midnight(date: &str) -> Result<jiff::Timestamp> {
     let d: jiff::civil::Date = date.trim().parse().with_context(|| format!("дата «{date}» не в формате YYYY-MM-DD"))?;
     Ok(d.to_zoned(jiff::tz::TimeZone::system()).map_err(|e| anyhow!("дата «{date}»: {e}"))?.timestamp())
+}
+
+/// Граница события «весь день» для транспорта: полночь UTC даты `YYYY-MM-DD` — так дата кодируется
+/// моментом, а транспорт шлёт её местной полуночью пояса пользователя (§ 5i документации протокола).
+fn all_day_bound(date: &str) -> Result<jiff::Timestamp> {
+    let d: jiff::civil::Date = date.trim().parse().with_context(|| format!("дата «{date}» не в формате YYYY-MM-DD"))?;
+    all_day_bound_date(d)
+}
+
+fn all_day_bound_date(d: jiff::civil::Date) -> Result<jiff::Timestamp> {
+    Ok(d.to_zoned(jiff::tz::TimeZone::UTC).map_err(|e| anyhow!("дата «{d}»: {e}"))?.timestamp())
+}
+
+/// Пояс пользователя для записи в календарь: из кэша базы (`Store::owa_time_zone`, ключ
+/// `OWA_TIME_ZONE_KEY` в `sync_state`); когда записи нет или она старше суток
+/// (`OWA_TIME_ZONE_TTL_MS`) — из настроек OWA (`GetUserConfiguration`) с записью в кэш («в OWA
+/// пояс не задан» тоже кэшируется). Если сервер не ответил, а устаревший пояс в кэше есть,
+/// остаётся он.
+async fn calendar_time_zone(t: &OwaTransport, store: &Store, account: AccountId) -> Result<Option<String>> {
+    let cached = store.owa_time_zone(account)?;
+    if let Some(c) = &cached
+        && !c.stale
+    {
+        match &c.zone {
+            Some(tz) => println!("Пояс пользователя (кэш базы): {tz}"),
+            None => println!("Пояс пользователя (кэш базы): в OWA не задан, запись в календарь пойдёт в контексте UTC"),
+        }
+        return Ok(c.zone.clone());
+    }
+    let refreshed = cached.is_some();
+    let started = std::time::Instant::now();
+    let tz = match t.user_time_zone().await {
+        Ok(tz) => tz,
+        Err(e) => {
+            if let Some(tz) = cached.and_then(|c| c.zone) {
+                println!("GetUserConfiguration OWA.UserOptions: {e}; остаётся пояс из кэша базы (старше суток): {tz}");
+                return Ok(Some(tz));
+            }
+            return Err(anyhow!("GetUserConfiguration OWA.UserOptions: {e}"));
+        }
+    };
+    store.set_owa_time_zone(account, tz.as_deref())?;
+    let saved = if refreshed { "кэш обновлён" } else { "записан в кэш" };
+    match &tz {
+        Some(z) => println!("Пояс пользователя (OWA.UserOptions за {} мс, {saved}): {z}", started.elapsed().as_millis()),
+        None => println!("Пояс пользователя в OWA.UserOptions не задан ({} мс, {saved}): запись в календарь пойдёт в контексте UTC", started.elapsed().as_millis()),
+    }
+    Ok(tz)
 }
 
 fn fmt_local(ms: i64) -> String {
     jiff::Timestamp::from_millisecond(ms).map(|t| t.to_zoned(jiff::tz::TimeZone::system()).strftime("%d.%m %a %H:%M").to_string()).unwrap_or_else(|_| ms.to_string())
 }
 
+/// Проверка «конец позже начала» после правки (`calendar-update`) и строка «начало – конец» для
+/// плана. У события на весь день границы сравниваются по календарным датам
+/// (`all_day_civil_date`, конец исключая), потому что они в разных кодировках: новые из
+/// `--start/--end` — полуночи UTC дат (`all_day_bound`), а недостающая берётся из кэша, где
+/// лежат местные полуночи пояса пользователя с сервера (`…T21:00:00Z`, § 5i); сравнение по
+/// миллисекундам пропустило бы `--end` той же даты. У обычного события — по моментам.
+fn updated_span(is_all_day: bool, start_ms: i64, end_ms: i64) -> Result<String> {
+    if is_all_day {
+        let day = |ms: i64| Ok::<_, anyhow::Error>(aiowa_core::all_day_civil_date(jiff::Timestamp::from_millisecond(ms)?));
+        let (start, end) = (day(start_ms)?, day(end_ms)?);
+        if end <= start {
+            bail!("последний день события должен быть позже первого ({start} – {end}, конец исключая)");
+        }
+        Ok(format!("{start} – {end} (весь день, конец исключая)"))
+    } else {
+        if end_ms <= start_ms {
+            bail!("конец должен быть позже начала ({} – {})", fmt_local(start_ms), fmt_local(end_ms));
+        }
+        Ok(format!("{} – {}", fmt_local(start_ms), fmt_local(end_ms)))
+    }
+}
+
 /// Сводка окна календаря из кэша: только счётчики и флаги, без тем, мест и имён.
 fn print_calendar_rows(rows: &[aiowa_store::CalendarRow]) {
     let count = |f: &dyn Fn(&aiowa_store::CalendarRow) -> bool| rows.iter().filter(|r| f(r)).count();
     println!(
-        "Событий {}: весь день {}, повторяющихся {} (экземпляров {}, исключений {}), встреч {}, отменённых {}, с вложениями {}, с подробностями {}",
+        "Событий {}: весь день {}, повторяющихся {} (экземпляров {}, исключений {}), встреч {}, отменённых {}, с вложениями {}, с местом {}, с подробностями {}",
         rows.len(),
         count(&|r| r.is_all_day),
         count(&|r| CalendarItemType::parse(&r.calendar_type).is_recurring()),
@@ -306,6 +494,7 @@ fn print_calendar_rows(rows: &[aiowa_store::CalendarRow]) {
         count(&|r| r.is_meeting),
         count(&|r| r.is_cancelled),
         count(&|r| r.has_attachments),
+        count(&|r| r.location.is_some()),
         count(&|r| r.has_details),
     );
     let mut by_busy: std::collections::BTreeMap<&str, usize> = Default::default();
@@ -336,6 +525,314 @@ fn print_calendar_rows(rows: &[aiowa_store::CalendarRow]) {
             r.subject.as_ref().map(|s| s.chars().count()).unwrap_or(0),
             if r.organizer_email.is_some() { "есть" } else { "" },
         );
+    }
+}
+
+/// Местное время `YYYY-MM-DDTHH:MM[:SS]` (или с пробелом вместо `T`) как момент UTC.
+fn local_datetime(s: &str) -> Result<jiff::Timestamp> {
+    let mut text = s.trim().replacen(' ', "T", 1);
+    if text.len() == "2026-10-25T09:00".len() {
+        text.push_str(":00");
+    }
+    let dt: jiff::civil::DateTime = text.parse().with_context(|| format!("время «{s}» не в формате YYYY-MM-DDTHH:MM"))?;
+    Ok(dt.to_zoned(jiff::tz::TimeZone::system()).map_err(|e| anyhow!("время «{s}»: {e}"))?.timestamp())
+}
+
+/// Местные сутки, содержащие момент: `[полночь, следующая полночь)` как моменты UTC.
+fn local_day_window(t: jiff::Timestamp) -> Result<(jiff::Timestamp, jiff::Timestamp)> {
+    let tz = jiff::tz::TimeZone::system();
+    let date = t.to_zoned(tz.clone()).date();
+    let start = date.to_zoned(tz.clone()).map_err(|e| anyhow!("{e}"))?.timestamp();
+    let end = date.tomorrow().map_err(|e| anyhow!("{e}"))?.to_zoned(tz).map_err(|e| anyhow!("{e}"))?.timestamp();
+    Ok((start, end))
+}
+
+/// Занятость из ключа интерфейса; неизвестный ключ — ошибка (а не `NoData`).
+fn parse_free_busy(s: &str) -> Result<FreeBusy> {
+    let fb = FreeBusy::parse(s);
+    if fb == FreeBusy::NoData && !s.eq_ignore_ascii_case("no_data") && !s.eq_ignore_ascii_case("nodata") {
+        bail!("занятость «{s}»: ожидается free, tentative, busy, oof или working_elsewhere");
+    }
+    Ok(fb)
+}
+
+/// Адреса участников из флагов с проверкой формы.
+fn attendee_participants(values: &[String], what: &str) -> Result<Vec<Participant>> {
+    let addresses = split_addresses(values);
+    if let Some(bad) = addresses.iter().find(|a| !looks_like_email(a)) {
+        bail!("{what}: адрес «{bad}» не похож на почтовый");
+    }
+    Ok(participants(&addresses))
+}
+
+/// Длительность события для печати: «день», «1ч», «45м».
+fn fmt_duration(r: &CalendarRow) -> String {
+    let minutes = (r.end_at - r.start_at) / 60_000;
+    if r.is_all_day {
+        "день".to_string()
+    } else if minutes % 60 == 0 {
+        format!("{}ч", minutes / 60)
+    } else {
+        format!("{minutes}м")
+    }
+}
+
+/// Строка кэша календаря одной строкой без темы, места и имён: времена, флаги, длины, напоминание.
+fn describe_calendar_row(store: &Store, r: &CalendarRow) -> Result<String> {
+    let reminder = store.calendar_reminder_minutes(r.calendar_pk)?;
+    Ok(format!(
+        "calendar_pk {}: {} – {} ({}), весь день {}, тип {}, занятость {}, мой ответ {}, встреча {}, отменено {}, конфиденциальность {}, тема {} символов, место {}, напоминание {}, ChangeKey {}",
+        r.calendar_pk,
+        fmt_local(r.start_at),
+        fmt_local(r.end_at),
+        fmt_duration(r),
+        if r.is_all_day { "да" } else { "нет" },
+        r.calendar_type,
+        r.free_busy,
+        r.my_response,
+        if r.is_meeting { "да" } else { "нет" },
+        if r.is_cancelled { "да" } else { "нет" },
+        r.sensitivity.as_deref().unwrap_or("(нет)"),
+        r.subject.as_ref().map(|s| s.chars().count()).unwrap_or(0),
+        r.location.as_ref().map(|l| format!("есть ({} символов)", l.chars().count())).unwrap_or_else(|| "нет".into()),
+        reminder.map(|m| format!("за {m} мин")).unwrap_or_else(|| "нет".into()),
+        r.id.change_key.as_ref().map(|c| format!("{} символов", c.len())).unwrap_or_else(|| "нет".into()),
+    ))
+}
+
+/// Перечитывает окно `[start, end)` с сервера в кэш и печатает счётчики; возвращает строки кэша окна.
+async fn refresh_calendar_window(t: &OwaTransport, store: &Store, account: AccountId, start: jiff::Timestamp, end: jiff::Timestamp) -> Result<Vec<CalendarRow>> {
+    let started = std::time::Instant::now();
+    let events = t.find_calendar_view(start, end).await.map_err(|e| anyhow!("FindItem CalendarView: {e}"))?;
+    let (start_ms, end_ms) = (start.as_millisecond(), end.as_millisecond());
+    store.replace_calendar_range(account, start_ms, end_ms, &events)?;
+    let rows = store.calendar_events(account, start_ms, end_ms)?;
+    println!("FindItem CalendarView {} – {}: {} событий за {} мс, в кэше окна {}", fmt_local(start_ms), fmt_local(end_ms), events.len(), started.elapsed().as_millis(), rows.len());
+    Ok(rows)
+}
+
+/// Перечитывает окно дня события и печатает его строку из кэша (или что её нет).
+async fn refresh_and_show(t: &OwaTransport, store: &Store, account: AccountId, at: jiff::Timestamp, id: &ItemId, expect_present: bool) -> Result<Option<CalendarRow>> {
+    let (ds, de) = local_day_window(at)?;
+    let rows = refresh_calendar_window(t, store, account, ds, de).await?;
+    let found = rows.into_iter().find(|r| r.id.id == id.id);
+    match (&found, expect_present) {
+        (Some(r), true) => println!("  в окне дня есть: {}", describe_calendar_row(store, r)?),
+        (Some(r), false) => println!("  ОШИБКА: событие всё ещё в окне дня: {}", describe_calendar_row(store, r)?),
+        (None, true) => println!("  ОШИБКА: событие в окне дня не найдено"),
+        (None, false) => println!("  в окне дня события нет (как и ожидалось)"),
+    }
+    Ok(found)
+}
+
+/// Тема события живой проверки записи в календарь.
+const CALENDAR_CHECK_SUBJECT: &str = "[AIOWA] проверка календаря";
+/// Места тестового события: при создании и после изменения.
+const CALENDAR_CHECK_LOCATION: &str = "Кабинет AIOWA";
+const CALENDAR_CHECK_LOCATION_2: &str = "Переговорная AIOWA 2";
+
+/// Что проверяется у тестового события по `GetItem AllProperties` (`--probe`).
+struct ProbeExpect<'a> {
+    /// Ожидаемое место (`None` — места быть не должно).
+    location: Option<&'a str>,
+    /// Дата события на весь день: `StartWallClock` должен начинаться с её полуночи.
+    all_day: Option<jiff::civil::Date>,
+    /// Запись шла в контексте пояса пользователя: `StartTimeZoneId` не должен быть `UTC`.
+    user_zone: bool,
+}
+
+/// Место из ответа: строка `Location` или `DisplayName` объекта, иначе значение расширенного
+/// свойства `PidLidLocation` (`ExtendedProperty[].Value`).
+fn probe_location(fields: &serde_json::Value) -> Option<String> {
+    let clean = |s: &str| Some(s.trim().to_string()).filter(|s| !s.is_empty());
+    if let Some(loc) = fields.get("Location") {
+        let direct = loc.as_str().map(String::from).or_else(|| loc.get("DisplayName").and_then(|d| d.as_str()).map(String::from)).and_then(|s| clean(&s));
+        if direct.is_some() {
+            return direct;
+        }
+    }
+    fields.get("ExtendedProperty").and_then(|e| e.as_array()).into_iter().flatten().find_map(|p| p.get("Value").and_then(|v| v.as_str()).and_then(clean))
+}
+
+/// `GetItem AllProperties` тестового события: печатает поля времени, поясов и места (это своё
+/// событие с известным содержимым) и сверяет их с ожиданием. Возвращает, всё ли совпало.
+async fn probe_fields(t: &OwaTransport, id: &ItemId, label: &str, expect: &ProbeExpect<'_>) -> Result<bool> {
+    let started = std::time::Instant::now();
+    let fields = t.probe_calendar_item_fields(id).await.map_err(|e| anyhow!("GetItem AllProperties ({label}): {e}"))?;
+    println!("  GetItem AllProperties {label} за {} мс: {fields}", started.elapsed().as_millis());
+    let zone_id = fields.get("StartTimeZoneId").and_then(|v| v.as_str()).unwrap_or("");
+    let zone_ok = if expect.user_zone { zone_id.len() > 3 && fields.get("EndTimeZoneId").and_then(|v| v.as_str()).is_some_and(|z| z.len() > 3) } else { true };
+    let all_day_ok = match expect.all_day {
+        Some(d) => {
+            let wall = fields.get("StartWallClock").and_then(|v| v.as_str()).unwrap_or("");
+            fields.get("IsAllDayEvent").and_then(|v| v.as_bool()) == Some(true) && wall.starts_with(&format!("{d}T00:00:00"))
+        }
+        None => true,
+    };
+    let location = probe_location(&fields);
+    let location_ok = location.as_deref() == expect.location;
+    println!(
+        "    пояс {} ({}), весь день {}, место {}",
+        if zone_ok { "ок" } else { "НЕ ок" },
+        if zone_id.is_empty() { "StartTimeZoneId нет" } else { zone_id },
+        match expect.all_day {
+            Some(_) if all_day_ok => "ок (StartWallClock — местная полночь даты)",
+            Some(_) => "НЕ ок",
+            None => "не проверяется",
+        },
+        match (expect.location, &location) {
+            (Some(_), Some(_)) if location_ok => "совпадает",
+            (Some(_), Some(_)) => "ДРУГОЕ",
+            (Some(_), None) => "НЕТ",
+            (None, None) => "снято",
+            (None, Some(_)) => "НЕ снято",
+        }
+    );
+    Ok(zone_ok && all_day_ok && location_ok)
+}
+
+/// `UpdateItem` тестового события без прерывания проверки: при отказе печатает ошибку и
+/// возвращает `None`.
+async fn try_update(t: &OwaTransport, id: &ItemId, label: &str, changes: &CalendarItemChanges, zone: Option<&str>) -> Option<ItemId> {
+    let started = std::time::Instant::now();
+    match t.update_calendar_item(id, changes, false, zone).await {
+        Ok(updated) => {
+            println!("UpdateItem ({label}): Ok за {} мс; ItemId {}, ChangeKey {}", started.elapsed().as_millis(), if updated.id == id.id { "тот же" } else { "другой" }, describe_change_key(id, &updated));
+            Some(updated)
+        }
+        Err(e) => {
+            println!("UpdateItem ({label}): ОТКАЗ за {} мс: {e}", started.elapsed().as_millis());
+            None
+        }
+    }
+}
+
+/// Живая проверка одной сессией: пояс пользователя → создать (с местом) → FindItem → сменить
+/// место и время (у всё-день — тему) → FindItem → снять место → FindItem → удалить навсегда →
+/// FindItem. С `--probe` после каждой записи — `GetItem AllProperties` с `PidLidLocation`. При
+/// сбое после создания событие всё равно удаляется. Четыре записи на сервер.
+async fn calendar_check_flow(t: &OwaTransport, store: &Store, account: AccountId, date: jiff::civil::Date, all_day: bool, probe: bool) -> Result<()> {
+    let tz = jiff::tz::TimeZone::system();
+    let at = |h: i8, m: i8| -> Result<jiff::Timestamp> { Ok(date.at(h, m, 0, 0).to_zoned(tz.clone()).map_err(|e| anyhow!("{e}"))?.timestamp()) };
+    let zone = calendar_time_zone(t, store, account).await?;
+    let (start, end) = if all_day { (all_day_bound_date(date)?, all_day_bound_date(date.tomorrow().map_err(|e| anyhow!("{e}"))?)?) } else { (at(9, 0)?, at(9, 30)?) };
+    let location = Some(CALENDAR_CHECK_LOCATION);
+    let item = NewCalendarItem {
+        subject: CALENDAR_CHECK_SUBJECT.into(),
+        start,
+        end,
+        is_all_day: all_day,
+        location: location.map(String::from),
+        body_html: Some("<div>Проверка записи в календарь клиентом AIOWA. Событие будет удалено автоматически.</div>".into()),
+        required: vec![],
+        optional: vec![],
+        reminder_minutes: Some(15),
+        free_busy: FreeBusy::Tentative,
+        sensitivity_private: false,
+    };
+    let started = std::time::Instant::now();
+    let id = t.create_calendar_item(&item, zone.as_deref()).await.map_err(|e| anyhow!("CreateItem CalendarItem: {e}"))?;
+    println!(
+        "CreateItem CalendarItem: Ok за {} мс; ItemId {} символов, ChangeKey {}",
+        started.elapsed().as_millis(),
+        id.id.len(),
+        id.change_key.as_ref().map(|c| format!("{} символов", c.len())).unwrap_or_else(|| "нет".into())
+    );
+    let all_day_date_of = |ms: i64| jiff::Timestamp::from_millisecond(ms).ok().map(aiowa_core::all_day_civil_date);
+    // Время строки кэша совпало с запросом: у всё-день — по датам ближайших полуночей, иначе по моментам.
+    let time_matches = |row: &CalendarRow, s: jiff::Timestamp, e: jiff::Timestamp| if all_day { (all_day_date_of(row.start_at), all_day_date_of(row.end_at)) == (Some(aiowa_core::all_day_civil_date(s)), Some(aiowa_core::all_day_civil_date(e))) } else { row.start_at == s.as_millisecond() && row.end_at == e.as_millisecond() };
+    let user_zone = zone.is_some();
+    let outcome = async {
+        let mut all_ok = true;
+        if probe {
+            all_ok &= probe_fields(t, &id, "после CreateItem", &ProbeExpect { location, all_day: all_day.then_some(date), user_zone }).await?;
+        }
+        let row = refresh_and_show(t, store, account, start, &id, true).await?.ok_or_else(|| anyhow!("созданное событие не пришло в FindItem окна дня"))?;
+        let reminder_ok = store.calendar_reminder_minutes(row.calendar_pk)? == Some(15);
+        let location_ok = row.location.as_deref() == location;
+        println!(
+            "  проверка создания: время {}, весь день {}, занятость Tentative {}, напоминание 15 {}, место {}",
+            if time_matches(&row, start, end) { "совпало" } else { "НЕ совпало" },
+            if row.is_all_day == all_day { "как задано" } else { "НЕ как задано" },
+            if row.free_busy == "Tentative" { "принята" } else { "НЕ принята" },
+            if reminder_ok { "есть" } else { "НЕТ" },
+            match (location, &row.location) {
+                (Some(_), Some(_)) if location_ok => "совпадает",
+                (Some(_), Some(_)) => "ДРУГОЕ",
+                (Some(_), None) => "НЕТ",
+                (None, None) => "не задавалось",
+                (None, Some(_)) => "ЕСТЬ, хотя не задавалось",
+            }
+        );
+        all_ok &= time_matches(&row, start, end) && row.is_all_day == all_day && row.free_busy == "Tentative" && reminder_ok && location_ok;
+        let mut current = row.id.clone();
+        let mut calendar_pk = row.calendar_pk;
+        // Изменение 1: место и время (у всё-день — тема, время не трогается).
+        let (new_start, new_end) = if all_day { (start, end) } else { (at(10, 0)?, at(10, 45)?) };
+        let changes = if all_day {
+            CalendarItemChanges { subject: Some(format!("{CALENDAR_CHECK_SUBJECT} (изменено)")), location: Some(Some(CALENDAR_CHECK_LOCATION_2.into())), ..Default::default() }
+        } else {
+            CalendarItemChanges { start: Some(new_start), end: Some(new_end), location: Some(Some(CALENDAR_CHECK_LOCATION_2.into())), ..Default::default() }
+        };
+        match try_update(t, &current, "место и время", &changes, zone.as_deref()).await {
+            Some(updated) => {
+                current = updated;
+                if probe {
+                    all_ok &= probe_fields(t, &current, "после UpdateItem (место и время)", &ProbeExpect { location: Some(CALENDAR_CHECK_LOCATION_2), all_day: all_day.then_some(date), user_zone }).await?;
+                }
+                let row = refresh_and_show(t, store, account, new_start, &current, true).await?.ok_or_else(|| anyhow!("изменённое событие не пришло в FindItem окна дня"))?;
+                let reminder_ok = store.calendar_reminder_minutes(row.calendar_pk)? == Some(15);
+                let location_ok = row.location.as_deref() == Some(CALENDAR_CHECK_LOCATION_2);
+                println!(
+                    "  проверка изменения: время {}, место {}, напоминание {}",
+                    if time_matches(&row, new_start, new_end) { "совпало" } else { "НЕ совпало" },
+                    if location_ok { "совпадает" } else if row.location.is_some() { "ДРУГОЕ" } else { "НЕТ" },
+                    if reminder_ok { "сохранилось" } else { "ПРОПАЛО" }
+                );
+                all_ok &= time_matches(&row, new_start, new_end) && location_ok && reminder_ok;
+                current = row.id.clone();
+                calendar_pk = row.calendar_pk;
+            }
+            None => all_ok = false,
+        }
+        // Изменение 2: снять место.
+        match try_update(t, &current, "снятие места", &CalendarItemChanges { location: Some(None), ..Default::default() }, zone.as_deref()).await {
+            Some(updated) => {
+                current = updated;
+                if probe {
+                    all_ok &= probe_fields(t, &current, "после UpdateItem (место снято)", &ProbeExpect { location: None, all_day: all_day.then_some(date), user_zone }).await?;
+                }
+                let row = refresh_and_show(t, store, account, new_start, &current, true).await?.ok_or_else(|| anyhow!("событие без места не пришло в FindItem окна дня"))?;
+                println!("  проверка снятия места: место {}", if row.location.is_none() { "снято" } else { "НЕ снято" });
+                all_ok &= row.location.is_none();
+                current = row.id.clone();
+                calendar_pk = row.calendar_pk;
+            }
+            None => all_ok = false,
+        }
+        Ok::<(bool, ItemId, i64), anyhow::Error>((all_ok, current, calendar_pk))
+    }
+    .await;
+    // Удаление навсегда — всегда, даже после сбоя проверок.
+    let (checks_ok, current, calendar_pk) = match outcome {
+        Ok(v) => v,
+        Err(e) => {
+            println!("Сбой после создания: {e}. Удаляю событие навсегда.");
+            (false, ItemId { id: id.id.clone(), change_key: None }, 0)
+        }
+    };
+    let started = std::time::Instant::now();
+    t.delete_calendar_item_with(&current, DeleteMode::Hard, false).await.map_err(|e| anyhow!("DeleteItem HardDelete события: {e} (событие могло остаться в календаре!)"))?;
+    println!("DeleteItem HardDelete: Ok за {} мс", started.elapsed().as_millis());
+    if calendar_pk != 0 {
+        store.remove_calendar_event(calendar_pk)?;
+    }
+    let gone = refresh_and_show(t, store, account, start, &current, false).await?.is_none();
+    if checks_ok && gone {
+        println!("Живая проверка календаря пройдена: создание, изменение, снятие места и удаление подтверждены.");
+        Ok(())
+    } else {
+        bail!("живая проверка календаря не пройдена (см. строки с ОШИБКА/НЕ выше)")
     }
 }
 
@@ -504,8 +1001,13 @@ fn fmt_date(t: Option<jiff::Timestamp>) -> String {
     t.map(|t| t.to_zoned(jiff::tz::TimeZone::system()).strftime("%Y-%m-%d %H:%M").to_string()).unwrap_or_default()
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    // Будущее `real_main` в отладочной сборке огромно (все команды — одна функция): на куче,
+    // иначе переполняется стек главного потока ещё до разбора аргументов.
+    tokio::runtime::Builder::new_multi_thread().enable_all().build()?.block_on(Box::pin(real_main()))
+}
+
+async fn real_main() -> Result<()> {
     init_tracing();
     let cli = Cli::parse();
 
@@ -601,7 +1103,7 @@ async fn main() -> Result<()> {
             let started = std::time::Instant::now();
             let rows = store.list_conversations(account, f.folder_pk, *limit)?;
             println!("{}: {} бесед за {} мс\n", f.name, rows.len(), started.elapsed().as_millis());
-            println!("{}  {}  {:>5} {:>6}  {}", pad("Дата", 16), pad("Участники", 36), "Писем", "Непроч", "Тема");
+            println!("{}  {}  {:>5} {:>6}  Тема", pad("Дата", 16), pad("Участники", 36), "Писем", "Непроч");
             for c in rows {
                 let who = c.participants.iter().take(4).cloned().collect::<Vec<_>>().join(", ");
                 let marker = if c.unread_count > 0 { "●" } else { " " };
@@ -675,7 +1177,7 @@ async fn main() -> Result<()> {
                 s.attachments_with_text,
                 s.attachment_cache_bytes as f64 / 1e6
             );
-            println!("{} {:>8} {:>8} {:>8}  {:<10} {:<10} {}", pad("Папка", 34), "Сервер", "Локально", "Тел", "Старейшее", "Новейшее", "Синхр.");
+            println!("{} {:>8} {:>8} {:>8}  {:<10} {:<10} Синхр.", pad("Папка", 34), "Сервер", "Локально", "Тел", "Старейшее", "Новейшее");
             for f in s.folders {
                 let fmt = |t: Option<jiff::Timestamp>| t.map(|t| t.strftime("%Y-%m-%d").to_string()).unwrap_or_default();
                 println!(
@@ -869,7 +1371,7 @@ async fn main() -> Result<()> {
             let t = connect(&cli).await?;
             let started = std::time::Instant::now();
             let fetched = t.find_calendar_view(start, end).await;
-            let outcome = async {
+            let outcome = Box::pin(async {
                 let events = fetched.map_err(|e| anyhow!("FindItem CalendarView: {e}"))?;
                 println!("FindItem CalendarView: {} событий за {} мс", events.len(), started.elapsed().as_millis());
                 let stored = store.replace_calendar_range(account, start_ms, end_ms, &events)?;
@@ -902,7 +1404,7 @@ async fn main() -> Result<()> {
                         *by_response.entry(a.response.as_str()).or_default() += 1;
                     }
                     println!(
-                        "GetItem №{n}: Ok за {} мс; тело {} символов{}, тип {:?}, участников {} (обязательных {}, по ответам {:?}), напоминание {}, повторение: {}, ChangeKey {}",
+                        "GetItem №{n}: Ok за {} мс; тело {} символов{}, тип {:?}, участников {} (обязательных {}, по ответам {:?}), напоминание {}, повторение: {}, место {}, ChangeKey {}",
                         started.elapsed().as_millis(),
                         body_len,
                         d.body.as_ref().map(|b| if b.is_truncated { " (усечено)" } else { "" }).unwrap_or(" (нет)"),
@@ -912,6 +1414,7 @@ async fn main() -> Result<()> {
                         by_response,
                         d.reminder_minutes.map(|m| format!("за {m} мин")).unwrap_or_else(|| "нет".into()),
                         d.recurrence_text.as_deref().unwrap_or("нет"),
+                        d.event.location.as_ref().map(|l| format!("есть ({} символов)", l.chars().count())).unwrap_or_else(|| "нет".into()),
                         describe_change_key(&row.id, &d.event.id)
                     );
                     store.store_calendar_details(row.calendar_pk, &d)?;
@@ -921,6 +1424,267 @@ async fn main() -> Result<()> {
                         let started = std::time::Instant::now();
                         let shape = t.probe_calendar_item_shape(&row.id).await.map_err(|e| anyhow!("GetItem AllProperties: {e}"))?;
                         println!("GetItem AllProperties за {} мс, форма элемента (без содержимого):\n{shape}", started.elapsed().as_millis());
+                    }
+                }
+                Ok::<(), anyhow::Error>(())
+            })
+            .await;
+            t.logoff().await.ok();
+            outcome?;
+        }
+        Cmd::CalendarCreate { subject, start, end, all_day, location, reminder, free_busy, private, body, required, optional, yes_i_know } => {
+            let (start_ts, end_ts) = if *all_day { (all_day_bound(start)?, all_day_bound(end)?) } else { (local_datetime(start)?, local_datetime(end)?) };
+            if end_ts <= start_ts {
+                bail!("конец должен быть позже начала");
+            }
+            if subject.trim().is_empty() {
+                bail!("тема пуста");
+            }
+            if reminder.is_some_and(|m| m < 0) {
+                bail!("напоминание не может быть отрицательным");
+            }
+            let item = NewCalendarItem {
+                subject: subject.clone(),
+                start: start_ts,
+                end: end_ts,
+                is_all_day: *all_day,
+                location: location.clone(),
+                body_html: body.as_deref().map(text_to_html),
+                required: attendee_participants(required, "обязательные участники")?,
+                optional: attendee_participants(optional, "необязательные участники")?,
+                reminder_minutes: *reminder,
+                free_busy: parse_free_busy(free_busy)?,
+                sensitivity_private: *private,
+            };
+            let attendees = item.required.len() + item.optional.len();
+            println!(
+                "План: событие {} – {} (UTC {} – {}), весь день {}, тема {} символов, место {}, напоминание {}, занятость {}, частное {}, описание {} символов, участников {}",
+                fmt_local(start_ts.as_millisecond()),
+                fmt_local(end_ts.as_millisecond()),
+                start_ts,
+                end_ts,
+                if *all_day { "да" } else { "нет" },
+                subject.chars().count(),
+                if location.as_deref().map(str::trim).is_some_and(|l| !l.is_empty()) { "есть" } else { "нет" },
+                reminder.map(|m| format!("за {m} мин")).unwrap_or_else(|| "нет".into()),
+                item.free_busy.as_str(),
+                if *private { "да" } else { "нет" },
+                body.as_ref().map(|b| b.chars().count()).unwrap_or(0),
+                attendees
+            );
+            if attendees > 0 {
+                println!("ВНИМАНИЕ: с участниками это встреча, сервер разошлёт им приглашения (SendToAllAndSaveCopy).");
+            }
+            if !yes_i_know {
+                println!("Это запись в настоящий календарь. Повторите с --yes-i-know, чтобы выполнить.");
+                return Ok(());
+            }
+            let store = Store::open(&db_path)?;
+            let account = store.account(&cli.host, &cli.user)?;
+            let t = connect(&cli).await?;
+            let outcome = async {
+                let zone = calendar_time_zone(&t, &store, account).await?;
+                let started = std::time::Instant::now();
+                let id = t.create_calendar_item(&item, zone.as_deref()).await.map_err(|e| anyhow!("CreateItem CalendarItem: {e}"))?;
+                println!("CreateItem CalendarItem: Ok за {} мс; ItemId {} символов, ChangeKey {}", started.elapsed().as_millis(), id.id.len(), id.change_key.as_ref().map(|c| format!("{} символов", c.len())).unwrap_or_else(|| "нет".into()));
+                refresh_and_show(&t, &store, account, start_ts, &id, true).await?;
+                Ok::<(), anyhow::Error>(())
+            }
+            .await;
+            t.logoff().await.ok();
+            outcome?;
+        }
+        Cmd::CalendarUpdate { calendar_pk, subject, start, end, location, clear_location, reminder, no_reminder, free_busy, send_updates, yes_i_know } => {
+            let store = Store::open(&db_path)?;
+            let account = store.account(&cli.host, &cli.user)?;
+            let row = store.calendar_event(*calendar_pk)?.ok_or_else(|| anyhow!("события #{calendar_pk} нет в кэше календаря (сначала `calendar --from --to`)"))?;
+            if location.is_some() && *clear_location {
+                bail!("--location и --clear-location вместе не имеют смысла");
+            }
+            if reminder.is_some() && *no_reminder {
+                bail!("--reminder и --no-reminder вместе не имеют смысла");
+            }
+            let parse_at = |s: &str| if row.is_all_day { all_day_bound(s) } else { local_datetime(s) };
+            let mut changes = CalendarItemChanges::default();
+            let mut fields: Vec<&str> = Vec::new();
+            if let Some(s) = subject {
+                if s.trim().is_empty() {
+                    bail!("тема пуста");
+                }
+                changes.subject = Some(s.clone());
+                fields.push("тема");
+            }
+            if let Some(s) = start {
+                changes.start = Some(parse_at(s)?);
+                fields.push("начало");
+            }
+            if let Some(s) = end {
+                changes.end = Some(parse_at(s)?);
+                fields.push("конец");
+            }
+            if row.is_all_day && (changes.start.is_some() || changes.end.is_some()) {
+                // Признак рядом с границами: по нему транспорт шлёт местные полуночи дат.
+                changes.is_all_day = Some(true);
+            }
+            if let Some(l) = location {
+                changes.location = Some(Some(l.clone()));
+                fields.push("место");
+            } else if *clear_location {
+                changes.location = Some(None);
+                fields.push("место (снять)");
+            }
+            if let Some(m) = reminder {
+                if *m < 0 {
+                    bail!("напоминание не может быть отрицательным");
+                }
+                changes.reminder_minutes = Some(Some(*m));
+                fields.push("напоминание");
+            } else if *no_reminder {
+                changes.reminder_minutes = Some(None);
+                fields.push("напоминание (выключить)");
+            }
+            if let Some(fb) = free_busy {
+                changes.free_busy = Some(parse_free_busy(fb)?);
+                fields.push("занятость");
+            }
+            if changes.is_empty() {
+                bail!("нечего менять: укажите хотя бы одно поле");
+            }
+            let new_start = changes.start.map(|t| t.as_millisecond()).unwrap_or(row.start_at);
+            let new_end = changes.end.map(|t| t.as_millisecond()).unwrap_or(row.end_at);
+            // У всё-день границы в разных кодировках (новые — полуночи UTC дат, из кэша — местные
+            // полуночи пояса пользователя): `updated_span` сравнивает их по датам.
+            let span = updated_span(row.is_all_day, new_start, new_end)?;
+            println!("Сейчас: {}", describe_calendar_row(&store, &row)?);
+            println!("План: UpdateItem полей [{}], станет {span}, рассылка участникам: {}", fields.join(", "), if *send_updates { "да (SendToAllAndSaveCopy)" } else { "нет (SendToNone)" });
+            if row.is_meeting && !send_updates {
+                println!("Это встреча с участниками: без --send-updates они не узнают об изменении.");
+            }
+            if !yes_i_know {
+                println!("Это запись в настоящий календарь. Повторите с --yes-i-know, чтобы выполнить.");
+                return Ok(());
+            }
+            let t = connect(&cli).await?;
+            let outcome = async {
+                let zone = calendar_time_zone(&t, &store, account).await?;
+                let started = std::time::Instant::now();
+                let updated = t.update_calendar_item(&row.id, &changes, *send_updates, zone.as_deref()).await.map_err(|e| anyhow!("UpdateItem CalendarItem: {e}"))?;
+                println!("UpdateItem CalendarItem: Ok за {} мс; ItemId {}, ChangeKey {}", started.elapsed().as_millis(), if updated.id == row.id.id { "тот же" } else { "другой" }, describe_change_key(&row.id, &updated));
+                let old_day = local_day_window(jiff::Timestamp::from_millisecond(row.start_at)?)?;
+                let new_at = jiff::Timestamp::from_millisecond(new_start)?;
+                if local_day_window(new_at)? != old_day {
+                    // День сменился: старое окно перечитывается, чтобы событие ушло из него.
+                    refresh_calendar_window(&t, &store, account, old_day.0, old_day.1).await?;
+                }
+                refresh_and_show(&t, &store, account, new_at, &updated, true).await?;
+                Ok::<(), anyhow::Error>(())
+            }
+            .await;
+            t.logoff().await.ok();
+            outcome?;
+        }
+        Cmd::CalendarDelete { calendar_pk, permanent, send_cancellations, yes_i_know } => {
+            let store = Store::open(&db_path)?;
+            let account = store.account(&cli.host, &cli.user)?;
+            let row = store.calendar_event(*calendar_pk)?.ok_or_else(|| anyhow!("события #{calendar_pk} нет в кэше календаря (сначала `calendar --from --to`)"))?;
+            let mode = if *permanent { DeleteMode::Hard } else { DeleteMode::ToDeletedItems };
+            println!("Сейчас: {}", describe_calendar_row(&store, &row)?);
+            println!("План: DeleteItem {}, рассылка отмены участникам: {}", if *permanent { "HardDelete (навсегда)" } else { "MoveToDeletedItems (в «Удалённые»)" }, if *send_cancellations { "да (SendToAllAndSaveCopy)" } else { "нет (SendToNone)" });
+            if row.is_meeting && row.my_response != "Organizer" {
+                if *send_cancellations {
+                    bail!("--send-cancellations у чужой встречи: сервер отправил бы организатору отказ (Decline), а не отмену. Удалите без флага или ответьте «Отклонить» из окна.");
+                }
+                println!("ВНИМАНИЕ: это чужая встреча (вы не организатор): удаление уберёт её только из вашего календаря, организатор не узнает (SendToNone).");
+            }
+            if !yes_i_know {
+                println!("Это запись в настоящий календарь. Повторите с --yes-i-know, чтобы выполнить.");
+                return Ok(());
+            }
+            let t = connect(&cli).await?;
+            let outcome = async {
+                let started = std::time::Instant::now();
+                t.delete_calendar_item_with(&row.id, mode, *send_cancellations).await.map_err(|e| anyhow!("DeleteItem события: {e}"))?;
+                println!("DeleteItem: Ok за {} мс", started.elapsed().as_millis());
+                store.remove_calendar_event(*calendar_pk)?;
+                refresh_and_show(&t, &store, account, jiff::Timestamp::from_millisecond(row.start_at)?, &row.id, false).await?;
+                Ok::<(), anyhow::Error>(())
+            }
+            .await;
+            t.logoff().await.ok();
+            outcome?;
+        }
+        Cmd::CalendarCheck { date, all_day, probe, yes_i_know } => {
+            let date: jiff::civil::Date = match date {
+                Some(d) => d.trim().parse().with_context(|| format!("дата «{d}» не в формате YYYY-MM-DD"))?,
+                None => jiff::Zoned::now().date().tomorrow().map_err(|e| anyhow!("{e}"))?,
+            };
+            println!(
+                "План: пояс пользователя из OWA → {date} {} «{CALENDAR_CHECK_SUBJECT}» без участников, место, напоминание 15 мин, занятость Tentative → FindItem дня → {} и смена места → FindItem → снятие места → FindItem → HardDelete → FindItem. Записей на сервер: 4. Одна сессия, приглашения никому не уходят.",
+                if *all_day { "весь день" } else { "09:00–09:30" },
+                if *all_day { "смена темы" } else { "перенос на 10:00–10:45" }
+            );
+            if !yes_i_know {
+                println!("Это запись в настоящий календарь. Повторите с --yes-i-know, чтобы выполнить.");
+                return Ok(());
+            }
+            let store = Store::open(&db_path)?;
+            let account = store.account(&cli.host, &cli.user)?;
+            let t = connect(&cli).await?;
+            let outcome = Box::pin(calendar_check_flow(&t, &store, account, date, *all_day, *probe)).await;
+            t.logoff().await.ok();
+            outcome?;
+        }
+        Cmd::MeetingInfo { item_pk, probe } => {
+            let store = Store::open(&db_path)?;
+            let mut targets: Vec<(i64, ItemId, Option<String>)> = Vec::new();
+            for s in item_pk.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                let pk: i64 = s.parse().with_context(|| format!("item_pk «{s}» не число"))?;
+                let r = store.item_ref(pk)?.ok_or_else(|| anyhow!("письмо #{pk} не найдено в базе или удалено"))?;
+                let class = store.message_head(pk)?.and_then(|h| h.item_class);
+                targets.push((pk, r.id, class));
+            }
+            if targets.is_empty() {
+                bail!("нужен хотя бы один item_pk");
+            }
+            let t = connect(&cli).await?;
+            let outcome = async {
+                for (pk, id, class) in &targets {
+                    let started = std::time::Instant::now();
+                    match t.get_meeting_request(id).await {
+                        Ok(info) => {
+                            let duration = match (info.start, info.end) {
+                                (Some(s), Some(e)) => format!("{} мин", e.duration_since(s).as_mins()),
+                                _ => "?".into(),
+                            };
+                            println!(
+                                "#{pk}: класс в базе {}; GetItem за {} мс: вид {}, начало {}, конец {}, длительность {}, весь день {}, место {}, организатор {}, мой ответ {}, устарело {}, связанное событие {}, повторение {}, ответ отправителя {}",
+                                class.as_deref().unwrap_or("(нет)"),
+                                started.elapsed().as_millis(),
+                                info.kind.key(),
+                                info.start.map(|s| fmt_local(s.as_millisecond())).unwrap_or_else(|| "нет".into()),
+                                info.end.map(|e| fmt_local(e.as_millisecond())).unwrap_or_else(|| "нет".into()),
+                                duration,
+                                if info.is_all_day { "да" } else { "нет" },
+                                info.location.as_ref().map(|l| format!("есть ({} символов)", l.chars().count())).unwrap_or_else(|| "нет".into()),
+                                match &info.organizer {
+                                    Some(p) => format!("есть ({}{})", if p.name.is_some() { "имя" } else { "" }, if p.email.is_some() { "+адрес" } else { "" }),
+                                    None => "нет".into(),
+                                },
+                                info.my_response.as_str(),
+                                if info.is_out_of_date { "да" } else { "нет" },
+                                info.associated_calendar_item.as_ref().map(|i| format!("есть (Id {} символов)", i.id.len())).unwrap_or_else(|| "нет".into()),
+                                if info.recurrence_text.is_some() { "есть" } else { "нет" },
+                                info.response_type_of_sender.map(|r| r.as_str()).unwrap_or("нет"),
+                            );
+                        }
+                        Err(e) => println!("#{pk}: класс в базе {}; GetItem: {e}", class.as_deref().unwrap_or("(нет)")),
+                    }
+                    if *probe {
+                        let started = std::time::Instant::now();
+                        match t.probe_meeting_request_shape(id).await {
+                            Ok(shape) => println!("#{pk}: GetItem AllProperties за {} мс, форма элемента (без содержимого):\n{shape}", started.elapsed().as_millis()),
+                            Err(e) => println!("#{pk}: GetItem AllProperties: {e}"),
+                        }
                     }
                 }
                 Ok::<(), anyhow::Error>(())
@@ -1085,4 +1849,35 @@ fn print_folder_tree(changes: &[FolderChange]) {
     }
     println!("\nВсего папок: {} (· = не почтовая)", folders.len());
     let _ = SyncState(String::new());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ms(s: &str) -> i64 {
+        s.parse::<jiff::Timestamp>().unwrap().as_millisecond()
+    }
+
+    #[test]
+    fn all_day_update_compares_civil_dates() {
+        // Событие 26.10 в кэше — местные полуночи Москвы; `--end 2026-10-26` (полночь UTC) — та же дата: отказ.
+        let cached_start = ms("2026-10-25T21:00:00Z");
+        let cached_end = ms("2026-10-26T21:00:00Z");
+        assert!(updated_span(true, cached_start, ms("2026-10-26T00:00:00Z")).is_err());
+        assert_eq!(updated_span(true, cached_start, ms("2026-10-27T00:00:00Z")).unwrap(), "2026-10-26 – 2026-10-27 (весь день, конец исключая)");
+        // `--start` без `--end`: конец из кэша (`26.10T21:00Z` — дата 27.10, конец исключая).
+        assert!(updated_span(true, ms("2026-10-27T00:00:00Z"), cached_end).is_err());
+        assert!(updated_span(true, ms("2026-10-26T00:00:00Z"), cached_end).is_ok());
+        // Западный пояс в кэше (`…T04:00:00Z`) — те же даты.
+        assert!(updated_span(true, ms("2026-10-26T04:00:00Z"), ms("2026-10-26T00:00:00Z")).is_err());
+        assert!(updated_span(true, ms("2026-10-26T04:00:00Z"), ms("2026-10-27T00:00:00Z")).is_ok());
+    }
+
+    #[test]
+    fn timed_update_compares_moments() {
+        assert!(updated_span(false, 1_000, 1_000).is_err());
+        assert!(updated_span(false, 2_000, 1_000).is_err());
+        assert!(updated_span(false, 1_000, 2_000).is_ok());
+    }
 }

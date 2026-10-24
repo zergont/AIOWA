@@ -3,9 +3,9 @@
 //! как требует сервер). Ответы разбираются толерантно: неизвестные поля игнорируются.
 
 use aiowa_core::{
-    AttachmentMeta, Attendee, BodyType, CalendarEvent, CalendarEventDetails, CalendarItemType, ComposeKind, ConversationId, DistinguishedFolder, FlagStatus, Folder, FolderChange,
-    FolderId, FolderRef, FreeBusy, Importance, ItemChange, ItemId, MessageBody, MessageFull, MessageMeta, OutgoingAttachment, OutgoingMessage, Participant, ResponseType, Signature,
-    SyncState,
+    response_from_item_class, AttachmentMeta, Attendee, BodyType, CalendarEvent, CalendarEventDetails, CalendarItemChanges, CalendarItemType, ComposeKind, ConversationId, DistinguishedFolder,
+    FlagStatus, Folder, FolderChange, FolderId, FolderRef, FreeBusy, Importance, ItemChange, ItemId, MeetingMessageKind, MeetingRequestInfo, MeetingResponse, MessageBody, MessageFull, MessageMeta,
+    NewCalendarItem, OutgoingAttachment, OutgoingMessage, Participant, ResponseType, Signature, SyncState,
 };
 use aiowa_transport::WriteResult;
 use base64::prelude::*;
@@ -368,13 +368,16 @@ pub fn get_user_configuration_body(base: &str) -> Value {
 // Календарь (см. docs/protocol-owa-json.md § 5g)
 
 /// Поля события для списка (`FindItem` с `CalendarView`); у `GetItem` к ним добавляются
-/// `CALENDAR_DETAIL_FIELDS`.
+/// `CALENDAR_DETAIL_FIELDS`. Место запрашивается и как `calendar:Location`, и как
+/// `calendar:EnhancedLocation`: член `Location` в OWA JSON — объект `EnhancedLocation`, и
+/// заполняет его только второе свойство; по одному `calendar:Location` место не приходит (§ 5i).
 pub const CALENDAR_FIELDS: &[&str] = &[
     "item:Subject",
     "calendar:Start",
     "calendar:End",
     "calendar:IsAllDayEvent",
     "calendar:Location",
+    "calendar:EnhancedLocation",
     "calendar:Organizer",
     "calendar:LegacyFreeBusyStatus",
     "calendar:CalendarItemType",
@@ -385,13 +388,15 @@ pub const CALENDAR_FIELDS: &[&str] = &[
     "item:HasAttachments",
     "item:LastModifiedTime",
     "calendar:AppointmentState",
+    "item:ReminderIsSet",
+    "item:ReminderMinutesBeforeStart",
 ];
 
 /// Бит `AppointmentState`: встреча отменена (`IsCancelled` в `FindItem` сервер не отдаёт).
 const APPOINTMENT_STATE_CANCELLED: i64 = 0x4;
 
-/// Поля события для панели: участники с ответами, повторение, тело, напоминание.
-pub const CALENDAR_DETAIL_FIELDS: &[&str] = &["calendar:RequiredAttendees", "calendar:OptionalAttendees", "calendar:Recurrence", "item:Body", "item:ReminderIsSet", "item:ReminderMinutesBeforeStart"];
+/// Поля события для панели: участники с ответами, повторение, тело (напоминание уже в `CALENDAR_FIELDS`).
+pub const CALENDAR_DETAIL_FIELDS: &[&str] = &["calendar:RequiredAttendees", "calendar:OptionalAttendees", "calendar:Recurrence", "item:Body"];
 
 /// Момент для окна `CalendarView`: `2026-10-20T00:00:00Z` (`with_zone`) или без `Z`
 /// (на случай, если сервер ждёт «наивное» время в поясе контекста, как у `GetCalendarView`).
@@ -462,6 +467,20 @@ pub fn get_calendar_item_body(id: &ItemId, shape: CalendarItemShape, max_body: u
     })
 }
 
+/// Расширенное свойство места встречи `PidLidLocation` (набор `Appointment`, 0x8208, строка):
+/// читается и пишется напрямую в хранилище, минуя `calendar:Location`/`EnhancedLocation`.
+pub fn location_extended_uri() -> Value {
+    json!({ "__type": "ExtendedPropertyUri:#Exchange", "DistinguishedPropertySetId": "Appointment", "PropertyId": 33288, "PropertyType": "String" })
+}
+
+/// `GetItem` события для проверки записи: `AllProperties` плюс `PidLidLocation` расширенным
+/// свойством — место видно и когда сервер не отдаёт `Location` в JSON.
+pub fn get_calendar_probe_body(id: &ItemId) -> Value {
+    let mut body = get_calendar_item_body(id, CalendarItemShape::AllProperties, 4096);
+    body["ItemShape"]["AdditionalProperties"] = json!([location_extended_uri()]);
+    body
+}
+
 /// `GetItem` повторяющейся встречи по идентификатору её экземпляра (`RecurringMasterItemId`
 /// с `OccurrenceId`): только образец повторения, который у экземпляров отсутствует.
 pub fn get_recurring_master_body(occurrence: &ItemId) -> Value {
@@ -513,6 +532,15 @@ fn location_of(v: &Value) -> Option<String> {
     raw.or_else(|| v.get("EnhancedLocation").and_then(|e| str_of(e, "DisplayName"))).map(str::trim).filter(|s| !s.is_empty()).map(String::from)
 }
 
+/// Напоминание из полей элемента: минуты, если `ReminderIsSet` не выключен явно (без
+/// `ReminderIsSet` минуты считаются включёнными; число приходит и числом, и строкой).
+fn reminder_of(v: &Value) -> Option<i64> {
+    match v.get("ReminderIsSet").and_then(Value::as_bool) {
+        Some(false) => None,
+        _ => num_of(v, "ReminderMinutesBeforeStart"),
+    }
+}
+
 /// Событие из элемента `CalendarItem:#Exchange` (`FindItem`, `GetCalendarView`, `GetItem`).
 /// Без `ItemId`, `Start` или `End` события нет. OWA JSON отдаёт занятость как `FreeBusyType`
 /// и свой ответ как `ResponseType` (имена EWS `LegacyFreeBusyStatus`/`MyResponseType` тоже
@@ -538,6 +566,7 @@ pub fn parse_calendar_event(v: &Value) -> Option<CalendarEvent> {
         sensitivity: str_of(v, "Sensitivity").map(String::from),
         has_attachments: bool_of(v, "HasAttachments"),
         last_modified: parse_timestamp(str_of(v, "LastModifiedTime")),
+        reminder_minutes: reminder_of(v),
     })
 }
 
@@ -571,9 +600,285 @@ pub fn parse_calendar_details(v: &Value) -> Option<CalendarEventDetails> {
     });
     let mut attendees = parse_attendees(v.get("RequiredAttendees"), true);
     attendees.extend(parse_attendees(v.get("OptionalAttendees"), false));
-    let reminder_set = v.get("ReminderIsSet").and_then(Value::as_bool).unwrap_or(true);
-    let reminder_minutes = if reminder_set { num_of(v, "ReminderMinutesBeforeStart") } else { None };
+    let reminder_minutes = event.reminder_minutes;
     Some(CalendarEventDetails { event, body, attendees, reminder_minutes, recurrence_text: v.get("Recurrence").and_then(recurrence_text) })
+}
+
+// ---------------------------------------------------------------------------
+// Календарь: запись и письма о встречах (см. docs/protocol-owa-json.md § 5i)
+
+/// Имя члена занятости в объекте `CalendarItem` запроса. В ответах сервер отдаёт
+/// `calendar:LegacyFreeBusyStatus` как `FreeBusyType` (§ 5g); сериализация DataContract
+/// симметрична, поэтому и в запросе значение идёт под этим именем. `FieldURI` при этом
+/// остаётся `calendar:LegacyFreeBusyStatus`.
+pub const FREE_BUSY_KEY: &str = "FreeBusyType";
+
+/// Момент в полях события запроса: ISO в UTC с `Z`, без долей секунды (как сервер отдаёт сам).
+pub fn calendar_datetime(t: Timestamp) -> String {
+    calendar_view_date(t, true)
+}
+
+/// Граница события в запросе: обычно момент UTC с `Z`; у события «весь день» в контексте пояса
+/// пользователя (`local_all_day`) — местная полночь календарной даты без зоны
+/// (`2026-10-26T00:00:00`), как шлёт браузерная OWA: сервер читает её в поясе `TimeZoneContext`
+/// и хранит событие в этом поясе (§ 5i). Дата берётся из момента по `all_day_civil_date`.
+pub fn calendar_bound(t: Timestamp, local_all_day: bool) -> String {
+    if local_all_day { format!("{}T00:00:00", aiowa_core::all_day_civil_date(t)) } else { calendar_datetime(t) }
+}
+
+/// Участник встречи для запроса: `AttendeeType:#Exchange` с `Mailbox` в форме получателя письма.
+pub fn attendee_json(p: &Participant) -> Value {
+    json!({ "__type": "AttendeeType:#Exchange", "Mailbox": recipient_json(p) })
+}
+
+fn attendees_json(list: &[Participant]) -> Value {
+    Value::Array(list.iter().map(attendee_json).collect())
+}
+
+/// Место после очистки: пустое или из одних пробелов — нет места.
+fn clean_location(s: Option<&str>) -> Option<&str> {
+    s.map(str::trim).filter(|s| !s.is_empty())
+}
+
+/// Место в объекте `CalendarItem` запроса: член `Location` — объект `EnhancedLocation:#Exchange`
+/// с `DisplayName`. Строка в этом члене не десериализуется (HTTP 500), объект с `Annotation` и
+/// `PostalAddress` (`PersonaPostalAddress:#Exchange`, `LocationSource: None`) — тоже HTTP 500
+/// (§ 5i). Член соответствует свойству `calendar:EnhancedLocation`, а не `calendar:Location`.
+/// Пустое `DisplayName` снимает место.
+pub fn location_json(display_name: &str) -> Value {
+    json!({ "__type": "EnhancedLocation:#Exchange", "DisplayName": display_name })
+}
+
+/// Свойство места для `SetItemField`: ему соответствует член `Location` объекта.
+pub const LOCATION_FIELD: &str = "calendar:EnhancedLocation";
+
+/// `SetItemField` события: свойство `field` и значение под членом `key` объекта
+/// `CalendarItem:#Exchange` (в объекте должен быть ровно один член, иначе
+/// `ErrorIncorrectUpdatePropertyCount`).
+pub fn set_calendar_field(field: &str, key: &str, value: Value) -> Value {
+    let mut item = json!({ "__type": "CalendarItem:#Exchange" });
+    item[key] = value;
+    json!({ "__type": "SetItemField:#Exchange", "Path": property_uri(field), "Item": item })
+}
+
+/// `DeleteItemField` по свойству `field`.
+pub fn delete_calendar_field(field: &str) -> Value {
+    json!({ "__type": "DeleteItemField:#Exchange", "Path": property_uri(field) })
+}
+
+/// Элемент `CalendarItem:#Exchange` для `CreateItem`: тема, тело (если есть), начало и конец
+/// (`local_all_day` — местные полуночи дат без зоны, см. `calendar_bound`), признак «весь день»,
+/// место (если есть), участники (только непустые списки), напоминание (`ReminderIsSet` всегда,
+/// минуты — при включённом), занятость, конфиденциальность.
+pub fn calendar_item_json(item: &NewCalendarItem, local_all_day: bool) -> Value {
+    let mut v = json!({ "__type": "CalendarItem:#Exchange", "Subject": item.subject });
+    if let Some(b) = &item.body_html {
+        v["Body"] = body_content_json(b);
+    }
+    v["Start"] = json!(calendar_bound(item.start, local_all_day));
+    v["End"] = json!(calendar_bound(item.end, local_all_day));
+    v["IsAllDayEvent"] = json!(item.is_all_day);
+    if let Some(l) = clean_location(item.location.as_deref()) {
+        v["Location"] = location_json(l);
+    }
+    if !item.required.is_empty() {
+        v["RequiredAttendees"] = attendees_json(&item.required);
+    }
+    if !item.optional.is_empty() {
+        v["OptionalAttendees"] = attendees_json(&item.optional);
+    }
+    match item.reminder_minutes {
+        Some(m) => {
+            v["ReminderIsSet"] = json!(true);
+            v["ReminderMinutesBeforeStart"] = json!(m);
+        }
+        None => v["ReminderIsSet"] = json!(false),
+    }
+    v[FREE_BUSY_KEY] = json!(item.free_busy.as_str());
+    v["Sensitivity"] = json!(if item.sensitivity_private { "Private" } else { "Normal" });
+    v
+}
+
+/// `CreateItem` события в папке `calendar`: с участниками приглашения рассылает сервер
+/// (`SendToAllAndSaveCopy`), без них — `SendToNone`. `local_all_day` — запрос идёт в контексте
+/// пояса пользователя и событие на весь день: границы местными полуночами дат.
+pub fn create_calendar_item_body(item: &NewCalendarItem, local_all_day: bool) -> Value {
+    json!({
+        "__type": "CreateItemRequest:#Exchange",
+        "SendMeetingInvitations": if item.has_attendees() { "SendToAllAndSaveCopy" } else { "SendToNone" },
+        "SavedItemFolderId": target_folder_json(&FolderRef::Distinguished(DistinguishedFolder::Calendar)),
+        "Items": [ calendar_item_json(item, local_all_day) ],
+    })
+}
+
+/// `UpdateItem` события с готовым списком `updates` (`set_calendar_field`/`delete_calendar_field`).
+/// `ConflictResolution: AlwaysOverwrite`, как у писем. Рассылка обновлений для событий обязательна
+/// и в OWA JSON называется **`SendCalendarInvitationsOrCancellations`** (имя схемы EWS
+/// `SendMeetingInvitationsOrCancellations` сервер молча игнорирует и отвечает
+/// `ErrorSendMeetingInvitationsOrCancellationsRequired`, § 5i).
+pub fn update_calendar_item_request(id: &ItemId, updates: Vec<Value>, send_updates: bool) -> Value {
+    json!({
+        "__type": "UpdateItemRequest:#Exchange",
+        "ConflictResolution": "AlwaysOverwrite",
+        "SendCalendarInvitationsOrCancellations": if send_updates { "SendToAllAndSaveCopy" } else { "SendToNone" },
+        "ItemChanges": [ { "__type": "ItemChange:#Exchange", "ItemId": item_id_json(id), "Updates": updates } ],
+    })
+}
+
+/// `UpdateItem` события по заполненным полям `changes`: `SetItemField` со значением в объекте
+/// `CalendarItem:#Exchange`, опустевшие списки участников — `DeleteItemField`, снятие места —
+/// `EnhancedLocation` с пустым `DisplayName`, снятие напоминания — `ReminderIsSet: false`.
+/// `local_all_day` — запрос идёт в контексте пояса пользователя и `changes.is_all_day ==
+/// Some(true)`: границы местными полуночами дат (`calendar_bound`).
+pub fn update_calendar_item_body(id: &ItemId, changes: &CalendarItemChanges, send_updates: bool, local_all_day: bool) -> Value {
+    let set = set_calendar_field;
+    let del = delete_calendar_field;
+    let mut updates: Vec<Value> = Vec::new();
+    if let Some(s) = &changes.subject {
+        updates.push(set("item:Subject", "Subject", json!(s)));
+    }
+    if let Some(t) = changes.start {
+        updates.push(set("calendar:Start", "Start", json!(calendar_bound(t, local_all_day))));
+    }
+    if let Some(t) = changes.end {
+        updates.push(set("calendar:End", "End", json!(calendar_bound(t, local_all_day))));
+    }
+    if let Some(b) = changes.is_all_day {
+        updates.push(set("calendar:IsAllDayEvent", "IsAllDayEvent", json!(b)));
+    }
+    if let Some(loc) = &changes.location {
+        updates.push(set(LOCATION_FIELD, "Location", location_json(clean_location(loc.as_deref()).unwrap_or(""))));
+    }
+    if let Some(b) = &changes.body_html {
+        updates.push(set("item:Body", "Body", body_content_json(b)));
+    }
+    for (field, key, list) in [("calendar:RequiredAttendees", "RequiredAttendees", &changes.required), ("calendar:OptionalAttendees", "OptionalAttendees", &changes.optional)] {
+        if let Some(list) = list {
+            if list.is_empty() {
+                updates.push(del(field));
+            } else {
+                updates.push(set(field, key, attendees_json(list)));
+            }
+        }
+    }
+    if let Some(reminder) = changes.reminder_minutes {
+        match reminder {
+            Some(m) => {
+                updates.push(set("item:ReminderIsSet", "ReminderIsSet", json!(true)));
+                updates.push(set("item:ReminderMinutesBeforeStart", "ReminderMinutesBeforeStart", json!(m)));
+            }
+            None => updates.push(set("item:ReminderIsSet", "ReminderIsSet", json!(false))),
+        }
+    }
+    if let Some(fb) = changes.free_busy {
+        updates.push(set("calendar:LegacyFreeBusyStatus", FREE_BUSY_KEY, json!(fb.as_str())));
+    }
+    update_calendar_item_request(id, updates, send_updates)
+}
+
+/// `DeleteItem` события: `delete_type` — `MoveToDeletedItems` или `HardDelete`;
+/// `SendMeetingCancellations` обязателен для событий (иначе `ErrorSendMeetingCancellationsRequired`).
+pub fn delete_calendar_item_body(id: &ItemId, delete_type: &str, send_cancellations: bool) -> Value {
+    json!({
+        "__type": "DeleteItemRequest:#Exchange",
+        "ItemIds": [ item_id_json(id) ],
+        "DeleteType": delete_type,
+        "SendMeetingCancellations": if send_cancellations { "SendToAllAndSaveCopy" } else { "SendToNone" },
+    })
+}
+
+/// `CreateItem` с ответом на приглашение: `AcceptItem`, `TentativelyAcceptItem` или `DeclineItem`
+/// по `ReferenceItemId` (письмо-приглашение или событие календаря), с телом ответа, если есть.
+/// `MessageDisposition`: `SendAndSaveCopy` — ответ уходит организатору, `SaveOnly` — без ответа.
+pub fn respond_to_meeting_body(reference: &ItemId, response: MeetingResponse, send_response: bool, body_html: Option<&str>) -> Value {
+    let ty = match response {
+        MeetingResponse::Accept => "AcceptItem:#Exchange",
+        MeetingResponse::Tentative => "TentativelyAcceptItem:#Exchange",
+        MeetingResponse::Decline => "DeclineItem:#Exchange",
+    };
+    let mut item = json!({ "__type": ty, "ReferenceItemId": item_id_json(reference) });
+    if let Some(b) = body_html.map(str::trim).filter(|b| !b.is_empty()) {
+        item["Body"] = body_content_json(b);
+    }
+    json!({
+        "__type": "CreateItemRequest:#Exchange",
+        "MessageDisposition": if send_response { "SendAndSaveCopy" } else { "SaveOnly" },
+        "Items": [ item ],
+    })
+}
+
+/// Поля письма о встрече для `GetItem` в явной форме: класс и тема письма, поля встречи
+/// (`calendar:…` действуют и на письмах-приглашениях) и поля `meeting:…` письма.
+pub const MEETING_MESSAGE_FIELDS: &[&str] = &[
+    "item:ItemClass",
+    "item:Subject",
+    "item:DateTimeReceived",
+    "message:From",
+    "calendar:Start",
+    "calendar:End",
+    "calendar:IsAllDayEvent",
+    "calendar:Location",
+    "calendar:EnhancedLocation",
+    "calendar:Organizer",
+    "calendar:MyResponseType",
+    "calendar:CalendarItemType",
+    "calendar:Recurrence",
+    "meeting:IsOutOfDate",
+    "meeting:AssociatedCalendarItemId",
+    "meeting:ResponseType",
+    "meeting:HasBeenProcessed",
+    "meeting:IsDelegated",
+];
+
+/// `GetItem` письма о встрече: `IdOnly` с явным списком `MEETING_MESSAGE_FIELDS` или
+/// `AllProperties` (запасная форма; тело ограничено `max_body`).
+pub fn get_meeting_request_body(id: &ItemId, shape: CalendarItemShape, max_body: u64) -> Value {
+    let mut item_shape = json!({
+        "__type": "ItemResponseShape:#Exchange",
+        "BaseShape": match shape { CalendarItemShape::Explicit => "IdOnly", CalendarItemShape::AllProperties => "AllProperties" },
+        "BodyType": "HTML",
+        "FilterHtmlContent": true,
+        "BlockExternalImagesIfSenderUntrusted": true,
+        "MaximumBodySize": max_body,
+    });
+    if shape == CalendarItemShape::Explicit {
+        item_shape["AdditionalProperties"] = Value::Array(MEETING_MESSAGE_FIELDS.iter().map(|f| property_uri(f)).collect());
+    }
+    json!({
+        "__type": "GetItemRequest:#Exchange",
+        "ItemShape": item_shape,
+        "ItemIds": [ item_id_json(id) ],
+        "ShapeName": null,
+    })
+}
+
+/// Письмо о встрече из элемента ответа `GetItem`. Вид — по `ItemClass`; организатор — `Organizer`,
+/// иначе `From` (кроме письма-ответа: там `From` — отвечающий участник, и организатор остаётся
+/// пустым); свой ответ — `MyResponseType` или `ResponseType` (имя OWA JSON у приглашений);
+/// у письма-ответа `ResponseType` — ответ отправителя, при его отсутствии он выводится из класса
+/// (`…Resp.Pos`/`Neg`/`Tent`).
+pub fn parse_meeting_request_info(v: &Value) -> MeetingRequestInfo {
+    let class = str_of(v, "ItemClass").unwrap_or("");
+    let kind = MeetingMessageKind::from_item_class(class);
+    let response_type = str_of(v, "ResponseType").map(ResponseType::parse);
+    let (my_response, response_type_of_sender) = if kind == MeetingMessageKind::Response {
+        (ResponseType::Unknown, response_type.filter(|r| *r != ResponseType::Unknown).or_else(|| response_from_item_class(class)))
+    } else {
+        (str_of(v, "MyResponseType").map(ResponseType::parse).or(response_type).unwrap_or_default(), None)
+    };
+    MeetingRequestInfo {
+        kind,
+        start: parse_calendar_timestamp(str_of(v, "Start")),
+        end: parse_calendar_timestamp(str_of(v, "End")),
+        is_all_day: bool_of(v, "IsAllDayEvent"),
+        location: location_of(v),
+        organizer: v.get("Organizer").and_then(parse_participant).or_else(|| if kind == MeetingMessageKind::Response { None } else { v.get("From").and_then(parse_participant) }),
+        my_response,
+        is_out_of_date: bool_of(v, "IsOutOfDate"),
+        associated_calendar_item: v.get("AssociatedCalendarItemId").and_then(parse_item_id),
+        recurrence_text: v.get("Recurrence").and_then(recurrence_text),
+        response_type_of_sender,
+    }
 }
 
 /// Список дней недели из `DaysOfWeek`: строка через пробел (как в EWS) или массив строк.
@@ -1047,6 +1352,28 @@ pub fn parse_user_signature(msg: &Value) -> Option<Signature> {
     Some(Signature { html: html.to_string(), auto_add })
 }
 
+/// Часовой пояс пользователя из словаря настроек OWA: ключ `timezone` (сравнение без учёта
+/// регистра), значение — идентификатор пояса Windows (`Russian Standard Time`). Пустой или
+/// отсутствующий — `None`.
+pub fn parse_user_time_zone(msg: &Value) -> Option<String> {
+    user_configuration_dictionary(msg).into_iter().find(|(key, _)| key.eq_ignore_ascii_case("timezone")).map(|(_, v)| v.trim().to_string()).filter(|v| !v.is_empty())
+}
+
+/// Поля события из ответа `GetItem` с `AllProperties`, по которым проверяется запись: время и
+/// пояса (`Start`, `End`, `StartTimeZoneId`, `EndTimeZoneId`, `TimeZone`, `StartWallClock`,
+/// `EndWallClock`, `IsAllDayEvent`) и место (`Location` как есть — строка или объект
+/// `EnhancedLocation` с `DisplayName`; `ExtendedProperty` — запрошенное `PidLidLocation`).
+/// Отсутствующие ключи опускаются.
+pub fn calendar_probe_fields(item: &Value) -> Value {
+    let mut out = serde_json::Map::new();
+    for key in ["IsAllDayEvent", "Start", "End", "StartTimeZoneId", "EndTimeZoneId", "TimeZone", "StartWallClock", "EndWallClock", "Location", "EnhancedLocation", "ExtendedProperty"] {
+        if let Some(v) = item.get(key) {
+            out.insert(key.to_string(), v.clone());
+        }
+    }
+    Value::Object(out)
+}
+
 /// Код и текст ошибки сообщения ответа, если `ResponseClass != Success`.
 pub fn message_error(msg: &Value) -> Option<(String, String)> {
     let class = str_of(msg, "ResponseClass").unwrap_or("Success");
@@ -1326,7 +1653,7 @@ mod tests {
         let s = serde_json::to_string(&find_calendar_view_body(start, end, true, None)).unwrap();
         assert_eq!(
             s,
-            r#"{"__type":"FindItemRequest:#Exchange","ItemShape":{"__type":"ItemResponseShape:#Exchange","BaseShape":"IdOnly","AdditionalProperties":[{"__type":"PropertyUri:#Exchange","FieldURI":"item:Subject"},{"__type":"PropertyUri:#Exchange","FieldURI":"calendar:Start"},{"__type":"PropertyUri:#Exchange","FieldURI":"calendar:End"},{"__type":"PropertyUri:#Exchange","FieldURI":"calendar:IsAllDayEvent"},{"__type":"PropertyUri:#Exchange","FieldURI":"calendar:Location"},{"__type":"PropertyUri:#Exchange","FieldURI":"calendar:Organizer"},{"__type":"PropertyUri:#Exchange","FieldURI":"calendar:LegacyFreeBusyStatus"},{"__type":"PropertyUri:#Exchange","FieldURI":"calendar:CalendarItemType"},{"__type":"PropertyUri:#Exchange","FieldURI":"calendar:IsMeeting"},{"__type":"PropertyUri:#Exchange","FieldURI":"calendar:IsCancelled"},{"__type":"PropertyUri:#Exchange","FieldURI":"calendar:MyResponseType"},{"__type":"PropertyUri:#Exchange","FieldURI":"item:Sensitivity"},{"__type":"PropertyUri:#Exchange","FieldURI":"item:HasAttachments"},{"__type":"PropertyUri:#Exchange","FieldURI":"item:LastModifiedTime"},{"__type":"PropertyUri:#Exchange","FieldURI":"calendar:AppointmentState"}]},"ParentFolderIds":[{"__type":"DistinguishedFolderId:#Exchange","Id":"calendar"}],"Traversal":"Shallow","Paging":{"__type":"CalendarPageView:#Exchange","StartDate":"2026-10-20T00:00:00Z","EndDate":"2026-10-27T00:00:00Z"}}"#
+            r#"{"__type":"FindItemRequest:#Exchange","ItemShape":{"__type":"ItemResponseShape:#Exchange","BaseShape":"IdOnly","AdditionalProperties":[{"__type":"PropertyUri:#Exchange","FieldURI":"item:Subject"},{"__type":"PropertyUri:#Exchange","FieldURI":"calendar:Start"},{"__type":"PropertyUri:#Exchange","FieldURI":"calendar:End"},{"__type":"PropertyUri:#Exchange","FieldURI":"calendar:IsAllDayEvent"},{"__type":"PropertyUri:#Exchange","FieldURI":"calendar:Location"},{"__type":"PropertyUri:#Exchange","FieldURI":"calendar:EnhancedLocation"},{"__type":"PropertyUri:#Exchange","FieldURI":"calendar:Organizer"},{"__type":"PropertyUri:#Exchange","FieldURI":"calendar:LegacyFreeBusyStatus"},{"__type":"PropertyUri:#Exchange","FieldURI":"calendar:CalendarItemType"},{"__type":"PropertyUri:#Exchange","FieldURI":"calendar:IsMeeting"},{"__type":"PropertyUri:#Exchange","FieldURI":"calendar:IsCancelled"},{"__type":"PropertyUri:#Exchange","FieldURI":"calendar:MyResponseType"},{"__type":"PropertyUri:#Exchange","FieldURI":"item:Sensitivity"},{"__type":"PropertyUri:#Exchange","FieldURI":"item:HasAttachments"},{"__type":"PropertyUri:#Exchange","FieldURI":"item:LastModifiedTime"},{"__type":"PropertyUri:#Exchange","FieldURI":"calendar:AppointmentState"},{"__type":"PropertyUri:#Exchange","FieldURI":"item:ReminderIsSet"},{"__type":"PropertyUri:#Exchange","FieldURI":"item:ReminderMinutesBeforeStart"}]},"ParentFolderIds":[{"__type":"DistinguishedFolderId:#Exchange","Id":"calendar"}],"Traversal":"Shallow","Paging":{"__type":"CalendarPageView:#Exchange","StartDate":"2026-10-20T00:00:00Z","EndDate":"2026-10-27T00:00:00Z"}}"#
         );
         let s = serde_json::to_string(&find_calendar_view_body(start, end, false, Some(500))).unwrap();
         assert!(s.ends_with(r#""Paging":{"__type":"CalendarPageView:#Exchange","StartDate":"2026-10-20T00:00:00","EndDate":"2026-10-27T00:00:00","MaxEntriesReturned":500}}"#), "{s}");
@@ -1343,7 +1670,7 @@ mod tests {
         let id = ItemId { id: "E".into(), change_key: Some("ek".into()) };
         let s = serde_json::to_string(&get_calendar_item_body(&id, CalendarItemShape::Explicit, 4096)).unwrap();
         assert!(s.starts_with(r#"{"__type":"GetItemRequest:#Exchange","ItemShape":{"__type":"ItemResponseShape:#Exchange","BaseShape":"IdOnly","BodyType":"HTML","FilterHtmlContent":true,"BlockExternalImagesIfSenderUntrusted":true,"MaximumBodySize":4096,"MaximumRecipientsToReturn":500,"AdditionalProperties":[{"__type":"PropertyUri:#Exchange","FieldURI":"item:Subject"},"#), "{s}");
-        assert!(s.contains(r#"{"__type":"PropertyUri:#Exchange","FieldURI":"calendar:RequiredAttendees"},{"__type":"PropertyUri:#Exchange","FieldURI":"calendar:OptionalAttendees"},{"__type":"PropertyUri:#Exchange","FieldURI":"calendar:Recurrence"},{"__type":"PropertyUri:#Exchange","FieldURI":"item:Body"},{"__type":"PropertyUri:#Exchange","FieldURI":"item:ReminderIsSet"},{"__type":"PropertyUri:#Exchange","FieldURI":"item:ReminderMinutesBeforeStart"}]},"ItemIds":[{"__type":"ItemId:#Exchange","Id":"E","ChangeKey":"ek"}],"ShapeName":null}"#), "{s}");
+        assert!(s.contains(r#"{"__type":"PropertyUri:#Exchange","FieldURI":"item:ReminderIsSet"},{"__type":"PropertyUri:#Exchange","FieldURI":"item:ReminderMinutesBeforeStart"},{"__type":"PropertyUri:#Exchange","FieldURI":"calendar:RequiredAttendees"},{"__type":"PropertyUri:#Exchange","FieldURI":"calendar:OptionalAttendees"},{"__type":"PropertyUri:#Exchange","FieldURI":"calendar:Recurrence"},{"__type":"PropertyUri:#Exchange","FieldURI":"item:Body"}]},"ItemIds":[{"__type":"ItemId:#Exchange","Id":"E","ChangeKey":"ek"}],"ShapeName":null}"#), "{s}");
         let s = serde_json::to_string(&get_calendar_item_body(&id, CalendarItemShape::AllProperties, 4096)).unwrap();
         assert_eq!(
             s,
@@ -1364,14 +1691,18 @@ mod tests {
             {"__type":"CalendarItem:#Exchange","ItemId":{"Id":"B"},"Subject":"Отпуск","Start":"2026-10-21T00:00:00","End":"2026-10-22T00:00:00","IsAllDayEvent":true,"Location":"","LegacyFreeBusyStatus":"OOF","CalendarItemType":"Single","MyResponseType":"Organizer"},
             {"__type":"CalendarItem:#Exchange","ItemId":{"Id":"C"},"Start":"2026-10-22","IsCancelled":true,"LegacyFreeBusyStatus":"Nonsense"},
             {"__type":"CalendarItem:#Exchange","ItemId":{"Id":"D"},"Subject":"без начала"},
-            {"__type":"CalendarItem:#Exchange","ItemId":{"Id":"E"},"Start":"2026-10-23T10:00:00Z","End":"2026-10-23T11:00:00Z","FreeBusyType":"Tentative","ResponseType":"Decline","AppointmentState":5,"Location":{"__type":"EnhancedLocation:#Exchange","DisplayName":"Кабинет 7"}}
+            {"__type":"CalendarItem:#Exchange","ItemId":{"Id":"E"},"Start":"2026-10-23T10:00:00Z","End":"2026-10-23T11:00:00Z","FreeBusyType":"Tentative","ResponseType":"Decline","AppointmentState":5,"Location":{"__type":"EnhancedLocation:#Exchange","DisplayName":"Кабинет 7"},"ReminderIsSet":true,"ReminderMinutesBeforeStart":15},
+            {"__type":"CalendarItem:#Exchange","ItemId":{"Id":"F"},"Start":"2026-10-23T12:00:00Z","End":"2026-10-23T13:00:00Z","ReminderIsSet":false,"ReminderMinutesBeforeStart":15}
           ]}}"#).unwrap();
         let (items, last) = parse_calendar_view(&msg);
         assert!(!last);
-        assert_eq!(items.len(), 4, "событие без Start пропущено");
+        assert_eq!(items.len(), 5, "событие без Start пропущено");
         // Имена OWA JSON (снято с сервера): FreeBusyType, ResponseType, отмена битом AppointmentState, место объектом.
         let e = &items[3];
         assert_eq!((e.free_busy, e.my_response, e.is_cancelled, e.location.as_deref()), (FreeBusy::Tentative, ResponseType::Decline, true, Some("Кабинет 7")));
+        assert_eq!(e.reminder_minutes, Some(15));
+        assert_eq!(items[4].reminder_minutes, None, "ReminderIsSet: false гасит минуты");
+        assert_eq!(items[0].reminder_minutes, None, "без полей напоминания его нет");
         let a = &items[0];
         assert_eq!((a.id.id.as_str(), a.id.change_key.as_deref()), ("A", Some("a1")));
         assert_eq!(a.subject.as_deref(), Some("Планёрка"));
@@ -1443,6 +1774,201 @@ mod tests {
         assert_eq!(text(r#"{"__type":"RelativeYearlyRecurrence:#Exchange","DaysOfWeek":"Friday","DayOfWeekIndex":"Last","Month":"May"}"#, "{}").as_deref(), Some("Ежегодно: последний пт мая"));
         assert_eq!(text(r#"{"__type":"WeeklyRegeneration:#Exchange","Interval":1}"#, "{}"), None, "образцы задач не описываются");
         assert_eq!(recurrence_text(&json!({})), None);
+    }
+
+    fn new_item() -> NewCalendarItem {
+        NewCalendarItem {
+            subject: "[AIOWA] проверка календаря".into(),
+            start: "2026-10-25T06:00:00Z".parse().unwrap(),
+            end: "2026-10-25T06:30:00Z".parse().unwrap(),
+            is_all_day: false,
+            location: Some(" Переговорная 3 ".into()),
+            body_html: Some("<div>Повестка</div>".into()),
+            required: vec![],
+            optional: vec![],
+            reminder_minutes: Some(15),
+            free_busy: FreeBusy::Tentative,
+            sensitivity_private: false,
+        }
+    }
+
+    /// Место: объект `EnhancedLocation` с `DisplayName`.
+    const LOCATION_JSON: &str = r#"{"__type":"EnhancedLocation:#Exchange","DisplayName":"Переговорная 3"}"#;
+
+    #[test]
+    fn create_calendar_item_body_exact() {
+        // Без участников: SendToNone, списков участников нет, место обрезано, напоминание включено.
+        let s = serde_json::to_string(&create_calendar_item_body(&new_item(), false)).unwrap();
+        assert_eq!(
+            s,
+            format!(
+                r#"{{"__type":"CreateItemRequest:#Exchange","SendMeetingInvitations":"SendToNone","SavedItemFolderId":{{"__type":"TargetFolderId:#Exchange","BaseFolderId":{{"__type":"DistinguishedFolderId:#Exchange","Id":"calendar"}}}},"Items":[{{"__type":"CalendarItem:#Exchange","Subject":"[AIOWA] проверка календаря","Body":{{"__type":"BodyContentType:#Exchange","BodyType":"HTML","Value":"<div>Повестка</div>"}},"Start":"2026-10-25T06:00:00Z","End":"2026-10-25T06:30:00Z","IsAllDayEvent":false,"Location":{LOCATION_JSON},"ReminderIsSet":true,"ReminderMinutesBeforeStart":15,"FreeBusyType":"Tentative","Sensitivity":"Normal"}}]}}"#
+            )
+        );
+        let env = envelope("CreateItem", V_2017, "Russian Standard Time", create_calendar_item_body(&new_item(), false));
+        assert!(serde_json::to_string(&env).unwrap().starts_with(
+            r#"{"__type":"CreateItemJsonRequest:#Exchange","Header":{"__type":"JsonRequestHeaders:#Exchange","RequestServerVersion":"V2017_08_18","TimeZoneContext":{"__type":"TimeZoneContext:#Exchange","TimeZoneDefinition":{"__type":"TimeZoneDefinitionType:#Exchange","Id":"Russian Standard Time"}}},"Body":{"__type":"CreateItemRequest:#Exchange""#
+        ));
+        // С участниками: SendToAllAndSaveCopy, AttendeeType с Mailbox; без тела, места и напоминания; весь день без
+        // пояса пользователя — полуночи UTC с Z (как хранит NewCalendarItem), частное.
+        let mut item = new_item();
+        item.required = vec![Participant { name: Some("Иван".into()), email: Some("i@x.ru".into()), routing_type: None }];
+        item.optional = vec![Participant { name: None, email: Some("o@x.ru".into()), routing_type: Some("SMTP".into()) }];
+        item.body_html = None;
+        item.location = Some("   ".into());
+        item.reminder_minutes = None;
+        item.is_all_day = true;
+        item.start = "2026-10-26T00:00:00Z".parse().unwrap();
+        item.end = "2026-10-27T00:00:00Z".parse().unwrap();
+        item.free_busy = FreeBusy::Oof;
+        item.sensitivity_private = true;
+        let s = serde_json::to_string(&create_calendar_item_body(&item, false)).unwrap();
+        assert_eq!(
+            s,
+            r#"{"__type":"CreateItemRequest:#Exchange","SendMeetingInvitations":"SendToAllAndSaveCopy","SavedItemFolderId":{"__type":"TargetFolderId:#Exchange","BaseFolderId":{"__type":"DistinguishedFolderId:#Exchange","Id":"calendar"}},"Items":[{"__type":"CalendarItem:#Exchange","Subject":"[AIOWA] проверка календаря","Start":"2026-10-26T00:00:00Z","End":"2026-10-27T00:00:00Z","IsAllDayEvent":true,"RequiredAttendees":[{"__type":"AttendeeType:#Exchange","Mailbox":{"__type":"EmailAddress:#Exchange","Name":"Иван","EmailAddress":"i@x.ru","RoutingType":"SMTP"}}],"OptionalAttendees":[{"__type":"AttendeeType:#Exchange","Mailbox":{"__type":"EmailAddress:#Exchange","EmailAddress":"o@x.ru","RoutingType":"SMTP"}}],"ReminderIsSet":false,"FreeBusyType":"OOF","Sensitivity":"Private"}]}"#
+        );
+        // Весь день в контексте пояса пользователя: местные полуночи дат без зоны; даты — и из полуночей UTC, и из местных (МСК).
+        let s = serde_json::to_string(&create_calendar_item_body(&item, true)).unwrap();
+        assert!(s.contains(r#""Start":"2026-10-26T00:00:00","End":"2026-10-27T00:00:00","IsAllDayEvent":true"#), "{s}");
+        item.start = "2026-10-25T21:00:00Z".parse().unwrap();
+        item.end = "2026-10-26T21:00:00Z".parse().unwrap();
+        let s = serde_json::to_string(&create_calendar_item_body(&item, true)).unwrap();
+        assert!(s.contains(r#""Start":"2026-10-26T00:00:00","End":"2026-10-27T00:00:00","IsAllDayEvent":true"#), "{s}");
+        // Не весь день — момент UTC с Z даже в контексте пояса пользователя.
+        assert_eq!(calendar_bound("2026-10-25T06:00:00Z".parse().unwrap(), false), "2026-10-25T06:00:00Z");
+    }
+
+    #[test]
+    fn update_calendar_item_body_exact() {
+        let id = ItemId { id: "E".into(), change_key: Some("ek".into()) };
+        let changes = CalendarItemChanges {
+            start: Some("2026-10-25T07:00:00Z".parse().unwrap()),
+            end: Some("2026-10-25T07:45:00Z".parse().unwrap()),
+            location: Some(Some(" Переговорная 3 ".into())),
+            ..Default::default()
+        };
+        let s = serde_json::to_string(&update_calendar_item_body(&id, &changes, false, false)).unwrap();
+        assert_eq!(
+            s,
+            format!(
+                r#"{{"__type":"UpdateItemRequest:#Exchange","ConflictResolution":"AlwaysOverwrite","SendCalendarInvitationsOrCancellations":"SendToNone","ItemChanges":[{{"__type":"ItemChange:#Exchange","ItemId":{{"__type":"ItemId:#Exchange","Id":"E","ChangeKey":"ek"}},"Updates":[{{"__type":"SetItemField:#Exchange","Path":{{"__type":"PropertyUri:#Exchange","FieldURI":"calendar:Start"}},"Item":{{"__type":"CalendarItem:#Exchange","Start":"2026-10-25T07:00:00Z"}}}},{{"__type":"SetItemField:#Exchange","Path":{{"__type":"PropertyUri:#Exchange","FieldURI":"calendar:End"}},"Item":{{"__type":"CalendarItem:#Exchange","End":"2026-10-25T07:45:00Z"}}}},{{"__type":"SetItemField:#Exchange","Path":{{"__type":"PropertyUri:#Exchange","FieldURI":"calendar:EnhancedLocation"}},"Item":{{"__type":"CalendarItem:#Exchange","Location":{LOCATION_JSON}}}}}]}}]}}"#
+            )
+        );
+        // Все остальные поля: снятие места (EnhancedLocation с пустым DisplayName) и напоминания, опустевшие и заполненные списки участников, тело, занятость, рассылка.
+        let changes = CalendarItemChanges {
+            subject: Some("Тема".into()),
+            is_all_day: Some(true),
+            location: Some(None),
+            body_html: Some("<p>x</p>".into()),
+            required: Some(vec![]),
+            optional: Some(vec![Participant { name: None, email: Some("o@x.ru".into()), routing_type: None }]),
+            reminder_minutes: Some(None),
+            free_busy: Some(FreeBusy::Free),
+            ..Default::default()
+        };
+        let s = serde_json::to_string(&update_calendar_item_body(&ItemId { id: "E".into(), change_key: None }, &changes, true, false)).unwrap();
+        assert_eq!(
+            s,
+            r#"{"__type":"UpdateItemRequest:#Exchange","ConflictResolution":"AlwaysOverwrite","SendCalendarInvitationsOrCancellations":"SendToAllAndSaveCopy","ItemChanges":[{"__type":"ItemChange:#Exchange","ItemId":{"__type":"ItemId:#Exchange","Id":"E"},"Updates":[{"__type":"SetItemField:#Exchange","Path":{"__type":"PropertyUri:#Exchange","FieldURI":"item:Subject"},"Item":{"__type":"CalendarItem:#Exchange","Subject":"Тема"}},{"__type":"SetItemField:#Exchange","Path":{"__type":"PropertyUri:#Exchange","FieldURI":"calendar:IsAllDayEvent"},"Item":{"__type":"CalendarItem:#Exchange","IsAllDayEvent":true}},{"__type":"SetItemField:#Exchange","Path":{"__type":"PropertyUri:#Exchange","FieldURI":"calendar:EnhancedLocation"},"Item":{"__type":"CalendarItem:#Exchange","Location":{"__type":"EnhancedLocation:#Exchange","DisplayName":""}}},{"__type":"SetItemField:#Exchange","Path":{"__type":"PropertyUri:#Exchange","FieldURI":"item:Body"},"Item":{"__type":"CalendarItem:#Exchange","Body":{"__type":"BodyContentType:#Exchange","BodyType":"HTML","Value":"<p>x</p>"}}},{"__type":"DeleteItemField:#Exchange","Path":{"__type":"PropertyUri:#Exchange","FieldURI":"calendar:RequiredAttendees"}},{"__type":"SetItemField:#Exchange","Path":{"__type":"PropertyUri:#Exchange","FieldURI":"calendar:OptionalAttendees"},"Item":{"__type":"CalendarItem:#Exchange","OptionalAttendees":[{"__type":"AttendeeType:#Exchange","Mailbox":{"__type":"EmailAddress:#Exchange","EmailAddress":"o@x.ru","RoutingType":"SMTP"}}]}},{"__type":"SetItemField:#Exchange","Path":{"__type":"PropertyUri:#Exchange","FieldURI":"item:ReminderIsSet"},"Item":{"__type":"CalendarItem:#Exchange","ReminderIsSet":false}},{"__type":"SetItemField:#Exchange","Path":{"__type":"PropertyUri:#Exchange","FieldURI":"calendar:LegacyFreeBusyStatus"},"Item":{"__type":"CalendarItem:#Exchange","FreeBusyType":"Free"}}]}]}"#
+        );
+        // Включение напоминания — два поля подряд.
+        let s = serde_json::to_string(&update_calendar_item_body(&id, &CalendarItemChanges { reminder_minutes: Some(Some(30)), ..Default::default() }, false, false)).unwrap();
+        assert!(s.contains(r#""Updates":[{"__type":"SetItemField:#Exchange","Path":{"__type":"PropertyUri:#Exchange","FieldURI":"item:ReminderIsSet"},"Item":{"__type":"CalendarItem:#Exchange","ReminderIsSet":true}},{"__type":"SetItemField:#Exchange","Path":{"__type":"PropertyUri:#Exchange","FieldURI":"item:ReminderMinutesBeforeStart"},"Item":{"__type":"CalendarItem:#Exchange","ReminderMinutesBeforeStart":30}}]"#), "{s}");
+        assert!(serde_json::to_string(&update_calendar_item_body(&id, &CalendarItemChanges::default(), false, false)).unwrap().contains(r#""Updates":[]"#));
+        // Весь день в контексте пояса пользователя: границы — местные полуночи дат без зоны, IsAllDayEvent рядом.
+        let all_day = CalendarItemChanges { start: Some("2026-10-26T00:00:00Z".parse().unwrap()), end: Some("2026-10-27T00:00:00Z".parse().unwrap()), is_all_day: Some(true), ..Default::default() };
+        let s = serde_json::to_string(&update_calendar_item_body(&id, &all_day, false, true)).unwrap();
+        assert!(s.contains(r#""Item":{"__type":"CalendarItem:#Exchange","Start":"2026-10-26T00:00:00"}},{"__type":"SetItemField:#Exchange","Path":{"__type":"PropertyUri:#Exchange","FieldURI":"calendar:End"},"Item":{"__type":"CalendarItem:#Exchange","End":"2026-10-27T00:00:00"}},{"__type":"SetItemField:#Exchange","Path":{"__type":"PropertyUri:#Exchange","FieldURI":"calendar:IsAllDayEvent"},"Item":{"__type":"CalendarItem:#Exchange","IsAllDayEvent":true}}"#), "{s}");
+        // Без пояса те же границы — моменты UTC с Z.
+        let s = serde_json::to_string(&update_calendar_item_body(&id, &all_day, false, false)).unwrap();
+        assert!(s.contains(r#""Start":"2026-10-26T00:00:00Z"}}"#) && s.contains(r#""End":"2026-10-27T00:00:00Z"}}"#), "{s}");
+    }
+
+    #[test]
+    fn parses_user_time_zone_and_probe_fields() {
+        let msg: Value = serde_json::from_str(r#"{"ResponseClass":"Success","UserConfiguration":{"Dictionary":[
+            {"DictionaryKey":{"Type":"String","Value":["signaturehtml"]},"DictionaryValue":{"Type":"String","Value":["<p>x</p>"]}},
+            {"DictionaryKey":{"Type":"String","Value":["timezone"]},"DictionaryValue":{"Type":"String","Value":[" Russian Standard Time "]}}]}}"#).unwrap();
+        assert_eq!(parse_user_time_zone(&msg).as_deref(), Some("Russian Standard Time"));
+        let msg: Value = serde_json::from_str(r#"{"UserConfiguration":{"Dictionary":[{"DictionaryKey":{"Value":["TimeZone"]},"DictionaryValue":{"Value":[""]}}]}}"#).unwrap();
+        assert_eq!(parse_user_time_zone(&msg), None);
+        assert_eq!(parse_user_time_zone(&json!({"UserConfiguration":{}})), None);
+        let item: Value = serde_json::from_str(r#"{"__type":"CalendarItem:#Exchange","Subject":"секрет","Body":{"Value":"x"},"IsAllDayEvent":true,"Start":"2026-10-25T21:00:00Z","End":"2026-10-26T21:00:00Z","StartTimeZoneId":"Russian Standard Time","EndTimeZoneId":"Russian Standard Time","TimeZone":"(UTC+03:00) Moscow","Location":{"__type":"EnhancedLocation:#Exchange","DisplayName":"Кабинет"}}"#).unwrap();
+        assert_eq!(
+            serde_json::to_string(&calendar_probe_fields(&item)).unwrap(),
+            r#"{"IsAllDayEvent":true,"Start":"2026-10-25T21:00:00Z","End":"2026-10-26T21:00:00Z","StartTimeZoneId":"Russian Standard Time","EndTimeZoneId":"Russian Standard Time","TimeZone":"(UTC+03:00) Moscow","Location":{"__type":"EnhancedLocation:#Exchange","DisplayName":"Кабинет"}}"#
+        );
+        let body = serde_json::to_string(&get_calendar_probe_body(&ItemId { id: "E".into(), change_key: None })).unwrap();
+        assert!(body.contains(r#""BaseShape":"AllProperties""#), "{body}");
+        assert!(body.ends_with(r#""MaximumRecipientsToReturn":500,"AdditionalProperties":[{"__type":"ExtendedPropertyUri:#Exchange","DistinguishedPropertySetId":"Appointment","PropertyId":33288,"PropertyType":"String"}]},"ItemIds":[{"__type":"ItemId:#Exchange","Id":"E"}],"ShapeName":null}"#), "{body}");
+    }
+
+    #[test]
+    fn delete_and_respond_bodies_exact() {
+        let id = ItemId { id: "E".into(), change_key: Some("ek".into()) };
+        assert_eq!(
+            serde_json::to_string(&delete_calendar_item_body(&id, "MoveToDeletedItems", false)).unwrap(),
+            r#"{"__type":"DeleteItemRequest:#Exchange","ItemIds":[{"__type":"ItemId:#Exchange","Id":"E","ChangeKey":"ek"}],"DeleteType":"MoveToDeletedItems","SendMeetingCancellations":"SendToNone"}"#
+        );
+        let s = serde_json::to_string(&delete_calendar_item_body(&id, "HardDelete", true)).unwrap();
+        assert!(s.ends_with(r#""DeleteType":"HardDelete","SendMeetingCancellations":"SendToAllAndSaveCopy"}"#), "{s}");
+        assert_eq!(
+            serde_json::to_string(&respond_to_meeting_body(&id, MeetingResponse::Accept, true, None)).unwrap(),
+            r#"{"__type":"CreateItemRequest:#Exchange","MessageDisposition":"SendAndSaveCopy","Items":[{"__type":"AcceptItem:#Exchange","ReferenceItemId":{"__type":"ItemId:#Exchange","Id":"E","ChangeKey":"ek"}}]}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&respond_to_meeting_body(&id, MeetingResponse::Tentative, false, Some("<p>Постараюсь</p>"))).unwrap(),
+            r#"{"__type":"CreateItemRequest:#Exchange","MessageDisposition":"SaveOnly","Items":[{"__type":"TentativelyAcceptItem:#Exchange","ReferenceItemId":{"__type":"ItemId:#Exchange","Id":"E","ChangeKey":"ek"},"Body":{"__type":"BodyContentType:#Exchange","BodyType":"HTML","Value":"<p>Постараюсь</p>"}}]}"#
+        );
+        let s = serde_json::to_string(&respond_to_meeting_body(&id, MeetingResponse::Decline, true, Some("  "))).unwrap();
+        assert!(s.contains(r#"{"__type":"DeclineItem:#Exchange","ReferenceItemId":{"#) && !s.contains("Body"), "пустое тело не передаётся: {s}");
+    }
+
+    #[test]
+    fn get_meeting_request_body_exact() {
+        let id = ItemId { id: "M".into(), change_key: Some("mk".into()) };
+        let s = serde_json::to_string(&get_meeting_request_body(&id, CalendarItemShape::Explicit, 4096)).unwrap();
+        assert_eq!(
+            s,
+            r#"{"__type":"GetItemRequest:#Exchange","ItemShape":{"__type":"ItemResponseShape:#Exchange","BaseShape":"IdOnly","BodyType":"HTML","FilterHtmlContent":true,"BlockExternalImagesIfSenderUntrusted":true,"MaximumBodySize":4096,"AdditionalProperties":[{"__type":"PropertyUri:#Exchange","FieldURI":"item:ItemClass"},{"__type":"PropertyUri:#Exchange","FieldURI":"item:Subject"},{"__type":"PropertyUri:#Exchange","FieldURI":"item:DateTimeReceived"},{"__type":"PropertyUri:#Exchange","FieldURI":"message:From"},{"__type":"PropertyUri:#Exchange","FieldURI":"calendar:Start"},{"__type":"PropertyUri:#Exchange","FieldURI":"calendar:End"},{"__type":"PropertyUri:#Exchange","FieldURI":"calendar:IsAllDayEvent"},{"__type":"PropertyUri:#Exchange","FieldURI":"calendar:Location"},{"__type":"PropertyUri:#Exchange","FieldURI":"calendar:EnhancedLocation"},{"__type":"PropertyUri:#Exchange","FieldURI":"calendar:Organizer"},{"__type":"PropertyUri:#Exchange","FieldURI":"calendar:MyResponseType"},{"__type":"PropertyUri:#Exchange","FieldURI":"calendar:CalendarItemType"},{"__type":"PropertyUri:#Exchange","FieldURI":"calendar:Recurrence"},{"__type":"PropertyUri:#Exchange","FieldURI":"meeting:IsOutOfDate"},{"__type":"PropertyUri:#Exchange","FieldURI":"meeting:AssociatedCalendarItemId"},{"__type":"PropertyUri:#Exchange","FieldURI":"meeting:ResponseType"},{"__type":"PropertyUri:#Exchange","FieldURI":"meeting:HasBeenProcessed"},{"__type":"PropertyUri:#Exchange","FieldURI":"meeting:IsDelegated"}]},"ItemIds":[{"__type":"ItemId:#Exchange","Id":"M","ChangeKey":"mk"}],"ShapeName":null}"#
+        );
+        let s = serde_json::to_string(&get_meeting_request_body(&id, CalendarItemShape::AllProperties, 4096)).unwrap();
+        assert!(s.starts_with(r#"{"__type":"GetItemRequest:#Exchange","ItemShape":{"__type":"ItemResponseShape:#Exchange","BaseShape":"AllProperties","BodyType":"HTML","FilterHtmlContent":true,"BlockExternalImagesIfSenderUntrusted":true,"MaximumBodySize":4096},"ItemIds":["#), "{s}");
+    }
+
+    #[test]
+    fn parses_meeting_request_info() {
+        // Приглашение: Organizer, свой ответ под именем OWA JSON ResponseType, связанное событие, повторение.
+        let v: Value = serde_json::from_str(r#"{"__type":"MeetingRequest:#Exchange","ItemId":{"Id":"M","ChangeKey":"mk"},"ItemClass":"IPM.Schedule.Meeting.Request","Subject":"Планёрка",
+          "From":{"Mailbox":{"Name":"Секретарь","EmailAddress":"s@x.ru"}},"Organizer":{"Mailbox":{"Name":"Иван","EmailAddress":"i@x.ru","RoutingType":"SMTP"}},
+          "Start":"2026-10-27T07:00:00Z","End":"2026-10-27T07:30:00Z","IsAllDayEvent":false,"Location":"Зал","ResponseType":"NoResponseReceived","IsOutOfDate":true,
+          "AssociatedCalendarItemId":{"Id":"C1","ChangeKey":"ck"},"Recurrence":{"RecurrencePattern":{"__type":"DailyRecurrence:#Exchange","Interval":1},"RecurrenceRange":{"__type":"NoEndRecurrence:#Exchange","StartDate":"2026-10-27"}}}"#).unwrap();
+        let info = parse_meeting_request_info(&v);
+        assert_eq!(info.kind, MeetingMessageKind::Request);
+        assert_eq!(info.start, Some("2026-10-27T07:00:00Z".parse().unwrap()));
+        assert_eq!(info.end.unwrap().duration_since(info.start.unwrap()).as_mins(), 30);
+        assert_eq!((info.is_all_day, info.location.as_deref(), info.organizer.as_ref().unwrap().email.as_deref()), (false, Some("Зал"), Some("i@x.ru")));
+        assert_eq!((info.my_response, info.is_out_of_date, info.response_type_of_sender), (ResponseType::NoResponseReceived, true, None));
+        assert_eq!(info.associated_calendar_item, Some(ItemId { id: "C1".into(), change_key: Some("ck".into()) }));
+        assert_eq!(info.recurrence_text.as_deref(), Some("Ежедневно, с 27.10.2026"));
+        // Имя EWS MyResponseType важнее ResponseType; без Organizer — From.
+        let v: Value = serde_json::from_str(r#"{"ItemClass":"IPM.Schedule.Meeting.Request","From":{"Mailbox":{"EmailAddress":"s@x.ru"}},"MyResponseType":"Accept","ResponseType":"Unknown","Start":"2026-10-27T07:00:00Z"}"#).unwrap();
+        let info = parse_meeting_request_info(&v);
+        assert_eq!((info.my_response, info.organizer.unwrap().email.as_deref(), info.end, info.associated_calendar_item), (ResponseType::Accept, Some("s@x.ru"), None, None));
+        // Ответ участника: ResponseType — его ответ; без него — по классу письма. From — сам
+        // ответивший, организатором он не считается.
+        let v: Value = serde_json::from_str(r#"{"ItemClass":"IPM.Schedule.Meeting.Resp.Tent","From":{"Mailbox":{"EmailAddress":"p@x.ru"}},"ResponseType":"Tentative","Start":"2026-10-27T07:00:00Z","End":"2026-10-27T08:00:00Z"}"#).unwrap();
+        let info = parse_meeting_request_info(&v);
+        assert_eq!((info.kind, info.my_response, info.response_type_of_sender), (MeetingMessageKind::Response, ResponseType::Unknown, Some(ResponseType::Tentative)));
+        assert!(info.organizer.is_none(), "у письма-ответа From — участник, а не организатор");
+        let v: Value = serde_json::from_str(r#"{"ItemClass":"IPM.Schedule.Meeting.Resp.Neg"}"#).unwrap();
+        assert_eq!(parse_meeting_request_info(&v).response_type_of_sender, Some(ResponseType::Decline));
+        // Отмена (организатор — из From) и не письмо о встрече.
+        let v: Value = serde_json::from_str(r#"{"ItemClass":"IPM.Schedule.Meeting.Canceled","From":{"Mailbox":{"EmailAddress":"o@x.ru"}},"Start":"2026-10-27T07:00:00Z","IsOutOfDate":false}"#).unwrap();
+        let info = parse_meeting_request_info(&v);
+        assert_eq!((info.kind, info.organizer.unwrap().email.as_deref()), (MeetingMessageKind::Cancellation, Some("o@x.ru")));
+        let info = parse_meeting_request_info(&json!({"ItemClass":"IPM.Note"}));
+        assert_eq!((info.kind, info.start, info.my_response), (MeetingMessageKind::Other, None, ResponseType::Unknown));
     }
 
     #[test]

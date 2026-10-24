@@ -8,7 +8,10 @@
 pub mod notify;
 pub mod protocol;
 
-use aiowa_core::{CalendarEvent, CalendarEventDetails, ComposeKind, FolderChanges, FolderRef, ItemChanges, ItemId, OutgoingAttachment, OutgoingMessage, Signature, SyncState};
+use aiowa_core::{
+    CalendarEvent, CalendarEventDetails, CalendarItemChanges, ComposeKind, FolderChanges, FolderRef, ItemChanges, ItemId, MeetingRequestInfo, MeetingResponse, NewCalendarItem, OutgoingAttachment, OutgoingMessage,
+    Signature, SyncState,
+};
 use aiowa_transport::{
     async_trait, AttachmentContent, Credentials, DeleteMode, FolderCounts, ItemFetchShape, ItemResult, MailTransport, NotificationEvent, NotificationKind, Result, ServerInfo, StreamEnd, SubscriptionRequest,
     SubscriptionResult, TransportError, WriteResult,
@@ -89,6 +92,8 @@ struct Inner {
     calendar_mode: AtomicU8,
     /// Какую форму `ItemShape` для `GetItem` события принял сервер (`CALENDAR_SHAPE_*`).
     calendar_shape: AtomicU8,
+    /// Какую форму `ItemShape` для `GetItem` письма о встрече принял сервер (`CALENDAR_SHAPE_*`).
+    meeting_shape: AtomicU8,
     /// Какую форму `SubscribeToNotification` принял сервер (`SubscribeForm::code`, 0 не известно).
     subscribe_form: AtomicU8,
     /// Подписки текущей сессии: вид по идентификатору, чтобы разбирать события потока.
@@ -201,6 +206,7 @@ impl OwaTransport {
             attachment_mode: AtomicU8::new(ATTACHMENT_MODE_UNKNOWN),
             calendar_mode: AtomicU8::new(CALENDAR_MODE_UNKNOWN),
             calendar_shape: AtomicU8::new(CALENDAR_SHAPE_UNKNOWN),
+            meeting_shape: AtomicU8::new(CALENDAR_SHAPE_UNKNOWN),
             subscribe_form: AtomicU8::new(0),
             subscriptions: RwLock::new(HashMap::new()),
             subscriptions_stale: AtomicBool::new(false),
@@ -276,10 +282,10 @@ impl OwaTransport {
             self.remember_build(r.headers());
             if r.status().is_redirection() {
                 let l = r.headers().get(LOCATION).and_then(|v| v.to_str().ok()).map(String::from);
-                if let Some(l) = &l {
-                    if l.to_ascii_lowercase().contains("errorfe.aspx") {
-                        return Err(classify_redirect(l));
-                    }
+                if let Some(l) = &l
+                    && l.to_ascii_lowercase().contains("errorfe.aspx")
+                {
+                    return Err(classify_redirect(l));
                 }
                 next = l;
             } else {
@@ -329,7 +335,13 @@ impl OwaTransport {
 
     /// То же с собственным таймаутом запроса вместо общего из настроек (загрузка вложений).
     pub async fn call_with_timeout(&self, op: &str, version: &str, body: Value, timeout: Option<Duration>) -> Result<Value> {
-        let env = protocol::envelope(op, version, &self.inner.config.time_zone, body);
+        self.call_in_zone(op, version, None, body, timeout).await
+    }
+
+    /// Вызов с другим `TimeZoneContext` в заголовке только этого запроса: `time_zone` — пояс
+    /// Windows пользователя (запись в календарь, § 5i); `None` — пояс из настроек (UTC).
+    pub async fn call_in_zone(&self, op: &str, version: &str, time_zone: Option<&str>, body: Value, timeout: Option<Duration>) -> Result<Value> {
+        let env = protocol::envelope(op, version, time_zone.unwrap_or(&self.inner.config.time_zone), body);
         let payload = serde_json::to_vec(&env).map_err(|e| TransportError::Protocol { op: op.into(), status: 0, raw: e.to_string() })?;
         self.call_payload(op, payload, timeout).await
     }
@@ -367,10 +379,10 @@ impl OwaTransport {
         headers.insert("X-OWA-CANARY", HeaderValue::from_str(&canary).map_err(|_| TransportError::CsrfRejected)?);
         headers.insert("Content-Type", HeaderValue::from_static("application/json; charset=utf-8"));
         headers.insert("X-Requested-With", HeaderValue::from_static("XMLHttpRequest"));
-        if let Some(b) = inner.build.read().expect("build lock").as_deref() {
-            if let Ok(v) = HeaderValue::from_str(b) {
-                headers.insert("X-OWA-ClientBuildVersion", v);
-            }
+        if let Some(b) = inner.build.read().expect("build lock").as_deref()
+            && let Ok(v) = HeaderValue::from_str(b)
+        {
+            headers.insert("X-OWA-ClientBuildVersion", v);
         }
         let started = std::time::Instant::now();
         let mut req = inner.client.post(url).headers(headers).body(payload);
@@ -391,10 +403,10 @@ impl OwaTransport {
         debug!(op, %status, ms = started.elapsed().as_millis(), bytes = text.len(), "service.svc");
         if !status.is_success() {
             // Ошибка уровня сервиса приходит как {"Body":{"ErrorCode":500,"FaultMessage":...}}
-            if let Ok(v) = serde_json::from_str::<Value>(&text) {
-                if let Some(fault) = v.pointer("/Body/FaultMessage").and_then(Value::as_str) {
-                    return Err(TransportError::Protocol { op: op.into(), status: status.as_u16(), raw: truncate(fault, 300) });
-                }
+            if let Ok(v) = serde_json::from_str::<Value>(&text)
+                && let Some(fault) = v.pointer("/Body/FaultMessage").and_then(Value::as_str)
+            {
+                return Err(TransportError::Protocol { op: op.into(), status: status.as_u16(), raw: truncate(fault, 300) });
             }
             return Err(TransportError::Protocol { op: op.into(), status: status.as_u16(), raw: truncate(&text, 300) });
         }
@@ -473,10 +485,10 @@ impl OwaTransport {
             let text = r.text().await.unwrap_or_default();
             return Err(TransportError::Protocol { op: "GetFileAttachment".into(), status: status.as_u16(), raw: format!("сервер вернул страницу вместо файла: {}", truncate(&text, 200)) });
         }
-        if let Some(len) = r.headers().get(CONTENT_LENGTH).and_then(|v| v.to_str().ok()).and_then(|s| s.parse::<u64>().ok()) {
-            if len > max_bytes {
-                return Err(TransportError::TooLarge { limit: max_bytes });
-            }
+        if let Some(len) = r.headers().get(CONTENT_LENGTH).and_then(|v| v.to_str().ok()).and_then(|s| s.parse::<u64>().ok())
+            && len > max_bytes
+        {
+            return Err(TransportError::TooLarge { limit: max_bytes });
         }
         let file_name = r.headers().get(CONTENT_DISPOSITION).and_then(|v| v.to_str().ok()).and_then(parse_content_disposition_filename);
         let mut bytes: Vec<u8> = Vec::new();
@@ -680,6 +692,98 @@ impl OwaTransport {
         let v = self.call("GetItem", protocol::V_2017, body).await?;
         let msg = Self::first_message("GetItem", &v)?;
         Ok(protocol::json_shape(msg.pointer("/Items/0").unwrap_or(&Value::Null), 3))
+    }
+
+    /// Проверка записи в календарь: `GetItem` события с `AllProperties` и `PidLidLocation`
+    /// (`protocol::get_calendar_probe_body`), из ответа — только поля времени, поясов и места
+    /// (`protocol::calendar_probe_fields`) — для своего тестового события.
+    pub async fn probe_calendar_item_fields(&self, id: &ItemId) -> Result<Value> {
+        let body = protocol::get_calendar_probe_body(id);
+        let v = self.call("GetItem", protocol::V_2017, body).await?;
+        let msg = Self::first_message("GetItem", &v)?;
+        Ok(protocol::calendar_probe_fields(msg.pointer("/Items/0").unwrap_or(&Value::Null)))
+    }
+
+    /// Словарь `OWA.UserOptions` (`GetUserConfiguration`): объект ищется сначала в корне ящика
+    /// (`root`, как в EWS Managed API), затем в корне почтовых папок (`msgfolderroot`);
+    /// `ErrorItemNotFound` в обоих — `None`.
+    async fn user_options(&self) -> Result<Option<Value>> {
+        for base in ["root", "msgfolderroot"] {
+            let v = self.call("GetUserConfiguration", protocol::V_2013, protocol::get_user_configuration_body(base)).await?;
+            match Self::first_message("GetUserConfiguration", &v) {
+                Ok(m) => {
+                    let dict = protocol::user_configuration_dictionary(&m);
+                    let keys: Vec<&str> = dict.iter().map(|(k, _)| k.as_str()).collect();
+                    debug!(base, entries = dict.len(), ?keys, shape = %protocol::json_shape(&m, 5), "GetUserConfiguration: словарь OWA.UserOptions");
+                    return Ok(Some(m));
+                }
+                Err(TransportError::Server { code, message }) if code == "ErrorItemNotFound" => {
+                    debug!(base, message, "GetUserConfiguration: объекта OWA.UserOptions нет в этой папке");
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(None)
+    }
+
+    /// Удалить событие календаря: в «Удалённые» (`MoveToDeletedItems`) или навсегда (`HardDelete`),
+    /// с рассылкой отмены участникам или без неё. Трейтовый `delete_calendar_item` — всегда в
+    /// «Удалённые»; CLI после проверки удаляет навсегда.
+    pub async fn delete_calendar_item_with(&self, id: &ItemId, mode: DeleteMode, send_cancellations: bool) -> Result<()> {
+        let delete_type = match mode {
+            DeleteMode::ToDeletedItems => "MoveToDeletedItems",
+            DeleteMode::Hard => "HardDelete",
+        };
+        let v = self.call("DeleteItem", protocol::V_2017, protocol::delete_calendar_item_body(id, delete_type, send_cancellations)).await?;
+        let m = Self::first_message("DeleteItem", &v)?;
+        Self::log_shape("DeleteItem", &m);
+        debug!(delete_type, send_cancellations, "событие календаря удалено");
+        Ok(())
+    }
+
+    /// Отладка форм протокола: `GetItem` письма о встрече с `AllProperties`; возвращает форму
+    /// элемента ответа без содержимого (`protocol::json_shape`: ключи, длины строк и массивов).
+    pub async fn probe_meeting_request_shape(&self, id: &ItemId) -> Result<String> {
+        let body = protocol::get_meeting_request_body(id, CalendarItemShape::AllProperties, 4096);
+        let v = self.call("GetItem", protocol::V_2017, body).await?;
+        let msg = Self::first_message("GetItem", &v)?;
+        Ok(protocol::json_shape(msg.pointer("/Items/0").unwrap_or(&Value::Null), 3))
+    }
+
+    /// Элемент ответа `GetItem` письма о встрече: сначала `IdOnly` с явным списком полей, при
+    /// отказе сервера по форме — `AllProperties`; принятая форма запоминается на сессию.
+    async fn meeting_request_item(&self, id: &ItemId) -> Result<Value> {
+        let known = self.inner.meeting_shape.load(Ordering::Relaxed);
+        let candidates: &[(u8, CalendarItemShape)] = match known {
+            CALENDAR_SHAPE_ALL => &[(CALENDAR_SHAPE_ALL, CalendarItemShape::AllProperties)],
+            CALENDAR_SHAPE_EXPLICIT => &[(CALENDAR_SHAPE_EXPLICIT, CalendarItemShape::Explicit)],
+            _ => &[(CALENDAR_SHAPE_EXPLICIT, CalendarItemShape::Explicit), (CALENDAR_SHAPE_ALL, CalendarItemShape::AllProperties)],
+        };
+        let mut last_err: Option<TransportError> = None;
+        for (i, (code, shape)) in candidates.iter().enumerate() {
+            let body = protocol::get_meeting_request_body(id, *shape, 4096);
+            let msg = match self.call("GetItem", protocol::V_2017, body).await.and_then(|v| Self::first_message("GetItem", &v)) {
+                Ok(m) => m,
+                Err(e) if i + 1 < candidates.len() && (matches!(&e, TransportError::Protocol { status: 500, .. }) || matches!(&e, TransportError::Server { code, .. } if code.contains("Property") || code.contains("Shape"))) => {
+                    warn!(error = %e, "GetItem письма о встрече: форма {:?} отвергнута, пробую следующую", shape);
+                    last_err = Some(e);
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
+            Self::log_shape("GetItem", &msg);
+            let Some(item) = msg.pointer("/Items/0") else {
+                return Err(TransportError::Protocol { op: "GetItem".into(), status: 200, raw: format!("нет Items[0]: {}", truncate(&msg.to_string(), 200)) });
+            };
+            if known == CALENDAR_SHAPE_UNKNOWN {
+                info!(shape = ?shape, item_type = protocol::str_of(item, "__type").unwrap_or("?"), keys = item.as_object().map(|o| o.len()).unwrap_or(0), "GetItem письма о встрече: сервер принял форму");
+            }
+            self.inner.meeting_shape.store(*code, Ordering::Relaxed);
+            // Форма элемента без содержимого (строки — длинами): для документации протокола.
+            debug!(shape = %protocol::json_shape(item, 2), "GetItem письма о встрече: форма элемента");
+            return Ok(item.clone());
+        }
+        Err(last_err.unwrap_or(TransportError::Protocol { op: "GetItem".into(), status: 0, raw: "ни одна форма не принята".into() }))
     }
 
     /// Статус ответа канала уведомлений: 440/401 и редирект на вход — истёкшая сессия,
@@ -960,10 +1064,8 @@ impl MailTransport for OwaTransport {
                 }
             }
             let all_failed = parsed.iter().all(|p| matches!(p, Some(ItemResult::Failed { .. }) | None));
-            if all_failed {
-                if let Some(t) = throttled {
-                    return Err(t);
-                }
+            if all_failed && let Some(t) = throttled {
+                return Err(t);
             }
             for (i, p) in parsed.into_iter().enumerate() {
                 out.push(p.unwrap_or_else(|| ItemResult::Failed { id: chunk[i].clone(), code: "NoResponse".into(), message: "сервер не вернул ответ по элементу".into() }));
@@ -979,10 +1081,10 @@ impl MailTransport for OwaTransport {
             if protocol::message_error(msg).is_some() {
                 continue;
             }
-            if let Some(f) = msg.pointer("/Folders/0") {
-                if let Some(id) = f.get("FolderId").and_then(protocol::parse_folder_id) {
-                    out.push(FolderCounts { id, total: protocol::i64_of(f, "TotalCount").unwrap_or(0), unread: protocol::i64_of(f, "UnreadCount").unwrap_or(0) });
-                }
+            if let Some(f) = msg.pointer("/Folders/0")
+                && let Some(id) = f.get("FolderId").and_then(protocol::parse_folder_id)
+            {
+                out.push(FolderCounts { id, total: protocol::i64_of(f, "TotalCount").unwrap_or(0), unread: protocol::i64_of(f, "UnreadCount").unwrap_or(0) });
             }
         }
         Ok(out)
@@ -1053,25 +1155,16 @@ impl MailTransport for OwaTransport {
         Ok(protocol::written_item_id(&m).unwrap_or_else(|| item.clone()))
     }
 
-    /// Объект `OWA.UserOptions` ищется сначала в корне ящика (`root`, как в EWS Managed API),
-    /// затем в корне почтовых папок (`msgfolderroot`); `ErrorItemNotFound` в обоих — подписи нет.
+    /// Подпись из словаря `OWA.UserOptions` (`user_options`); нет объекта или подписи — `None`.
     async fn user_signature(&self) -> Result<Option<Signature>> {
-        for base in ["root", "msgfolderroot"] {
-            let v = self.call("GetUserConfiguration", protocol::V_2013, protocol::get_user_configuration_body(base)).await?;
-            match Self::first_message("GetUserConfiguration", &v) {
-                Ok(m) => {
-                    let dict = protocol::user_configuration_dictionary(&m);
-                    let keys: Vec<&str> = dict.iter().map(|(k, _)| k.as_str()).collect();
-                    debug!(base, entries = dict.len(), ?keys, shape = %protocol::json_shape(&m, 5), "GetUserConfiguration: словарь OWA.UserOptions");
-                    return Ok(protocol::parse_user_signature(&m));
-                }
-                Err(TransportError::Server { code, message }) if code == "ErrorItemNotFound" => {
-                    debug!(base, message, "GetUserConfiguration: объекта OWA.UserOptions нет в этой папке");
-                }
-                Err(e) => return Err(e),
-            }
-        }
-        Ok(None)
+        Ok(self.user_options().await?.as_ref().and_then(protocol::parse_user_signature))
+    }
+
+    /// Пояс пользователя из словаря `OWA.UserOptions` (ключ `timezone`); нет объекта или ключа — `None`.
+    async fn user_time_zone(&self) -> Result<Option<String>> {
+        let tz = self.user_options().await?.as_ref().and_then(protocol::parse_user_time_zone);
+        debug!(known = tz.is_some(), len = tz.as_deref().map(str::len), "GetUserConfiguration: пояс пользователя");
+        Ok(tz)
     }
 
     async fn find_calendar_view(&self, start: Timestamp, end: Timestamp) -> Result<Vec<CalendarEvent>> {
@@ -1151,6 +1244,49 @@ impl MailTransport for OwaTransport {
             return Ok(details);
         }
         Err(last_err.unwrap_or(TransportError::Protocol { op: "GetItem".into(), status: 0, raw: "ни одна форма не принята".into() }))
+    }
+
+    /// Запрос идёт в контексте пояса пользователя (`TimeZoneContext` этого запроса), у события на
+    /// весь день границы — местные полуночи дат без зоны; без пояса — контекст UTC и моменты с `Z`.
+    async fn create_calendar_item(&self, item: &NewCalendarItem, time_zone: Option<&str>) -> Result<ItemId> {
+        let body = protocol::create_calendar_item_body(item, time_zone.is_some() && item.is_all_day);
+        let v = self.call_in_zone("CreateItem", protocol::V_2017, time_zone, body, None).await?;
+        let m = Self::first_message("CreateItem", &v)?;
+        Self::log_shape("CreateItem", &m);
+        let id = protocol::parse_created_item_id(&m).ok_or_else(|| TransportError::Protocol { op: "CreateItem".into(), status: 200, raw: format!("нет Items[0].ItemId: {}", truncate(&m.to_string(), 200)) })?;
+        debug!(attendees = item.required.len() + item.optional.len(), all_day = item.is_all_day, reminder = ?item.reminder_minutes, zone = time_zone.is_some(), id_len = id.id.len(), ck_len = id.change_key.as_deref().map(str::len), "событие календаря создано");
+        Ok(id)
+    }
+
+    async fn update_calendar_item(&self, id: &ItemId, changes: &CalendarItemChanges, send_updates: bool, time_zone: Option<&str>) -> Result<ItemId> {
+        if changes.is_empty() {
+            debug!("событие календаря: изменений нет, запрос не нужен");
+            return Ok(id.clone());
+        }
+        let body = protocol::update_calendar_item_body(id, changes, send_updates, time_zone.is_some() && changes.is_all_day == Some(true));
+        let v = self.call_in_zone("UpdateItem", protocol::V_2017, time_zone, body, None).await?;
+        let m = Self::first_message("UpdateItem", &v)?;
+        Self::log_shape("UpdateItem", &m);
+        Ok(protocol::written_item_id(&m).unwrap_or_else(|| id.clone()))
+    }
+
+    async fn delete_calendar_item(&self, id: &ItemId, send_cancellations: bool) -> Result<()> {
+        self.delete_calendar_item_with(id, DeleteMode::ToDeletedItems, send_cancellations).await
+    }
+
+    async fn respond_to_meeting(&self, reference: &ItemId, response: MeetingResponse, send_response: bool, body_html: Option<&str>) -> Result<()> {
+        let v = self.call("CreateItem", protocol::V_2017, protocol::respond_to_meeting_body(reference, response, send_response, body_html)).await?;
+        let m = Self::first_message("CreateItem", &v)?;
+        Self::log_shape("CreateItem", &m);
+        debug!(response = response.key(), send_response, "ответ на приглашение принят сервером");
+        Ok(())
+    }
+
+    async fn get_meeting_request(&self, id: &ItemId) -> Result<MeetingRequestInfo> {
+        let item = self.meeting_request_item(id).await?;
+        let info = protocol::parse_meeting_request_info(&item);
+        debug!(kind = info.kind.key(), has_start = info.start.is_some(), my_response = info.my_response.as_str(), out_of_date = info.is_out_of_date, associated = info.associated_calendar_item.is_some(), sender = ?info.response_type_of_sender, "GetItem письма о встрече");
+        Ok(info)
     }
 
     /// `SubscribeToNotification` через `call_raw` с подбором формы (один раз на сессию): форма

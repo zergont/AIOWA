@@ -7,9 +7,11 @@
     selected: Date;
     /** Период, показанный в сетке: его дни подсвечены. */
     range?: ViewRange | null;
+    /** Ключи дней (dayKey) с событиями из уже загруженных окон: точка под числом. */
+    eventDays?: Set<number> | null;
     onselect: (d: Date) => void;
   }
-  let { selected, range = null, onselect }: Props = $props();
+  let { selected, range = null, eventDays = null, onselect }: Props = $props();
 
   const WEEKDAYS = ["пн", "вт", "ср", "чт", "пт", "сб", "вс"];
 
@@ -64,7 +66,8 @@
   <div class="days" role="group" aria-label="Дни месяца">
     {#each cells as d (d.getTime())}
       {@const isSelected = sameDay(d, selected)}
-      <button class="day" class:other={d.getMonth() !== month.getMonth()} class:today={sameDay(d, today)} class:selected={isSelected} class:inrange={inRange(d)} class:weekend={isWeekend(d)} onclick={() => onselect(d)} aria-label={dayLong(d)} aria-pressed={isSelected}>
+      {@const busy = eventDays?.has(dayKey(d)) ?? false}
+      <button class="day" class:other={d.getMonth() !== month.getMonth()} class:today={sameDay(d, today)} class:selected={isSelected} class:inrange={inRange(d)} class:weekend={isWeekend(d)} class:busy onclick={() => onselect(d)} aria-label={busy ? `${dayLong(d)}, есть события` : dayLong(d)} aria-pressed={isSelected}>
         {d.getDate()}
       </button>
     {/each}
@@ -163,5 +166,23 @@
   }
   .day.selected:hover {
     background: var(--accent-hover);
+  }
+  /* Точка под числом: в этот день есть события (по уже загруженным окнам). */
+  .day.busy::after {
+    content: "";
+    position: absolute;
+    left: 50%;
+    bottom: 3px;
+    width: 4px;
+    height: 4px;
+    margin-left: -2px;
+    border-radius: 50%;
+    background: var(--accent);
+  }
+  .day.busy.other::after {
+    background: var(--fg-4);
+  }
+  .day.selected::after {
+    background: var(--fg-on-accent);
   }
 </style>

@@ -26,7 +26,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
-pub use calendar::CalendarRow;
+pub use calendar::{reminder_state_key, CachedTimeZone, CalendarRow, ReminderMark, ReminderRow, ReminderState, OWA_TIME_ZONE_KEY, OWA_TIME_ZONE_TTL_MS};
 pub use schema::{FETCH_FAILED, TEXT_FAILED, TEXT_OK, TEXT_PENDING, TEXT_UNSUPPORTED};
 
 #[derive(Debug, thiserror::Error)]
@@ -1674,10 +1674,10 @@ fn apply_changes_in_tx(tx: &Transaction, account: AccountId, folder_pk: i64, cha
             ItemChange::ReadFlag { item_id, is_read } => {
                 let n = tx.execute("UPDATE items SET is_read = ?3, updated_at = ?4 WHERE account_id = ?1 AND server_id = ?2", params![account.0, item_id.id, *is_read as i64, now])?;
                 stats.read_flags += n;
-                if n > 0 {
-                    if let Some(st) = item_state(tx, account, &item_id.id)? {
-                        touched.add(st.conversation_pk, st.folder_pk);
-                    }
+                if n > 0
+                    && let Some(st) = item_state(tx, account, &item_id.id)?
+                {
+                    touched.add(st.conversation_pk, st.folder_pk);
                 }
             }
         }
@@ -1722,17 +1722,17 @@ struct Upserted {
 fn upsert_meta(tx: &Transaction, account: AccountId, folder_pk: i64, m: &MessageMeta, now: i64) -> Result<Upserted> {
     let mut existed = item_state(tx, account, &m.item_id.id)?.is_some();
     let mut adopted_from = None;
-    if !existed {
-        if let (Some(imid), Some(received)) = (&m.internet_message_id, m.received_at) {
-            let orphan: Option<(i64, Option<i64>, i64)> = tx
-                .prepare_cached("SELECT item_pk, conversation_pk, folder_pk FROM items WHERE account_id = ?1 AND internet_message_id = ?2 AND received_at = ?3 AND deleted = 1 LIMIT 1")?
-                .query_row(params![account.0, imid, received.as_millisecond()], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
-                .optional()?;
-            if let Some((pk, conv, old_folder)) = orphan {
-                tx.execute("UPDATE items SET server_id = ?2, change_key = ?3, folder_pk = ?4, deleted = 0, updated_at = ?5 WHERE item_pk = ?1", params![pk, m.item_id.id, m.item_id.change_key, folder_pk, now])?;
-                existed = true;
-                adopted_from = Some((conv, old_folder));
-            }
+    if !existed
+        && let (Some(imid), Some(received)) = (&m.internet_message_id, m.received_at)
+    {
+        let orphan: Option<(i64, Option<i64>, i64)> = tx
+            .prepare_cached("SELECT item_pk, conversation_pk, folder_pk FROM items WHERE account_id = ?1 AND internet_message_id = ?2 AND received_at = ?3 AND deleted = 1 LIMIT 1")?
+            .query_row(params![account.0, imid, received.as_millisecond()], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .optional()?;
+        if let Some((pk, conv, old_folder)) = orphan {
+            tx.execute("UPDATE items SET server_id = ?2, change_key = ?3, folder_pk = ?4, deleted = 0, updated_at = ?5 WHERE item_pk = ?1", params![pk, m.item_id.id, m.item_id.change_key, folder_pk, now])?;
+            existed = true;
+            adopted_from = Some((conv, old_folder));
         }
     }
     tx.prepare_cached(
@@ -2052,7 +2052,7 @@ mod tests {
         let (fpk, _) = s.folder_by_distinguished(acc, "inbox").unwrap().unwrap();
         let att = |id: &str, name: &str, size: i64, inline: bool| AttachmentMeta { id: id.into(), name: Some(name.into()), content_type: Some("application/pdf".into()), size: Some(size), is_inline: inline, content_id: None };
         let msg = full(meta("A", "Письмо с файлами"), "<p>см. вложение</p>", vec![att("att1", "Спецификация №156.pdf", 1000, false), att("att2", "logo.png", 50, true), att("att3", "huge.pdf", 50_000_000, false)]);
-        s.store_full_messages(acc, fpk, &[msg.clone()]).unwrap();
+        s.store_full_messages(acc, fpk, std::slice::from_ref(&msg)).unwrap();
 
         // Имя файла ищется сразу по метаданным вложения.
         let hits = s.search(acc, "спецификац", 10).unwrap();

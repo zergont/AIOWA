@@ -1,15 +1,25 @@
 <script lang="ts">
-  import { untrack } from "svelte";
-  import { api, errorMessage, personLabel, type Attendee, type CalendarEvent, type CalendarEventDetails } from "../api";
+  import { onDestroy, untrack } from "svelte";
+  import { api, errorMessage, personLabel, type Attendee, type CalendarEvent, type CalendarEventDetails, type MeetingResponse } from "../api";
   import { FREE_BUSY_LABEL, MY_RESPONSE_LABEL, RESPONSE_LABEL, eventWhen, reminderLabel, sensitivityLabel } from "../calendar";
+  import { focusBack } from "../popover";
   import BodyFrame from "./BodyFrame.svelte";
+  import ConfirmPopover from "./ConfirmPopover.svelte";
+  import ChoicePopover from "./ChoicePopover.svelte";
 
   interface Props {
     /** Событие из сетки; подробности панель грузит сама. */
     event: CalendarEvent;
     onclose: () => void;
+    /** «Изменить»: открыть редактор с событием и его подробностями (кнопка доступна только с ними). */
+    onedit: (ev: CalendarEvent, details: CalendarEventDetails | null) => void;
+    /** Событие удалено или на приглашение дан ответ: родитель перечитывает окно календаря. */
+    onchanged: (what: "deleted" | "responded") => void;
   }
-  let { event, onclose }: Props = $props();
+  let { event, onclose, onedit, onchanged }: Props = $props();
+
+  let alive = true;
+  onDestroy(() => (alive = false));
 
   let details = $state<CalendarEventDetails | null>(null);
   let loading = $state(false);
@@ -24,8 +34,91 @@
   const required = $derived((details?.attendees ?? []).filter((a) => a.required));
   const optional = $derived((details?.attendees ?? []).filter((a) => !a.required));
   const myResponse = $derived(ev.is_meeting ? MY_RESPONSE_LABEL[ev.my_response] : null);
-  const reminder = $derived(reminderLabel(details?.reminder_minutes ?? null));
+  const reminder = $derived(reminderLabel(details?.reminder_minutes ?? ev.reminder_minutes ?? null));
   const recurring = $derived(ev.calendar_type === "occurrence" || ev.calendar_type === "exception" || ev.calendar_type === "recurring_master");
+  /** Подробности этого события загружены: только тогда редактор открывается — иначе он не знал бы участников и описания. */
+  const detailsReady = $derived(details != null && details.event.calendar_pk === event.calendar_pk);
+
+  // --- действия: изменить, удалить (отменить встречу), ответить на приглашение -----------------
+  // Команды идут отсюда (панель показывает занятость и ошибку у себя), а родитель по onchanged
+  // перечитывает окно календаря: после удаления событие уйдёт из сетки, после ответа сменится значок.
+
+  /** Я организатор встречи: удаление — это отмена, и участников можно уведомить. */
+  const isOrganizerMeeting = $derived(ev.is_meeting && ev.my_response === "organizer");
+  /** Приглашённый на живую встречу: можно принять, ответить «под вопросом» или отклонить. */
+  const canRespond = $derived(ev.is_meeting && ev.my_response !== "organizer" && !ev.is_cancelled);
+
+  const RESPONSES: { id: MeetingResponse; label: string; question: string }[] = [
+    { id: "accept", label: "Принять", question: "Принять приглашение?" },
+    { id: "tentative", label: "Под вопросом", question: "Ответить «под вопросом»?" },
+    { id: "decline", label: "Отклонить", question: "Отклонить приглашение?" },
+  ];
+
+  let busy = $state(false);
+  let actionError = $state<string | null>(null);
+  let deleteBtn = $state<HTMLButtonElement | null>(null);
+  /** Открыт вопрос об удалении: у организатора — с выбором про уведомление участников. */
+  let confirmDelete = $state(false);
+  /** Открыт вопрос «отправить ответ?» для выбранного ответа; якорь — нажатая кнопка. */
+  let pendingResponse = $state<{ response: MeetingResponse; anchor: HTMLButtonElement } | null>(null);
+
+  function requestDelete() {
+    if (busy) return;
+    confirmDelete = true;
+  }
+  function closeDelete() {
+    confirmDelete = false;
+    focusBack(deleteBtn);
+  }
+
+  async function deleteNow(sendCancellations: boolean) {
+    closeDelete();
+    if (busy) return;
+    busy = true;
+    actionError = null;
+    try {
+      await api.calendarDelete(event.calendar_pk, sendCancellations);
+      if (!alive) return;
+      onchanged("deleted");
+    } catch (e) {
+      if (alive) actionError = errorMessage(e);
+    } finally {
+      if (alive) busy = false;
+    }
+  }
+
+  function askRespond(e: MouseEvent, response: MeetingResponse) {
+    if (busy) return;
+    if (pendingResponse?.response === response) {
+      closeRespond();
+      return;
+    }
+    pendingResponse = { response, anchor: e.currentTarget as HTMLButtonElement };
+  }
+  function closeRespond() {
+    const anchor = pendingResponse?.anchor;
+    pendingResponse = null;
+    focusBack(anchor);
+  }
+
+  async function respondNow(sendResponse: boolean) {
+    const p = pendingResponse;
+    closeRespond();
+    if (!p || busy) return;
+    busy = true;
+    actionError = null;
+    try {
+      await api.calendarRespond(event.calendar_pk, p.response, sendResponse);
+      if (!alive) return;
+      // После отказа сервер убирает встречу из календаря: перечитывать её нечего, сетку обновит родитель.
+      if (p.response !== "decline") void load(event.calendar_pk, true);
+      onchanged("responded");
+    } catch (e) {
+      if (alive) actionError = errorMessage(e);
+    } finally {
+      if (alive) busy = false;
+    }
+  }
 
   async function load(pk: number, refresh: boolean) {
     const req = ++request;
@@ -109,6 +202,36 @@
       {#if sensitivityLabel(ev.sensitivity)}<span class="badge">{sensitivityLabel(ev.sensitivity)}</span>{/if}
       {#if ev.has_attachments}<span class="badge">с вложениями</span>{/if}
     </div>
+    <div class="actions" role="toolbar" aria-label="Действия с событием" aria-busy={busy}>
+      {#if !ev.is_cancelled}
+        <button class="btn" onclick={() => detailsReady && onedit(ev, details)} disabled={busy || !detailsReady} title={detailsReady ? undefined : "Сначала загружаются подробности события"}>Изменить</button>
+      {/if}
+      <button class="btn danger" bind:this={deleteBtn} onclick={() => (confirmDelete ? closeDelete() : requestDelete())} disabled={busy} aria-haspopup="dialog" aria-expanded={confirmDelete}>
+        {isOrganizerMeeting && !ev.is_cancelled ? "Отменить встречу" : "Удалить"}
+      </button>
+      {#if canRespond}
+        <span class="act-sep" aria-hidden="true"></span>
+        {#each RESPONSES as r (r.id)}
+          <button class="btn resp {r.id}" class:on={ev.my_response === r.id} onclick={(e) => askRespond(e, r.id)} disabled={busy} aria-pressed={ev.my_response === r.id} aria-haspopup="dialog" aria-expanded={pendingResponse?.response === r.id} title={ev.my_response === r.id ? `Текущий ответ: ${r.label.toLowerCase()}` : r.question}>{r.label}</button>
+        {/each}
+      {/if}
+    </div>
+    {#if actionError}
+      <div class="action-error" role="alert">
+        <span class="note-text">{actionError}</span>
+        <button class="btn" onclick={() => (actionError = null)} aria-label="Скрыть сообщение об ошибке">Скрыть</button>
+      </div>
+    {/if}
+    {#if confirmDelete && deleteBtn}
+      {#if isOrganizerMeeting && !ev.is_cancelled}
+        <ChoicePopover anchor={deleteBtn} align="start" title="Отменить встречу?" text="Встреча уйдёт в «Удалённые». С отменой участники получат письмо и она исчезнет из их календарей." options={[{ id: "send", label: "Отправить отмену участникам", danger: true }, { id: "nosend", label: "Удалить без уведомления" }]} onpick={(id) => deleteNow(id === "send")} oncancel={closeDelete} />
+      {:else}
+        <ConfirmPopover anchor={deleteBtn} align="start" title="Удалить событие?" text="Событие уйдёт в «Удалённые» на сервере." confirmLabel="Удалить" onconfirm={() => deleteNow(false)} oncancel={closeDelete} />
+      {/if}
+    {/if}
+    {#if pendingResponse}
+      <ChoicePopover anchor={pendingResponse.anchor} align="start" title={RESPONSES.find((r) => r.id === pendingResponse?.response)?.question ?? ""} text="Организатор получит письмо с ответом, если его отправить." options={[{ id: "send", label: "Отправить ответ", primary: true }, { id: "nosend", label: "Не отправлять" }]} onpick={(id) => respondNow(id === "send")} oncancel={closeRespond} />
+    {/if}
   </header>
 
   <div class="content">
@@ -269,6 +392,53 @@
   .badge.tone-oof {
     color: var(--cal-oof);
     border-color: var(--cal-oof);
+  }
+  .actions {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--space-1);
+    margin-top: var(--space-2);
+  }
+  .actions .btn {
+    height: 28px;
+    font: var(--text-body);
+    color: var(--fg-1);
+  }
+  .actions .btn.danger:hover:not(:disabled) {
+    color: var(--danger);
+  }
+  .actions .btn:disabled {
+    color: var(--fg-disabled);
+  }
+  .act-sep {
+    width: 1px;
+    height: 16px;
+    margin: 0 4px;
+    background: var(--stroke-2);
+  }
+  .btn.resp.on {
+    background: var(--accent-soft);
+    border-color: var(--accent);
+    color: var(--accent);
+  }
+  .btn.resp.decline.on {
+    background: transparent;
+    border-color: var(--danger);
+    color: var(--danger);
+  }
+  .btn.resp.tentative.on {
+    background: transparent;
+    border-color: var(--warning);
+    color: var(--warning);
+  }
+  .action-error {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    margin-top: var(--space-2);
+    color: var(--danger);
+    font: var(--text-caption);
   }
 
   .content {

@@ -27,6 +27,9 @@ pub struct MessageHead {
     pub body_state: i64,
     /// Флаг «к исполнению» поставлен (`FlagStatus = Flagged`).
     pub is_flagged: bool,
+    /// Класс письма: `IPM.Note`, приглашение `IPM.Schedule.Meeting.Request`, отмена
+    /// `…Canceled`, ответ участника `…Resp.Pos`/`Neg`/`Tent`.
+    pub item_class: Option<String>,
 }
 
 /// Тело письма для показа.
@@ -70,7 +73,7 @@ pub struct MessageKey {
 
 /// Выборка заголовка письма в порядке, который разбирает `head_row`.
 const HEAD_SELECT: &str = "SELECT i.item_pk, i.folder_pk, f.display_name, i.subject, i.from_name, i.from_email, i.display_to, i.received_at, i.sent_at,
-        i.is_read, i.is_draft, i.has_attachments, i.importance, i.preview, i.body_state, i.flag_status = 'Flagged'
+        i.is_read, i.is_draft, i.has_attachments, i.importance, i.preview, i.body_state, i.flag_status = 'Flagged', i.item_class
  FROM items i LEFT JOIN folders f ON f.folder_pk = i.folder_pk";
 
 fn head_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<MessageHead> {
@@ -91,6 +94,7 @@ fn head_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<MessageHead> {
         preview: r.get(13)?,
         body_state: r.get(14)?,
         is_flagged: r.get::<_, Option<i64>>(15)?.unwrap_or(0) != 0,
+        item_class: r.get(16)?,
     })
 }
 

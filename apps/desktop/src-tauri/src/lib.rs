@@ -15,6 +15,11 @@
 //! Канал мгновенных уведомлений (`notify.rs`): после первой удачной синхронизации фоновая задача
 //! держит поток `PendingNotificationRequest` и по событиям сервера синхронизирует папки, показывает
 //! тосты о новых письмах и ведёт счётчик непрочитанных в заголовке окна.
+//!
+//! Запись в календарь и приглашения (`calendar_write.rs`): создание, правка и удаление события,
+//! ответ на приглашение по событию и по письму, сведения о письме-приглашении. Напоминания
+//! (`reminders.rs`): планировщик раз в 30 с смотрит кэш событий, шлёт окну событие `reminder`
+//! и тост; «закрыть» и «отложить» хранятся в базе.
 
 use aiowa_core::{AccountId, BodyType};
 use aiowa_store::ui::{ConversationCursor, MessageHead};
@@ -31,9 +36,11 @@ use tauri::{Emitter, Manager, State};
 use tracing::warn;
 
 mod calendar;
+mod calendar_write;
 mod compose;
 mod notify;
 mod ondemand;
+mod reminders;
 mod sync;
 mod write;
 
@@ -168,6 +175,9 @@ pub(crate) struct MessageDto {
     is_truncated: bool,
     recipients: Vec<RecipientDto>,
     attachments: Vec<AttachmentDto>,
+    /// Класс элемента Exchange (`IPM.Note`, приглашение `IPM.Schedule.Meeting.Request`, отмена
+    /// `…Canceled`, ответ участника `…Resp.Pos`/`Neg`/`Tent`): по нему окно узнаёт письмо о встрече.
+    item_class: Option<String>,
 }
 
 /// Ключ состояния письма для `conversation_key`: по нему окно решает, перечитывать ли беседу.
@@ -362,6 +372,7 @@ pub(crate) fn build_message(store: &Store, h: MessageHead) -> CmdResult<MessageD
         is_truncated,
         recipients,
         attachments,
+        item_class: h.item_class,
     })
 }
 
@@ -471,6 +482,7 @@ pub fn run() {
     let account = store.account(&host, &user).expect("учётная запись");
     let sync_state = Arc::new(sync::SyncState::new(store.clone(), account, host.clone(), user.clone()));
     let notify_state = Arc::new(notify::NotifyState::new(store.clone(), account, sync_state.clone()));
+    let reminders_state = Arc::new(reminders::RemindersState::new(store.clone(), account));
     let state = AppState { store, account, host, user };
 
     let app = tauri::Builder::default()
@@ -479,17 +491,22 @@ pub fn run() {
         .manage(state)
         .manage(sync_state.clone())
         .manage(notify_state.clone())
+        .manage(reminders_state.clone())
         .manage(ondemand::OnDemand::default())
         .manage(write::WriteState::default())
         .manage(compose::ComposeState::default())
         .manage(calendar::CalendarState::default())
+        .manage(calendar_write::CalendarWriteState::default())
         .manage(CloseState::default())
         // Окно из конфигурации к этому моменту уже создано: заголовок «AIOWA (N)» и значок
         // непрочитанных выставляются по базе сразу, не дожидаясь первой удачной синхронизации.
+        // Планировщик напоминаний стартует здесь же: он читает только кэш, сети ему не нужно.
         .setup({
             let notify = notify_state.clone();
+            let reminders = reminders_state.clone();
             move |app| {
                 notify.refresh_unread(app.handle());
+                reminders.start(app.handle().clone());
                 Ok(())
             }
         })
@@ -533,6 +550,15 @@ pub fn run() {
             compose::attachments_pick,
             calendar::calendar_events,
             calendar::calendar_event_details,
+            calendar_write::calendar_create,
+            calendar_write::calendar_update,
+            calendar_write::calendar_delete,
+            calendar_write::calendar_respond,
+            calendar_write::meeting_info,
+            calendar_write::meeting_respond,
+            reminders::reminders_pending,
+            reminders::reminder_dismiss,
+            reminders::reminder_snooze,
             notify::notify_status,
             notify::notify_set_toasts,
             window_close_guard,
@@ -544,6 +570,7 @@ pub fn run() {
         // Сессия на сервере одна на процесс: при выходе закрыть канал уведомлений, остановить
         // синхронизацию и выйти из сессии, иначе сервер накапливает сессии до MapiExceptionSessionLimit.
         if let tauri::RunEvent::Exit = event {
+            reminders_state.shutdown();
             notify_state.shutdown();
             sync_state.shutdown();
         }

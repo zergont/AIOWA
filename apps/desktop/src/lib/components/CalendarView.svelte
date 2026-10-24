@@ -1,18 +1,24 @@
 <script lang="ts">
   import { onMount, untrack } from "svelte";
-  import { api, errorMessage, onCalendarChanged, type CalendarEvent } from "../api";
-  import { periodTitle, shiftAnchor, startOfDay, updatedLabel, viewRange, type CalendarViewKind } from "../calendar";
+  import { api, errorMessage, onCalendarChanged, type CalendarEvent, type CalendarEventDetails } from "../api";
+  import { addDays, dayKey, draftFromEvent, eventDayKeys, newEventDraft, nextSlot, periodTitle, shiftAnchor, startOfDay, updatedLabel, viewRange, type CalendarViewKind, type EventDraft } from "../calendar";
   import WeekGrid from "./WeekGrid.svelte";
+  import MonthGrid from "./MonthGrid.svelte";
   import EventDetails from "./EventDetails.svelte";
+  import EventEditor from "./EventEditor.svelte";
 
   interface Props {
-    /** Якорный день: для вида «день» — сам день, для недель — любой день недели. Меняется и отсюда (стрелки, «Сегодня»), и снаружи (мини-календарь). */
+    /** Якорный день: для вида «день» — сам день, для недель — любой день недели, для месяца — день его месяца. Меняется и отсюда (стрелки, «Сегодня»), и снаружи (мини-календарь). */
     anchor: Date;
     kind: CalendarViewKind;
     /** Раздел календаря на экране: спрятанный календарь не ловит клавиши и не обновляется сам. */
     visible?: boolean;
+    /** Выделенное событие; снаружи ставится из напоминания (после загрузки окна панель откроется сама). */
+    selectedPk?: number | null;
+    /** Дни с событиями (ключи dayKey) по всем уже загруженным окнам: точки в мини-календаре. */
+    eventDays?: Set<number>;
   }
-  let { anchor = $bindable(), kind = $bindable(), visible = true }: Props = $props();
+  let { anchor = $bindable(), kind = $bindable(), visible = true, selectedPk = $bindable(null), eventDays = $bindable(new Set<number>()) }: Props = $props();
 
   /** Кэш окна старше этого срока дотягивается с сервера фоном; тот же период у автообновления. */
   const STALE_MS = 5 * 60_000;
@@ -25,6 +31,7 @@
     { kind: "day", label: "День", keys: "D" },
     { kind: "work", label: "Рабочая неделя", keys: "Shift+W" },
     { kind: "week", label: "Неделя", keys: "W" },
+    { kind: "month", label: "Месяц", keys: "M" },
   ];
 
   let events = $state<CalendarEvent[]>([]);
@@ -32,11 +39,12 @@
   let loading = $state(false);
   let error = $state<string | null>(null);
   let fetchedMs = $state<number | null>(null);
-  let selectedPk = $state<number | null>(null);
   let now = $state(new Date());
+  /** Открытый редактор события (модально над сеткой); null — закрыт. */
+  let editor = $state<EventDraft | null>(null);
 
   const range = $derived(viewRange(kind, anchor));
-  const title = $derived(periodTitle(kind, range));
+  const title = $derived(periodTitle(kind, range, anchor));
   const selectedEvent = $derived(selectedPk == null ? null : (events.find((e) => e.calendar_pk === selectedPk) ?? null));
   const statusText = $derived.by(() => {
     if (loading) return "Обновляю…";
@@ -54,6 +62,16 @@
    */
   let serverChanged = false;
 
+  /** Дни с событиями по всем окнам, которые загружались в этой сессии: для точек мини-календаря. */
+  const knownDays = new Set<number>();
+
+  /** Окно перечитано: его дни считаются заново (ушедшие события снимают точку), остальные остаются. */
+  function rememberDays(startMs: number, endMs: number, evs: CalendarEvent[]) {
+    for (let d = startOfDay(new Date(startMs)); d.getTime() < endMs; d = addDays(d, 1)) knownDays.delete(dayKey(d));
+    for (const ev of evs) for (const k of eventDayKeys(ev)) knownDays.add(k);
+    eventDays = new Set(knownDays);
+  }
+
   async function load(startMs: number, endMs: number, refresh: boolean) {
     const req = ++request;
     loading = true;
@@ -62,6 +80,7 @@
       const r = await api.calendarEvents(startMs, endMs, refresh);
       if (req !== request) return;
       events = r.events;
+      rememberDays(startMs, endMs, r.events);
       fetchedMs = r.fetched_ms;
       error = r.error;
       // Без refresh бэкенд всегда отвечает кэшем (что есть): если он старый или окно ещё не забирали
@@ -148,14 +167,57 @@
     anchor = shiftAnchor(kind, anchor, dir);
   }
 
+  /** Из сетки месяца — в день: число дня или «ещё N». */
+  function openDay(d: Date) {
+    anchor = d;
+    kind = "day";
+  }
+
+  // --- создание, правка, удаление, ответы ------------------------------------------------------
+  // Редактор и панель события зовут бэкенд сами; здесь после удачи окно перечитывается с сервера
+  // (refresh), чтобы сетка показала то, что реально записалось, а не только локальный кэш.
+
+  /** «Новая встреча»: с ближайшего получаса сегодня, а если показан другой день — с 09:00 якоря. */
+  function openNew() {
+    if (editor) return;
+    const today = startOfDay(new Date());
+    const inView = range.days.some((d) => d.getTime() === today.getTime());
+    const start = inView ? nextSlot(new Date()) : new Date(anchor.getFullYear(), anchor.getMonth(), anchor.getDate(), 9);
+    editor = newEventDraft(start, false);
+  }
+
+  /** Двойной клик по сетке: событие с момента под курсором или на весь день. */
+  function createAt(startMs: number, allDay: boolean) {
+    if (editor) return;
+    editor = newEventDraft(new Date(startMs), allDay);
+  }
+
+  function openEdit(ev: CalendarEvent, details: CalendarEventDetails | null) {
+    if (editor) return;
+    editor = draftFromEvent(ev, details);
+  }
+
+  function onSaved(ev: CalendarEvent) {
+    editor = null;
+    selectedPk = ev.calendar_pk;
+    // Событие могло уйти в другой период: сетка покажет его, когда пользователь туда перейдёт.
+    refresh();
+  }
+
+  function onDetailsChanged(what: "deleted" | "responded") {
+    if (what === "deleted") selectedPk = null;
+    refresh();
+  }
+
   /** Фокус в поле ввода или во фрейме: клавиши-буквы и стрелки там не наши. */
   function inEditable(): boolean {
     const el = document.activeElement;
-    return el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement || el instanceof HTMLIFrameElement || (el instanceof HTMLElement && el.isContentEditable);
+    return el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement || el instanceof HTMLSelectElement || el instanceof HTMLIFrameElement || (el instanceof HTMLElement && el.isContentEditable);
   }
 
   function onKeydown(e: KeyboardEvent) {
-    if (!visible || e.ctrlKey || e.metaKey || e.altKey || inEditable()) return;
+    // Открытый редактор ловит свои клавиши сам (Esc, Ctrl+Enter), сетка в это время молчит.
+    if (!visible || editor || e.ctrlKey || e.metaKey || e.altKey || inEditable()) return;
     if (e.key === "ArrowLeft") shift(-1);
     else if (e.key === "ArrowRight") shift(1);
     else if (e.key === "Escape") {
@@ -166,6 +228,8 @@
     else if (e.code === "KeyT") goToday();
     else if (e.code === "KeyD") kind = "day";
     else if (e.code === "KeyW") kind = e.shiftKey ? "work" : "week";
+    else if (e.code === "KeyM") kind = "month";
+    else if (e.code === "KeyN") openNew();
     else return;
     e.preventDefault();
   }
@@ -175,6 +239,10 @@
 
 <div class="cal">
   <div class="toolbar" role="toolbar" aria-label="Календарь">
+    <button class="btn primary" onclick={openNew} disabled={editor != null} title="Новая встреча (N); двойной клик по сетке — в выбранное время">
+      <svg width="12" height="12" viewBox="0 0 16 16" aria-hidden="true"><path d="M8 3v10M3 8h10" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" /></svg>
+      Новая встреча
+    </button>
     <button class="btn" onclick={goToday} title="Сегодня (T)">Сегодня</button>
     <div class="arrows">
       <button class="icon-btn" onclick={() => shift(-1)} aria-label="Предыдущий период" title="Назад (←)">
@@ -206,14 +274,22 @@
 
   <div class="main">
     <div class="grid-wrap">
-      <WeekGrid days={range.days} {events} {selectedPk} {now} onselect={(ev) => (selectedPk = ev.calendar_pk)} />
+      {#if kind === "month"}
+        <MonthGrid days={range.days} month={anchor} {events} {selectedPk} {now} onselect={(ev) => (selectedPk = ev.calendar_pk)} onpickday={openDay} oncreate={createAt} />
+      {:else}
+        <WeekGrid days={range.days} {events} {selectedPk} {now} onselect={(ev) => (selectedPk = ev.calendar_pk)} oncreate={createAt} />
+      {/if}
     </div>
     {#if selectedEvent}
       <aside class="details" aria-label="Событие">
-        <EventDetails event={selectedEvent} onclose={() => (selectedPk = null)} />
+        <EventDetails event={selectedEvent} onclose={() => (selectedPk = null)} onedit={openEdit} onchanged={onDetailsChanged} />
       </aside>
     {/if}
   </div>
+
+  {#if editor}
+    <EventEditor draft={editor} onsaved={onSaved} onclose={() => (editor = null)} />
+  {/if}
 </div>
 
 <style>
@@ -253,6 +329,21 @@
   }
   .btn:disabled {
     color: var(--fg-disabled);
+  }
+  .btn.primary {
+    background: var(--accent);
+    border-color: var(--accent);
+    color: var(--fg-on-accent);
+  }
+  .btn.primary:hover:not(:disabled) {
+    background: var(--accent-hover);
+  }
+  .btn.primary:active:not(:disabled) {
+    background: var(--accent-pressed);
+  }
+  .btn.primary:disabled {
+    opacity: 0.6;
+    color: var(--fg-on-accent);
   }
   .btn.small {
     height: 24px;

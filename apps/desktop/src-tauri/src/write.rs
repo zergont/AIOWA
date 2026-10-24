@@ -66,6 +66,14 @@ struct ItemsChanged {
     folder_pks: Vec<i64>,
 }
 
+/// Событие `items-changed` окну от другой команды (ответ на приглашение по письму): окно
+/// перечитает беседу и папку. Ошибка отправки только в журнал.
+pub(crate) fn emit_items_changed(app: &AppHandle, conversation_pks: Vec<i64>, folder_pks: Vec<i64>) {
+    if let Err(e) = app.emit(ITEMS_CHANGED, ItemsChanged { conversation_pks, folder_pks }) {
+        warn!(error = %e, "не удалось отправить событие items-changed");
+    }
+}
+
 /// Что затронуто: собирается по ходу операции (применение, подтверждение, откат), в конце
 /// уходит событием в окно.
 #[derive(Default)]

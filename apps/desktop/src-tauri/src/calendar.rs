@@ -14,7 +14,7 @@
 use crate::ondemand::{describe_transport, timed_out, KeyedLocks};
 use crate::sync::SyncState;
 use crate::{err, sanitize_html, AppState, CmdResult, InlineMap};
-use aiowa_core::{AccountId, Attendee, CalendarEvent, CalendarEventDetails, CalendarItemType, FreeBusy, ItemId, ResponseType};
+use aiowa_core::{AccountId, Attendee, CalendarEvent, CalendarEventDetails, CalendarItemType, FreeBusy, ItemId, Participant, ResponseType};
 use aiowa_store::{CalendarRow, Store};
 use aiowa_transport::{MailTransport, TransportError};
 use jiff::Timestamp;
@@ -31,11 +31,20 @@ const CALENDAR_TIMEOUT: Duration = Duration::from_secs(60);
 /// шесть недель сетки месяца).
 const MAX_WINDOW_MS: i64 = 100 * 24 * 3600 * 1000;
 
-/// Состояние команд календаря: замки по окну `(start_ms, end_ms)` и по событию.
+/// Состояние команд календаря: замки по окну `(start_ms, end_ms)` и по событию. Замок события
+/// делят чтение подробностей и команды записи (`calendar_write.rs`): правка не переплетается
+/// с перечитыванием того же события.
 #[derive(Default)]
 pub(crate) struct CalendarState {
     windows: KeyedLocks<(i64, i64)>,
     items: KeyedLocks<i64>,
+}
+
+impl CalendarState {
+    /// Замок одного события по ключу кэша.
+    pub(crate) fn item_lock(&self, calendar_pk: i64) -> Arc<tokio::sync::Mutex<()>> {
+        self.items.get(calendar_pk)
+    }
 }
 
 fn now_ms() -> i64 {
@@ -47,8 +56,14 @@ fn now_ms() -> i64 {
 /// Организатор события для окна.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct ParticipantDto {
-    name: Option<String>,
-    email: Option<String>,
+    pub(crate) name: Option<String>,
+    pub(crate) email: Option<String>,
+}
+
+impl From<Participant> for ParticipantDto {
+    fn from(p: Participant) -> Self {
+        Self { name: p.name, email: p.email }
+    }
 }
 
 /// Событие для сетки календаря. Перечисления — ключами интерфейса (`FreeBusy::key` и т. п.).
@@ -73,6 +88,8 @@ pub(crate) struct CalendarEventDto {
     has_attachments: bool,
     /// Подробности (тело, участники) уже есть в кэше: панель откроется без сети.
     has_details: bool,
+    /// Напоминание за N минут до начала; `None` — без напоминания.
+    reminder_minutes: Option<i64>,
 }
 
 impl From<CalendarRow> for CalendarEventDto {
@@ -97,6 +114,7 @@ impl From<CalendarRow> for CalendarEventDto {
             sensitivity: r.sensitivity,
             has_attachments: r.has_attachments,
             has_details: r.has_details,
+            reminder_minutes: r.reminder_minutes,
         }
     }
 }
@@ -180,10 +198,13 @@ fn details_dto(store: &Store, row: CalendarRow, from_cache: bool, error: Option<
 
 // --- сеть -----------------------------------------------------------------------------------
 
+/// Код отказа сервера «элемента нет» (удалён или перенесён другим клиентом).
+pub(crate) const ITEM_NOT_FOUND: &str = "ErrorItemNotFound";
+
 /// Текст ошибки транспорта для календаря: удалённое событие словами, остальное — как везде.
 fn describe(e: &TransportError) -> String {
     match e {
-        TransportError::Server { code, .. } if code == "ErrorItemNotFound" => "Событие удалено на сервере".into(),
+        TransportError::Server { code, .. } if code == ITEM_NOT_FOUND => "Событие удалено на сервере".into(),
         other => describe_transport(other),
     }
 }
@@ -244,6 +265,8 @@ pub(crate) async fn calendar_events(start_ms: i64, end_ms: i64, refresh: bool, s
     let st = store.clone();
     tauri::async_runtime::spawn_blocking(move || st.replace_calendar_range(account, start_ms, end_ms, &events)).await.map_err(err)?.map_err(|e| format!("Ошибка локальной базы: {e}"))?;
     info!(start_ms, end_ms, events = fetched, refresh, "окно календаря загружено с сервера");
+    // Пояс пользователя в кэш (или обновить устаревший), чтобы запись его не ждала.
+    crate::calendar_write::prefetch_time_zone(sync.inner().clone(), store.clone(), account);
     let rows = store.calendar_events(account, start_ms, end_ms).map_err(err)?;
     Ok(CalendarRangeDto { events: rows.into_iter().map(CalendarEventDto::from).collect(), from_cache: false, fetched_ms: Some(now_ms()), error: None })
 }
@@ -279,7 +302,6 @@ pub(crate) async fn calendar_event_details(calendar_pk: i64, refresh: bool, stat
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aiowa_core::Participant;
 
     fn row(free_busy: &str, calendar_type: &str, my_response: &str) -> CalendarRow {
         CalendarRow {
@@ -300,6 +322,7 @@ mod tests {
             sensitivity: Some("Normal".into()),
             has_attachments: false,
             has_details: false,
+            reminder_minutes: Some(15),
         }
     }
 
@@ -321,7 +344,7 @@ mod tests {
             assert_eq!((dto.free_busy, dto.calendar_type, dto.my_response), want, "{fb}/{ct}/{mr}");
         }
         let dto = CalendarEventDto::from(row("Busy", "Single", "Accept"));
-        assert_eq!((dto.calendar_pk, dto.start_ms, dto.end_ms, dto.is_meeting), (7, 1_000, 2_000, true));
+        assert_eq!((dto.calendar_pk, dto.start_ms, dto.end_ms, dto.is_meeting, dto.reminder_minutes), (7, 1_000, 2_000, true, Some(15)));
         assert!(dto.organizer.is_none(), "без имени и адреса организатора нет");
         let mut r = row("Busy", "Single", "Accept");
         r.organizer_email = Some("o@x.ru".into());
@@ -351,7 +374,7 @@ mod tests {
 
     #[test]
     fn item_not_found_has_its_own_text() {
-        assert_eq!(describe(&TransportError::Server { code: "ErrorItemNotFound".into(), message: "secret".into() }), "Событие удалено на сервере");
+        assert_eq!(describe(&TransportError::Server { code: ITEM_NOT_FOUND.into(), message: "secret".into() }), "Событие удалено на сервере");
         assert_eq!(describe(&TransportError::SessionExpired), describe_transport(&TransportError::SessionExpired));
     }
 }

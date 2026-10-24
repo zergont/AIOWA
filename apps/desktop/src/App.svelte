@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount, tick } from "svelte";
-  import { api, conversationKeyOf, errorMessage, messagesKey, newMailSender, onCloseRequested, onItemsChanged, onNewMail, onNotifyStatus, onSyncProgress, type AccountInfo, type ComposeContext, type ComposeKind, type Conversation, type Folder, type ItemsChanged, type Message, type NewMail, type NotifyStatus, type SearchHit, type SyncStatus, type WriteReport } from "./lib/api";
+  import { api, conversationKeyOf, errorMessage, messagesKey, newMailSender, onCalendarChanged, onCloseRequested, onItemsChanged, onNewMail, onNotifyStatus, onReminder, onSyncProgress, type AccountInfo, type ComposeContext, type ComposeKind, type Conversation, type Folder, type ItemsChanged, type Message, type NewMail, type NotifyStatus, type ReminderDto, type SearchHit, type SyncStatus, type WriteReport } from "./lib/api";
   import { ICON, failureText, type ItemAction } from "./lib/actions";
   import { focusBack, type Anchor } from "./lib/popover";
   import FolderTree from "./lib/components/FolderTree.svelte";
@@ -12,7 +12,8 @@
   import ConfirmPopover from "./lib/components/ConfirmPopover.svelte";
   import CalendarView from "./lib/components/CalendarView.svelte";
   import MiniMonth from "./lib/components/MiniMonth.svelte";
-  import { sameDay, startOfDay, viewRange, type CalendarViewKind } from "./lib/calendar";
+  import ReminderBanner from "./lib/components/ReminderBanner.svelte";
+  import { addDays, sameDay, startOfDay, viewRange, type CalendarViewKind } from "./lib/calendar";
 
   let account = $state<AccountInfo | null>(null);
   let folders = $state<Folder[]>([]);
@@ -49,6 +50,87 @@
   let calendarAnchor = $state(startOfDay(new Date()));
   let calendarKind = $state<CalendarViewKind>("week");
   const calendarRange = $derived(viewRange(calendarKind, calendarAnchor));
+  /** Выделенное событие в сетке: ставится и из напоминания (клик по теме). */
+  let calendarSelectedPk = $state<number | null>(null);
+  /** Дни с событиями по загруженным окнам календаря — точки в мини-календаре. */
+  let calendarEventDays = $state(new Set<number>());
+
+  // --- напоминания о событиях -------------------------------------------------------------
+  // Планировщик бэкенда шлёт событие `reminder` с полным актуальным списком (и когда он опустел);
+  // на старте окна список запрашивается. Панель сама прячет просроченные (30 минут после начала),
+  // закрытие и откладывание — команды, после которых бэкенд присылает список заново.
+
+  let reminders = $state<ReminderDto[]>([]);
+
+  /** Список из бэкенда целиком заменяет свой: перенесённые, удалённые и закрытые в нём уже отсутствуют. */
+  function setReminders(items: ReminderDto[]) {
+    reminders = [...items].sort((a, b) => a.start_ms - b.start_ms);
+  }
+
+  // Планировщик читает только кэш календаря, а CalendarView обновляет его лишь пока раздел на
+  // экране. Чтобы напоминания приходили и тому, кто весь день в почте (встреча поставлена коллегой,
+  // приглашение принято из письма), окно [сегодня, +2 суток) перечитывается отсюда раз в 5 минут
+  // и по calendar-changed; первый раз — с задержкой, когда синхронизация уже вошла на сервер.
+  const NEAR_WINDOW_DAYS = 2;
+  const NEAR_REFRESH_MS = 5 * 60_000;
+  const NEAR_FIRST_DELAY_MS = 30_000;
+  let nearRefreshing = false;
+
+  async function refreshNearWindow() {
+    if (nearRefreshing) return;
+    nearRefreshing = true;
+    try {
+      const start = startOfDay(new Date());
+      await api.calendarEvents(start.getTime(), addDays(start, NEAR_WINDOW_DAYS).getTime(), true);
+    } catch (e) {
+      console.warn("calendar near window:", errorMessage(e));
+    } finally {
+      nearRefreshing = false;
+    }
+  }
+
+  function dropReminder(calendarPk: number) {
+    reminders = reminders.filter((r) => r.calendar_pk !== calendarPk);
+  }
+
+  async function dismissReminder(calendarPk: number) {
+    dropReminder(calendarPk);
+    try {
+      await api.reminderDismiss(calendarPk);
+    } catch (e) {
+      error = errorMessage(e);
+    }
+  }
+
+  async function snoozeReminder(calendarPk: number, minutes: number) {
+    dropReminder(calendarPk);
+    try {
+      await api.reminderSnooze(calendarPk, minutes);
+    } catch (e) {
+      error = errorMessage(e);
+    }
+  }
+
+  async function dismissAllReminders() {
+    const pks = reminders.map((r) => r.calendar_pk);
+    reminders = [];
+    for (const pk of pks) {
+      try {
+        await api.reminderDismiss(pk);
+      } catch (e) {
+        error = errorMessage(e);
+      }
+    }
+  }
+
+  /** Клик по теме напоминания: календарь на дне события с открытой карточкой; напоминание закрывается. */
+  function openReminder(r: ReminderDto) {
+    calendarAnchor = startOfDay(new Date(r.start_ms));
+    calendarKind = "day";
+    calendarSelectedPk = r.calendar_pk;
+    section = "calendar";
+    void dismissReminder(r.calendar_pk);
+  }
   /**
    * Какое «сегодня» было при последней смене якоря. Якорь, равный ему, значил «сегодня»: окно может
    * висеть открытым сутками, и календарь, который ещё не листали, должен открыться на сегодняшнем
@@ -327,6 +409,18 @@
       }
     } finally {
       if (req === conversationRequest) loadingMessages = false;
+    }
+  }
+
+  /** После ответа на приглашение с карточки: перечитать открытую беседу (класс и состояние письма меняются на сервере). */
+  async function rereadConversation() {
+    if (!selected || loadingMessages) return;
+    const pk = selected.conversation_pk;
+    try {
+      const fresh = await api.conversation(pk);
+      if (selected?.conversation_pk === pk && !loadingMessages) messages = fresh;
+    } catch (e) {
+      error = errorMessage(e);
     }
   }
 
@@ -746,14 +840,24 @@
     let unlistenClose: (() => void) | undefined;
     let unlistenNotify: (() => void) | undefined;
     let unlistenNewMail: (() => void) | undefined;
+    let unlistenReminder: (() => void) | undefined;
+    let unlistenCalendar: (() => void) | undefined;
     let wasRunning = false;
     const timer = setInterval(syncTick, 15_000);
+    const nearTimer = setInterval(() => void refreshNearWindow(), NEAR_REFRESH_MS);
+    const nearFirst = setTimeout(() => void refreshNearWindow(), NEAR_FIRST_DELAY_MS);
     document.addEventListener("visibilitychange", syncTick);
 
     (async () => {
       try {
         unlistenNotify = await onNotifyStatus((s) => (notify = s));
         unlistenNewMail = await onNewMail(showNewMail);
+        unlistenReminder = await onReminder((ev) => setReminders(ev.items));
+        unlistenCalendar = await onCalendarChanged(() => void refreshNearWindow());
+        // Напоминания, которые пора показать, пока окна не было; команды может не быть в старом бэкенде.
+        api.remindersPending()
+          .then(setReminders)
+          .catch((e) => console.warn("reminders_pending:", errorMessage(e)));
         // Канал запускается после первой удачной синхронизации; до неё команда отвечает «не подключён».
         // Если бэкенд собран без неё, окно остаётся в режиме «по таймеру».
         api.notifyStatus()
@@ -788,6 +892,8 @@
 
     return () => {
       clearInterval(timer);
+      clearInterval(nearTimer);
+      clearTimeout(nearFirst);
       clearTimeout(noticeTimer);
       clearTimeout(newMailTimer);
       document.removeEventListener("visibilitychange", syncTick);
@@ -796,6 +902,8 @@
       unlistenClose?.();
       unlistenNotify?.();
       unlistenNewMail?.();
+      unlistenReminder?.();
+      unlistenCalendar?.();
     };
   });
 
@@ -857,7 +965,7 @@
       <FolderTree {folders} selected={selectedFolder} onselect={openFolder} onsync={startFolderSync} syncing={syncStatus?.running ?? false} />
     </div>
     {#if section === "calendar"}
-      <MiniMonth selected={calendarAnchor} range={calendarRange} onselect={pickCalendarDay} />
+      <MiniMonth selected={calendarAnchor} range={calendarKind === "month" ? null : calendarRange} eventDays={calendarEventDays} onselect={pickCalendarDay} />
     {/if}
   </nav>
 
@@ -872,18 +980,20 @@
   <div class="splitter" class:off={section !== "mail"} role="separator" aria-orientation="vertical" aria-label="Ширина списка" onpointerdown={startDrag}></div>
 
   <section class="reader" class:off={section !== "mail"} aria-label="Чтение" bind:this={readerEl}>
-    <ReadingPane conversation={selected} {messages} loading={loadingMessages} onfetch={fetchMessage} {folders} {deletedFolderPk} onaction={onMessageAction} oncompose={composeFromMessage} composer={compose ? composerSnippet : undefined} {composerAlone} bind:topExpandedPk />
+    <ReadingPane conversation={selected} {messages} loading={loadingMessages} onfetch={fetchMessage} {folders} {deletedFolderPk} onaction={onMessageAction} oncompose={composeFromMessage} composer={compose ? composerSnippet : undefined} {composerAlone} bind:topExpandedPk onmeeting={() => void rereadConversation()} />
   </section>
 
   {#if calendarMounted}
     <section class="calendar" class:off={section !== "calendar"} aria-label="Календарь">
-      <CalendarView bind:anchor={calendarAnchor} bind:kind={calendarKind} visible={section === "calendar"} />
+      <CalendarView bind:anchor={calendarAnchor} bind:kind={calendarKind} visible={section === "calendar"} bind:selectedPk={calendarSelectedPk} bind:eventDays={calendarEventDays} />
     </section>
   {/if}
 
   <footer class="status" aria-label="Состояние синхронизации">
     <StatusBar status={syncStatus} {notice} {notify} newMail={newMail ? newMailSender(newMail) : null} onrefresh={startSync} oncancel={cancelSync} ontoasts={setToasts} onnewmail={openNewMail} />
   </footer>
+
+  <ReminderBanner {reminders} onopen={openReminder} ondismiss={(pk) => void dismissReminder(pk)} onsnooze={(pk, min) => void snoozeReminder(pk, min)} ondismissall={() => void dismissAllReminders()} />
 
   {#if pendingCompose}
     <ConfirmPopover anchor={pendingCompose.anchor} align="start" title="Отменить текущее письмо?" text="Набранный текст будет потерян, откроется новое." confirmLabel="Отменить письмо" onconfirm={confirmReplace} oncancel={cancelReplace} />

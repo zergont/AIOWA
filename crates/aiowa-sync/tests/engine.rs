@@ -203,12 +203,36 @@ impl MailTransport for Fake {
         Ok(None)
     }
 
+    async fn user_time_zone(&self) -> TResult<Option<String>> {
+        Ok(Some("Russian Standard Time".into()))
+    }
+
     async fn find_calendar_view(&self, _start: Timestamp, _end: Timestamp) -> TResult<Vec<CalendarEvent>> {
         Ok(vec![])
     }
 
     async fn get_calendar_item(&self, id: &ItemId) -> TResult<CalendarEventDetails> {
         Err(TransportError::Server { code: "ErrorItemNotFound".into(), message: format!("нет события {}", id.id) })
+    }
+
+    async fn create_calendar_item(&self, _item: &NewCalendarItem, _time_zone: Option<&str>) -> TResult<ItemId> {
+        Ok(ItemId { id: "event".into(), change_key: Some("e1".into()) })
+    }
+
+    async fn update_calendar_item(&self, id: &ItemId, _changes: &CalendarItemChanges, _send_updates: bool, _time_zone: Option<&str>) -> TResult<ItemId> {
+        Ok(ItemId { id: id.id.clone(), change_key: Some("e2".into()) })
+    }
+
+    async fn delete_calendar_item(&self, _id: &ItemId, _send_cancellations: bool) -> TResult<()> {
+        Ok(())
+    }
+
+    async fn respond_to_meeting(&self, _reference: &ItemId, _response: MeetingResponse, _send_response: bool, _body_html: Option<&str>) -> TResult<()> {
+        Ok(())
+    }
+
+    async fn get_meeting_request(&self, id: &ItemId) -> TResult<MeetingRequestInfo> {
+        Err(TransportError::Server { code: "ErrorItemNotFound".into(), message: format!("нет письма {}", id.id) })
     }
 
     async fn subscribe_notifications(&self, subs: &[SubscriptionRequest]) -> TResult<Vec<SubscriptionResult>> {

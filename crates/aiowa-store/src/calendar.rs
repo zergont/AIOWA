@@ -9,6 +9,127 @@ use rusqlite::{params, OptionalExtension, Transaction};
 use std::collections::HashSet;
 use tracing::debug;
 
+/// Событие с напоминанием для планировщика: `remind_at` — момент напоминания
+/// (`start_at − reminder_minutes`), миллисекунды UTC.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReminderRow {
+    pub calendar_pk: i64,
+    /// `ItemId.id` события без `ChangeKey`: ключ состояния напоминания (`reminder_state`).
+    pub server_id: String,
+    pub subject: Option<String>,
+    pub start_at: i64,
+    pub end_at: i64,
+    pub is_all_day: bool,
+    pub location: Option<String>,
+    pub reminder_minutes: i64,
+    pub remind_at: i64,
+}
+
+/// Состояние напоминания, выставленное пользователем: закрыто насовсем или отложено до момента
+/// (миллисекунды UTC).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReminderState {
+    Dismissed,
+    SnoozedUntil(i64),
+}
+
+impl ReminderState {
+    /// Напоминание сейчас скрыто: закрыто или отложено до момента позже `now_ms`.
+    pub fn hides_at(self, now_ms: i64) -> bool {
+        match self {
+            Self::Dismissed => true,
+            Self::SnoozedUntil(until) => now_ms < until,
+        }
+    }
+}
+
+/// Состояние напоминания вместе с моментом напоминания (`remind_at` = `start_at − reminder_minutes`),
+/// к которому оно относится: после переноса события или смены напоминания момент другой, и
+/// прежнее «закрыто»/«отложено» не действует — напоминание взводится заново, как в Outlook.
+/// Хранится в `sync_state` под ключом `desktop.reminder.<server_id>`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReminderMark {
+    pub state: ReminderState,
+    pub remind_at: i64,
+}
+
+impl ReminderMark {
+    /// Значение в базе: `dismissed:<момент>` или `snoozed_until:<мс>:<момент>`.
+    pub fn encode(self) -> String {
+        match self.state {
+            ReminderState::Dismissed => format!("dismissed:{}", self.remind_at),
+            ReminderState::SnoozedUntil(ms) => format!("snoozed_until:{ms}:{}", self.remind_at),
+        }
+    }
+
+    /// Разбор значения из базы; неизвестное или без момента напоминания — `None` (состояния нет).
+    pub fn decode(s: &str) -> Option<Self> {
+        let mut parts = s.trim().split(':').map(str::trim);
+        let kind = parts.next()?;
+        let num = |p: Option<&str>| p?.parse::<i64>().ok();
+        let mark = if kind.eq_ignore_ascii_case("dismissed") {
+            Self { state: ReminderState::Dismissed, remind_at: num(parts.next())? }
+        } else if kind.eq_ignore_ascii_case("snoozed_until") {
+            Self { state: ReminderState::SnoozedUntil(num(parts.next())?), remind_at: num(parts.next())? }
+        } else {
+            return None;
+        };
+        parts.next().is_none().then_some(mark)
+    }
+
+    /// Напоминание с моментом `remind_at` сейчас скрыто: состояние относится к этому же моменту
+    /// и ещё действует (закрыто или отложено до момента позже `now_ms`).
+    pub fn hides(self, remind_at: i64, now_ms: i64) -> bool {
+        self.remind_at == remind_at && self.state.hides_at(now_ms)
+    }
+}
+
+/// Ключ состояния напоминания в `sync_state`.
+pub fn reminder_state_key(server_id: &str) -> String {
+    format!("desktop.reminder.{server_id}")
+}
+
+/// Ключ `sync_state` с часовым поясом пользователя из настроек OWA (Windows-идентификатор,
+/// например `Russian Standard Time`): его читают окно и CLI перед записью в календарь
+/// (`Store::owa_time_zone`), а с сервера (`MailTransport::user_time_zone`) берут и кладут сюда
+/// (`Store::set_owa_time_zone`), когда записи нет или она старше `OWA_TIME_ZONE_TTL_MS`. Пустая
+/// строка — маркер «в OWA пояс не задан»: он годен тот же срок и избавляет от запроса к серверу
+/// при каждом обращении к календарю и каждой записи.
+pub const OWA_TIME_ZONE_KEY: &str = "desktop.owa_timezone";
+
+/// Срок годности кэша пояса пользователя: сутки. Смена пояса в настройках OWA (переезд,
+/// командировка) подхватывается не позже чем через сутки, без ручной чистки `sync_state`.
+pub const OWA_TIME_ZONE_TTL_MS: i64 = 24 * 60 * 60 * 1000;
+
+/// Запись кэша пояса пользователя (`OWA_TIME_ZONE_KEY`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CachedTimeZone {
+    /// Пояс; `None` — в настройках OWA пояс не задан (в базе — пустая строка).
+    pub zone: Option<String>,
+    /// Запись старше `OWA_TIME_ZONE_TTL_MS`: пояс стоит перечитать с сервера, а при отказе сервера
+    /// годится и эта.
+    pub stale: bool,
+}
+
+impl Store {
+    /// Кэш пояса пользователя с признаком устаревания; `None` — записи нет.
+    pub fn owa_time_zone(&self, account: AccountId) -> Result<Option<CachedTimeZone>> {
+        self.owa_time_zone_at(account, now_ms())
+    }
+
+    fn owa_time_zone_at(&self, account: AccountId, now: i64) -> Result<Option<CachedTimeZone>> {
+        self.with_conn(|c| {
+            let row: Option<(Option<String>, i64)> = c.query_row("SELECT value, updated_at FROM sync_state WHERE account_id = ?1 AND key = ?2", params![account.0, OWA_TIME_ZONE_KEY], |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
+            Ok(row.map(|(value, updated_at)| CachedTimeZone { zone: value.filter(|z| !z.trim().is_empty()), stale: now - updated_at >= OWA_TIME_ZONE_TTL_MS }))
+        })
+    }
+
+    /// Пояс пользователя в кэш с моментом записи «сейчас»; `None` — маркер «в OWA пояс не задан».
+    pub fn set_owa_time_zone(&self, account: AccountId, zone: Option<&str>) -> Result<()> {
+        self.set_state(account, OWA_TIME_ZONE_KEY, Some(zone.map(str::trim).unwrap_or("")))
+    }
+}
+
 /// Строка кэша календаря для сетки и панели события. `free_busy`, `calendar_type`, `my_response`
 /// хранятся именами значений EWS (`Busy`, `Occurrence`, `Accept`); их разбирают
 /// `FreeBusy::parse`, `CalendarItemType::parse`, `ResponseType::parse`.
@@ -32,11 +153,13 @@ pub struct CalendarRow {
     pub has_attachments: bool,
     /// Тело и участники уже загружены (`GetItem`).
     pub has_details: bool,
+    /// Минут до начала, если напоминание включено (из `FindItem`, обновляется `GetItem`).
+    pub reminder_minutes: Option<i64>,
 }
 
 /// Колонки `calendar_items` в порядке, который разбирает `calendar_row`.
 const CALENDAR_COLUMNS: &str = "calendar_pk, server_id, change_key, subject, start_at, end_at, is_all_day, location, organizer_name, organizer_email,
-        free_busy, calendar_type, is_meeting, is_cancelled, my_response, sensitivity, has_attachments, details_at IS NOT NULL";
+        free_busy, calendar_type, is_meeting, is_cancelled, my_response, sensitivity, has_attachments, details_at IS NOT NULL, reminder_minutes";
 
 fn calendar_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<CalendarRow> {
     Ok(CalendarRow {
@@ -57,6 +180,7 @@ fn calendar_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<CalendarRow> {
         sensitivity: r.get(15)?,
         has_attachments: r.get::<_, i64>(16)? != 0,
         has_details: r.get::<_, i64>(17)? != 0,
+        reminder_minutes: r.get(18)?,
     })
 }
 
@@ -65,22 +189,22 @@ fn calendar_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<CalendarRow> {
 /// кончается ровно в начале окна, — нет.
 const INTERSECTS_SQL: &str = "start_at < ?3 AND (start_at >= ?2 OR end_at > ?2)";
 
-/// Вставка или обновление экземпляра по `(account_id, server_id)`. Подробности (`body_html`,
-/// `attendees_json`, `reminder_minutes`, `recurrence_text`, `details_at`) сохраняются, пока
-/// `ChangeKey` тот же (или сервер его не прислал); при новом ключе сбрасываются.
+/// Вставка или обновление экземпляра по `(account_id, server_id)`. Напоминание приходит и с
+/// `FindItem`, поэтому пишется всегда; подробности (`body_html`, `attendees_json`,
+/// `recurrence_text`, `details_at`) сохраняются, пока `ChangeKey` тот же (или сервер его не
+/// прислал); при новом ключе сбрасываются.
 const UPSERT_SQL: &str = "INSERT INTO calendar_items(account_id, server_id, change_key, subject, start_at, end_at, is_all_day, location, organizer_name, organizer_email,
-        free_busy, calendar_type, is_meeting, is_cancelled, my_response, sensitivity, has_attachments, last_modified_at, fetched_at)
-     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)
+        free_busy, calendar_type, is_meeting, is_cancelled, my_response, sensitivity, has_attachments, last_modified_at, fetched_at, reminder_minutes)
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)
      ON CONFLICT(account_id, server_id) DO UPDATE SET
        subject = excluded.subject, start_at = excluded.start_at, end_at = excluded.end_at, is_all_day = excluded.is_all_day,
        location = excluded.location, organizer_name = excluded.organizer_name, organizer_email = excluded.organizer_email,
        free_busy = excluded.free_busy, calendar_type = excluded.calendar_type, is_meeting = excluded.is_meeting,
        is_cancelled = excluded.is_cancelled, my_response = excluded.my_response, sensitivity = excluded.sensitivity,
        has_attachments = excluded.has_attachments, last_modified_at = COALESCE(excluded.last_modified_at, calendar_items.last_modified_at),
-       fetched_at = excluded.fetched_at,
+       fetched_at = excluded.fetched_at, reminder_minutes = excluded.reminder_minutes,
        body_html        = CASE WHEN excluded.change_key IS NULL OR excluded.change_key = calendar_items.change_key THEN calendar_items.body_html ELSE NULL END,
        attendees_json   = CASE WHEN excluded.change_key IS NULL OR excluded.change_key = calendar_items.change_key THEN calendar_items.attendees_json ELSE NULL END,
-       reminder_minutes = CASE WHEN excluded.change_key IS NULL OR excluded.change_key = calendar_items.change_key THEN calendar_items.reminder_minutes ELSE NULL END,
        recurrence_text  = CASE WHEN excluded.change_key IS NULL OR excluded.change_key = calendar_items.change_key THEN calendar_items.recurrence_text ELSE NULL END,
        details_at       = CASE WHEN excluded.change_key IS NULL OR excluded.change_key = calendar_items.change_key THEN calendar_items.details_at ELSE NULL END,
        change_key = COALESCE(excluded.change_key, calendar_items.change_key)";
@@ -105,9 +229,29 @@ fn upsert_event(tx: &Transaction, account: AccountId, ev: &CalendarEvent, now: i
         ev.sensitivity,
         ev.has_attachments as i64,
         ts_ms(ev.last_modified),
-        now
+        now,
+        ev.reminder_minutes
     ])?;
     Ok(())
+}
+
+/// Условие строк с напоминанием: оно включено, событие не отменено и не отклонено.
+const REMINDER_SQL: &str = "reminder_minutes IS NOT NULL AND is_cancelled = 0 AND my_response != 'Decline'";
+
+fn reminder_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<ReminderRow> {
+    let start_at: i64 = r.get(3)?;
+    let reminder_minutes: i64 = r.get(7)?;
+    Ok(ReminderRow {
+        calendar_pk: r.get(0)?,
+        server_id: r.get(1)?,
+        subject: r.get(2)?,
+        start_at,
+        end_at: r.get(4)?,
+        is_all_day: r.get::<_, i64>(5)? != 0,
+        location: r.get(6)?,
+        reminder_minutes,
+        remind_at: start_at - reminder_minutes * 60_000,
+    })
 }
 
 /// Вычитает `[rs, re)` из каждого интервала `uncovered`.
@@ -192,11 +336,108 @@ impl Store {
         })
     }
 
+    /// Вставляет или обновляет одно событие (после `CreateItem`/`UpdateItem`, чтобы кэш не ждал
+    /// перечитывания окна); подробности сохраняются при том же `ChangeKey`. Возвращает `calendar_pk`.
+    pub fn upsert_calendar_event(&self, account: AccountId, event: &CalendarEvent) -> Result<i64> {
+        self.with_tx(|tx| {
+            upsert_event(tx, account, event, now_ms())?;
+            let pk: i64 = tx.prepare_cached("SELECT calendar_pk FROM calendar_items WHERE account_id = ?1 AND server_id = ?2")?.query_row(params![account.0, event.id.id], |r| r.get(0))?;
+            Ok(pk)
+        })
+    }
+
+    /// Минуты напоминания события из кэша (`None` — напоминания нет или события нет).
+    pub fn calendar_reminder_minutes(&self, calendar_pk: i64) -> Result<Option<i64>> {
+        self.with_conn(|c| Ok(c.prepare_cached("SELECT reminder_minutes FROM calendar_items WHERE calendar_pk = ?1")?.query_row(params![calendar_pk], |r| r.get::<_, Option<i64>>(0)).optional()?.flatten()))
+    }
+
+    /// Удаляет событие из кэша (после `DeleteItem`); `false` — его и не было.
+    pub fn remove_calendar_event(&self, calendar_pk: i64) -> Result<bool> {
+        self.with_conn(|c| Ok(c.prepare_cached("DELETE FROM calendar_items WHERE calendar_pk = ?1")?.execute(params![calendar_pk])? > 0))
+    }
+
+    /// События с включённым напоминанием (не отменённые, не отклонённые), у которых момент
+    /// напоминания `start_at − reminder_minutes` лежит в окне `[from_ms, to_ms)`; по моменту
+    /// напоминания. Закрытые и отложенные напоминания здесь не отсеиваются — см. `reminder_states`.
+    pub fn calendar_events_with_reminders(&self, account: AccountId, from_ms: i64, to_ms: i64) -> Result<Vec<ReminderRow>> {
+        self.with_conn(|c| {
+            let mut st = c.prepare_cached(&format!(
+                "SELECT calendar_pk, server_id, subject, start_at, end_at, is_all_day, location, reminder_minutes
+                 FROM calendar_items WHERE account_id = ?1 AND {REMINDER_SQL}
+                   AND start_at - reminder_minutes * 60000 >= ?2 AND start_at - reminder_minutes * 60000 < ?3
+                 ORDER BY start_at - reminder_minutes * 60000, start_at, calendar_pk"
+            ))?;
+            let rows = st.query_map(params![account.0, from_ms, to_ms], reminder_row)?;
+            Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+        })
+    }
+
+    /// Состояние напоминания события (`desktop.reminder.<server_id>` в `sync_state`) с моментом
+    /// напоминания, к которому оно относится.
+    pub fn reminder_state(&self, account: AccountId, server_id: &str) -> Result<Option<ReminderMark>> {
+        Ok(self.get_state(account, &reminder_state_key(server_id))?.as_deref().and_then(ReminderMark::decode))
+    }
+
+    /// Записывает состояние напоминания; `None` — снимает (напоминание снова показывается).
+    pub fn set_reminder_state(&self, account: AccountId, server_id: &str, state: Option<ReminderMark>) -> Result<()> {
+        let key = reminder_state_key(server_id);
+        match state {
+            Some(s) => self.set_state(account, &key, Some(&s.encode())),
+            None => self.with_conn(|c| {
+                c.execute("DELETE FROM sync_state WHERE account_id = ?1 AND key = ?2", params![account.0, key])?;
+                Ok(())
+            }),
+        }
+    }
+
+    /// Все состояния напоминаний аккаунта: `(server_id, состояние с моментом)`; нечитаемые
+    /// значения пропускаются.
+    pub fn reminder_states(&self, account: AccountId) -> Result<Vec<(String, ReminderMark)>> {
+        let prefix = reminder_state_key("");
+        self.with_conn(|c| {
+            let mut st = c.prepare_cached("SELECT key, value FROM sync_state WHERE account_id = ?1 AND key LIKE ?2 ESCAPE '\\'")?;
+            let pattern = format!("{}%", prefix.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_"));
+            let rows = st.query_map(params![account.0, pattern], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)))?;
+            let mut out = Vec::new();
+            for row in rows {
+                let (key, value) = row?;
+                if let (Some(id), Some(state)) = (key.strip_prefix(&prefix), value.as_deref().and_then(ReminderMark::decode)) {
+                    out.push((id.to_string(), state));
+                }
+            }
+            Ok(out)
+        })
+    }
+
+    /// Забывает состояния напоминаний событий, которых больше нет в кэше (чтобы `sync_state`
+    /// не рос); возвращает число удалённых.
+    pub fn prune_reminder_states(&self, account: AccountId) -> Result<usize> {
+        let prefix = reminder_state_key("");
+        self.with_conn(|c| {
+            let pattern = format!("{}%", prefix.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_"));
+            let n = c.execute(
+                "DELETE FROM sync_state WHERE account_id = ?1 AND key LIKE ?2 ESCAPE '\\'
+                   AND NOT EXISTS (SELECT 1 FROM calendar_items ci WHERE ci.account_id = ?1 AND ?3 || ci.server_id = sync_state.key)",
+                params![account.0, pattern, prefix],
+            )?;
+            Ok(n)
+        })
+    }
+
     /// Один экземпляр по ключу.
     pub fn calendar_event(&self, calendar_pk: i64) -> Result<Option<CalendarRow>> {
         self.with_conn(|c| {
             let mut st = c.prepare_cached(&format!("SELECT {CALENDAR_COLUMNS} FROM calendar_items WHERE calendar_pk = ?1"))?;
             Ok(st.query_row(params![calendar_pk], calendar_row).optional()?)
+        })
+    }
+
+    /// Один экземпляр по идентификатору на сервере (`ItemId.id` без `ChangeKey`): так письмо о
+    /// встрече находит связанное событие (`AssociatedCalendarItemId`) в кэше.
+    pub fn calendar_event_by_server_id(&self, account: AccountId, server_id: &str) -> Result<Option<CalendarRow>> {
+        self.with_conn(|c| {
+            let mut st = c.prepare_cached(&format!("SELECT {CALENDAR_COLUMNS} FROM calendar_items WHERE account_id = ?1 AND server_id = ?2"))?;
+            Ok(st.query_row(params![account.0, server_id], calendar_row).optional()?)
         })
     }
 
@@ -300,6 +541,7 @@ mod tests {
             sensitivity: Some("Normal".into()),
             has_attachments: false,
             last_modified: None,
+            reminder_minutes: Some(15),
         }
     }
 
@@ -365,6 +607,10 @@ mod tests {
         assert!(s.calendar_details(b_pk).unwrap().is_none(), "подробности B сброшены вместе с ключом");
         assert_eq!(s.calendar_details(a_pk).unwrap().unwrap().0.as_deref(), Some("<p>Повестка A</p>"));
         assert_eq!(s.calendar_events(acc, tue, wed).unwrap().len(), 1, "соседнее окно не тронуто");
+        // Напоминание из FindItem пишется всегда, и при новом ключе тоже (B получило 15 из выдачи).
+        let reminders = s.calendar_events_with_reminders(acc, mon, tue).unwrap();
+        assert_eq!(reminders.iter().map(|r| r.calendar_pk).collect::<Vec<_>>(), vec![a_pk, b_pk, rows[2].calendar_pk], "D тоже с напоминанием");
+        assert_eq!((reminders[0].reminder_minutes, reminders[0].remind_at), (15, ms("2026-10-19T06:45:00Z")));
 
         // Подробности с новым ключом от GetItem обновляют и ключ, и поля события.
         let mut fresh = s.calendar_event(b_pk).unwrap().unwrap();
@@ -402,6 +648,97 @@ mod tests {
         assert_eq!(ids(ms("2026-10-20T12:00:00Z"), ms("2026-10-20T13:00:00Z")), vec!["MULTI", "ALL"]);
         assert!(s.calendar_events(acc, ms("2026-10-25T00:00:00Z"), ms("2026-10-26T00:00:00Z")).unwrap().is_empty());
         assert!(s.calendar_events(acc, day_start, day_end).unwrap().iter().find(|r| r.id.id == "ALL").unwrap().is_all_day);
+    }
+
+    #[test]
+    fn upsert_remove_and_reminders() {
+        let s = tmp_store("reminders");
+        let acc = s.account("h", "u").unwrap();
+        let (mon, tue) = (ms("2026-10-19T00:00:00Z"), ms("2026-10-20T00:00:00Z"));
+        // Одиночная вставка после CreateItem: строка видна в окне, напоминание записано.
+        let a = event("A", "a1", "2026-10-19T07:00:00Z", "2026-10-19T08:00:00Z");
+        let a_pk = s.upsert_calendar_event(acc, &a).unwrap();
+        assert_eq!(s.calendar_events(acc, mon, tue).unwrap().len(), 1);
+        assert!(s.calendar_range_age(acc, mon, tue).unwrap().is_none(), "одиночная вставка окно не покрывает");
+        let rem = s.calendar_events_with_reminders(acc, mon, tue).unwrap();
+        assert_eq!((rem.len(), rem[0].calendar_pk, rem[0].server_id.as_str(), rem[0].remind_at), (1, a_pk, "A", ms("2026-10-19T06:45:00Z")));
+        assert_eq!((rem[0].subject.as_deref(), rem[0].location.as_deref(), rem[0].is_all_day, rem[0].end_at), (Some("Событие A"), Some("Зал"), false, ms("2026-10-19T08:00:00Z")));
+        // Повторная вставка того же события с новым ключом — тот же pk, подробности сброшены, поля обновлены.
+        s.store_calendar_details(a_pk, &details(a.clone(), "<p>A</p>")).unwrap();
+        let mut a2 = a.clone();
+        a2.id.change_key = Some("a2".into());
+        a2.start = "2026-10-19T09:00:00Z".parse().unwrap();
+        a2.end = "2026-10-19T09:45:00Z".parse().unwrap();
+        a2.reminder_minutes = Some(30);
+        assert_eq!(s.upsert_calendar_event(acc, &a2).unwrap(), a_pk);
+        let row = s.calendar_event(a_pk).unwrap().unwrap();
+        assert_eq!((row.start_at, row.has_details, row.id.change_key.as_deref()), (ms("2026-10-19T09:00:00Z"), false, Some("a2")));
+        assert_eq!(s.calendar_reminder_minutes(a_pk).unwrap(), Some(30));
+        assert_eq!(row.reminder_minutes, Some(30), "напоминание есть и в строке кэша");
+        assert_eq!(s.calendar_reminder_minutes(999_999).unwrap(), None);
+        assert_eq!(s.calendar_event_by_server_id(acc, "A").unwrap().map(|r| r.calendar_pk), Some(a_pk));
+        assert!(s.calendar_event_by_server_id(acc, "NOPE").unwrap().is_none());
+        assert_eq!(s.calendar_events_with_reminders(acc, mon, tue).unwrap()[0].remind_at, ms("2026-10-19T08:30:00Z"));
+        // Окно по моменту напоминания: [08:30, 08:31) находит, [08:31, …) — нет; без напоминания,
+        // отменённое и отклонённое не попадают.
+        assert_eq!(s.calendar_events_with_reminders(acc, ms("2026-10-19T08:30:00Z"), ms("2026-10-19T08:31:00Z")).unwrap().len(), 1);
+        assert!(s.calendar_events_with_reminders(acc, ms("2026-10-19T08:31:00Z"), tue).unwrap().is_empty());
+        let mut none = event("N", "n1", "2026-10-19T10:00:00Z", "2026-10-19T11:00:00Z");
+        none.reminder_minutes = None;
+        let mut cancelled = event("C", "c1", "2026-10-19T10:00:00Z", "2026-10-19T11:00:00Z");
+        cancelled.is_cancelled = true;
+        let mut declined = event("D", "d1", "2026-10-19T10:00:00Z", "2026-10-19T11:00:00Z");
+        declined.my_response = ResponseType::Decline;
+        let mut zero = event("Z", "z1", "2026-10-19T10:00:00Z", "2026-10-19T11:00:00Z");
+        zero.reminder_minutes = Some(0);
+        for ev in [&none, &cancelled, &declined, &zero] {
+            s.upsert_calendar_event(acc, ev).unwrap();
+        }
+        let rem = s.calendar_events_with_reminders(acc, mon, tue).unwrap();
+        assert_eq!(rem.iter().map(|r| r.server_id.as_str()).collect::<Vec<_>>(), vec!["A", "Z"]);
+        assert_eq!(rem[1].remind_at, rem[1].start_at, "напоминание «в момент начала»");
+        // Состояния напоминаний в KV (с моментом напоминания): закрыто, отложено, снято; обход и чистка.
+        let remind_a = ms("2026-10-19T08:30:00Z");
+        let dismissed_a = ReminderMark { state: ReminderState::Dismissed, remind_at: remind_a };
+        let snoozed_z = ReminderMark { state: ReminderState::SnoozedUntil(ms("2026-10-19T10:05:00Z")), remind_at: ms("2026-10-19T10:00:00Z") };
+        assert_eq!(s.reminder_state(acc, "A").unwrap(), None);
+        s.set_reminder_state(acc, "A", Some(dismissed_a)).unwrap();
+        s.set_reminder_state(acc, "Z", Some(snoozed_z)).unwrap();
+        s.set_reminder_state(acc, "GONE", Some(dismissed_a)).unwrap();
+        assert_eq!(s.reminder_state(acc, "A").unwrap(), Some(dismissed_a));
+        assert_eq!(s.reminder_state(acc, "Z").unwrap(), Some(snoozed_z));
+        assert_eq!(s.get_state(acc, "desktop.reminder.Z").unwrap(), Some(format!("snoozed_until:{}:{}", ms("2026-10-19T10:05:00Z"), ms("2026-10-19T10:00:00Z"))));
+        assert_eq!(s.get_state(acc, "desktop.reminder.A").unwrap(), Some(format!("dismissed:{remind_a}")));
+        let mut states = s.reminder_states(acc).unwrap();
+        states.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(states.len(), 3);
+        assert_eq!(states[0], ("A".to_string(), dismissed_a));
+        assert_eq!(s.prune_reminder_states(acc).unwrap(), 1, "состояние события, которого нет в кэше, забыто");
+        assert_eq!(s.reminder_states(acc).unwrap().len(), 2);
+        s.set_reminder_state(acc, "A", None).unwrap();
+        assert_eq!(s.reminder_state(acc, "A").unwrap(), None);
+        // Значение старого вида (без момента) не читается: состояния нет.
+        s.set_state(acc, "desktop.reminder.A", Some("dismissed")).unwrap();
+        assert_eq!(s.reminder_state(acc, "A").unwrap(), None);
+        assert_eq!(s.reminder_states(acc).unwrap().len(), 1);
+        assert!(ReminderState::Dismissed.hides_at(0));
+        assert!(ReminderState::SnoozedUntil(100).hides_at(99) && !ReminderState::SnoozedUntil(100).hides_at(100));
+        assert_eq!(ReminderMark::decode("snoozed_until:5:7"), Some(ReminderMark { state: ReminderState::SnoozedUntil(5), remind_at: 7 }));
+        assert_eq!(ReminderMark::decode(" dismissed : 9 "), Some(ReminderMark { state: ReminderState::Dismissed, remind_at: 9 }));
+        assert_eq!(ReminderMark::decode("dismissed"), None);
+        assert_eq!(ReminderMark::decode("snoozed_until:5"), None);
+        assert_eq!(ReminderMark::decode("dismissed:9:1"), None);
+        assert_eq!(ReminderMark::decode("что-то"), None);
+        // Состояние действует только для своего момента: после переноса события оно не скрывает напоминание.
+        assert!(dismissed_a.hides(remind_a, 0));
+        assert!(!dismissed_a.hides(remind_a + 1, 0));
+        assert!(snoozed_z.hides(ms("2026-10-19T10:00:00Z"), ms("2026-10-19T10:04:00Z")));
+        assert!(!snoozed_z.hides(ms("2026-10-19T10:00:00Z"), ms("2026-10-19T10:05:00Z")));
+        // Удаление из кэша после DeleteItem.
+        assert!(s.remove_calendar_event(a_pk).unwrap());
+        assert!(!s.remove_calendar_event(a_pk).unwrap());
+        assert!(s.calendar_event(a_pk).unwrap().is_none());
+        assert_eq!(s.calendar_events(acc, mon, tue).unwrap().len(), 4);
     }
 
     #[test]
@@ -447,5 +784,23 @@ mod tests {
         assert_eq!(u, vec![(5, 10)]);
         subtract_range(&mut u, 5, 10);
         assert!(u.is_empty());
+    }
+
+    #[test]
+    fn owa_time_zone_cache_expires_and_keeps_unset_marker() {
+        let s = tmp_store("tz");
+        let acc = s.account("h", "u").unwrap();
+        assert_eq!(s.owa_time_zone(acc).unwrap(), None, "записи нет");
+        s.set_owa_time_zone(acc, Some(" Russian Standard Time ")).unwrap();
+        let now = now_ms();
+        assert_eq!(s.owa_time_zone_at(acc, now).unwrap(), Some(CachedTimeZone { zone: Some("Russian Standard Time".into()), stale: false }));
+        // Запас в секунду: между записью и `now` часы успевают тикнуть на миллисекунды.
+        assert!(!s.owa_time_zone_at(acc, now + OWA_TIME_ZONE_TTL_MS - 1000).unwrap().unwrap().stale, "почти сутки — ещё годен");
+        assert!(s.owa_time_zone_at(acc, now + OWA_TIME_ZONE_TTL_MS + 1000).unwrap().unwrap().stale, "старше суток — перечитать");
+        // «В OWA пояс не задан» — тоже запись, годная сутки: сервер не спрашивается на каждом окне.
+        s.set_owa_time_zone(acc, None).unwrap();
+        assert_eq!(s.get_state(acc, OWA_TIME_ZONE_KEY).unwrap(), Some(String::new()));
+        assert_eq!(s.owa_time_zone_at(acc, now_ms()).unwrap(), Some(CachedTimeZone { zone: None, stale: false }));
+        assert!(s.owa_time_zone_at(acc, now_ms() + OWA_TIME_ZONE_TTL_MS + 1000).unwrap().unwrap().stale);
     }
 }

@@ -220,7 +220,8 @@ impl NotifyState {
         Ok(())
     }
 
-    fn toasts_enabled(&self) -> bool {
+    /// Тосты включены пользователем (настройка общая для писем и напоминаний календаря).
+    pub(crate) fn toasts_enabled(&self) -> bool {
         self.lock().status.toasts_enabled
     }
 
