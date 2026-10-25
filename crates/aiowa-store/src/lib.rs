@@ -14,6 +14,7 @@ pub mod query;
 pub mod schema;
 pub mod text;
 pub mod ui;
+pub mod view_state;
 
 use aiowa_core::{AccountId, Folder, FolderChange, FolderId, ItemChange, ItemId, MessageFull, MessageMeta, RecipientKind, SyncState};
 use jiff::Timestamp;
@@ -130,6 +131,9 @@ pub struct SearchHit {
     pub attachment_name: Option<String>,
     /// Беседа письма; нужна интерфейсу, чтобы открыть результат в области чтения.
     pub conversation_pk: Option<i64>,
+    /// Начало текста письма (серверный `Preview`): строка результата показывает его, когда
+    /// фрагмента нет (тело ещё не загружено, совпадение только в теме или отправителе).
+    pub preview: Option<String>,
 }
 
 /// Сводка по папке для `stats`.
@@ -289,6 +293,9 @@ pub struct ConversationRow {
     pub has_attachments: bool,
     /// Есть ли в беседе (во всех папках) письмо с флагом «к исполнению».
     pub has_flagged: bool,
+    /// Начало текста самого свежего письма беседы в этой папке (серверный `Preview`), как в
+    /// третьей строке списка OWA; `None` — у письма его нет.
+    pub preview: Option<String>,
 }
 
 /// Подзапрос «в беседе есть письмо с флагом» для списков бесед (`c` — `conversations`).
@@ -1373,7 +1380,7 @@ impl Store {
             sql.push_str(
                 "SELECT i.item_pk, bm25(items_fts, 8.0, 4.0, 2.0, 1.0, 1.0, 0.5) AS rank,
                         i.subject, i.from_name, i.from_email, i.received_at, f.display_name,
-                        snippet(items_fts, 4, ?1, ?2, '…', 14), snippet(items_fts, 5, ?1, ?2, '…', 14), i.conversation_pk
+                        snippet(items_fts, 4, ?1, ?2, '…', 14), snippet(items_fts, 5, ?1, ?2, '…', 14), i.conversation_pk, i.preview
                  FROM items_fts JOIN items i ON i.item_pk = items_fts.rowid
                  LEFT JOIN folders f ON f.folder_pk = i.folder_pk
                  WHERE items_fts MATCH ?3 AND i.account_id = ?4 AND i.deleted = 0",
@@ -1385,7 +1392,7 @@ impl Store {
         } else {
             sql.push_str(
                 "SELECT i.item_pk, 0.0 AS rank, i.subject, i.from_name, i.from_email, i.received_at, f.display_name,
-                        COALESCE(i.preview, ''), '', i.conversation_pk
+                        COALESCE(i.preview, ''), '', i.conversation_pk, i.preview
                  FROM items i LEFT JOIN folders f ON f.folder_pk = i.folder_pk
                  WHERE i.account_id = ?1 AND i.deleted = 0",
             );
@@ -1426,11 +1433,12 @@ impl Store {
                     r.get::<_, String>(7)?,
                     r.get::<_, String>(8)?,
                     r.get::<_, Option<i64>>(9)?,
+                    r.get::<_, Option<String>>(10)?,
                 ))
             })?;
             let raw = rows.collect::<std::result::Result<Vec<_>, _>>()?;
             let mut hits = Vec::with_capacity(raw.len());
-            for (item_pk, rank, subject, from_name, from_email, received_at, folder_name, body_snip, att_snip, conversation_pk) in raw {
+            for (item_pk, rank, subject, from_name, from_email, received_at, folder_name, body_snip, att_snip, conversation_pk, preview) in raw {
                 let body_hit = body_snip.contains(MARK_OPEN);
                 let att_hit = att_snip.contains(MARK_OPEN);
                 let (snippet, attachment_name) = if att_hit && !body_hit {
@@ -1440,7 +1448,8 @@ impl Store {
                     (body_snip, None)
                 };
                 let snippet = snippet.replace(MARK_OPEN, "[").replace(MARK_CLOSE, "]");
-                hits.push(SearchHit { item_pk, rank, subject, from_name, from_email, received_at: ms_ts(received_at), folder_name, snippet, attachment_name, conversation_pk });
+                let preview = preview.filter(|p| !p.trim().is_empty());
+                hits.push(SearchHit { item_pk, rank, subject, from_name, from_email, received_at: ms_ts(received_at), folder_name, snippet, attachment_name, conversation_pk, preview });
             }
             Ok(hits)
         })
@@ -1481,7 +1490,7 @@ impl Store {
                  WHERE cf.folder_pk = ?1 AND c.account_id = ?2
                  ORDER BY cf.last_received_at DESC, c.conversation_pk DESC LIMIT ?3"
             ))?;
-            let rows: Vec<ConversationRow> = st
+            let mut rows: Vec<ConversationRow> = st
                 .query_map(params![folder_pk, account.0, limit as i64], |r| {
                     Ok(ConversationRow {
                         conversation_pk: r.get(0)?,
@@ -1493,9 +1502,11 @@ impl Store {
                         last_received_at: ms_ts(r.get::<_, Option<i64>>(5)?),
                         has_attachments: r.get::<_, i64>(6)? != 0,
                         has_flagged: r.get::<_, i64>(7)? != 0,
+                        preview: None,
                     })
                 })?
                 .collect::<std::result::Result<Vec<_>, _>>()?;
+            ui::fill_previews(c, folder_pk, &mut rows)?;
             let mut people = c.prepare_cached(
                 "SELECT COALESCE(from_name, from_email) FROM items WHERE conversation_pk = ?1 AND deleted = 0
                  ORDER BY COALESCE(received_at, sent_at) DESC LIMIT 50",

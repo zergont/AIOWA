@@ -1,6 +1,6 @@
 <script lang="ts">
-  import { tick } from "svelte";
-  import { errorMessage, type Folder } from "../api";
+  import { onDestroy, onMount, tick } from "svelte";
+  import { api, errorMessage, type Folder } from "../api";
   import { DND_CONVERSATIONS, ICON, folderNameError, isInsideDeleted, readDragPayload, type DragPayload } from "../actions";
   import { focusBack, type Anchor } from "../popover";
   import { layerOpen } from "../hotkeys";
@@ -33,7 +33,41 @@
   const PINNED = ["inbox", "drafts", "sentitems", "deleteditems", "junkemail", "archive"];
   const HIDDEN_CLASSES_NOTE = "не почтовые папки скрыты";
 
+  // --- свёрнутые ветки: хранятся в базе учётной записи (folders_collapsed_get / _set) ---------------
+  // В базе — серверные идентификаторы папок, окну приходят локальные ключи; удалённые на сервере
+  // папки бэкенд выбрасывает сам. Пока список не прочитан, строки дерева не рисуются: иначе дерево
+  // на миг показалось бы развёрнутым целиком. Сохранение — с задержкой, одной записью на серию щелчков.
+
   let collapsed = $state<Set<number>>(new Set());
+  let collapsedLoaded = $state(false);
+  const SAVE_DELAY_MS = 300;
+  let saveTimer: ReturnType<typeof setTimeout> | undefined;
+  let savePending = false;
+
+  onMount(() => {
+    api
+      .foldersCollapsedGet()
+      .then((pks) => (collapsed = new Set(pks)))
+      .catch((e) => console.warn("folders_collapsed_get:", errorMessage(e)))
+      .finally(() => (collapsedLoaded = true));
+  });
+
+  function setCollapsed(next: Set<number>) {
+    collapsed = next;
+    savePending = true;
+    clearTimeout(saveTimer);
+    saveTimer = setTimeout(flushCollapsed, SAVE_DELAY_MS);
+  }
+
+  /** Записать несохранённое сейчас (по таймеру, при уходе со страницы и при размонтировании). */
+  function flushCollapsed() {
+    clearTimeout(saveTimer);
+    if (!savePending) return;
+    savePending = false;
+    api.foldersCollapsedSet([...collapsed]).catch((e) => console.warn("folders_collapsed_set:", errorMessage(e)));
+  }
+
+  onDestroy(flushCollapsed);
 
   interface Node {
     folder: Folder;
@@ -78,14 +112,14 @@
     const next = new Set(collapsed);
     if (next.has(pk)) next.delete(pk);
     else next.add(pk);
-    collapsed = next;
+    setCollapsed(next);
   }
 
   function expand(pk: number) {
     if (!collapsed.has(pk)) return;
     const next = new Set(collapsed);
     next.delete(pk);
-    collapsed = next;
+    setCollapsed(next);
   }
 
   function icon(f: Folder): string {
@@ -403,7 +437,7 @@
   }
 </script>
 
-<svelte:window ondragend={onDragEnd} ondrop={onDragEnd} />
+<svelte:window ondragend={onDragEnd} ondrop={onDragEnd} onpagehide={flushCollapsed} />
 
 {#snippet editRow(depth: number)}
   <div class="row editing" style="--depth: {depth}" role="none">
@@ -499,7 +533,7 @@
 <div class="tree" role="tree" aria-label="Папки почты" tabindex="-1" bind:this={treeEl} oncontextmenu={onTreeContextMenu}>
   {#if folders.length === 0}
     <p class="caption empty">Папок ещё нет: они появятся после первой синхронизации (кнопка «Обновить» внизу).</p>
-  {:else}
+  {:else if collapsedLoaded}
     {#if oncreate}
       <div class="tree-head" role="none">
         <span class="caption tree-title">Папки</span>
