@@ -6,21 +6,28 @@
 //! логин, как `aiowa set-password`), пишет `config.json` с блоком `initial` и перезапускает
 //! приложение — оно поднимается в режиме почты с новой учётной записью.
 //!
-//! Проверка входа — отдельная сессия (не транспорт процесса): вход и один лёгкий запрос
-//! (иерархия папок) — не дольше 60 с, затем выход (всегда, с отдельным пределом 5 с). Пароль
-//! живёт только в `SecretString` и в журнал не попадает. Тексты ошибок — фиксированные фразы
-//! для пользователя.
+//! Проверка входа — отдельная сессия (не транспорт процесса): вход и два лёгких запроса
+//! (иерархия папок и сведения о ящике, `sessiondata.ashx`) — не дольше 60 с, затем выход
+//! (всегда, с отдельным пределом 5 с). Пароль живёт только в `SecretString` и в журнал не
+//! попадает. Тексты ошибок — фиксированные фразы для пользователя.
+//!
+//! Одна база на ящик (`mailbox.rs`): после удачной проверки мастер ищет на диске базы этого
+//! ящика и показывает их на шаге «Синхронизация» — «Продолжить с этой базой» (по умолчанию) или
+//! «Начать новую» (каталог из адреса ящика). Выбор записывается в `config.json` (`db_path`).
 
 use crate::config::{self, InitialConfig, MailBoot};
+use crate::mailbox::{self, MatchKind};
 use crate::ondemand::describe_transport;
 use crate::sync::KEYRING_SERVICE;
 use crate::CmdResult;
 use aiowa_core::FolderChange;
 use aiowa_transport::{Credentials, MailTransport, TransportError};
+use aiowa_transport_owa::mailbox::MailboxInfo;
 use aiowa_transport_owa::{OwaConfig, OwaTransport};
 use secrecy::{ExposeSecret, SecretString};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::Duration;
 use tauri::{AppHandle, State};
 use tracing::{info, warn};
@@ -53,11 +60,24 @@ pub(crate) struct SetupState {
     pub(crate) boot_error: Option<String>,
     /// Одна проверка входа за раз: двойной клик не открывает на сервере две сессии.
     login_lock: tokio::sync::Mutex<()>,
+    /// Базы, предложенные последней удачной проверкой входа: `setup_save` принимает только их.
+    db_choices: Mutex<Option<DbChoices>>,
+}
+
+/// Из каких баз мастер даёт выбрать (по последней удачной проверке входа).
+#[derive(Debug, Clone)]
+struct DbChoices {
+    host: String,
+    user: String,
+    /// Найденные базы этого ящика.
+    existing: Vec<PathBuf>,
+    /// Где будет новая база.
+    new_path: PathBuf,
 }
 
 impl SetupState {
     pub(crate) fn first_run(config_dir: PathBuf) -> Self {
-        Self { mode: Mode::Setup, host: None, user: None, config_dir, dev_env: false, autostart_sync: false, boot_error: None, login_lock: tokio::sync::Mutex::new(()) }
+        Self { mode: Mode::Setup, host: None, user: None, config_dir, dev_env: false, autostart_sync: false, boot_error: None, login_lock: tokio::sync::Mutex::new(()), db_choices: Mutex::new(None) }
     }
 
     pub(crate) fn mail(boot: &MailBoot, config_dir: PathBuf) -> Self {
@@ -70,6 +90,7 @@ impl SetupState {
             autostart_sync: boot.initial.is_none_or(|i| i.start_sync),
             boot_error: None,
             login_lock: tokio::sync::Mutex::new(()),
+            db_choices: Mutex::new(None),
         }
     }
 
@@ -107,6 +128,36 @@ pub(crate) struct LoginCheckDto {
     pub(crate) error: Option<String>,
     /// Адрес сервера после нормализации (`host[:port]`), с которым шла проверка.
     pub(crate) host: Option<String>,
+    /// Ящик, в который выполнен вход, если сервер сообщил (`sessiondata.ashx`).
+    pub(crate) mailbox: Option<MailboxDto>,
+    /// Базы этого ящика на диске: сначала полнее. Мастер предлагает продолжить с первой.
+    pub(crate) stores: Vec<CandidateDto>,
+    /// Путь новой базы, если начать с нуля (каталог из адреса ящика).
+    pub(crate) new_db_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub(crate) struct MailboxDto {
+    pub(crate) email: Option<String>,
+    pub(crate) display_name: Option<String>,
+}
+
+/// Найденная база ящика для шага «Синхронизация».
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct CandidateDto {
+    path: String,
+    /// Почему база подходит: `guid` — тот же ящик точно, `email` — совпал адрес, `login` — логин.
+    kind: MatchKind,
+    items: i64,
+    last_sync_ms: Option<i64>,
+    /// База с журналами и кэшем вложений.
+    total_bytes: u64,
+}
+
+impl From<&mailbox::Candidate> for CandidateDto {
+    fn from(c: &mailbox::Candidate) -> Self {
+        Self { path: c.path.display().to_string(), kind: c.kind, items: c.summary.items, last_sync_ms: c.summary.last_sync_ms, total_bytes: c.summary.total_bytes() }
+    }
 }
 
 impl LoginCheckDto {
@@ -216,6 +267,12 @@ pub(crate) fn describe_login_error(e: &TransportError, host: &str) -> String {
 /// срок может истечь внутри `connect` уже после удачного auth.owa (на редиректах) — транспорта
 /// ещё нет, выйти нечем; закрыть её можно, только если `connect` отдаст транспорт до входа.
 pub(crate) async fn check_login(host: &str, user: &str, password: SecretString) -> LoginCheckDto {
+    check_login_with_mailbox(host, user, password).await.0
+}
+
+/// То же, плюс сведения о ящике (адрес и GUID) для поиска его базы: запрашиваются после
+/// иерархии в том же сроке; не пришли — `None`, проверка входа от этого не проваливается.
+async fn check_login_with_mailbox(host: &str, user: &str, password: SecretString) -> (LoginCheckDto, Option<MailboxInfo>) {
     let creds = Credentials { host: host.to_string(), user: user.to_string(), password };
     let timed_out = || {
         warn!(host, "проверка входа не уложилась в {} с", LOGIN_CHECK_TIMEOUT.as_secs());
@@ -227,11 +284,25 @@ pub(crate) async fn check_login(host: &str, user: &str, password: SecretString) 
     };
     let deadline = tokio::time::Instant::now() + LOGIN_CHECK_TIMEOUT;
     let t = match tokio::time::timeout_at(deadline, OwaTransport::connect(creds, OwaConfig::default())).await {
-        Err(_) => return timed_out(),
-        Ok(Err(e)) => return failed(e),
+        Err(_) => return (timed_out(), None),
+        Ok(Err(e)) => return (failed(e), None),
         Ok(Ok(t)) => t,
     };
     let hierarchy = tokio::time::timeout_at(deadline, t.sync_folder_hierarchy(None)).await;
+    let info = match &hierarchy {
+        Ok(Ok(_)) => match tokio::time::timeout_at(deadline, t.mailbox_info()).await {
+            Ok(Ok(info)) => Some(info),
+            Ok(Err(e)) => {
+                warn!(error = %e, "сведения о ящике при проверке входа не получены");
+                None
+            }
+            Err(_) => {
+                warn!("сведения о ящике при проверке входа не уложились в срок");
+                None
+            }
+        },
+        _ => None,
+    };
     let build = t.server_info().build;
     // Выход — всегда, при любом исходе запроса иерархии.
     match tokio::time::timeout(LOGOFF_TIMEOUT, t.logoff()).await {
@@ -240,12 +311,13 @@ pub(crate) async fn check_login(host: &str, user: &str, password: SecretString) 
         Err(_) => warn!("выход из проверочной сессии не уложился в {} с", LOGOFF_TIMEOUT.as_secs()),
     }
     match hierarchy {
-        Err(_) => timed_out(),
-        Ok(Err(e)) => failed(e),
+        Err(_) => (timed_out(), None),
+        Ok(Err(e)) => (failed(e), None),
         Ok(Ok(changes)) => {
             let folders = changes.changes.iter().filter(|c| matches!(c, FolderChange::Create(f) if f.is_mail())).count() as i64;
-            info!(host, build = build.as_deref().unwrap_or("?"), folders, "проверка входа прошла");
-            LoginCheckDto { ok: true, server_version: build.as_deref().map(describe_build), folders: Some(folders), error: None, host: Some(host.to_string()) }
+            info!(host, build = build.as_deref().unwrap_or("?"), folders, mailbox_email = info.as_ref().is_some_and(|i| i.email.is_some()), mailbox_guid = info.as_ref().is_some_and(|i| i.mailbox_guid.is_some()), "проверка входа прошла");
+            let mailbox = info.as_ref().map(|i| MailboxDto { email: i.email.clone(), display_name: i.display_name.clone() });
+            (LoginCheckDto { ok: true, server_version: build.as_deref().map(describe_build), folders: Some(folders), error: None, host: Some(host.to_string()), mailbox, ..LoginCheckDto::default() }, info)
         }
     }
 }
@@ -256,6 +328,37 @@ pub(crate) async fn check_login_locked(setup: &SetupState, host: &str, user: &st
     check_login(host, user, password).await
 }
 
+/// Базы ящика на диске и путь новой базы: базы этого сервера под `%LOCALAPPDATA%\AIOWA` и путь
+/// из `config.json` (после «Забыть учётную запись» он остаётся), если там есть база. Блокирующий.
+fn find_db_choices(config_dir: &Path, host: &str, user: &str, info: &MailboxInfo) -> (Vec<mailbox::Candidate>, PathBuf) {
+    let root = aiowa_store::identity::data_root();
+    let mut paths = mailbox::host_databases(&root, host);
+    if let Some(p) = config::load(config_dir).and_then(|c| c.db_path).filter(|p| p.is_file())
+        && !paths.iter().any(|x| crate::data::same_path(x, &p))
+    {
+        paths.push(p);
+    }
+    let found = mailbox::find_candidates(&paths, host, user, info);
+    info!(databases = paths.len(), matching = found.len(), by_guid = found.iter().filter(|c| c.kind == MatchKind::Guid).count(), "поиск базы ящика");
+    (found, mailbox::new_db_path(&root, host, user, info))
+}
+
+/// Какой путь к базе записать в конфиг: выбранный в мастере (только из предложенных последней
+/// проверкой входа с этими сервером и логином) или новый. Проверки не было — путь по логину,
+/// как раньше.
+fn chosen_db_path(choices: Option<&DbChoices>, host: &str, user: &str, wanted: Option<&str>) -> Result<PathBuf, String> {
+    let choices = choices.filter(|c| c.host == host && c.user == user);
+    match (choices, wanted) {
+        (Some(c), Some(p)) => {
+            let p = Path::new(p);
+            c.existing.iter().chain(std::iter::once(&c.new_path)).find(|x| crate::data::same_path(x, p)).cloned().ok_or_else(|| "Выбранной базы нет среди найденных: проверьте вход ещё раз".to_string())
+        }
+        (Some(c), None) => Ok(c.new_path.clone()),
+        (None, Some(_)) => Err("Сначала проверьте вход: база выбирается после него".into()),
+        (None, None) => Ok(config::default_db_path(host, user)),
+    }
+}
+
 /// Перезапуск процесса через штатный выход: сработает `RunEvent::Exit` (канал уведомлений,
 /// отложенные действия, logoff), затем Tauri запустит процесс заново.
 pub(crate) fn restart(app: &AppHandle) {
@@ -263,10 +366,11 @@ pub(crate) fn restart(app: &AppHandle) {
     app.request_restart();
 }
 
-/// Записать учётную запись и блок первого запуска в конфиг (путь к базе сохраняется).
-pub(crate) fn write_account(dir: &Path, host: &str, user: &str, initial: InitialConfig) -> std::io::Result<()> {
+/// Записать учётную запись, путь к базе и блок первого запуска в конфиг.
+pub(crate) fn write_account(dir: &Path, host: &str, user: &str, db_path: &Path, initial: InitialConfig) -> std::io::Result<()> {
     config::update(dir, |c| {
         c.account = Some(config::AccountConfig { host: host.to_string(), user: user.to_string() });
+        c.db_path = Some(db_path.to_path_buf());
         c.initial = Some(initial);
     })
     .map(|_| ())
@@ -308,13 +412,29 @@ pub(crate) async fn setup_test_login(host: String, user: String, password: Strin
     if password.expose_secret().is_empty() {
         return Ok(LoginCheckDto::failed(Some(host), "Введите пароль"));
     }
-    Ok(check_login_locked(&setup, &host, &user, password).await)
+    let (mut dto, info) = {
+        let _one = setup.login_lock.lock().await;
+        check_login_with_mailbox(&host, &user, password).await
+    };
+    if !dto.ok {
+        return Ok(dto);
+    }
+    // Базы этого ящика на диске: шаг «Синхронизация» предложит продолжить с найденной.
+    let (dir, h, u) = (setup.config_dir.clone(), host.clone(), user.clone());
+    let info = info.unwrap_or_default();
+    let (found, new_path) = tauri::async_runtime::spawn_blocking(move || find_db_choices(&dir, &h, &u, &info)).await.map_err(crate::err)?;
+    dto.stores = found.iter().map(CandidateDto::from).collect();
+    dto.new_db_path = Some(new_path.display().to_string());
+    *setup.db_choices.lock().unwrap_or_else(|p| p.into_inner()) = Some(DbChoices { host, user, existing: found.into_iter().map(|c| c.path).collect(), new_path });
+    Ok(dto)
 }
 
-/// Завершение мастера: пароль — в диспетчер учётных данных, учётная запись и настройки первого
-/// старта — в `config.json`, затем перезапуск в режим почты.
+/// Завершение мастера: пароль — в диспетчер учётных данных, учётная запись, путь к базе и
+/// настройки первого старта — в `config.json`, затем перезапуск в режим почты. `db_path` — одна
+/// из баз, найденных проверкой входа («Продолжить с этой базой»); `None` — новая база.
 #[tauri::command]
-pub(crate) async fn setup_save(host: String, user: String, password: String, body_days: u32, start_sync: bool, app: AppHandle, setup: State<'_, SetupState>) -> CmdResult<()> {
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn setup_save(host: String, user: String, password: String, body_days: u32, start_sync: bool, db_path: Option<String>, app: AppHandle, setup: State<'_, SetupState>) -> CmdResult<()> {
     let password = SecretString::from(password);
     let host = config::normalize_host(&host)?;
     let user = config::normalize_user(&user)?;
@@ -322,15 +442,17 @@ pub(crate) async fn setup_save(host: String, user: String, password: String, bod
         return Err("Введите пароль".into());
     }
     crate::settings::check_body_days(body_days)?;
+    let db = chosen_db_path(setup.db_choices.lock().unwrap_or_else(|p| p.into_inner()).as_ref(), &host, &user, db_path.as_deref())?;
+    let existing = db.is_file();
     let dir = setup.config_dir.clone();
     let (h, u) = (host.clone(), user.clone());
     tauri::async_runtime::spawn_blocking(move || -> CmdResult<()> {
         save_password(&u, &password)?;
-        write_account(&dir, &h, &u, InitialConfig { body_days, start_sync }).map_err(|e| format!("Не удалось записать конфигурацию {}: {e}", config::config_path(&dir).display()))
+        write_account(&dir, &h, &u, &db, InitialConfig { body_days, start_sync }).map_err(|e| format!("Не удалось записать конфигурацию {}: {e}", config::config_path(&dir).display()))
     })
     .await
     .map_err(crate::err)??;
-    info!(host, user, body_days, start_sync, "учётная запись сохранена");
+    info!(host, user, body_days, start_sync, existing_db = existing, "учётная запись сохранена");
     restart(&app);
     Ok(())
 }
@@ -362,6 +484,20 @@ mod tests {
         let timeout = "error sending request | operation timed out";
         assert!(classify_network(timeout, "h").contains("не отвечает"));
         assert_eq!(classify_network("something else", "h"), "Сервер недоступен: нет связи");
+    }
+
+    #[test]
+    fn db_choice_is_limited_to_found_databases() {
+        let choices = DbChoices { host: "mail.x.ru".into(), user: "savvidi".into(), existing: vec![PathBuf::from(r"C:\A\mail.x.ru\savvidi_ngenergo\mail.db")], new_path: PathBuf::from(r"C:\A\mail.x.ru\savvidi_x.ru\mail.db") };
+        let c = Some(&choices);
+        assert_eq!(chosen_db_path(c, "mail.x.ru", "savvidi", Some(r"C:\A\mail.x.ru\savvidi_ngenergo\mail.db")).unwrap(), choices.existing[0]);
+        assert_eq!(chosen_db_path(c, "mail.x.ru", "savvidi", Some(r"c:\a\MAIL.X.RU\savvidi_ngenergo\mail.db")).unwrap(), choices.existing[0], "регистр пути не важен");
+        assert_eq!(chosen_db_path(c, "mail.x.ru", "savvidi", None).unwrap(), choices.new_path, "новая база — по адресу ящика");
+        assert!(chosen_db_path(c, "mail.x.ru", "savvidi", Some(r"C:\Windows\mail.db")).is_err(), "произвольный путь не принимается");
+        // Проверка была с другим логином — выбор не годится.
+        assert!(chosen_db_path(c, "mail.x.ru", "petrov", Some(r"C:\A\mail.x.ru\savvidi_ngenergo\mail.db")).is_err());
+        assert_eq!(chosen_db_path(c, "mail.x.ru", "petrov", None).unwrap(), config::default_db_path("mail.x.ru", "petrov"));
+        assert_eq!(chosen_db_path(None, "mail.x.ru", "savvidi", None).unwrap(), config::default_db_path("mail.x.ru", "savvidi"));
     }
 
     #[test]

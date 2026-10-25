@@ -62,7 +62,8 @@ pub(crate) struct AppConfig {
     pub version: u32,
     #[serde(default)]
     pub account: Option<AccountConfig>,
-    /// Путь к базе; `null` — по умолчанию `%LOCALAPPDATA%\AIOWA\<host>\<user>\mail.db`.
+    /// Путь к базе. Мастер пишет его явно: найденная база ящика или новая в каталоге по адресу
+    /// ящика (`mailbox.rs`). `null` — по логину: `%LOCALAPPDATA%\AIOWA\<host>\<user>\mail.db`.
     #[serde(default)]
     pub db_path: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

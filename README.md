@@ -32,6 +32,8 @@ cargo build -p aiowa-cli
 ./target/debug/aiowa --host mail.example.com --user 'user@domain' list --folder inbox --limit 30
 ./target/debug/aiowa --host mail.example.com --user 'user@domain' search "запчасти колыма от:петров после:2026-09 вложение:"
 ./target/debug/aiowa --host mail.example.com --user 'user@domain' stats
+./target/debug/aiowa --host mail.example.com --user 'user@domain' mailbox --record   # чей ящик: адрес и MailboxGuid в базу
+./target/debug/aiowa --host mail.example.com --user 'user@domain' db-summary         # сводка базы без сети
 ```
 
 `--host` и `--user` можно задать переменными `AIOWA_HOST` и `AIOWA_USER`. База по умолчанию: `%LOCALAPPDATA%\AIOWA\<host>\<user>\mail.db`, файлы вложений в `attachments` рядом с ней. `sync` берёт все почтовые папки кроме служебных (`--folders inbox,sentitems` для явного выбора), метаданные за всё время, тела и вложения за `--days`; повторный запуск докачивает только изменения. Операторы поиска: `от:`/`from:`, `кому:`/`to:`, `тема:`/`subject:`, `вложение:`/`has:attachment`, `папка:`/`in:`, `после:`/`до:`; ё и е равнозначны.

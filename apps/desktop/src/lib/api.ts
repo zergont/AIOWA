@@ -574,6 +574,23 @@ export interface LoginTest {
   error: string | null;
   /** Адрес сервера после нормализации (host[:port]), с которым шла проверка. */
   host?: string | null;
+  /** Ящик, в который выполнен вход (сервер сообщил адрес и имя). */
+  mailbox?: { email: string | null; display_name: string | null } | null;
+  /** Базы этого ящика на диске, сначала полнее: мастер предлагает продолжить с первой. */
+  stores?: FoundStore[];
+  /** Где будет новая база, если начать с нуля (каталог из адреса ящика). */
+  new_db_path?: string | null;
+}
+
+/** База ящика, найденная мастером после проверки входа. */
+export interface FoundStore {
+  path: string;
+  /** Почему подходит: guid — тот же ящик точно, email — совпал адрес ящика, login — логин без домена. */
+  kind: "guid" | "email" | "login";
+  items: number;
+  last_sync_ms: number | null;
+  /** База с журналами и кэшем вложений, байт. */
+  total_bytes: number;
 }
 
 export type Theme = "system" | "light" | "dark";
@@ -748,8 +765,11 @@ export const api = {
   appMode: () => invoke<AppMode>("app_mode"),
   /** Пробный вход с этим паролем: ничего не сохраняет. */
   setupTestLogin: (host: string, user: string, password: string) => invoke<LoginTest>("setup_test_login", { host, user, password }),
-  /** Сохранить пароль и config.json и перезапустить приложение: ответ может не успеть прийти. */
-  setupSave: (host: string, user: string, password: string, bodyDays: number, startSync: boolean) => invoke<void>("setup_save", { host, user, password, bodyDays, startSync }),
+  /**
+   * Сохранить пароль и config.json и перезапустить приложение: ответ может не успеть прийти.
+   * `dbPath` — найденная база ящика («Продолжить с этой базой»); null — новая база.
+   */
+  setupSave: (host: string, user: string, password: string, bodyDays: number, startSync: boolean, dbPath: string | null = null) => invoke<void>("setup_save", { host, user, password, bodyDays, startSync, dbPath }),
 
   // --- настройки (режим mail) ----------------------------------------------------------------
   settingsGet: () => invoke<Settings>("settings_get"),

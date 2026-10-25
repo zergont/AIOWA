@@ -4,6 +4,9 @@
 //! Пароль берётся из диспетчера учётных данных Windows (служба `AIOWA`, ключ = логин),
 //! как в `aiowa set-password`; задаётся мастером первого запуска и «Сменить пароль…» в настройках
 //! (`setup.rs`, `settings.rs`). Глубина тел, квота кэша и лимит вложения — из настроек окна.
+//!
+//! После входа транспорт процесса сверяет ящик с базой (`mailbox::verify_login`): в базе записан
+//! GUID другого ящика — транспорт не выдаётся (`ConnectError::WrongMailbox`) до перезапуска.
 
 use aiowa_core::AccountId;
 use aiowa_store::Store;
@@ -189,6 +192,8 @@ pub struct SyncState {
     account: AccountId,
     host: String,
     user: String,
+    /// База чужого ящика (сверка при входе, `mailbox.rs`): транспорт не выдаётся до перезапуска.
+    identity: crate::mailbox::IdentityGuard,
 }
 
 const MAX_WARNINGS: usize = 5;
@@ -212,6 +217,8 @@ pub(crate) enum ConnectError {
     Closing,
     /// Вход на сервер не удался.
     Connect(TransportError),
+    /// В базе записан GUID другого ящика: синхронизировать в неё нельзя.
+    WrongMailbox,
 }
 
 impl std::fmt::Display for ConnectError {
@@ -222,6 +229,7 @@ impl std::fmt::Display for ConnectError {
             // Текст про отклонённый вход уже начинается со слова «Вход»; остальным нужен контекст.
             ConnectError::Connect(e @ TransportError::AuthFailed(_)) => f.write_str(&crate::ondemand::describe_transport(e)),
             ConnectError::Connect(e) => write!(f, "Вход не удался: {}", crate::ondemand::describe_transport(e)),
+            ConnectError::WrongMailbox => f.write_str(crate::mailbox::WRONG_MAILBOX),
         }
     }
 }
@@ -230,7 +238,7 @@ impl SyncState {
     pub fn new(store: Arc<Store>, account: AccountId, host: String, user: String) -> Self {
         let last_ok_ms = store.get_state(account, LAST_OK_KEY).ok().flatten().and_then(|v| v.parse::<i64>().ok());
         let status = SyncStatusDto { last_ok_ms, ..SyncStatusDto::default() };
-        Self { inner: Mutex::new(Inner { status, ..Inner::default() }), connect_lock: tokio::sync::Mutex::new(()), closing: AtomicBool::new(false), store, account, host, user }
+        Self { inner: Mutex::new(Inner { status, ..Inner::default() }), connect_lock: tokio::sync::Mutex::new(()), closing: AtomicBool::new(false), store, account, host, user, identity: Default::default() }
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
@@ -353,12 +361,21 @@ impl SyncState {
         if let Some(t) = self.lock().transport.clone() {
             return Ok(t);
         }
+        if self.identity.blocked() {
+            return Err(ConnectError::WrongMailbox);
+        }
         let password = load_password(&self.user).map_err(|detail| {
             warn!(error = %detail, "пароль не найден");
             ConnectError::NoPassword
         })?;
         let creds = Credentials { host: self.host.clone(), user: self.user.clone(), password };
         let t = OwaTransport::connect(creds, OwaConfig::default()).await.map_err(ConnectError::Connect)?;
+        // Чей ящик: GUID в базе не записан — записать; записан другой — в эту базу не синхронизировать.
+        if crate::mailbox::verify_login(&self.store, self.account, &t).await.is_err() {
+            self.identity.block();
+            let _ = tokio::time::timeout(LOGOFF_TIMEOUT, t.logoff()).await;
+            return Err(ConnectError::WrongMailbox);
+        }
         // Пока шёл вход, приложение могли начать закрывать: такую сессию не сохраняем, а сразу
         // завершаем, иначе её никто не разлогинит. (Окно между проверкой и записью закрывает
         // `shutdown`: он ждёт замок входа и забирает транспорт ещё раз.)

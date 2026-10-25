@@ -36,6 +36,10 @@
 //! перезапускает процесс — тот поднимается в режиме почты. База учётной записи не открылась —
 //! тоже мастер, с текстом ошибки (`app_mode().boot_error`), а не падение на каждом старте.
 //! Настройки окна (`settings.rs`) лежат в `sync_state` базы.
+//!
+//! Одна база на ящик (`mailbox.rs`): после входа ящик сверяется с базой по `MailboxGuid`, мастер
+//! находит базу ящика при любой форме логина. Все базы на диске, их размер и удаление лишних —
+//! вкладка «Данные» (`data.rs`).
 
 use aiowa_core::{AccountId, BodyType};
 use aiowa_store::ui::{ConversationCursor, MessageHead};
@@ -55,9 +59,11 @@ mod calendar;
 mod calendar_write;
 mod compose;
 mod config;
+mod data;
 mod directory;
 mod folders;
 mod logging;
+mod mailbox;
 mod navigation;
 mod notify;
 mod ondemand;
@@ -551,7 +557,8 @@ struct MailServices {
 /// стартует мастером с этим текстом (иначе негодный путь в конфиге ронял бы каждый запуск).
 fn open_mail(boot: &config::MailBoot, config_dir: &Path) -> Result<MailParts, String> {
     let store = Arc::new(Store::open(&boot.db_path).map_err(|e| format!("Не удалось открыть локальную базу {}: {e}", boot.db_path.display()))?);
-    let account = store.account(&boot.host, &boot.user).map_err(|e| format!("Не удалось прочитать учётную запись в базе {}: {e}", boot.db_path.display()))?;
+    // Логин в базе мог быть записан в другой форме того же ящика (`savvidi@ngenergo` вместо `savvidi`).
+    let account = store.resolve_account(&boot.host, &boot.user).map_err(|e| format!("Не удалось прочитать учётную запись в базе {}: {e}", boot.db_path.display()))?;
     if let Some(initial) = boot.initial {
         settings::apply_initial(&store, account, config_dir, initial);
     }
@@ -774,7 +781,12 @@ pub fn run() {
             settings::settings_set,
             settings::settings_change_password,
             settings::settings_forget_account,
-            settings::settings_open_data_dir
+            settings::settings_open_data_dir,
+            // Одна база на ящик, раздел «Данные» (data.rs, mailbox.rs).
+            data::data_stores,
+            data::data_usage,
+            data::data_store_open_dir,
+            data::data_store_delete
         ])
         .build(tauri::generate_context!())
         .expect("ошибка запуска приложения");

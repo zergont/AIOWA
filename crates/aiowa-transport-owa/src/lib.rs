@@ -5,6 +5,7 @@
 //! `__type` первым ключом каждого объекта; системный TLS; одна сессия на процесс и
 //! явный `logoff.owa`; истечение сессии = 440/401/редирект на `logon.aspx`.
 
+pub mod mailbox;
 pub mod notify;
 pub mod protocol;
 

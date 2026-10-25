@@ -41,6 +41,30 @@ client-request-id: <та же строка>
 
 Клиенту этого достаточно, чтобы после входа показать дерево папок и входящие одним запросом. Обработчик ответа трактует HTTP 440 и 401 как истёкшую сессию и уводит на страницу входа: это и есть сигнал для повторного входа.
 
+### 2.1. Чей ящик: `SessionSettings` (клиент `aiowa mailbox --probe`, 25.10.2026)
+
+Снято командой `aiowa mailbox --probe` (только чтение, `logoff` в конце; печатаются имена ключей, типы и длины строк, без значений). Запрос — как выше: пустое тело с `Content-Length: 0`, заголовки `X-OWA-CorrelationId`, `client-request-id`, `X-Requested-With: XMLHttpRequest`; канарейка не нужна. Ответ — три раздела `owaUserConfig`, `findFolders`, `findMailFolderItem`.
+
+`owaUserConfig` — 29 ключей: `AdMarket`, `ApplicationSettings`, `AsyncSendEnabled`, `AttachmentPolicy`, `CanaryTokenForOutlookExport`, `FlightConfiguration`, `GroupsSets`, `HexCID`, `InlineExploreContent`, `IsConsumerChild`, `LeanPopoutEnabled`, `LinkPreviewEnabled`, `MailTipsLargeAudienceThreshold`, `MasterCategoryList`, `MaxRecipientsPerMessage`, `MobileDevicePolicySettings`, `PolicySettings`, `PolicyTipsEnabled`, `PublicComputersDetectionEnabled`, `RecoverDeletedItemsEnabled`, `RetentionPolicyTags`, `RmsV2UIEnabled`, `SafetyUserOptions`, `SegmentationSettings`, `SessionSettings`, `SmimeAdminSettings`, `UnblockUnsafeSenderPromptEnabled`, `UserOptions`, `ViewStateConfiguration`.
+
+`owaUserConfig.SessionSettings` — плоский объект; для личности ящика нужны:
+
+| Ключ | Тип (длина на сервере автора) | Что это |
+|---|---|---|
+| `UserEmailAddress` | строка (19) | основной SMTP-адрес ящика; клиент берёт его первым |
+| `LogonEmailAddress` | строка (19) | адрес входа (у своего ящика тот же); запасной |
+| `MailboxGuid` | строка (36) | GUID ящика: 8-4-4-4-12, с дефисами, без скобок; клиент хранит в нижнем регистре |
+| `UserDisplayName` | строка (29) | отображаемое имя |
+| `UserPrincipalName` | строка (22) | UPN учётной записи (не адрес почты) |
+| `UserProxyAddresses` | массив (3) | все адреса ящика (`SMTP:`/`smtp:`…) |
+| `UserLegacyExchangeDN` | строка (66) | X500-адрес |
+
+Остальные ключи `SessionSettings`: `ArchiveDisplayName`, `BposCompanyName`, `CanActAsOwner`, `CompanyName`, `ConnectedAccountInfos` (массив), `DefaultFolderIds` и `DefaultFolderNames` (массивы по 197), `DefaultFromAddress`, `DefaultPublicFolderMailbox`, `EncryptedUserPuid`, `ExternalDirectoryTenantGuid`, `ExternalDirectoryUserGuid` (пустые на локальном Exchange), `HasArchive`, `HelpUrl`, `IsBposUser`, `IsExplicitLogon`, `IsExplicitLogonOthersMailbox`, `IsGallatin`, `IsMigratedConsumer`, `IsPremiumConsumerMailbox`, `IsProsumerConsumerMailbox`, `IsPublicComputerSession`, `IsPublicLogon`, `IsRequireProtectedPlayOnPhone`, `IsSPOnPrem`, `IsShadowMailbox`, `IsSubstrateSearchServiceAvailable`, `IsUMEnabled`, `IsUserCultureRightToLeft`, `IsUserCultureSpeechEnabled`, `MaxMessageSizeInKb`, `NotManagedEmailAddresses`, `OnlineBookingUserVoiceUrl`, `OrganizationDomain`, `PeopleConnectionsExist`, `PlayOnPhoneDialString`, `QuotaSend`, `QuotaUsed`, `QuotaWarning`, `SharePointTitle`, `SharePointUrl`, `TenantDomain`, `TenantGuid` (36 — GUID организации, не ящика), `UserCulture`, `UserLanguage`, `UserPuid`, `UserSipUri`, `UserVoiceId`, `UserVoiceUrl`.
+
+**Запасной путь — `GetOwaUserConfiguration`.** `POST service.svc?action=GetOwaUserConfiguration` с заголовками обычной операции (§ 3.1, `Action`, `X-OWA-CANARY`) и телом `{}` — без конверта, параметров у операции нет — сервер принимает. Ответ — сам объект `owaUserConfig` (те же 29 ключей в корне, `SessionSettings` той же формы), без `Header`/`Body`. Клиент (`OwaTransport::mailbox_info`) идёт сюда, только если `sessiondata.ashx` не ответил или в нём нет адреса и GUID.
+
+Зачем клиенту: одна база на ящик при любой форме логина (`user`, `user@domain`, `DOMAIN\user`). Окно записывает `MailboxGuid` и адрес в базу и при каждом входе сверяет их (`apps/desktop/src-tauri/src/mailbox.rs`); мастер ищет на диске базу этого ящика, новая база заводится в каталоге по адресу ящика.
+
 ## 3. Операции `service.svc`
 
 ### 3.1. Конверт запроса

@@ -453,6 +453,77 @@ enum Cmd {
         #[arg(long)]
         rows_only: bool,
     },
+    /// Чей ящик: адрес, MailboxGuid и имя из sessiondata.ashx (запасной путь —
+    /// GetOwaUserConfiguration). Печатает только наличие и длины, не значения
+    Mailbox {
+        /// Снять форму ответов: имена ключей, типы и длины строк (§ 2 протокола)
+        #[arg(long)]
+        probe: bool,
+        /// Записать личность ящика в базу (desktop.mailbox_guid, desktop.mailbox_email)
+        #[arg(long)]
+        record: bool,
+    },
+    /// Сводка базы без сети и без изменения файлов (как вкладка «Данные» окна): учётные записи,
+    /// письма, последняя синхронизация, размер, есть ли личность ящика
+    DbSummary,
+}
+
+/// Наличие и длина значения без самого значения.
+fn presence(v: Option<&str>) -> String {
+    v.map(|s| format!("есть ({} симв.)", s.chars().count())).unwrap_or_else(|| "нет".into())
+}
+
+/// `aiowa mailbox`: вход, сведения о ящике, форма ответов (по `--probe`), выход — всегда.
+async fn mailbox_command(cli: &Cli, db_path: &std::path::Path, probe: bool, record: bool) -> Result<()> {
+    use aiowa_transport_owa::protocol::json_shape;
+    let t = connect(cli).await?;
+    let result = async {
+        if probe {
+            match t.session_data_value().await {
+                Ok(v) => {
+                    let keys = |p: &str| v.pointer(p).and_then(serde_json::Value::as_object).map(|o| o.keys().cloned().collect::<Vec<_>>()).unwrap_or_default();
+                    println!("sessiondata.ashx: разделы {:?}", keys(""));
+                    println!("owaUserConfig: ключи {:?}", keys("/owaUserConfig"));
+                    match v.pointer("/owaUserConfig/SessionSettings") {
+                        Some(ss) => println!("SessionSettings: {}", json_shape(ss, 1)),
+                        None => println!("SessionSettings: нет"),
+                    }
+                }
+                Err(e) => println!("sessiondata.ashx: ошибка {e}"),
+            }
+            match t.owa_user_configuration_value().await {
+                Ok(v) => {
+                    let top = v.as_object().map(|o| o.keys().cloned().collect::<Vec<_>>()).unwrap_or_default();
+                    println!("GetOwaUserConfiguration: ключи {top:?}");
+                    for p in ["/SessionSettings", "/Body/SessionSettings", "/owaUserConfig/SessionSettings"] {
+                        if let Some(ss) = v.pointer(p) {
+                            println!("GetOwaUserConfiguration{p}: {}", json_shape(ss, 1));
+                        }
+                    }
+                }
+                Err(e) => println!("GetOwaUserConfiguration: ошибка {e}"),
+            }
+        }
+        let info = t.mailbox_info().await.map_err(|e| anyhow!("сведения о ящике не получены: {e}"))?;
+        println!("Ящик: адрес {}, MailboxGuid {}, имя {}", presence(info.email.as_deref()), presence(info.mailbox_guid.as_deref()), presence(info.display_name.as_deref()));
+        if record {
+            let store = Store::open(db_path)?;
+            let account = store.resolve_account(&cli.host, &cli.user)?;
+            let before = store.mailbox_identity(account)?;
+            match (&before.mailbox_guid, &info.mailbox_guid) {
+                (Some(a), Some(b)) if a != b => bail!("в базе записан GUID другого ящика: личность не перезаписана"),
+                _ => {}
+            }
+            store.set_mailbox_identity(account, &aiowa_store::MailboxIdentity { mailbox_guid: info.mailbox_guid.clone(), email: info.email.clone() })?;
+            let s = aiowa_store::read_summary(db_path)?;
+            println!("Записано в базу {}: учётных записей {}, писем {}, GUID {}, адрес {}", db_path.display(), s.accounts.len(), s.items, presence(s.identity().mailbox_guid.as_deref()), presence(s.identity().email.as_deref()));
+        }
+        Ok(())
+    }
+    .await;
+    t.logoff().await.ok();
+    println!("Выход из сессии выполнен");
+    result
 }
 
 /// Событие канала одной строкой без содержимого: вид, папка по имени, длины полей.
@@ -2910,6 +2981,36 @@ async fn real_main() -> Result<()> {
             .await;
             t.logoff().await.ok();
             outcome?;
+        }
+        Cmd::Mailbox { probe, record } => mailbox_command(&cli, &db_path, *probe, *record).await?,
+        Cmd::DbSummary => {
+            let started = std::time::Instant::now();
+            let s = aiowa_store::read_summary(&db_path)?;
+            let id = s.identity();
+            println!(
+                "База {}: учётных записей {}, писем {}, последняя синхронизация {}, база {:.1} МБ, кэш вложений {:.1} МБ, GUID {}, адрес {}; прочитано за {} мс",
+                db_path.display(),
+                s.accounts.len(),
+                s.items,
+                s.last_sync_ms.map(|ms| fmt_date(jiff::Timestamp::from_millisecond(ms).ok())).unwrap_or_else(|| "нет".into()),
+                s.db_bytes as f64 / 1e6,
+                s.cache_bytes as f64 / 1e6,
+                presence(id.mailbox_guid.as_deref()),
+                presence(id.email.as_deref()),
+                started.elapsed().as_millis()
+            );
+            for (i, a) in s.accounts.iter().enumerate() {
+                println!(
+                    "  учётная запись {}: сервер {}, логин {} симв. (без домена {} симв.), писем {}, GUID {}, адрес {}",
+                    i + 1,
+                    a.host,
+                    a.login.chars().count(),
+                    aiowa_store::login_key(&a.login).chars().count(),
+                    a.items,
+                    presence(a.identity.mailbox_guid.as_deref()),
+                    presence(a.identity.email.as_deref())
+                );
+            }
         }
         Cmd::Notify { seconds, folders, rows_only } => {
             let store = Store::open(&db_path)?;

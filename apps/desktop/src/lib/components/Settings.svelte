@@ -6,6 +6,7 @@
   import { focusBack } from "../popover";
   import { hint, isTopLayer, layer } from "../hotkeys";
   import SignatureDialog from "./SignatureDialog.svelte";
+  import DataStores from "./DataStores.svelte";
 
   /**
    * Окно настроек (шестерёнка в верхней панели, Ctrl+,). Значения применяются сразу через
@@ -600,6 +601,8 @@
             {#if numError.max_attachment_mb}<span class="err">{numError.max_attachment_mb}</span>{:else}Такие вложения скачиваются, только когда их открывают или сохраняют.{/if}
           </p>
         </div>
+        <!-- Все базы на диске; опрос раз в несколько секунд обновляет и размеры текущей выше. -->
+        <DataStores onusage={(db, cache) => s && (s = { ...s, db_size_bytes: db, cache_size_bytes: cache })} />
       {/if}
     </div>
   </div>
