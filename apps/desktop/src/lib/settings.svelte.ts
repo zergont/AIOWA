@@ -4,7 +4,7 @@
  * Источник — `settings_get` бэкенда; здесь лежит реактивная копия, которую ведут App и окно настроек.
  */
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { api, errorMessage, type Settings, type SettingsPatch, type Theme } from "./api";
+import { api, errorMessage, type DarkMail, type Settings, type SettingsPatch, type Theme } from "./api";
 
 /** Значения по умолчанию — те же, что у бэкенда, пока ключа в базе нет. */
 export const AUTO_READ_DEFAULT_MS = 1500;
@@ -20,6 +20,8 @@ export const prefs = $state({
   syncIntervalMin: SYNC_INTERVAL_DEFAULT_MIN,
   toasts: true,
   theme: "system" as Theme,
+  /** Письма в тёмной теме (`darkmail.svelte.ts`): в тёмных тонах или на светлом листе. */
+  darkMail: "dark" as DarkMail,
 });
 
 /** Период таймера синхронизации, мс: при живом канале — не меньше 10 минут. */
@@ -59,7 +61,11 @@ function setThemeAttr(theme: Theme) {
 export function restoreTheme() {
   try {
     const t = localStorage.getItem(THEME_KEY);
-    if (isTheme(t)) setThemeAttr(t);
+    if (isTheme(t)) {
+      setThemeAttr(t);
+      // Письма (тёмные тона) тоже сразу по прошлой теме, а не по системной до ответа settings_get.
+      prefs.theme = t;
+    }
   } catch {
     /* хранилище недоступно — остаётся системная тема */
   }
@@ -81,6 +87,7 @@ export function adoptSettings(s: SettingsPatch) {
   if (s.sync_interval_min != null) prefs.syncIntervalMin = s.sync_interval_min;
   if (s.toasts != null) prefs.toasts = s.toasts;
   if (isTheme(s.theme)) applyTheme(s.theme);
+  if (s.dark_mail === "dark" || s.dark_mail === "light") prefs.darkMail = s.dark_mail;
 }
 
 /** Настройки на старте окна; старый бэкенд без команды — остаются значения по умолчанию. */

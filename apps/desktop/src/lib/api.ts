@@ -74,6 +74,11 @@ export interface Message {
   preview: string | null;
   body_state: number;
   body_html: string | null;
+  /**
+   * Тёмная палитра тела: цвета письма в `body_html` — `var(--aiowa-dN, исходный)`, N-й цвет здесь
+   * (`mail_dark.rs`). Нет у старого бэкенда — письмо показывается только на светлом листе.
+   */
+  dark_colors?: string[] | null;
   body_is_text: boolean;
   is_truncated: boolean;
   recipients: Recipient[];
@@ -598,6 +603,8 @@ export interface FoundStore {
 }
 
 export type Theme = "system" | "light" | "dark";
+/** Письма в тёмной теме: в тёмных тонах или на светлом листе. */
+export type DarkMail = "dark" | "light";
 
 /** Ответ `settings_get`; изменяемые поля меняются через `settings_set` по одному или пачкой. */
 export interface Settings {
@@ -610,6 +617,8 @@ export interface Settings {
   /** Тосты Windows о новых письмах (тот же ключ, что у переключателя в строке состояния). */
   toasts: boolean;
   theme: Theme;
+  /** Письма в тёмной теме; нет у старого бэкенда — в тёмных тонах. */
+  dark_mail?: DarkMail;
   /** Интервал страховочной синхронизации, минут (при живом канале — не чаще раза в 10 минут). */
   sync_interval_min: number;
   /** Квота кэша вложений на диске, МБ. */
@@ -627,7 +636,7 @@ export interface Settings {
 }
 
 /** Изменяемые поля настроек; `settings_set` принимает любое их подмножество. */
-export type SettingsPatch = Partial<Pick<Settings, "body_days" | "auto_read_ms" | "toasts" | "theme" | "sync_interval_min" | "attachment_cache_mb" | "max_attachment_mb">>;
+export type SettingsPatch = Partial<Pick<Settings, "body_days" | "auto_read_ms" | "toasts" | "theme" | "sync_interval_min" | "attachment_cache_mb" | "max_attachment_mb" | "dark_mail">>;
 
 /** Допустимые диапазоны числовых настроек (те же проверяет бэкенд в `settings_set`). */
 export const SETTINGS_LIMITS = {
