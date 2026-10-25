@@ -824,3 +824,96 @@ async fn mailbox_info_from_session_data_and_fallback() {
     t.logoff().await.unwrap();
     assert_eq!(server.state().active_sessions(), 0);
 }
+
+/// § 5m: последние письма папки — запрос в форме, снятой с сервера (`FindItem`, `IndexedPageView`,
+/// `SortResults` по `item:DateTimeReceived` по убыванию, свойства как у `SyncFolderItems`); свежие
+/// первыми, с теми же идентификаторами и метаданными, что пришлёт полная выгрузка.
+#[tokio::test]
+async fn find_recent_items_newest_first_with_sync_ids() {
+    let server = FakeOwa::start().await;
+    let fresh = server.state().deliver("[AIOWA test] Новый шлагбаум", Addr::new("Анна Смирнова", "anna@aiowa.test"), "<div>Поставили шлагбаум у склада.</div>");
+    let t = connect(&server).await;
+    let recent = t.find_recent_items(&folder(INBOX), 2).await.unwrap();
+    assert_eq!(recent.iter().map(|m| m.subject.as_deref().unwrap_or("")).collect::<Vec<_>>(), vec!["[AIOWA test] Новый шлагбаум", SHIPMENT]);
+    assert_eq!(recent[0].item_id.id, fresh);
+    {
+        let st = server.state();
+        let call = st.calls_of("FindItem")[0].clone();
+        assert_eq!(call.version, "V2017_08_18");
+        assert_eq!(call.body["Paging"], json!({ "__type": "IndexedPageView:#Exchange", "BasePoint": "Beginning", "Offset": 0, "MaxEntriesReturned": 2 }));
+        assert_eq!(call.body["SortOrder"], json!([{ "__type": "SortResults:#Exchange", "Order": "Descending", "Path": { "__type": "PropertyUri:#Exchange", "FieldURI": "item:DateTimeReceived" } }]));
+        assert_eq!(call.body["ParentFolderIds"], json!([{ "__type": "FolderId:#Exchange", "Id": INBOX }]));
+        let props: Vec<&str> = call.body["ItemShape"]["AdditionalProperties"].as_array().unwrap().iter().filter_map(|p| p["FieldURI"].as_str()).collect();
+        assert_eq!(props, protocol::META_FIELDS);
+    }
+    // Полная выгрузка присылает те же письма с теми же метаданными: запись поверх свежей страницы
+    // идёт по идентификатору без дублей.
+    let (all, _) = sync_folder(&t, INBOX).await;
+    for m in &recent {
+        assert_eq!(all.iter().find(|x| x.item_id.id == m.item_id.id), Some(m), "то же письмо в SyncFolderItems");
+    }
+    // Страница больше папки: вся папка, по убыванию даты.
+    let everything = t.find_recent_items(&folder(INBOX), 100).await.unwrap();
+    assert_eq!(everything.len(), 4);
+    assert!(everything.windows(2).all(|w| w[0].received_at >= w[1].received_at));
+    t.logoff().await.unwrap();
+}
+
+/// Первая синхронизация движком через настоящий транспорт: свежие страницы всех непустых папок
+/// (`FindItem`) — раньше первого `SyncFolderItems`, полная выгрузка ложится поверх без дублей.
+#[tokio::test]
+async fn engine_takes_recent_pages_before_full_sync() {
+    let server = FakeOwa::start().await;
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("fake-owa-recent-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let store = Arc::new(Store::open(dir.join("mail.db")).unwrap());
+    let account = store.account(&server.host(), USER).unwrap();
+    let t = connect(&server).await;
+    let engine = Engine::new(Arc::new(t.clone()), store.clone(), account, Arc::new(AtomicBool::new(false)));
+    let opts = SyncOptions { folders: FolderSelection::AllMail, fetch_bodies: false, fetch_attachments: false, page_size: 2, recent_first: 2, ..SyncOptions::default() };
+    let report = engine.run(&opts).await.unwrap();
+    assert_eq!(report.recent_items, 4, "два свежих письма «Входящих», по одному из «Отправленных» и «Проектов»; пустые «Черновики» без запроса");
+    assert_eq!((report.items_created, report.recent_vanished), (5, 0));
+    assert_eq!(store.stats(account).unwrap().items, 5, "без дублей");
+    {
+        let st = server.state();
+        let ops: Vec<&str> = st.calls.iter().map(|c| c.op.as_str()).collect();
+        let last_find = ops.iter().rposition(|op| *op == "FindItem").expect("FindItem был");
+        let first_sync = ops.iter().position(|op| *op == "SyncFolderItems").expect("SyncFolderItems был");
+        assert!(last_find < first_sync, "свежие страницы раньше полных выгрузок: {ops:?}");
+        assert_eq!(ops.iter().filter(|op| **op == "FindItem").count(), 3);
+    }
+    // Повторный прогон: у папок есть состояние, свежие страницы не запрашиваются.
+    engine.run(&opts).await.unwrap();
+    assert_eq!(server.state().calls_of("FindItem").len(), 3);
+    t.logoff().await.unwrap();
+}
+
+/// Долгий запрос синхронизации занимает одно разрешение транспорта: тело письма и пометка из окна
+/// проходят, не дожидаясь его ответа.
+#[tokio::test]
+async fn window_requests_pass_while_sync_request_is_pending() {
+    let server = FakeOwa::start().await;
+    let t = connect(&server).await;
+    let (metas, _) = sync_folder(&t, INBOX).await;
+    let shipment = by_subject(&metas, SHIPMENT).item_id.clone();
+    let hold = Arc::new(Hold::default());
+    server.state().faults.hold_op = Some(("SyncFolderItems".into(), hold.clone()));
+    let pending = {
+        let t = t.clone();
+        tokio::spawn(async move { t.sync_folder_items(&folder(INBOX), None, 512, true).await })
+    };
+    tokio::time::timeout(Duration::from_secs(10), hold.arrived.notified()).await.expect("SyncFolderItems не дошёл до сервера");
+    let window = async {
+        let body = t.get_items(std::slice::from_ref(&shipment), ItemFetchShape::WithUniqueBody).await.unwrap();
+        assert!(matches!(&body[0], ItemResult::Ok(m) if m.body.is_some()), "{body:?}");
+        let marked = t.set_read(std::slice::from_ref(&shipment), true).await.unwrap();
+        assert!(marked[0].is_ok(), "{marked:?}");
+    };
+    tokio::time::timeout(Duration::from_secs(10), window).await.expect("команды окна ждут ответа на запрос синхронизации");
+    assert!(!pending.is_finished(), "запрос синхронизации всё ещё задержан сервером");
+    hold.release.notify_one();
+    let changes = tokio::time::timeout(Duration::from_secs(10), pending).await.expect("SyncFolderItems не завершился").unwrap().unwrap();
+    assert_eq!(changes.changes.len(), 3);
+    t.logoff().await.unwrap();
+}

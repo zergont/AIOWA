@@ -132,6 +132,27 @@ pub fn sync_folder_items_body(folder: &FolderRef, state: Option<&SyncState>, max
     body
 }
 
+/// Свойство, по которому сортируется выборка последних писем папки.
+pub const RECENT_SORT_FIELD: &str = "item:DateTimeReceived";
+
+/// `FindItem` последних писем папки (§ 5m): `IdOnly` с теми же свойствами, что у
+/// `SyncFolderItems` (`META_FIELDS`), страница `IndexedPageView` от начала со смещением `offset`,
+/// сортировка по `DateTimeReceived` по убыванию — свежие первыми.
+pub fn find_recent_items_body(folder: &FolderRef, max: u32, offset: u32) -> Value {
+    json!({
+        "__type": "FindItemRequest:#Exchange",
+        "ItemShape": {
+            "__type": "ItemResponseShape:#Exchange",
+            "BaseShape": "IdOnly",
+            "AdditionalProperties": META_FIELDS.iter().map(|f| property_uri(f)).collect::<Vec<_>>()
+        },
+        "ParentFolderIds": [ folder_ref_json(folder) ],
+        "Traversal": "Shallow",
+        "Paging": { "__type": "IndexedPageView:#Exchange", "BasePoint": "Beginning", "Offset": offset, "MaxEntriesReturned": max },
+        "SortOrder": [ { "__type": "SortResults:#Exchange", "Order": "Descending", "Path": property_uri(RECENT_SORT_FIELD) } ],
+    })
+}
+
 /// Свойство `Reply-To` письма, которого нет в именованных формах (`ItemPart` и т. п.): запрашивается
 /// через `AdditionalProperties` поверх `ShapeName` (§ 5j).
 pub const REPLY_TO_FIELD: &str = "message:ReplyTo";
@@ -1676,6 +1697,28 @@ pub fn parse_item_changes(msg: &Value, requested: u32) -> (SyncState, Vec<ItemCh
     (state, out, includes_last)
 }
 
+/// Выдача `FindItem` писем папки (§ 5m).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FoundItems {
+    /// Письма в порядке ответа сервера (для `find_recent_items_body` — свежие первыми).
+    pub items: Vec<MessageMeta>,
+    /// Элементов в ответе, включая не разобранные (без `ItemId`).
+    pub raw_count: usize,
+    /// `RootFolder.IncludesLastItemInRange`; нет ключа — по длине выдачи.
+    pub includes_last: bool,
+    /// `RootFolder.TotalItemsInView`: сколько всего писем в папке.
+    pub total_in_view: Option<i64>,
+}
+
+/// Письма из ответа `FindItem` (`RootFolder.Items[]`) в той же форме, что у `SyncFolderItems`.
+pub fn parse_find_items(msg: &Value, requested: u32) -> FoundItems {
+    let root = msg.get("RootFolder").unwrap_or(msg);
+    let raw: &[Value] = root.get("Items").and_then(Value::as_array).map(Vec::as_slice).unwrap_or(&[]);
+    let items: Vec<MessageMeta> = raw.iter().filter_map(parse_message_meta).collect();
+    let includes_last = root.get("IncludesLastItemInRange").and_then(Value::as_bool).unwrap_or(raw.len() < requested as usize);
+    FoundItems { items, raw_count: raw.len(), includes_last, total_in_view: i64_of(root, "TotalItemsInView") }
+}
+
 pub fn parse_folder_changes(msg: &Value) -> (SyncState, Vec<FolderChange>, bool) {
     let state = SyncState(str_of(msg, "SyncState").unwrap_or("").to_string());
     let raw = changes_array(msg);
@@ -2809,5 +2852,32 @@ mod tests {
         assert!(parse_expand_dl(&json!({"ResponseClass": "Success"})).is_empty());
         let keys = key_union(&[json!({"A": 1, "B": 2}), json!({"B": 3}), json!("x")]);
         assert_eq!(keys, vec![("A".to_string(), 1), ("B".to_string(), 2)]);
+    }
+
+    /// § 5m: запрос последних писем и разбор ответа в форме, снятой с сервера 25.10.2026.
+    #[test]
+    fn recent_items_request_and_response() {
+        let folder = FolderRef::Id(FolderId { id: "F1".into(), change_key: None });
+        let body = find_recent_items_body(&folder, 50, 100);
+        assert_eq!(body["__type"], "FindItemRequest:#Exchange");
+        assert_eq!(body["Paging"], json!({ "__type": "IndexedPageView:#Exchange", "BasePoint": "Beginning", "Offset": 100, "MaxEntriesReturned": 50 }));
+        assert_eq!(body["SortOrder"][0]["Path"]["FieldURI"], RECENT_SORT_FIELD);
+        assert_eq!(body["ItemShape"]["AdditionalProperties"].as_array().map(Vec::len), Some(META_FIELDS.len()));
+        assert_eq!(body.as_object().and_then(|o| o.keys().next()).map(String::as_str), Some("__type"));
+        let msg = json!({
+            "__type": "FindItemResponseMessage:#Exchange", "ResponseCode": "NoError", "ResponseClass": "Success", "HighlightTerms": null,
+            "RootFolder": { "IncludesLastItemInRange": false, "IndexedPagingOffset": 2, "TotalItemsInView": 77267, "Groups": null, "Items": [
+                { "__type": "Message:#Exchange", "ItemId": { "Id": "I1", "ChangeKey": "C1" }, "DateTimeReceived": "2026-10-25T10:00:00Z", "IsRead": false, "Flag": { "FlagStatus": "Flagged" }, "InternetMessageId": "<1@x>" },
+                { "__type": "Message:#Exchange", "ItemId": { "Id": "I2", "ChangeKey": "C2" }, "DateTimeReceived": "2026-10-25T09:00:00Z", "IsRead": true },
+                { "__type": "Message:#Exchange" }
+            ] }
+        });
+        let found = parse_find_items(&msg, 3);
+        assert_eq!(found.items.iter().map(|m| m.item_id.id.as_str()).collect::<Vec<_>>(), vec!["I1", "I2"]);
+        assert_eq!((found.raw_count, found.includes_last, found.total_in_view), (3, false, Some(77267)));
+        assert_eq!(found.items[0].flag, FlagStatus::Flagged);
+        assert!(!found.items[0].is_read && found.items[1].is_read);
+        // Без `IncludesLastItemInRange` конец выдачи — по короткой странице.
+        assert!(parse_find_items(&json!({ "RootFolder": { "Items": [] } }), 10).includes_last);
     }
 }

@@ -35,6 +35,8 @@ pub enum StageDto {
     /// Вход на сервер.
     Login,
     Hierarchy,
+    /// Свежие письма папки, синхронизируемой впервые.
+    Recent,
     Items,
     Bodies,
     Attachments,
@@ -44,6 +46,7 @@ impl From<SyncStage> for StageDto {
     fn from(s: SyncStage) -> Self {
         match s {
             SyncStage::Hierarchy => StageDto::Hierarchy,
+            SyncStage::Recent => StageDto::Recent,
             SyncStage::Items => StageDto::Items,
             SyncStage::Bodies => StageDto::Bodies,
             SyncStage::Attachments => StageDto::Attachments,
@@ -194,6 +197,8 @@ pub struct SyncState {
     user: String,
     /// База чужого ящика (сверка при входе, `mailbox.rs`): транспорт не выдаётся до перезапуска.
     identity: crate::mailbox::IdentityGuard,
+    /// Живое окно: события о записи в базу по ходу прогона (`live.rs`).
+    live: Arc<crate::live::LiveEvents>,
 }
 
 const MAX_WARNINGS: usize = 5;
@@ -238,7 +243,7 @@ impl SyncState {
     pub fn new(store: Arc<Store>, account: AccountId, host: String, user: String) -> Self {
         let last_ok_ms = store.get_state(account, LAST_OK_KEY).ok().flatten().and_then(|v| v.parse::<i64>().ok());
         let status = SyncStatusDto { last_ok_ms, ..SyncStatusDto::default() };
-        Self { inner: Mutex::new(Inner { status, ..Inner::default() }), connect_lock: tokio::sync::Mutex::new(()), closing: AtomicBool::new(false), store, account, host, user, identity: Default::default() }
+        Self { inner: Mutex::new(Inner { status, ..Inner::default() }), connect_lock: tokio::sync::Mutex::new(()), closing: AtomicBool::new(false), store, account, host, user, identity: Default::default(), live: Arc::default() }
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
@@ -437,6 +442,8 @@ impl SyncState {
     async fn run(self: Arc<Self>, app: AppHandle, days: Option<u32>, scope: Scope, cancel: Arc<AtomicBool>) {
         let hierarchy_only = scope == Scope::HierarchyOnly;
         let outcome = self.run_inner(&app, days, scope, cancel).await;
+        // Окно по концу прогона перечитывает всё само: накопленные живые события больше не нужны.
+        self.live.finish();
         match &outcome {
             // Прогон по одному дереву время «последней синхронизации» и итог не меняет: письма не читались.
             Ok(report) if hierarchy_only => {
@@ -594,6 +601,9 @@ impl SyncState {
                     }
                 });
             }
+            // Живое окно: дерево и письма видны по ходу прогона, а не только по его концу.
+            SyncEvent::FoldersApplied { .. } => self.live.folders_applied(app),
+            SyncEvent::ItemsApplied { folder_pk, .. } => self.live.items_applied(app, *folder_pk),
         }
     }
 

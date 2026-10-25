@@ -112,7 +112,7 @@ export interface SearchHit {
 }
 
 /** Этап синхронизации; совпадает с `StageDto` в src-tauri/src/sync.rs. */
-export type SyncStage = "login" | "hierarchy" | "items" | "bodies" | "attachments";
+export type SyncStage = "login" | "hierarchy" | "recent" | "items" | "bodies" | "attachments";
 
 export interface SyncReport {
   folders_synced: number;
@@ -791,6 +791,20 @@ export function onCloseRequested(cb: () => void): Promise<UnlistenFn> {
 /** Подписка на ход синхронизации. Возвращает функцию отписки. */
 export function onSyncProgress(cb: (status: SyncStatus) => void): Promise<UnlistenFn> {
   return listen<SyncStatus>("sync-progress", (e) => cb(e.payload));
+}
+
+/**
+ * Событие `sync-live` (src-tauri/src/live.rs): что записано в базу по ходу прогона с прошлого
+ * события — дерево папок и папки, в которых записаны письма. Приходит не чаще раза в 2,5 с.
+ */
+export interface SyncLive {
+  folders: boolean;
+  folder_pks: number[];
+}
+
+/** Подписка на записи в базу по ходу синхронизации (живое окно). Возвращает функцию отписки. */
+export function onSyncLive(cb: (ev: SyncLive) => void): Promise<UnlistenFn> {
+  return listen<SyncLive>("sync-live", (e) => cb(e.payload));
 }
 
 /** Подписка на изменения писем после команд записи. Возвращает функцию отписки. */

@@ -65,6 +65,7 @@ mod config;
 mod data;
 mod directory;
 mod folders;
+mod live;
 mod logging;
 mod mailbox;
 mod navigation;
@@ -467,13 +468,15 @@ fn account_info(state: State<'_, AppState>) -> AccountDto {
     AccountDto { host: state.host.clone(), user: state.user.clone(), db_path: state.store.path().display().to_string() }
 }
 
-#[tauri::command]
+// Дерево, список, ключ беседы и поиск окно читает и во время синхронизации (живое окно): не в главном
+// потоке, иначе ожидание базы, пока движок пишет пачку, замораживало бы окно.
+#[tauri::command(async)]
 fn folders(state: State<'_, AppState>) -> CmdResult<Vec<FolderDto>> {
     let list = state.store.list_folders(state.account).map_err(err)?;
     Ok(folder_dtos(&list))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn conversations(state: State<'_, AppState>, folder_pk: i64, after_ms: Option<i64>, after_pk: Option<i64>, limit: Option<usize>) -> CmdResult<Vec<ConversationDto>> {
     let cursor = match (after_ms, after_pk) {
         (Some(last_received_at), Some(conversation_pk)) => Some(ConversationCursor { last_received_at, conversation_pk }),
@@ -514,13 +517,13 @@ async fn conversation(state: State<'_, AppState>, conversation_pk: i64) -> CmdRe
 
 /// Дешёвый ключ беседы (один запрос без тел и файлов): окно сравнивает его с открытой беседой
 /// после синхронизации и перечитывает письма только при реальных изменениях.
-#[tauri::command]
+#[tauri::command(async)]
 fn conversation_key(state: State<'_, AppState>, conversation_pk: i64) -> CmdResult<Vec<MessageKeyDto>> {
     let keys = state.store.conversation_keys(state.account, conversation_pk).map_err(err)?;
     Ok(keys.into_iter().map(|k| MessageKeyDto { item_pk: k.item_pk, body_state: k.body_state, is_read: k.is_read, cached: k.cached, is_flagged: k.is_flagged }).collect())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn search(state: State<'_, AppState>, query: String, limit: Option<usize>) -> CmdResult<Vec<SearchHitDto>> {
     let hits = state.store.search(state.account, &query, limit.unwrap_or(50).clamp(1, 200)).map_err(err)?;
     let mut out = Vec::with_capacity(hits.len());

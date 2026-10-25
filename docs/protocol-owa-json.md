@@ -136,7 +136,7 @@ X-OWA-UrlPostData: <JSON запроса в URL-кодировке>   — при 
 | `GetConversationItems` | открытие беседы и предзагрузка видимых строк | `Conversations[{ConversationId, SyncState}]`, `ShapeName:"ItemPart"`, `SortOrder:"DateOrderDescending"`, `MaxItemsToReturn:20`, `FoldersToIgnore` (удалённые); `ItemShape` с флагами безопасности (`FilterHtmlContent`, `BlockExternalImagesIfSenderUntrusted`, `MaximumBodySize: 2097152`). Ответ: `Conversation.ConversationNodes[]`, каждый узел `{InternetMessageId, ParentInternetMessageId, HasQuotedText, IsRootNode, Items[]}`. **У элемента есть `UniqueBody {BodyType, Value, IsTruncated}`**, а также `Subject`, `From`, `Sender`, `ToRecipients`, `CcRecipients`, `DateTimeReceived/Sent/Created`, `IsRead`, `ItemClass`, `ItemId{Id,ChangeKey}`, `ParentFolderId`, `Preview`, `Attachments[]` (`AttachmentId`, `Name`, `ContentType`, `Size`, `IsInline`, `ContentId`), `Flag`, `Importance`, `Sensitivity`, `ExtendedProperty[]`. Повторный вызов с `SyncState` из прошлого ответа возвращает только изменения |
 | `GetFolder` | после смены папки | `FolderIds[]`, `FolderShape {BaseShape:"IdOnly", AdditionalProperties:[UnreadCount, TotalCount]}` |
 | `GetItem` | при старте (несколько), открытие одиночных элементов | формы сняты клиентом: письма § 5b', события календаря § 5g |
-| `FindItem` | при старте, календарь, напоминания | форма с `CalendarPageView` снята клиентом, § 5g |
+| `FindItem` | при старте, календарь, напоминания | форма с `CalendarPageView` снята клиентом, § 5g; последние письма папки (`IndexedPageView`, сортировка по дате) — § 5m |
 | `GetCalendarView` | календарь, листание месяца | `Body {CalendarId: TargetFolderId{BaseFolderId: FolderId{Id, ChangeKey}}, RangeStart, RangeEnd}` (локальное время без зоны, зона в `Header.TimeZoneContext`), `RequestServerVersion: V2017_08_18`; ответ `Body {ResponseClass, ResponseCode, Items[]}` |
 | `GetCalendarFolders`, `GetReminders` | старт, календарь | формы не сняты |
 | `FindPeople` | старт (избранные контакты), автодополнение | по справочнику (`directory`) снято клиентом, § 5l: записи в `Body.ResultSet` |
@@ -146,7 +146,7 @@ X-OWA-UrlPostData: <JSON запроса в URL-кодировке>   — при 
 | `GetPresence`, `ResetPresence`, `InstantMessageSignIn` | Lync | клиенту не нужны |
 | `GetFavorites`, `GetAllowedOptions`, `GetUserVoiceData`, `GetUnseenLightningIds` | старт | второстепенны |
 
-Не наблюдалось в этой сессии (проверяется в Rust-спайке напрямую): `SyncFolderItems`, `SyncFolderHierarchy`, `MarkAllItemsAsRead`, `CreateItem`, `UpdateItem`, `GetAttachment`. Позже сняты клиентом: `SyncFolderItems`/`SyncFolderHierarchy`/`GetItem` (§ 5b'), `GetFileAttachment` (§ 5), `UpdateItem` (§ 5e), `CreateItem`/`CreateAttachment`/`SendItem`/`GetUserConfiguration` (§ 5f), `FindItem` с `CalendarView` и `GetItem` события (§ 5g), `CreateFolder`/`UpdateFolder`/`DeleteFolder` и `message:ReplyTo` поверх `ShapeName` (§ 5j), `FindPeople`/`ResolveNames` по справочнику (§ 5l; `ExpandDL` в форме EWS сервер отвергает).
+Не наблюдалось в этой сессии (проверяется в Rust-спайке напрямую): `SyncFolderItems`, `SyncFolderHierarchy`, `MarkAllItemsAsRead`, `CreateItem`, `UpdateItem`, `GetAttachment`. Позже сняты клиентом: `SyncFolderItems`/`SyncFolderHierarchy`/`GetItem` (§ 5b'), `GetFileAttachment` (§ 5), `UpdateItem` (§ 5e), `CreateItem`/`CreateAttachment`/`SendItem`/`GetUserConfiguration` (§ 5f), `FindItem` с `CalendarView` и `GetItem` события (§ 5g), `CreateFolder`/`UpdateFolder`/`DeleteFolder` и `message:ReplyTo` поверх `ShapeName` (§ 5j), `FindPeople`/`ResolveNames` по справочнику (§ 5l; `ExpandDL` в форме EWS сервер отвергает), `FindItem` последних писем папки (§ 5m).
 
 ## 4. Канал уведомлений
 
@@ -807,6 +807,41 @@ X-OWA-CANARY: <канарейка>          — дублируется заго�
 **Кэш справочника** (схема версии 5, `crates/aiowa-store/src/directory.rs`): таблица `directory_people (account_id, email PK — SMTP в нижнем регистре, display_name, kind, json, fetched_at)`, `kind` — `mailbox`/`list`/`contact`/`room`/`other`, остальные поля — объектом JSON. `Store::upsert_directory_people` сливает запись со старой (заполненные поля новой побеждают, пустые берутся из старой: выдача `FindPeople` без отдела не стирает отдел из `ResolveNames`), `replace_directory_person` заменяет целиком; `directory_person` — по адресу без учёта регистра; `directory_search_cached` — по началу слов имени и адреса без учёта регистра и ё (0,2–0,8 мс). Миграция добавляет и индексы `items(account_id, lower(from_email))` и `recipients(lower(email))` для счётчиков переписки карточки (`Store::contact_local_stats`: писем от адреса, писем владельца ему из «Отправленных» или с собственного адреса, последнее); на тестовой базе (154 тыс. писем) миграция заняла 0,38 с.
 
 CLI: `aiowa directory [--query Q] [--resolve] [--prefix3] [--expand first|АДРЕС] [--max N] [--probe-shapes] [--dl-candidates N] [--dl-query Q …]` — без `--query` ищет фамилию владельца; печатает только счётчики, ключи, коды и длительности и пишет найденное в кэш справочника.
+
+## 5m. Последние письма папки: `FindItem` по дате по убыванию (клиент `aiowa`, 25.10.2026)
+
+Зачем: первая синхронизация большой папки (`SyncFolderItems`, письма в порядке сервера) идёт десятки минут, и свежие письма не обязательно приходят первыми. Клиент сначала берёт последнюю страницу писем папки по дате получения и показывает её, а полную выгрузку ведёт потом. Снято командой `aiowa recent-probe --folders inbox,sentitems --limit 50` (только чтение, один вход и `logoff`, в выводе только ключи, счётчики и длины).
+
+**Запрос** (`protocol::find_recent_items_body`, `RequestServerVersion: V2017_08_18`):
+
+```json
+{ "__type": "FindItemRequest:#Exchange",
+  "ItemShape": { "__type": "ItemResponseShape:#Exchange", "BaseShape": "IdOnly",
+                 "AdditionalProperties": [ { "__type": "PropertyUri:#Exchange", "FieldURI": "item:Subject" }, "…те же 18 свойств, что у SyncFolderItems (§ 5b')…" ] },
+  "ParentFolderIds": [ { "__type": "FolderId:#Exchange", "Id": "…" } ],
+  "Traversal": "Shallow",
+  "Paging": { "__type": "IndexedPageView:#Exchange", "BasePoint": "Beginning", "Offset": 0, "MaxEntriesReturned": 50 },
+  "SortOrder": [ { "__type": "SortResults:#Exchange", "Order": "Descending",
+                   "Path": { "__type": "PropertyUri:#Exchange", "FieldURI": "item:DateTimeReceived" } } ] }
+```
+
+Сервер принял все четыре проверенные формы с одинаковой выдачей: `V2017_08_18` и `Exchange2013`; `FieldURI` сортировки с префиксом (`item:DateTimeReceived`) и без (`DateTimeReceived`); `ShapeName: "MailListItem"` вместо `AdditionalProperties`. Страница из 50 писем — 160–300 мс («Входящие» 77 267 писем, «Отправленные» 25 043).
+
+**Ответ** — `Body.ResponseMessages.Items[0]`:
+
+```json
+{ "__type": "FindItemResponseMessage:#Exchange", "ResponseCode": "NoError", "ResponseClass": "Success", "HighlightTerms": "…",
+  "RootFolder": { "IncludesLastItemInRange": false, "IndexedPagingOffset": 50, "TotalItemsInView": 77267, "Groups": "…",
+                  "Items": [ { "__type": "Message:#Exchange", "ItemId": { "Id": "…", "ChangeKey": "…" }, "...": "запрошенные свойства" } ] } }
+```
+
+- `IndexedPagingOffset` — смещение **следующей** страницы (`Offset` + число писем); `TotalItemsInView` — писем в папке, `IncludesLastItemInRange: false`, пока страница не последняя.
+- У каждого элемента ровно запрошенное: 18 свойств, `ItemId` и `__type` — те же ключи, что у `Create` в `SyncFolderItems`, все 18 заполнены у всех 50 писем. Разбор — тот же `protocol::parse_message_meta` (`protocol::parse_find_items`).
+- **Идентификаторы те же, что у `SyncFolderItems`**: `Id` 152 символа, `ChangeKey` 40. Письма страницы, уже лежавшие в базе (копия, синхронизированная `SyncFolderItems` за несколько дней до пробы): 10 из 50 второй страницы «Входящих» и 18 из 50 первой и 50 из 50 второй страницы «Отправленных» нашлись по `Id`, у всех совпали прочитанность, флаг и папка, `ChangeKey` — у 77 из 78. Значит, `Create` полной выгрузки ложится на письмо свежей страницы обычным upsert по идентификатору, без дублей.
+- Порядок строго по убыванию `DateTimeReceived` (нарушений 0), вторая страница (`Offset: 50`) продолжает первую без пересечения.
+- `ShapeName: "MailListItem"` даёт 27 ключей (лишние `InstanceKey`, `ExtendedProperty`, `ReceivedOrRenewTime`, `IconIndex`, `Sensitivity`, `IsSubmitted`, `IsReadReceiptRequested`, `IsDeliveryReceiptRequested`, `DateTimeCreated`), но **без `InternetMessageId`**, который нужен базе для «усыновления» перенесённых писем. Клиент запрашивает свойства явно.
+
+Как этим пользуется движок (`aiowa-sync`, `Engine::run`): после дерева папок у каждой непустой папки без состояния `SyncFolderItems` (в порядке плана, «Входящие» первыми) берётся страница из `SyncOptions::recent_first` писем (по умолчанию 100) и записывается в базу как обычные заголовки без состояния папки; затем идут полные выгрузки. Идентификаторы страницы хранятся в `sync_state` (`recent_pending.<folder_pk>`) и снимаются по мере того, как их присылает `SyncFolderItems`. Что осталось к концу выгрузки и всё ещё лежит в этой папке, сверяется с сервером одним `GetItem` (`MailListItem`): помечается удалённым только то, на что сервер ответил `ErrorItemNotFound` (письмо удалено или перенесено за время выгрузки — у перенесённого новый идентификатор). Не ответил — сверка повторяется при следующей синхронизации. Отказ `FindItem` синхронизацию не останавливает: папка выгружается обычным порядком.
 
 ## 6. Что это значит для клиента
 

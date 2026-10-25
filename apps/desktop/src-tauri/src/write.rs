@@ -499,7 +499,9 @@ pub(crate) async fn items_delete(item_pks: Vec<i64>, permanent: bool, app: AppHa
 }
 
 /// Письма беседы (не удалённые), при `folder_pk` — только лежащие в этой папке; новые первыми.
-#[tauri::command]
+// Первый шаг каждого действия над беседами списка: не в главном потоке, иначе во время
+// синхронизации окно замирало бы, пока движок пишет пачку.
+#[tauri::command(async)]
 pub(crate) fn conversation_item_pks(conversation_pk: i64, folder_pk: Option<i64>, state: State<'_, AppState>) -> CmdResult<Vec<i64>> {
     state.store.conversation_item_pks(state.account, conversation_pk, folder_pk).map_err(err)
 }

@@ -2,7 +2,7 @@
 
 use aiowa_core::*;
 use aiowa_store::Store;
-use aiowa_sync::{BodyFetchOutcome, Engine, FolderSelection, SyncOptions};
+use aiowa_sync::{BodyFetchOutcome, Engine, FolderSelection, SyncEvent, SyncOptions, SyncStage};
 use aiowa_transport::{
     async_trait, AttachmentContent, DeleteMode, FolderCounts, ItemFetchShape, ItemResult, MailTransport, NotificationEvent, Result as TResult, ServerInfo, StreamEnd, SubscriptionRequest, SubscriptionResult,
     TransportError, WriteResult,
@@ -10,6 +10,7 @@ use aiowa_transport::{
 use jiff::Timestamp;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use tokio::sync::Notify;
 
 fn folder(id: &str, name: &str, dist: Option<&str>, total: i64) -> Folder {
     Folder {
@@ -49,6 +50,21 @@ fn meta(id: &str, subject: &str, days_ago: i64) -> MessageMeta {
     }
 }
 
+/// Письмо «a», каким его видит сервер: с флагом и высокой важностью (так его отдают и свежая
+/// страница, и полная выгрузка).
+fn server_a() -> MessageMeta {
+    let mut m = meta("a", "Запчасти на Колыму", 1);
+    m.flag = FlagStatus::Flagged;
+    m.importance = Importance::High;
+    m
+}
+
+/// Задержка первого `SyncFolderItems`: сервер сообщает, что запрос дошёл, и ждёт разрешения теста.
+struct Gate {
+    arrived: Notify,
+    release: Notify,
+}
+
 /// Сценарий: входящие отдаются двумя страницами, вторая с признаком конца.
 /// Тело письма "gone" на сервере отсутствует. У письма "a" два вложения: текстовое
 /// скачивается, второе сервер отвергает. Папка «Проекты» пуста, нежелательная почта
@@ -63,11 +79,34 @@ struct Fake {
     seen_folders: Mutex<Vec<String>>,
     /// Сессия мертва и повторный вход отклонён: каждый `GetItem` и `GetAttachment` падает `AuthFailed`.
     auth_dead: AtomicBool,
+    /// Свежая страница «Входящих» (`find_recent_items`); `None` — сервер операцию не принимает.
+    recent: Mutex<Option<Vec<MessageMeta>>>,
+    /// Вызовы `find_recent_items` по папкам.
+    recent_calls: Mutex<Vec<String>>,
+    /// Первый `SyncFolderItems` ждёт теста (см. [`Gate`]).
+    gate: Mutex<Option<Arc<Gate>>>,
 }
 
 impl Fake {
     fn new() -> Arc<Self> {
-        Arc::new(Self { sync_calls: AtomicUsize::new(0), get_calls: AtomicUsize::new(0), attachment_calls: AtomicUsize::new(0), seen_states: Mutex::new(vec![]), seen_folders: Mutex::new(vec![]), auth_dead: AtomicBool::new(false) })
+        Arc::new(Self {
+            sync_calls: AtomicUsize::new(0),
+            get_calls: AtomicUsize::new(0),
+            attachment_calls: AtomicUsize::new(0),
+            seen_states: Mutex::new(vec![]),
+            seen_folders: Mutex::new(vec![]),
+            auth_dead: AtomicBool::new(false),
+            recent: Mutex::new(None),
+            recent_calls: Mutex::new(vec![]),
+            gate: Mutex::new(None),
+        })
+    }
+
+    /// Со свежей страницей «Входящих».
+    fn with_recent(page: Vec<MessageMeta>) -> Arc<Self> {
+        let f = Self::new();
+        *f.recent.lock().unwrap() = Some(page);
+        f
     }
 }
 
@@ -90,6 +129,11 @@ impl MailTransport for Fake {
     }
 
     async fn sync_folder_items(&self, folder: &FolderRef, state: Option<&SyncState>, _max: u32, _with_meta: bool) -> TResult<ItemChanges> {
+        let gate = self.gate.lock().unwrap().take();
+        if let Some(g) = gate {
+            g.arrived.notify_one();
+            g.release.notified().await;
+        }
         self.sync_calls.fetch_add(1, Ordering::SeqCst);
         self.seen_states.lock().unwrap().push(state.map(|s| s.0.clone()));
         let FolderRef::Id(fid) = folder else { panic!("ожидается FolderId") };
@@ -98,11 +142,7 @@ impl MailTransport for Fake {
             return Ok(ItemChanges { state: SyncState(format!("{}-done", fid.id)), changes: vec![], includes_last: true });
         }
         match state.map(|s| s.0.as_str()) {
-            None => Ok(ItemChanges {
-                state: SyncState("I1".into()),
-                changes: vec![ItemChange::Create(meta("a", "Запчасти на Колыму", 1)), ItemChange::Create(meta("b", "Старое письмо", 400))],
-                includes_last: false,
-            }),
+            None => Ok(ItemChanges { state: SyncState("I1".into()), changes: vec![ItemChange::Create(server_a()), ItemChange::Create(meta("b", "Старое письмо", 400))], includes_last: false }),
             Some("I1") => Ok(ItemChanges {
                 state: SyncState("I2".into()),
                 changes: vec![ItemChange::Create(meta("gone", "Исчезнувшее", 2)), ItemChange::ReadFlag { item_id: ItemId { id: "a".into(), change_key: None }, is_read: true }],
@@ -110,6 +150,16 @@ impl MailTransport for Fake {
             }),
             Some("I2") => Ok(ItemChanges { state: SyncState("I2".into()), changes: vec![], includes_last: true }),
             Some(other) => Err(TransportError::Server { code: "ErrorInvalidSyncStateData".into(), message: other.to_string() }),
+        }
+    }
+
+    async fn find_recent_items(&self, folder: &FolderRef, max: u32) -> TResult<Vec<MessageMeta>> {
+        let FolderRef::Id(fid) = folder else { panic!("ожидается FolderId") };
+        self.recent_calls.lock().unwrap().push(fid.id.clone());
+        match &*self.recent.lock().unwrap() {
+            None => Err(TransportError::Protocol { op: "FindItem".into(), status: 500, raw: "не поддерживается".into() }),
+            Some(_) if fid.id != "F-INBOX" => Ok(vec![]),
+            Some(page) => Ok(page.iter().take(max as usize).cloned().collect()),
         }
     }
 
@@ -121,13 +171,14 @@ impl MailTransport for Fake {
         Ok(ids
             .iter()
             .map(|id| {
-                if id.id == "gone" {
+                // «ghost» и «moved» есть только на свежей странице: к концу выгрузки их на сервере уже нет.
+                if id.id == "gone" || id.id == "ghost" || id.id == "moved" {
                     ItemResult::Failed { id: id.clone(), code: "ErrorItemNotFound".into(), message: "нет".into() }
                 } else if id.id == "broken" {
                     ItemResult::Failed { id: id.clone(), code: "ErrorInternalServerError".into(), message: "сломалось".into() }
                 } else {
                     // Сервер отдаёт текущее состояние: письмо «a» к этому моменту уже прочитано.
-                    let mut m = meta(&id.id, if id.id == "a" { "Запчасти на Колыму" } else { "Старое письмо" }, 1);
+                    let mut m = if id.id == "a" { server_a() } else { meta(&id.id, "Старое письмо", 1) };
                     m.is_read = id.id == "a";
                     let attachments = if id.id == "a" {
                         m.has_attachments = true;
@@ -516,4 +567,182 @@ async fn invalid_state_triggers_resync() {
     assert_eq!(report.items_created, 0);
     assert_eq!(report.items_updated, 3);
     assert_eq!(store.folder_sync_state(inbox_pk).unwrap().unwrap().0, "I2");
+}
+
+// --- свежие письма первыми и события по ходу прогона -------------------------------------------
+
+fn only_inbox() -> SyncOptions {
+    SyncOptions { folders: FolderSelection::Named(vec!["inbox".into(), "sentitems".into()]), fetch_bodies: false, fetch_attachments: false, ..SyncOptions::default() }
+}
+
+fn ids_in(store: &Store, account: AccountId, folder_pk: i64) -> Vec<String> {
+    let mut ids: Vec<String> = store.list_items(account, folder_pk, 100).unwrap().into_iter().map(|r| r.item_id.id).collect();
+    ids.sort();
+    ids
+}
+
+/// Первая синхронизация: сначала свежая страница (`FindItem`), окно узнаёт о ней событием до
+/// первого `SyncFolderItems`; полная выгрузка присылает те же письма `Create`-ами — без дублей, флаг
+/// на месте, тело, загруженное между ними, не теряется. Письмо свежей страницы, которого полная
+/// выгрузка не прислала, к её концу помечено удалённым.
+#[tokio::test]
+async fn recent_page_first_then_full_sync_without_duplicates() {
+    let store = test_store("recent");
+    let account = store.account("fake", "u").unwrap();
+    let fake = Fake::with_recent(vec![meta("ghost", "Удалено на сервере во время выгрузки", 0), server_a(), meta("gone", "Исчезнувшее", 2)]);
+    let events = Arc::new(Mutex::new(Vec::<SyncEvent>::new()));
+    let (sink, st) = (events.clone(), store.clone());
+    // Пока идёт выгрузка, пользователь открывает свежее письмо «a»: тело ложится в базу раньше, чем
+    // полная выгрузка присылает это письмо.
+    let progress: aiowa_sync::ProgressFn = Arc::new(move |e: &SyncEvent| {
+        if let SyncEvent::ItemsApplied { folder_pk, recent: true, .. } = e {
+            let body = MessageBody { body_type: BodyType::Html, unique_body: Some("<p>Отгрузили запчасти</p>".into()), full_body: None, is_truncated: false };
+            let full = MessageFull { meta: server_a(), to: vec![], cc: vec![], bcc: vec![], reply_to: vec![], body: Some(body), attachments: vec![] };
+            st.store_full_messages(account, *folder_pk, &[full]).unwrap();
+        }
+        sink.lock().unwrap().push(e.clone());
+    });
+    let engine = Engine::new(fake.clone(), store.clone(), account, Arc::new(AtomicBool::new(false))).on_progress(progress);
+    let report = engine.run(&only_inbox()).await.unwrap();
+    let (inbox_pk, _) = store.folder_by_distinguished(account, "inbox").unwrap().unwrap();
+
+    // Свежая страница запрошена только у непустой папки, синхронизируемой впервые.
+    assert_eq!(*fake.recent_calls.lock().unwrap(), vec!["F-INBOX".to_string()]);
+    assert_eq!((report.recent_items, report.recent_vanished), (3, 1));
+    // Создано ровно столько писем, сколько пришло впервые: повторы из полной выгрузки — обновления.
+    assert_eq!(report.items_created, 4, "ghost, a, gone свежей страницей и b полной выгрузкой");
+    assert_eq!(ids_in(&store, account, inbox_pk), vec!["a", "b", "gone"]);
+    assert_eq!(store.stats(account).unwrap().items, 3, "без дублей");
+    let a = store.list_items(account, inbox_pk, 10).unwrap().into_iter().find(|r| r.item_id.id == "a").unwrap();
+    assert!(store.item_ref(a.item_pk).unwrap().unwrap().is_flagged, "флаг сервера на месте");
+    assert!(a.is_read, "пометка прочтения из второй пачки применилась");
+    assert_eq!(a.body_state, 1, "тело, загруженное во время выгрузки, не сброшено повторным Create");
+    assert!(store.message_body(a.item_pk).unwrap().is_some());
+    assert_eq!(store.search(account, "колым", 10).unwrap().len(), 1, "индекс без дублей");
+    let convs = store.list_conversations(account, inbox_pk, 10).unwrap();
+    assert_eq!(convs.len(), 1);
+    assert_eq!((convs[0].item_count, convs[0].unread_count), (3, 2));
+    assert_eq!(store.get_state(account, &format!("recent_pending.{inbox_pk}")).unwrap().as_deref(), Some(""), "список свежей страницы снят с учёта");
+
+    // Порядок событий: дерево → свежая страница → полная выгрузка; пачки с изменениями — событиями.
+    let ev = events.lock().unwrap().clone();
+    let pos = |f: &dyn Fn(&SyncEvent) -> bool| ev.iter().position(f).unwrap_or(usize::MAX);
+    let tree = pos(&|e| matches!(e, SyncEvent::FoldersApplied { upserts: 4 }));
+    let recent_stage = pos(&|e| matches!(e, SyncEvent::Stage { stage: SyncStage::Recent, folder: Some(_) }));
+    let recent = pos(&|e| matches!(e, SyncEvent::ItemsApplied { recent: true, changed: 3, .. }));
+    let items_stage = pos(&|e| matches!(e, SyncEvent::Stage { stage: SyncStage::Items, .. }));
+    assert!(tree < recent_stage && recent_stage < recent && recent < items_stage, "{ev:?}");
+    let batches: Vec<(i64, usize)> = ev
+        .iter()
+        .filter_map(|e| match e {
+            SyncEvent::ItemsApplied { folder_pk, changed, recent: false, .. } => Some((*folder_pk, *changed)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(batches, vec![(inbox_pk, 2), (inbox_pk, 2), (inbox_pk, 1)], "две пачки входящих и пропавшее письмо; пустые «Отправленные» молчат");
+
+    // Повторный прогон: дерево не менялось, пачки пустые — событий о записи нет, свежая страница не запрашивается.
+    events.lock().unwrap().clear();
+    let report2 = engine.run(&only_inbox()).await.unwrap();
+    assert_eq!(report2.recent_items, 0);
+    assert_eq!(fake.recent_calls.lock().unwrap().len(), 1);
+    assert!(!events.lock().unwrap().iter().any(|e| matches!(e, SyncEvent::FoldersApplied { .. } | SyncEvent::ItemsApplied { .. })));
+}
+
+/// Прерванная первая выгрузка продолжается со списком свежей страницы из базы: страница второй раз
+/// не запрашивается, пропавшее письмо помечается удалённым к концу, а письмо, которое пользователь
+/// успел перенести в другую папку, не трогается.
+#[tokio::test]
+async fn interrupted_first_sync_keeps_recent_list() {
+    let store = test_store("recent-resume");
+    let account = store.account("fake", "u").unwrap();
+    let fake = Fake::with_recent(vec![server_a(), meta("ghost", "Призрак", 0), meta("moved", "Перенесённое", 0)]);
+    let engine = Engine::new(fake.clone(), store.clone(), account, Arc::new(AtomicBool::new(false)));
+    let first = engine.run(&SyncOptions { max_pages: 1, ..only_inbox() }).await.unwrap();
+    assert_eq!(first.recent_vanished, 0, "выгрузка не дошла до конца — пропавших ещё нет");
+    let (inbox_pk, _) = store.folder_by_distinguished(account, "inbox").unwrap().unwrap();
+    assert_eq!(ids_in(&store, account, inbox_pk), vec!["a", "b", "ghost", "moved"]);
+
+    let proj_pk = store.folder_pk(account, "F-PROJ").unwrap().unwrap();
+    let moved = store.list_items(account, inbox_pk, 10).unwrap().into_iter().find(|r| r.item_id.id == "moved").unwrap();
+    store.move_local(moved.item_pk, proj_pk, None).unwrap();
+
+    let second = engine.run(&only_inbox()).await.unwrap();
+    assert_eq!(fake.recent_calls.lock().unwrap().len(), 1, "свежая страница берётся один раз на первую выгрузку");
+    assert_eq!(second.recent_vanished, 1);
+    assert_eq!(ids_in(&store, account, inbox_pk), vec!["a", "b", "gone"]);
+    assert_eq!(ids_in(&store, account, proj_pk), vec!["moved"], "перенесённое письмо живёт в своей папке");
+}
+
+/// Письмо из списка свежей страницы, которое полная выгрузка уже прислала (запуск прервали между
+/// записью пачки и списка), не помечается удалённым: сервер на проверке отвечает, что письмо есть.
+#[tokio::test]
+async fn recent_list_left_after_crash_does_not_delete_existing_mail() {
+    let store = test_store("recent-crash");
+    let account = store.account("fake", "u").unwrap();
+    let fake = Fake::with_recent(vec![server_a()]);
+    let engine = Engine::new(fake.clone(), store.clone(), account, Arc::new(AtomicBool::new(false)));
+    engine.run(&only_inbox()).await.unwrap();
+    let (inbox_pk, _) = store.folder_by_distinguished(account, "inbox").unwrap().unwrap();
+    // Как после сбоя: в списке осталось «b», которое выгрузка уже прислала и больше не пришлёт.
+    store.set_state(account, &format!("recent_pending.{inbox_pk}"), Some("b")).unwrap();
+    let gets = fake.get_calls.load(Ordering::SeqCst);
+    let report = engine.run(&only_inbox()).await.unwrap();
+    assert_eq!(fake.get_calls.load(Ordering::SeqCst), gets + 1, "оставшееся в списке сверено с сервером");
+    assert_eq!(report.recent_vanished, 0);
+    assert_eq!(ids_in(&store, account, inbox_pk), vec!["a", "b", "gone"]);
+    assert_eq!(store.get_state(account, &format!("recent_pending.{inbox_pk}")).unwrap().as_deref(), Some(""));
+}
+
+/// Сервер не принял `FindItem`: синхронизация идёт обычным порядком, без ошибки. С выключенной
+/// опцией свежая страница не запрашивается вовсе.
+#[tokio::test]
+async fn refused_recent_page_falls_back_to_full_sync() {
+    let store = test_store("recent-refused");
+    let account = store.account("fake", "u").unwrap();
+    let fake = Fake::new();
+    let engine = Engine::new(fake.clone(), store.clone(), account, Arc::new(AtomicBool::new(false)));
+    let report = engine.run(&only_inbox()).await.unwrap();
+    assert_eq!(*fake.recent_calls.lock().unwrap(), vec!["F-INBOX".to_string()]);
+    assert_eq!((report.recent_items, report.items_created), (0, 3));
+    let (inbox_pk, _) = store.folder_by_distinguished(account, "inbox").unwrap().unwrap();
+    assert_eq!(ids_in(&store, account, inbox_pk), vec!["a", "b", "gone"]);
+
+    let fake2 = Fake::with_recent(vec![server_a()]);
+    let store2 = test_store("recent-off");
+    let account2 = store2.account("fake", "u").unwrap();
+    let engine2 = Engine::new(fake2.clone(), store2.clone(), account2, Arc::new(AtomicBool::new(false)));
+    engine2.run(&SyncOptions { recent_first: 0, ..only_inbox() }).await.unwrap();
+    assert!(fake2.recent_calls.lock().unwrap().is_empty());
+}
+
+/// Пока полная выгрузка ждёт сервер, свежее письмо открывается (тело по требованию) и помечается
+/// прочитанным через тот же транспорт: движок не держит ничего, что заставило бы окно ждать конца прогона.
+#[tokio::test]
+async fn window_actions_do_not_wait_for_running_sync() {
+    let store = test_store("live");
+    let account = store.account("fake", "u").unwrap();
+    let fake = Fake::with_recent(vec![server_a()]);
+    let gate = Arc::new(Gate { arrived: Notify::new(), release: Notify::new() });
+    *fake.gate.lock().unwrap() = Some(gate.clone());
+    let engine = Arc::new(Engine::new(fake.clone(), store.clone(), account, Arc::new(AtomicBool::new(false))));
+    let running = {
+        let e = engine.clone();
+        tokio::spawn(async move { e.run(&only_inbox()).await })
+    };
+    gate.arrived.notified().await;
+
+    let (inbox_pk, _) = store.folder_by_distinguished(account, "inbox").unwrap().unwrap();
+    let a = store.list_items(account, inbox_pk, 10).unwrap().into_iter().find(|r| r.item_id.id == "a").expect("свежее письмо уже в базе");
+    let a_ref = store.item_ref(a.item_pk).unwrap().unwrap();
+    let window = Engine::new(fake.clone(), store.clone(), account, Arc::new(AtomicBool::new(false)));
+    assert_eq!(window.fetch_body(&a_ref.id, a_ref.folder_pk).await.unwrap(), BodyFetchOutcome::Stored);
+    assert_eq!(store.set_read_local(&[a.item_pk], true).unwrap(), vec![a.item_pk]);
+    assert!(fake.set_read(std::slice::from_ref(&a_ref.id), true).await.unwrap()[0].is_ok());
+    assert!(!running.is_finished(), "выгрузка всё ещё ждёт ответа сервера");
+
+    gate.release.notify_one();
+    let report = running.await.unwrap().unwrap();
+    assert_eq!(report.recent_items, 1);
+    assert_eq!(store.item_ref(a.item_pk).unwrap().unwrap().body_state, 1, "тело, загруженное во время выгрузки, на месте");
 }

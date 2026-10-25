@@ -36,6 +36,7 @@
   const STAGES: Record<SyncStage, string> = {
     login: "Вход на сервер",
     hierarchy: "Папки",
+    recent: "Свежие письма",
     items: "Список писем",
     bodies: "Тексты писем",
     attachments: "Вложения",
