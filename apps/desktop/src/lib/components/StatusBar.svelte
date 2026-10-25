@@ -2,6 +2,7 @@
   import type { NotifyStatus, SyncStage, SyncStatus } from "../api";
   import { ICON } from "../actions";
   import { hint } from "../hotkeys";
+  import UpdateNotice from "./UpdateNotice.svelte";
 
   interface Props {
     status: SyncStatus | null;
@@ -166,6 +167,8 @@
   </div>
 
   <div class="right">
+    <!-- Обновление приложения: «Доступна версия X · Установить», ход установки (updates.svelte.ts). -->
+    <UpdateNotice />
     {#if status?.warnings_total}
       <span class="warn" title={warningsTitle}>{status.warnings_total} {status.warnings_total === 1 ? "предупреждение" : status.warnings_total < 5 ? "предупреждения" : "предупреждений"}</span>
     {/if}
