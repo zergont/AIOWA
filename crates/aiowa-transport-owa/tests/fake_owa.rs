@@ -9,7 +9,7 @@ use aiowa_store::Store;
 use aiowa_sync::{Engine, FolderSelection, SyncOptions};
 use aiowa_transport::{Credentials, DeleteMode, ItemFetchShape, ItemResult, MailTransport, TransportError, WriteResult};
 use aiowa_transport_owa::{protocol, OwaConfig, OwaTransport};
-use common::{Addr, Expiry, FakeAttachment, FakeOwa, Gather, Hold, Mailbox, BUILD, DELETED, DRAFTS, INBOX, OWNER, PASSWORD, PROJECTS, ROOT, SENT, USER};
+use common::{Addr, Expiry, FakeAttachment, FakeOwa, Gather, Hold, Mailbox, BUILD, DELETED, DRAFTS, INBOX, MAILBOX_GUID, OWNER, OWNER_NAME, PASSWORD, PROJECTS, ROOT, SENT, USER};
 use secrecy::SecretString;
 use serde_json::{json, Value};
 use std::path::PathBuf;
@@ -791,4 +791,36 @@ async fn html_page_instead_of_file_falls_back() {
     assert_eq!(server.state().calls_of("GetAttachment").len(), 1);
     assert_eq!(server.state().rejected, vec!["file_get_page".to_string()]);
     t.logoff().await.unwrap();
+}
+
+/// Сведения о ящике после входа (§ 2): из `sessiondata.ashx`; при его сбое — из
+/// `GetOwaUserConfiguration`; истёкшая сессия — повторный вход и тот же ответ.
+#[tokio::test]
+async fn mailbox_info_from_session_data_and_fallback() {
+    let server = FakeOwa::start().await;
+    let t = connect(&server).await;
+    let info = t.mailbox_info().await.unwrap();
+    assert_eq!(info.email.as_deref(), Some(OWNER));
+    assert_eq!(info.mailbox_guid.as_deref(), Some(MAILBOX_GUID));
+    assert_eq!(info.display_name.as_deref(), Some(OWNER_NAME));
+    assert_eq!(server.state().calls_of("sessiondata.ashx").len(), 1);
+    assert!(server.state().calls_of("GetOwaUserConfiguration").is_empty(), "запасной путь не нужен");
+
+    // sessiondata.ashx отвечает 500: те же сведения из GetOwaUserConfiguration.
+    server.state().faults.fail_op.insert("sessiondata.ashx".into(), 1);
+    assert_eq!(t.mailbox_info().await.unwrap(), info);
+    assert_eq!(server.state().calls_of("GetOwaUserConfiguration").len(), 1);
+    assert_eq!(server.state().calls_of("GetOwaUserConfiguration")[0].body, json!({}), "тело — пустой объект без конверта");
+
+    // Оба пути отказали — ошибка основного.
+    server.state().faults.fail_op.insert("sessiondata.ashx".into(), 1);
+    server.state().faults.fail_op.insert("GetOwaUserConfiguration".into(), 1);
+    assert!(matches!(t.mailbox_info().await, Err(TransportError::Protocol { status: 500, .. })));
+
+    // Сессия истекла: один повторный вход, ответ тот же.
+    server.state().faults.expire_next = Some(Expiry::Status440);
+    assert_eq!(t.mailbox_info().await.unwrap(), info);
+    assert_eq!(server.state().logins_ok(), 2);
+    t.logoff().await.unwrap();
+    assert_eq!(server.state().active_sessions(), 0);
 }

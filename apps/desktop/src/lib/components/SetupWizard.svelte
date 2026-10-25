@@ -1,14 +1,19 @@
 <script lang="ts">
   import { onDestroy, tick, untrack } from "svelte";
-  import { api, errorMessage, type AppMode, type LoginTest } from "../api";
+  import { api, errorMessage, type AppMode, type FoundStore, type LoginTest } from "../api";
+  import { bytesText, syncedText } from "../data";
   import { BODY_DAYS_CHOICES, loginHint, owaUrl, parseHost } from "../setup";
   import Logo from "./Logo.svelte";
 
   /**
    * Мастер первого запуска: приложение поднялось без учётной записи (режим "setup"), почты ещё нет.
-   * Три шага: сервер → логин и пароль с пробным входом → глубина синхронизации. «Готово» доступно
-   * только после удачной проверки входа; бэкенд сохраняет пароль и config.json и перезапускает
-   * приложение уже в режиме почты.
+   * Три шага: сервер → логин и пароль с пробным входом → база и глубина синхронизации. «Готово»
+   * доступно только после удачной проверки входа; бэкенд сохраняет пароль и config.json и
+   * перезапускает приложение уже в режиме почты.
+   *
+   * Одна база на ящик: проверка входа узнаёт у сервера адрес ящика и ищет на диске его базы (при
+   * любой форме логина). Найденная предлагается на шаге «Синхронизация» — «Продолжить с этой
+   * базой» (по умолчанию) или «Начать новую».
    */
   interface Props {
     mode: AppMode | null;
@@ -87,6 +92,8 @@
       const r = await api.setupTestLogin(host, userInput.trim(), password);
       if (req !== testReq) return false;
       test = r;
+      // По умолчанию — продолжить с самой полной найденной базой ящика.
+      dbChoice = r.stores?.[0]?.path ?? NEW_DB;
       return r.ok;
     } catch (e) {
       if (req !== testReq) return false;
@@ -120,6 +127,7 @@
   const testText = $derived.by(() => {
     if (!test?.ok) return "";
     const parts = [test.host ? `Вход на ${test.host} выполнен` : "Вход выполнен"];
+    if (test.mailbox?.email) parts.push(`ящик ${test.mailbox.email}`);
     if (test.server_version) parts.push(test.server_version);
     if (test.folders != null) parts.push(`почтовых папок: ${test.folders.toLocaleString("ru-RU")}`);
     return parts.join(" · ");
@@ -134,10 +142,22 @@
   let saveError = $state<string | null>(null);
 
   const BODY_NOTES: Record<number, string> = {
-    30: "Быстрый старт, база небольшая",
-    90: "Рекомендуется: последние три месяца под рукой",
-    365: "Первая синхронизация дольше, база заметно больше",
+    30: "Тексты за месяц: первая загрузка быстрее, база меньше",
+    90: "Рекомендуется: тексты за три месяца под рукой",
+    365: "Тексты за год: первая синхронизация дольше, база заметно больше",
     0: "Все тексты за всё время: на большом ящике — гигабайты и долгая первая синхронизация",
+  };
+
+  /** Выбор базы: путь найденной базы ящика или новая. */
+  const NEW_DB = "new";
+  let dbChoice = $state<string>(NEW_DB);
+  const found = $derived<FoundStore[]>(test?.ok ? (test.stores ?? []) : []);
+  const chosenPath = $derived(dbChoice === NEW_DB ? (test?.new_db_path ?? null) : dbChoice);
+
+  const KIND_TEXT: Record<FoundStore["kind"], string> = {
+    guid: "тот же ящик",
+    email: "совпал адрес ящика",
+    login: "совпал логин",
   };
 
   async function finish(e: SubmitEvent) {
@@ -147,7 +167,7 @@
     saving = true;
     saveError = null;
     try {
-      await api.setupSave(host, userInput.trim(), password, bodyDays, startSync);
+      await api.setupSave(host, userInput.trim(), password, bodyDays, startSync, dbChoice === NEW_DB ? null : dbChoice);
       // Бэкенд сохранил всё и перезапускает приложение: пароль окну больше не нужен.
       password = "";
       saved = true;
@@ -168,7 +188,7 @@
     void tick().then(() => {
       if (s === 1) hostEl?.focus();
       else if (s === 2) (userInput.trim() && !login.error ? passwordEl : userEl)?.focus();
-      else document.querySelector<HTMLInputElement>(`input[name="${uid}-days"]:checked`)?.focus();
+      else (document.querySelector<HTMLInputElement>(`input[name="${uid}-db"]:checked`) ?? document.querySelector<HTMLInputElement>(`input[name="${uid}-days"]:checked`))?.focus();
     });
   });
 
@@ -275,6 +295,31 @@
       </form>
     {:else}
       <form class="body" onsubmit={finish} novalidate>
+        {#if found.length > 0}
+          <fieldset class="group" disabled={busy}>
+            <legend>База писем</legend>
+            <p class="hint">На этом компьютере уже есть база этого ящика: с ней почту не придётся скачивать заново.</p>
+            <div class="dbs">
+              {#each found as f, i (f.path)}
+                <label class="choice db" class:on={dbChoice === f.path}>
+                  <input type="radio" name="{uid}-db" value={f.path} bind:group={dbChoice} />
+                  <span class="choice-label">{found.length > 1 ? `Продолжить с базой ${i + 1}` : "Продолжить с этой базой"}</span>
+                  <span class="mono path">{f.path}</span>
+                  <span class="caption">
+                    {bytesText(f.total_bytes)} · писем {f.items.toLocaleString("ru-RU")} · обновлена {syncedText(f.last_sync_ms)} · {KIND_TEXT[f.kind]}
+                  </span>
+                </label>
+              {/each}
+              <label class="choice db" class:on={dbChoice === NEW_DB}>
+                <input type="radio" name="{uid}-db" value={NEW_DB} bind:group={dbChoice} />
+                <span class="choice-label">Начать новую базу</span>
+                {#if test?.new_db_path}<span class="mono path">{test.new_db_path}</span>{/if}
+                <span class="caption">Почта скачается с сервера заново. Найденная база останется на диске; удалить её можно в настройках, вкладка «Данные».</span>
+              </label>
+            </div>
+          </fieldset>
+        {/if}
+
         <fieldset class="group" disabled={busy}>
           <legend>Загружать тексты писем</legend>
           <div class="choices">
@@ -286,7 +331,9 @@
               </label>
             {/each}
           </div>
-          <p class="hint">Папки и списки писем загружаются целиком в любом случае. Тексты старше срока подтянутся при открытии письма. Срок можно поменять в настройках.</p>
+          <p class="hint">
+            Срок — только для текстов писем. Список писем всех папок (отправитель, тема, дата, флаги) загружается целиком при любом сроке: на большом ящике первая синхронизация займёт время. Тексты старше срока подтянутся при открытии письма. Срок можно поменять в настройках.
+          </p>
         </fieldset>
 
         <label class="check">
@@ -299,6 +346,14 @@
           <dd class="mono">{hostParse.host ? owaUrl(hostParse.host) : "—"}</dd>
           <dt>Логин</dt>
           <dd>{userInput.trim()}</dd>
+          {#if test?.mailbox?.email}
+            <dt>Ящик</dt>
+            <dd>{test.mailbox.email}</dd>
+          {/if}
+          {#if chosenPath}
+            <dt>База</dt>
+            <dd class="mono">{chosenPath}{dbChoice === NEW_DB ? " (новая)" : ""}</dd>
+          {/if}
         </dl>
 
         {#if saveError}
@@ -553,6 +608,16 @@
   }
   .choice .caption {
     grid-column: 2;
+  }
+  .dbs {
+    display: grid;
+    gap: var(--space-2);
+  }
+  .choice.db .path {
+    grid-column: 2;
+    font-size: 12px;
+    color: var(--fg-2);
+    overflow-wrap: anywhere;
   }
   .check {
     display: flex;

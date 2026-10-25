@@ -3,6 +3,7 @@
   import { ICON } from "../actions";
   import { hint } from "../hotkeys";
   import UpdateNotice from "./UpdateNotice.svelte";
+  import DiskUsage from "./DiskUsage.svelte";
 
   interface Props {
     status: SyncStatus | null;
@@ -173,6 +174,7 @@
       <span class="warn" title={warningsTitle}>{status.warnings_total} {status.warnings_total === 1 ? "предупреждение" : status.warnings_total < 5 ? "предупреждения" : "предупреждений"}</span>
     {/if}
     <span class="summary" title={reportTitle}>{summary}</span>
+    <DiskUsage {status} />
     <span class="channel" class:live class:failed={!live && !!notify?.error} title={channelTitle}>
       <span class="dot" aria-hidden="true"></span>
       {live ? "мгновенные обновления" : "по таймеру"}

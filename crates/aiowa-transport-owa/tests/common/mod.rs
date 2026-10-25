@@ -31,6 +31,8 @@ pub const USER: &str = "AIOWA\\tester";
 pub const PASSWORD: &str = "fake-owa-password";
 pub const OWNER_NAME: &str = "Тестовый Пользователь";
 pub const OWNER: &str = "tester@aiowa.test";
+/// `MailboxGuid` ящика в `SessionSettings` (§ 2).
+pub const MAILBOX_GUID: &str = "5f1d0c3a-7b2e-4c19-9a6d-0e8b4f2a1c77";
 
 pub const ROOT: &str = "AQMkFolder-msgfolderroot";
 pub const INBOX: &str = "AQMkFolder-inbox";
@@ -444,6 +446,7 @@ impl Mailbox {
             ("GET", "/owa") => self.owa_entry(req),
             ("GET", "/owa/") => self.owa_page(req),
             ("POST", "/owa/service.svc") => self.service(req),
+            ("POST", "/owa/sessiondata.ashx") => self.session_data(req),
             ("GET", "/owa/service.svc/s/getfileattachment") => self.file_attachment(req),
             ("GET", "/owa/logoff.owa") => self.logoff(req),
             _ => Response::html(404, "<html>Not Found</html>"),
@@ -604,6 +607,51 @@ impl Mailbox {
         Some(Wait::Gather(barrier))
     }
 
+    /// Профиль пользователя `owaUserConfig` (§ 2): `SessionSettings` с адресом, именем и
+    /// `MailboxGuid` ящика; остальные разделы — пустые заглушки.
+    fn owa_user_config(&self) -> Value {
+        json!({
+            "SessionSettings": {
+                "UserDisplayName": OWNER_NAME,
+                "UserEmailAddress": OWNER,
+                "LogonEmailAddress": OWNER,
+                "UserPrincipalName": "tester@aiowa.local",
+                "MailboxGuid": MAILBOX_GUID,
+                "QuotaUsed": 0
+            },
+            "UserOptions": {},
+            "PolicySettings": {}
+        })
+    }
+
+    /// Сбой по режиму `fail_op` для операции `op` (остаток уменьшается).
+    fn take_fail(&mut self, op: &str) -> bool {
+        match self.faults.fail_op.get_mut(op) {
+            Some(left) if *left > 0 => {
+                if *left != u32::MAX {
+                    *left -= 1;
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// § 2: `POST sessiondata.ashx` после входа — `owaUserConfig`, `findFolders`,
+    /// `findMailFolderItem` (два последних здесь пустые). Канарейку настоящий сервер здесь не
+    /// требует, фейк тоже. Вызов пишется в [`Mailbox::calls`] как операция `sessiondata.ashx`.
+    fn session_data(&mut self, req: &Request) -> Response {
+        let token = match self.session_of(req) {
+            Ok(t) => t,
+            Err(r) => return r,
+        };
+        self.calls.push(Call { op: "sessiondata.ashx".into(), version: String::new(), time_zone: String::new(), body: Value::Null, client_build: req.header("x-owa-clientbuildversion").map(String::from), session: token });
+        if self.take_fail("sessiondata.ashx") {
+            return Response::html(500, "<html>Ошибка сервера</html>");
+        }
+        Response::json(200, &json!({ "owaUserConfig": self.owa_user_config(), "findFolders": {}, "findMailFolderItem": {} }))
+    }
+
     /// § 3: `POST service.svc?action=<Op>` с JSON в теле.
     fn service(&mut self, req: &Request) -> Response {
         let token = match self.session_of(req) {
@@ -631,6 +679,15 @@ impl Mailbox {
             Ok(v) => v,
             Err(e) => return self.envelope_fault(format!("тело не JSON: {e}")),
         };
+        // § 2: у `GetOwaUserConfiguration` параметров нет, тело — пустой объект без конверта;
+        // ответ — `owaUserConfig` целиком.
+        if op == "GetOwaUserConfiguration" {
+            self.calls.push(Call { op: op.clone(), version: String::new(), time_zone: String::new(), body: v, client_build: req.header("x-owa-clientbuildversion").map(String::from), session: token });
+            if self.take_fail(&op) {
+                return fault(&format!("фейк: сбой операции {op} по режиму fail_op"));
+            }
+            return Response::json(200, &self.owa_user_config());
+        }
         if let Err(path) = type_first_everywhere(&v, "$") {
             return self.envelope_fault(format!("{ABSTRACT_CLASS} (__type не первый ключ: {path})"));
         }
