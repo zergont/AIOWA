@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { tick, untrack } from "svelte";
   import { SvelteSet } from "svelte/reactivity";
   import { conversationsText, errorMessage, listDate, type ComposeKind, type Conversation, type Folder } from "../api";
   import { COMPOSE_ACTIONS, DND_CONVERSATIONS, ICON, conversationActionLabels, isDeletedFolder, type DragPayload, type ItemAction } from "../actions";
@@ -88,6 +89,30 @@
       scrollTop = 0;
       viewport = scroller.clientHeight;
     }
+  });
+
+  // Живое обновление (синхронизация идёт, пришла почта): если список прокручен, верхняя видимая
+  // строка остаётся на месте, даже когда выше неё добавились или ушли беседы. В самом начале списка
+  // прокрутка не трогается — новые беседы просто появляются сверху.
+  let shownRows: Conversation[] = [];
+  $effect.pre(() => {
+    const rows = conversations;
+    const before = shownRows;
+    shownRows = rows;
+    const el = untrack(() => scroller);
+    if (!el || before === rows || el.scrollTop <= 0) return;
+    const top = el.scrollTop;
+    const idx = Math.floor(top / ROW);
+    const pk = before[idx]?.conversation_pk;
+    if (pk == null) return;
+    const now = rows.findIndex((c) => c.conversation_pk === pk);
+    if (now < 0 || now === idx) return;
+    const next = now * ROW + (top - idx * ROW);
+    void tick().then(() => {
+      if (scroller !== el) return;
+      el.scrollTop = next;
+      scrollTop = el.scrollTop;
+    });
   });
 
   function participantsLabel(c: Conversation): string {

@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount, tick, untrack } from "svelte";
   import { api, conversationKeyOf, conversationsText, errorMessage, messageNeedsFetch, messagesKey, newMailSender, onCalendarChanged, onCloseRequested, onFoldersChanged, onItemsChanged, onNewMail, onNotifyStatus, onReminder, onSyncProgress, onWriteFailed, type AccountInfo, type ComposeContext, type ComposeKind, type ComposeRecipient, type Conversation, type Folder, type ItemsChanged, type Message, type NewMail, type NotifyStatus, type ReminderDto, type SearchHit, type StageAction, type StagedDto, type SyncStatus, type WriteReport } from "./lib/api";
+  import { onSyncLive, type SyncLive } from "./lib/api";
   import { ICON, failureText, findArchiveFolder, type DragPayload, type ItemAction } from "./lib/actions";
   import { focusBack, type Anchor } from "./lib/popover";
   import { hint, keysOf, matchHotkey, preventBrowserKeys } from "./lib/hotkeys";
@@ -628,7 +629,7 @@
     applyToMessages(itemPks, a);
     let report: WriteReport;
     try {
-      report = await callWrite(itemPks, a);
+      report = await track(callWrite(itemPks, a));
     } catch (e) {
       await refreshAfterWrite({ conversation_pks: selected ? [selected.conversation_pk] : [], folder_pks: [] });
       throw errorMessage(e);
@@ -712,7 +713,7 @@
     applyToMessages(itemPks, a);
     let r: StagedDto;
     try {
-      r = await api.itemsStage(action, itemPks, action === "delete" ? null : targetFolderPk(a), false);
+      r = await track(api.itemsStage(action, itemPks, action === "delete" ? null : targetFolderPk(a), false));
     } catch (e) {
       await refreshAfterWrite({ conversation_pks: restore.pks, folder_pks: [] });
       throw errorMessage(e);
@@ -738,7 +739,7 @@
     if (!s) return;
     clearStaged();
     try {
-      const report = await api.itemsUndo(s.id);
+      const report = await track(api.itemsUndo(s.id));
       const failed = failureText(report);
       if (failed) error = failed;
       await refreshAfterWrite({ conversation_pks: s.restore.pks, folder_pks: [] });
@@ -859,7 +860,11 @@
    * Перечитать папки, не сбивая выбранную (объект заменяется свежим со счётчиками). Если выбранная
    * папка исчезла (удалена навсегда, пропала с сервера) — открыть «Входящие».
    */
+  /** Когда дерево перечитывалось последний раз (мс): живое обновление не повторяет только что сделанное. */
+  let foldersReloadedAt = 0;
+
   async function reloadFolders() {
+    foldersReloadedAt = Date.now();
     const fresh = await api.folders();
     folders = fresh;
     if (selectedFolder) {
@@ -874,6 +879,10 @@
           clearSelection();
         }
       }
+    } else if (searchHits === null) {
+      // Первый запуск: папки появились по ходу синхронизации — «Входящие» открываются сразу, не по концу прогона.
+      const inbox = fresh.find((f) => f.distinguished === "inbox") ?? fresh.find((f) => f.is_mail) ?? null;
+      if (inbox) await openFolder(inbox);
     }
   }
 
@@ -1230,6 +1239,86 @@
     }
   }
 
+  // --- живое окно во время синхронизации -----------------------------------------------------
+  // Бэкенд по ходу прогона шлёт sync-live (не чаще раза в 2,5 с): дерево записано, в каких папках
+  // записаны письма. Окно мягко перечитывает дерево, открытый список и открытую беседу: выбор,
+  // раскрытые письма, прокрутка (её держит список) и множественный выбор остаются, пустые
+  // состояния уходят сами. Пока идёт команда записи или загрузка списка, обновление ждёт;
+  // при открытом композере беседа под ним не перечитывается. Полное перечитывание — по концу прогона.
+
+  /** Задержка, за которую сливаются события, пришедшие вместе (folders-changed и sync-live). */
+  const LIVE_DELAY_MS = 150;
+  /** Повтор, пока пользователь занят. */
+  const LIVE_RETRY_MS = 1000;
+  /** Что перечитать при ближайшем живом обновлении. */
+  let liveWant: { folders: boolean; pks: Set<number> } = { folders: false, pks: new Set() };
+  let liveTimer: ReturnType<typeof setTimeout> | undefined;
+  let liveRunning = false;
+  /** Команды записи в полёте: пока они не ответили, окно держит оптимистичную правку, и база её ещё не видит. */
+  let writesInFlight = 0;
+
+  function track<T>(p: Promise<T>): Promise<T> {
+    writesInFlight++;
+    return p.finally(() => writesInFlight--);
+  }
+
+  function onLive(ev: SyncLive) {
+    if (ev.folders) liveWant.folders = true;
+    for (const pk of ev.folder_pks) liveWant.pks.add(pk);
+    scheduleLive(LIVE_DELAY_MS);
+  }
+
+  function scheduleLive(ms: number) {
+    if (liveTimer !== undefined) return;
+    liveTimer = setTimeout(() => {
+      liveTimer = undefined;
+      void liveRefresh();
+    }, ms);
+  }
+
+  /** Пользователь что-то делает: команда записи, загрузка списка, отправка или открытие черновика. */
+  function liveBusy(): boolean {
+    return liveRunning || writesInFlight > 0 || loadingList || composerBusy !== null || composeLoading !== null;
+  }
+
+  async function liveRefresh() {
+    if (!liveWant.folders && liveWant.pks.size === 0) return;
+    if (liveBusy()) {
+      scheduleLive(LIVE_RETRY_MS);
+      return;
+    }
+    const want = liveWant;
+    liveWant = { folders: false, pks: new Set() };
+    liveRunning = true;
+    try {
+      // Дерево обычно уже перечитано по folders-changed, пришедшему вместе с этим событием.
+      if (want.folders && Date.now() - foldersReloadedAt > LIVE_RETRY_MS) await reloadFolders();
+      const folderPk = selectedFolder?.folder_pk;
+      if (folderPk == null || !want.pks.has(folderPk)) return;
+      const rows = await reloadList();
+      if (!rows) return;
+      pruneSelection(rows);
+      if (!selected || selectedPks.size > 1) return;
+      const pk = selected.conversation_pk;
+      const same = rows.find((c) => c.conversation_pk === pk);
+      if (!same) return;
+      selected = same;
+      // Беседа под композером не трогается; иначе — только при реальных изменениях (дешёвый ключ, как по концу прогона).
+      if (compose || loadingMessages) return;
+      const keys = await api.conversationKey(pk);
+      const withFlag = keys.every((k) => k.is_flagged !== undefined);
+      if (conversationKeyOf(keys, withFlag) !== messagesKey(messages, withFlag)) {
+        const fresh = await api.conversation(pk);
+        if (selected?.conversation_pk === pk && !loadingMessages && !compose) messages = fresh;
+      }
+    } catch (e) {
+      // Живое обновление — не действие пользователя: ошибку не показываем, конец прогона перечитает всё.
+      console.warn("sync-live:", errorMessage(e));
+    } finally {
+      liveRunning = false;
+    }
+  }
+
   /**
    * Глобальные клавиши — по таблице lib/hotkeys.ts. matchHotkey не вернёт клавишу, пока на экране
    * слой (модальное окно, вопрос, выбор папки, меню): действия не должны трогать письмо или событие
@@ -1314,6 +1403,7 @@
     let unlistenCalendar: (() => void) | undefined;
     let unlistenFolders: (() => void) | undefined;
     let unlistenWriteFailed: (() => void) | undefined;
+    let unlistenLive: (() => void) | undefined;
     let wasRunning = false;
     // Настройки окна (тема, задержка автопометки, интервал таймера, тосты) — первым делом:
     // тема прошлого запуска уже стоит из localStorage, здесь она сверяется с базой.
@@ -1355,6 +1445,7 @@
         });
         unlistenItems = await onItemsChanged((ev) => void refreshAfterWrite(ev));
         unlistenFolders = await onFoldersChanged(() => void reloadFolders().catch((e) => (error = errorMessage(e))));
+        unlistenLive = await onSyncLive(onLive);
         // Отказ сервера по действию, окно отмены которого уже закрыто: локально оно откачено,
         // список перечитает items-changed, пользователю нужен только текст.
         unlistenWriteFailed = await onWriteFailed((ev) => (error = ev.message));
@@ -1380,8 +1471,10 @@
       clearTimeout(noticeTimer);
       clearTimeout(newMailTimer);
       clearTimeout(stageTimer);
+      clearTimeout(liveTimer);
       document.removeEventListener("visibilitychange", syncTick);
       unlisten?.();
+      unlistenLive?.();
       unlistenItems?.();
       unlistenFolders?.();
       unlistenWriteFailed?.();
