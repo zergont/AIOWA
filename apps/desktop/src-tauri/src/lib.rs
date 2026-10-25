@@ -6,6 +6,9 @@
 //! удалённые картинки и внешние ресурсы не загружаются. Инлайновые картинки (`src="cid:…"`)
 //! подставляются из кэша вложений как `data:`-URI прямо при очистке.
 //!
+//! Тёмные тона писем (`mail_dark.rs`): после очистки цвета письма заменяются переменными CSS с
+//! исходным цветом про запас, тёмная палитра к ним идёт в окно рядом с телом (`dark_colors`).
+//!
 //! Новое письмо, ответ, ответ всем и пересылка — команды композера (`compose.rs`): черновик на
 //! сервере, вложения, отправка через тот же транспорт процесса. Автосохранение, открытие и
 //! удаление черновиков — там же.
@@ -58,6 +61,7 @@ mod config;
 mod directory;
 mod folders;
 mod logging;
+mod mail_dark;
 mod navigation;
 mod notify;
 mod ondemand;
@@ -218,8 +222,12 @@ pub(crate) struct MessageDto {
     importance: Option<String>,
     preview: Option<String>,
     body_state: i64,
-    /// Очищенный HTML тела без цитируемой истории; `None`, если тело не загружено.
+    /// Очищенный HTML тела без цитируемой истории; `None`, если тело не загружено. Цвета письма в
+    /// нём — `var(--aiowa-dN, исходный)` (`mail_dark.rs`): только для показа и печати, на сервер
+    /// такой HTML не уходит.
     body_html: Option<String>,
+    /// Тёмная палитра к переменным `body_html` (N-й цвет — `--aiowa-dN`); `None` без тела.
+    dark_colors: Option<Vec<String>>,
     body_is_text: bool,
     is_truncated: bool,
     recipients: Vec<RecipientDto>,
@@ -412,6 +420,11 @@ pub(crate) fn build_message(store: &Store, h: MessageHead) -> CmdResult<MessageD
         }
         None => (None, false, false),
     };
+    // Тёмные тона: цвета письма — переменными, палитра к ним отдельно (одна копия тела на оба режима).
+    let (body_html, dark_colors) = match body_html.map(|h| mail_dark::darken(&h)) {
+        Some(d) => (Some(d.html), Some(d.colors)),
+        None => (None, None),
+    };
     let recipients = store.recipients(h.item_pk).map_err(err)?.into_iter().map(|r| RecipientDto { kind: r.kind, name: r.name, email: r.email }).collect();
     let attachments = attachments
         .into_iter()
@@ -436,6 +449,7 @@ pub(crate) fn build_message(store: &Store, h: MessageHead) -> CmdResult<MessageD
         preview: h.preview,
         body_state: h.body_state,
         body_html,
+        dark_colors,
         body_is_text,
         is_truncated,
         recipients,

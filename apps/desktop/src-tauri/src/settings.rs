@@ -24,6 +24,8 @@ use tracing::{info, warn};
 pub(crate) const BODY_DAYS_KEY: &str = "desktop.body_days";
 pub(crate) const AUTO_READ_KEY: &str = "desktop.auto_read_ms";
 pub(crate) const THEME_KEY: &str = "desktop.theme";
+/// Письма в тёмной теме: `dark` — в тёмных тонах (`mail_dark.rs`), `light` — на светлом листе.
+pub(crate) const DARK_MAIL_KEY: &str = "desktop.dark_mail";
 pub(crate) const SYNC_INTERVAL_KEY: &str = "desktop.sync_interval_min";
 pub(crate) const CACHE_MB_KEY: &str = "desktop.cache_mb";
 pub(crate) const MAX_ATTACHMENT_MB_KEY: &str = "desktop.max_attachment_mb";
@@ -42,6 +44,7 @@ const CACHE_MB: RangeInclusive<u32> = 100..=102_400;
 const MAX_ATTACHMENT_MB: RangeInclusive<u32> = 1..=200;
 
 const THEMES: &[&str] = &["system", "light", "dark"];
+const DARK_MAIL: &[&str] = &["dark", "light"];
 
 /// Настройки в значениях; по умолчанию — прежнее поведение (90 дней, 1,5 с, тосты, 2 мин, 2 ГБ, 25 МБ).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -50,6 +53,8 @@ pub(crate) struct Prefs {
     pub(crate) auto_read_ms: u32,
     pub(crate) toasts: bool,
     pub(crate) theme: String,
+    /// `dark` | `light`.
+    pub(crate) dark_mail: String,
     pub(crate) sync_interval_min: u32,
     pub(crate) cache_mb: u32,
     pub(crate) max_attachment_mb: u32,
@@ -57,7 +62,7 @@ pub(crate) struct Prefs {
 
 impl Default for Prefs {
     fn default() -> Self {
-        Self { body_days: 90, auto_read_ms: 1500, toasts: true, theme: "system".into(), sync_interval_min: 2, cache_mb: 2048, max_attachment_mb: 25 }
+        Self { body_days: 90, auto_read_ms: 1500, toasts: true, theme: "system".into(), dark_mail: "dark".into(), sync_interval_min: 2, cache_mb: 2048, max_attachment_mb: 25 }
     }
 }
 
@@ -75,6 +80,7 @@ impl Prefs {
             // Как в канале уведомлений: выключены только явным `0`.
             toasts: get(TOASTS_KEY).is_none_or(|v| v != "0"),
             theme: get(THEME_KEY).filter(|t| THEMES.contains(&t.as_str())).unwrap_or(d.theme),
+            dark_mail: get(DARK_MAIL_KEY).filter(|t| DARK_MAIL.contains(&t.as_str())).unwrap_or(d.dark_mail),
             sync_interval_min: parse_in(get(SYNC_INTERVAL_KEY), &SYNC_INTERVAL_MIN, d.sync_interval_min),
             cache_mb: parse_in(get(CACHE_MB_KEY), &CACHE_MB, d.cache_mb),
             max_attachment_mb: parse_in(get(MAX_ATTACHMENT_MB_KEY), &MAX_ATTACHMENT_MB, d.max_attachment_mb),
@@ -115,6 +121,7 @@ pub(crate) struct SettingsPatch {
     pub(crate) auto_read_ms: Option<u32>,
     pub(crate) toasts: Option<bool>,
     pub(crate) theme: Option<String>,
+    pub(crate) dark_mail: Option<String>,
     pub(crate) sync_interval_min: Option<u32>,
     #[serde(alias = "cache_mb")]
     pub(crate) attachment_cache_mb: Option<u32>,
@@ -150,6 +157,12 @@ pub(crate) fn plan(patch: &SettingsPatch) -> Result<PlannedWrites, String> {
             return Err(format!("Тема: допустимо system, light или dark, получено {t}"));
         }
         out.values.push((THEME_KEY, t.clone()));
+    }
+    if let Some(m) = &patch.dark_mail {
+        if !DARK_MAIL.contains(&m.as_str()) {
+            return Err(format!("Письма в тёмной теме: допустимо dark или light, получено {m}"));
+        }
+        out.values.push((DARK_MAIL_KEY, m.clone()));
     }
     if let Some(v) = patch.sync_interval_min {
         out.values.push((SYNC_INTERVAL_KEY, check_range("Интервал синхронизации (мин)", v, &SYNC_INTERVAL_MIN)?.to_string()));
@@ -188,6 +201,8 @@ pub(crate) struct SettingsDto {
     toasts: bool,
     /// `system` | `light` | `dark`.
     theme: String,
+    /// Письма в тёмной теме: `dark` — в тёмных тонах, `light` — на светлом листе.
+    dark_mail: String,
     sync_interval_min: u32,
     attachment_cache_mb: u32,
     max_attachment_mb: u32,
@@ -211,6 +226,7 @@ fn snapshot(store: &Store, account: AccountId, host: &str, user: &str, dev_env: 
         auto_read_ms: p.auto_read_ms,
         toasts: p.toasts,
         theme: p.theme,
+        dark_mail: p.dark_mail,
         sync_interval_min: p.sync_interval_min,
         attachment_cache_mb: p.cache_mb,
         max_attachment_mb: p.max_attachment_mb,
@@ -331,6 +347,18 @@ mod tests {
         assert_eq!(p.attachment_cache_bytes(), base.attachment_cache_bytes);
         assert_eq!(p.max_attachment_bytes(), base.max_attachment_bytes);
         assert_eq!((p.auto_read_ms, p.sync_interval_min, p.toasts, p.theme.as_str()), (1500, 2, true, "system"));
+        assert_eq!(p.dark_mail, "dark", "письма в тёмной теме по умолчанию в тёмных тонах");
+    }
+
+    #[test]
+    fn dark_mail_setting() {
+        assert_eq!(Prefs::from_lookup(lookup(&[(DARK_MAIL_KEY, "light")])).dark_mail, "light");
+        assert_eq!(Prefs::from_lookup(lookup(&[(DARK_MAIL_KEY, "Light")])).dark_mail, "dark", "негодное значение — по умолчанию");
+        let p = plan(&SettingsPatch { dark_mail: Some("light".into()), ..Default::default() }).unwrap();
+        assert_eq!(p.values, vec![(DARK_MAIL_KEY, "light".to_string())]);
+        assert!(plan(&SettingsPatch { dark_mail: Some("auto".into()), ..Default::default() }).is_err());
+        let p: SettingsPatch = serde_json::from_str(r#"{"dark_mail":"dark"}"#).unwrap();
+        assert_eq!(p.dark_mail.as_deref(), Some("dark"));
     }
 
     #[test]

@@ -8,6 +8,7 @@
   import { hint, keysOf } from "../hotkeys";
   import { printMessage } from "../print";
   import { prefs } from "../settings.svelte";
+  import { darkMailByDefault, MOON_ICON, SUN_ICON, windowIsDark } from "../darkmail.svelte";
   import FolderPicker from "./FolderPicker.svelte";
   import ConfirmPopover from "./ConfirmPopover.svelte";
   import ChoicePopover from "./ChoicePopover.svelte";
@@ -297,6 +298,17 @@
     }
   });
 
+  // --- тёмные тона -------------------------------------------------------------
+  // В тёмной теме окна письмо по настройке «Вид» перекрашено в тёмные тона или на светлом листе;
+  // кнопка с солнцем или луной меняет это для этого письма, пока открыта беседа (карточка живёт
+  // до смены беседы). В светлой теме кнопки нет. Печать всегда в исходных цветах на белом.
+
+  /** Выбор кнопкой для этого письма; null — как в настройках. */
+  let darkChoice = $state<boolean | null>(null);
+  const darkCapable = $derived(Array.isArray(message.dark_colors));
+  const darkToggleShown = $derived(windowIsDark() && hasBody && darkCapable);
+  const mailDark = $derived(windowIsDark() && darkCapable && (darkChoice ?? darkMailByDefault()));
+
   // --- печать -----------------------------------------------------------------
   // Печатается шапка и то же очищенное тело, что в карточке; письмо без тела сначала догружается.
 
@@ -462,6 +474,15 @@
   {#each list as p, i (i)}{#if i}{", "}{/if}{#if openContact && p.email}<button type="button" class="person" onclick={(e) => showContact(e, p.name, p.email)} aria-haspopup="dialog" title={p.name ? `${p.email} — карточка контакта` : "Карточка контакта"}>{personLabel(p.name, p.email)}</button>{:else}{personLabel(p.name, p.email)}{/if}{/each}
 {/snippet}
 
+<!-- Переключатель тёмных тонов письма: в панели действий письма и черновика, только в тёмной теме. -->
+{#snippet darkToggle()}
+  {#if darkToggleShown}
+    <button class="act" onclick={() => (darkChoice = !mailDark)} aria-label={mailDark ? "Показать как задумано" : "В тёмных тонах"} title={mailDark ? "Показать как задумано: исходные цвета на светлом листе" : "В тёмных тонах"}>
+      <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path d={mailDark ? SUN_ICON : MOON_ICON} fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round" /></svg>
+    </button>
+  {/if}
+{/snippet}
+
 <article class="card" class:expanded class:unread={!message.is_read} class:flagged={message.is_flagged} bind:this={cardEl}>
   <div class="head">
     <!-- Клавиши имён (Enter, пробел) не должны сворачивать письмо: реагируем только на сам заголовок. -->
@@ -509,6 +530,7 @@
             Открыть черновик
           {/if}
         </button>
+        {@render darkToggle()}
       </div>
     {:else if expanded}
       <div class="actions" role="toolbar" aria-label="Действия с письмом" aria-busy={busy}>
@@ -524,6 +546,7 @@
             <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path d={ICON.print} fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round" /></svg>
           {/if}
         </button>
+        {@render darkToggle()}
         <span class="act-sep" aria-hidden="true"></span>
         <button class="act" onclick={() => run({ kind: "read", read: !message.is_read })} disabled={busy} aria-label={message.is_read ? "Пометить непрочитанным" : "Пометить прочитанным"} title={message.is_read ? "Пометить непрочитанным" : "Пометить прочитанным"}>
           <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path d={message.is_read ? ICON.unread : ICON.read} fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round" /></svg>
@@ -673,7 +696,7 @@
         </div>
       {/if}
       {#if hasBody}
-        <BodyFrame html={message.body_html ?? ""} onprint={() => void print()} />
+        <BodyFrame html={message.body_html ?? ""} dark={mailDark} darkColors={message.dark_colors} onprint={() => void print()} />
         {#if message.is_truncated}<div class="caption note">Письмо обрезано при загрузке.</div>{/if}
       {:else if message.body_state === 2}
         <div class="note status">

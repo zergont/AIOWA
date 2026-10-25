@@ -1,5 +1,7 @@
 <script lang="ts">
+  import { untrack } from "svelte";
   import { api, errorMessage, isExternalLink } from "../api";
+  import { DARK_SHEET_CSS, darkPaletteCss } from "../darkmail.svelte";
   import { layerOpen } from "../hotkeys";
 
   interface Props {
@@ -8,12 +10,22 @@
     title?: string;
     /** Ctrl+P при фокусе внутри фрейма: печатать письмо, а не окно целиком. Без него клавиша просто гасится. */
     onprint?: () => void;
+    /** Показать в тёмных тонах; действует, только если у тела есть палитра `darkColors`. */
+    dark?: boolean;
+    /** Тёмная палитра тела (`Message.dark_colors`); нет — только светлый лист. */
+    darkColors?: string[] | null;
   }
-  let { html, title = "Текст письма", onprint }: Props = $props();
+  let { html, title = "Текст письма", onprint, dark = false, darkColors = null }: Props = $props();
+
+  // Тёмный лист — класс на корне документа рамки. Его ставит окно снаружи (рамка с
+  // allow-same-origin), скриптов внутри рамки нет и CSP не меняется; смена темы не перезагружает письмо.
+  const darkOn = $derived(dark && darkColors != null);
+  const palette = $derived(darkPaletteCss(darkColors));
 
   // Письмо живёт в изолированном фрейме: без скриптов, без внешних ресурсов, своя «бумага».
   // Инлайновые картинки приходят уже как data: (подставляет бэкенд), поэтому cid: в CSP не нужен.
-  const srcdoc = $derived(`<!doctype html><html lang="ru"><head><meta charset="utf-8">
+  // Класс в разметке — только начальный (без мигания белым при загрузке); дальше его ведёт эффект.
+  const srcdoc = $derived(`<!doctype html><html lang="ru"${untrack(() => darkOn) ? ' class="dark"' : ""}><head><meta charset="utf-8">
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src data:; style-src 'unsafe-inline'; font-src 'none'; frame-src 'none'">
 <style>
   html,body{margin:0;background:#fff;color:#1f1f1f}
@@ -23,6 +35,8 @@
   pre{white-space:pre-wrap}
   blockquote{border-left:3px solid #ddd;margin:8px 0;padding:0 12px;color:#555}
   a{color:#005fb8}
+${DARK_SHEET_CSS}
+${palette}
 </style></head><body>${html}</body></html>`);
 
   let frame = $state<HTMLIFrameElement | null>(null);
@@ -41,8 +55,18 @@
     return () => clearTimeout(id);
   });
 
+  /** Тёмный лист в загруженном документе рамки — по текущему выбору. */
+  function applyDark(on: boolean) {
+    frame?.contentDocument?.documentElement?.classList.toggle("dark", on);
+  }
+  $effect(() => {
+    applyDark(darkOn);
+  });
+
   /** Каждая загрузка srcdoc — новый документ, обработчики вешаются заново. */
   function onFrameLoad() {
+    // Выбор мог смениться, пока документ грузился: класс в разметке тогда устарел.
+    applyDark(darkOn);
     fit();
     // Ссылки из письма открываются снаружи: иначе клик увёл бы сам фрейм на чужой сайт.
     frame?.contentDocument?.addEventListener("click", onFrameClick, true);
@@ -83,7 +107,7 @@
     <button class="btn" onclick={() => (linkNotice = null)} aria-label="Скрыть сообщение">Скрыть</button>
   </div>
 {/if}
-<iframe bind:this={frame} {title} sandbox="allow-same-origin" {srcdoc} style="height: {height}px" onload={onFrameLoad}></iframe>
+<iframe bind:this={frame} {title} sandbox="allow-same-origin" {srcdoc} class:dark={darkOn} style="height: {height}px" onload={onFrameLoad}></iframe>
 
 <style>
   iframe {
@@ -91,6 +115,10 @@
     width: 100%;
     border: 0;
     background: #fff;
+  }
+  /* Под тёмным листом — тот же цвет, что у листа (`DARK_SHEET_CSS`): без белой вспышки при загрузке. */
+  iframe.dark {
+    background: #2b2b2b;
   }
   .notice {
     display: flex;

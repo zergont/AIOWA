@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onDestroy, onMount, tick, untrack } from "svelte";
-  import { api, errorMessage, formatSize, SETTINGS_LIMITS, type Settings, type SettingsPatch, type SignatureDto, type Theme } from "../api";
+  import { api, errorMessage, formatSize, SETTINGS_LIMITS, type DarkMail, type Settings, type SettingsPatch, type SignatureDto, type Theme } from "../api";
   import { adoptSettings, AUTO_READ_DEFAULT_MS, AUTO_READ_INSTANT_MS, saveSettings, SYNC_INTERVAL_LIVE_MIN } from "../settings.svelte";
   import { bodyDaysText, owaUrl } from "../setup";
   import { focusBack } from "../popover";
@@ -120,6 +120,11 @@
     { id: "system", label: "Как в Windows" },
     { id: "light", label: "Светлая" },
     { id: "dark", label: "Тёмная" },
+  ];
+
+  const DARK_MAIL: { id: DarkMail; label: string }[] = [
+    { id: "dark", label: "В тёмных тонах" },
+    { id: "light", label: "На светлом листе" },
   ];
 
   function bytesText(n: number | null | undefined): string {
@@ -572,7 +577,18 @@
             {/each}
           </div>
         </fieldset>
-        <p class="hint">Тексты писем всегда показываются на светлом листе — так, как их задумал отправитель.</p>
+        <fieldset class="group">
+          <legend class="label">Письма в тёмной теме</legend>
+          <div class="radios">
+            {#each DARK_MAIL as o (o.id)}
+              <label class="radio">
+                <input type="radio" name="{uid}-darkmail" value={o.id} checked={(s.dark_mail ?? "dark") === o.id} onchange={() => void update({ dark_mail: o.id })} />
+                {o.label}
+              </label>
+            {/each}
+          </div>
+          <p class="hint">В тёмных тонах светлые фоны письма темнеют, тёмный текст светлеет, оттенки и картинки остаются. Если перекраска что-то испортила, кнопка с солнцем на карточке письма покажет его как задумано — на светлом листе. В светлой теме письма всегда на светлом листе, печать — всегда в исходных цветах на белом.</p>
+        </fieldset>
       {:else if current === "data"}
         <h3 class="section-title">Данные</h3>
         <dl class="props">

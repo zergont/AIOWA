@@ -9,6 +9,7 @@
   import RecipientsInput from "./RecipientsInput.svelte";
   import Editor from "./Editor.svelte";
   import BodyFrame from "./BodyFrame.svelte";
+  import { darkMailByDefault, windowIsDark } from "../darkmail.svelte";
   import ChoicePopover from "./ChoicePopover.svelte";
   import SignatureDialog from "./SignatureDialog.svelte";
 
@@ -711,7 +712,8 @@
           <div><span class="orig-key">Тема:</span> {original.subject || "(без темы)"}</div>
         </div>
         {#if original.body_html != null}
-          <BodyFrame html={original.body_html} title="Исходное письмо" />
+          <!-- Исходное письмо — как в карточке по настройке «Вид»: тёмные тона только для показа, в цитату на сервер идёт тело с сервера. -->
+          <BodyFrame html={original.body_html} title="Исходное письмо" dark={windowIsDark() && darkMailByDefault()} darkColors={original.dark_colors} />
         {:else if origLoading}
           <div class="orig-note caption"><span class="spinner" aria-hidden="true"></span> Загружаю исходное письмо…</div>
         {:else if origError}
