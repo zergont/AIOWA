@@ -696,7 +696,7 @@
         </div>
       {/if}
       {#if hasBody}
-        <BodyFrame html={message.body_html ?? ""} dark={mailDark} darkColors={message.dark_colors} onprint={() => void print()} />
+        <BodyFrame html={message.body_html ?? ""} dark={mailDark} darkColors={message.dark_colors} darkTag={message.dark_tag} onprint={() => void print()} />
         {#if message.is_truncated}<div class="caption note">Письмо обрезано при загрузке.</div>{/if}
       {:else if message.body_state === 2}
         <div class="note status">

@@ -1,9 +1,11 @@
 /**
  * Письма в тёмных тонах (замечание 6 обкатки). Бэкенд уже заменил цвета письма на
- * `var(--aiowa-dN, исходный)` и прислал к ним тёмную палитру `dark_colors` (`mail_dark.rs`): без
- * палитры рамка показывает исходные цвета на белом листе, с ней — тёмный лист и перекрашенное
- * письмо. Здесь — когда письмо показывать тёмным и CSS тёмного листа для рамки (`BodyFrame`).
- * Печать (`print.ts`) палитру не подключает и всегда идёт в исходных цветах на белом.
+ * `var(--aiowa-<метка>-dN, исходный)` и прислал к ним тёмную палитру `dark_colors` и метку
+ * `dark_tag` (`mail_dark.rs`): без палитры рамка показывает исходные цвета на белом листе, с ней —
+ * тёмный лист и перекрашенное письмо. Метка случайная и своя у каждой сборки письма, поэтому
+ * письмо не может объявить переменную палитры само. Здесь — когда письмо показывать тёмным и CSS
+ * тёмного листа для рамки (`BodyFrame`). Печать (`print.ts`) палитру не подключает и всегда идёт в
+ * исходных цветах на белом.
  */
 import { prefs } from "./settings.svelte";
 
@@ -36,14 +38,21 @@ export const DARK_SHEET_CSS = [
 ].join("\n");
 
 const HEX = /^#[0-9a-f]{6}(?:[0-9a-f]{2})?$/;
+const TAG = /^[0-9a-f]{16}$/;
+
+/** Метка имён переменных палитры (`Message.dark_tag`) годится: 16 шестнадцатеричных цифр. */
+export function isDarkTag(tag: unknown): tag is string {
+  return typeof tag === "string" && TAG.test(tag);
+}
 
 /**
- * Переменные палитры письма для тёмного листа. В `<style>` рамки попадают только цвета вида
- * `#rrggbb[aa]`: всё прочее пропускается, и там остаётся исходный цвет письма.
+ * Переменные палитры письма для тёмного листа: `--aiowa-<метка>-dN`. В `<style>` рамки попадают
+ * только цвета вида `#rrggbb[aa]` и только с годной меткой: всё прочее пропускается, и там
+ * остаётся исходный цвет письма.
  */
-export function darkPaletteCss(colors: readonly string[] | null | undefined): string {
-  if (!colors?.length) return "";
-  const vars = colors.flatMap((c, i) => (typeof c === "string" && HEX.test(c) ? [`--aiowa-d${i}:${c}`] : []));
+export function darkPaletteCss(colors: readonly string[] | null | undefined, tag: string | null | undefined): string {
+  if (!colors?.length || !isDarkTag(tag)) return "";
+  const vars = colors.flatMap((c, i) => (typeof c === "string" && HEX.test(c) ? [`--aiowa-${tag}-d${i}:${c}`] : []));
   return vars.length ? `html.dark{${vars.join(";")}}` : "";
 }
 

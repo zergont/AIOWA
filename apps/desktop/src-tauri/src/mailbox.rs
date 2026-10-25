@@ -1,15 +1,18 @@
 //! Чей ящик в базе: проверка при входе (`sync.rs`) и поиск базы ящика в мастере (`setup.rs`).
 //!
 //! После входа сервер сообщает адрес ящика и `MailboxGuid` (`OwaTransport::mailbox_info`,
-//! `sessiondata.ashx`). В обычном режиме при каждом входе они сверяются с базой: GUID в базе не
-//! записан — записывается (вместе с адресом); записан GUID другого ящика — синхронизации в эту
+//! `sessiondata.ashx`). В обычном режиме при каждом входе они сверяются с базой по тем же
+//! правилам, что в мастере (`decide` и `classify`): GUID в базе не записан — записывается (вместе
+//! с адресом); записан GUID другого ящика или, у базы без GUID, другой адрес — синхронизации в эту
 //! базу нет, транспорт процесса не выдаётся до перезапуска, окно показывает ошибку. Сведения не
 //! пришли (сбой сервера) — вход не блокируется, проверка повторится при следующем входе.
 //!
 //! Мастер ищет базы этого сервера (`%LOCALAPPDATA%\AIOWA\<сервер>\*\mail.db`): совпал GUID — та
 //! же база; у старых баз GUID нет — кандидат, если совпал записанный адрес ящика или логин без
-//! домена (`savvidi` = `savvidi@ngenergo` = `NGENERGO\savvidi`). Новая база заводится в каталоге
-//! по адресу ящика, а не по введённому логину.
+//! домена (`savvidi` = `savvidi@ngenergo` = `NGENERGO\savvidi`). По умолчанию мастер предлагает
+//! базу, совпавшую по GUID или адресу; совпавшие только по логину показываются ниже и выбираются
+//! по умолчанию, лишь когда других нет. Новая база заводится в каталоге по адресу ящика, а не по
+//! введённому логину.
 //!
 //! Политика журналов: адреса и имена не пишутся — только признаки и счётчики.
 
@@ -37,6 +40,13 @@ pub(crate) enum MatchKind {
     Email,
     /// Совпал `MailboxGuid`: точно тот же ящик.
     Guid,
+}
+
+impl MatchKind {
+    /// Ящик узнан по GUID или записанному адресу, а не только по логину без домена.
+    pub(crate) fn is_reliable(self) -> bool {
+        self >= MatchKind::Email
+    }
 }
 
 /// Подходит ли база ящику: лучшее совпадение среди учётных записей базы этого сервера. Запись с
@@ -69,9 +79,10 @@ pub(crate) struct Candidate {
     pub kind: MatchKind,
 }
 
-/// Базы из `paths`, подходящие ящику: сначала полнее (больше писем), затем свежее. Полнота
-/// важнее вида совпадения: база, заведённая с нуля под новой формой логина, уже несёт GUID, а
-/// старая, полностью синхронизированная, — ещё нет, хотя ящик тот же.
+/// Базы из `paths`, подходящие ящику. Мастер по умолчанию предлагает первую, поэтому впереди —
+/// совпавшие по GUID или записанному адресу: совпадение лишь по логину без домена ненадёжно
+/// (`ivanov` в другом домене — другой человек) и выбирается по умолчанию, только если надёжных
+/// нет. Внутри каждой группы — сначала полнее (больше писем), затем свежее.
 pub(crate) fn find_candidates(paths: &[PathBuf], host: &str, user: &str, info: &MailboxInfo) -> Vec<Candidate> {
     let mut out: Vec<Candidate> = paths
         .iter()
@@ -83,7 +94,7 @@ pub(crate) fn find_candidates(paths: &[PathBuf], host: &str, user: &str, info: &
             }
         })
         .collect();
-    out.sort_by(|a, b| b.summary.items.cmp(&a.summary.items).then(b.summary.last_sync_ms.cmp(&a.summary.last_sync_ms)).then(b.kind.cmp(&a.kind)));
+    out.sort_by(|a, b| b.kind.is_reliable().cmp(&a.kind.is_reliable()).then(b.summary.items.cmp(&a.summary.items)).then(b.summary.last_sync_ms.cmp(&a.summary.last_sync_ms)).then(b.kind.cmp(&a.kind)));
     out
 }
 
@@ -112,13 +123,20 @@ pub(crate) fn new_db_path(root: &Path, host: &str, user: &str, info: &MailboxInf
 pub(crate) enum Verdict {
     /// Тот же ящик; `write` — что дописать в базу (GUID или адрес, которых не было).
     Same { write: Option<MailboxIdentity> },
-    /// В базе записан GUID другого ящика.
+    /// В базе записан другой ящик: другой GUID или, когда GUID не сравнить, другой адрес.
     Other,
 }
 
-/// Сверка: GUID в базе и на сервере — равны или нет; GUID в базе нет — дописать известное.
+/// Сверка по тем же правилам, что `classify` в мастере: GUID есть и в базе, и у сервера — решает
+/// он (адрес при том же GUID мог смениться — переименование ящика, адрес обновляется); GUID не
+/// сравнить, а адрес записан и сервер его сообщил — решает адрес. Другой ящик — `Other`, в базу
+/// ничего не пишется. Тот же — дописать то, чего в базе не было.
 pub(crate) fn decide(stored: &MailboxIdentity, server: &MailboxInfo) -> Verdict {
-    if let (Some(a), Some(b)) = (&stored.mailbox_guid, &server.mailbox_guid)
+    if let (Some(a), Some(b)) = (&stored.mailbox_guid, &server.mailbox_guid) {
+        if !a.eq_ignore_ascii_case(b) {
+            return Verdict::Other;
+        }
+    } else if let (Some(a), Some(b)) = (&stored.email, &server.email)
         && !a.eq_ignore_ascii_case(b)
     {
         return Verdict::Other;
@@ -155,7 +173,8 @@ pub(crate) async fn verify_login(store: &Store, account: AccountId, t: &OwaTrans
     };
     match decide(&stored, &info) {
         Verdict::Other => {
-            warn!("в базе записан GUID другого ящика: синхронизация в неё остановлена");
+            let by_guid = stored.mailbox_guid.is_some() && info.mailbox_guid.is_some();
+            warn!(by_guid, "в базе записан другой ящик: синхронизация в неё остановлена");
             Err(())
         }
         Verdict::Same { write: None } => Ok(()),
@@ -252,30 +271,42 @@ mod tests {
     }
 
     #[test]
-    fn candidates_are_ordered_by_completeness() {
+    fn reliable_candidates_come_first() {
         let root = std::env::temp_dir().join(format!("aiowa-desktop-candidates-{}", std::process::id())).join("AIOWA");
         let _ = std::fs::remove_dir_all(&root);
         let host = "mail.x.ru";
-        let make = |dir: &str, login: &str, guid: Option<&str>, items: usize| {
+        let make = |dir: &str, login: &str, guid: Option<&str>, email: Option<&str>, items: usize| {
             let path = root.join(host).join(dir).join("mail.db");
             let store = Store::open(&path).unwrap();
             let acc = store.account(host, login).unwrap();
-            store.set_mailbox_identity(acc, &MailboxIdentity { mailbox_guid: guid.map(String::from), email: None }).unwrap();
+            store.set_mailbox_identity(acc, &MailboxIdentity { mailbox_guid: guid.map(String::from), email: email.map(String::from) }).unwrap();
             store.upsert_folders(acc, &[aiowa_core::Folder { id: aiowa_core::FolderId { id: "F".into(), change_key: None }, parent_id: None, display_name: "Входящие".into(), distinguished: Some("inbox".into()), folder_class: Some("IPF.Note".into()), total_count: 0, unread_count: 0, child_folder_count: 0 }]).unwrap();
             let fpk = store.folder_pk(acc, "F").unwrap().unwrap();
             let changes: Vec<_> = (0..items).map(|i| aiowa_core::ItemChange::Create(meta(&format!("{dir}-{i}")))).collect();
             store.apply_item_changes(acc, fpk, &changes).unwrap();
             path
         };
-        let fresh = make("savvidi", "savvidi", Some(GUID), 1);
-        let full = make("savvidi_ngenergo", "savvidi@ngenergo", None, 3);
-        let foreign = make("petrov", "savvidi", Some(OTHER_GUID), 5);
+        let fresh = make("savvidi", "savvidi", Some(GUID), None, 1);
+        let by_email = make("s.savvidi", "CORP\\s.savvidi", None, Some("savvidi@x.ru"), 2);
+        let full = make("savvidi_ngenergo", "savvidi@ngenergo", None, None, 3);
+        let older = make("ngenergo_savvidi", "NGENERGO\\savvidi", None, None, 2);
+        let foreign = make("petrov", "savvidi", Some(OTHER_GUID), None, 5);
         let paths = host_databases(&root, host);
-        assert_eq!(paths.len(), 3);
-        let found = find_candidates(&paths, host, "savvidi", &info(Some("savvidi@x.ru"), Some(GUID)));
+        assert_eq!(paths.len(), 5);
+        let server = info(Some("savvidi@x.ru"), Some(GUID));
+        let found = find_candidates(&paths, host, "savvidi", &server);
         let got: Vec<(&Path, MatchKind)> = found.iter().map(|c| (c.path.as_path(), c.kind)).collect();
-        assert_eq!(got, vec![(full.as_path(), MatchKind::Login), (fresh.as_path(), MatchKind::Guid)], "чужая база отброшена, полная — первой");
+        assert_eq!(
+            got,
+            vec![(by_email.as_path(), MatchKind::Email), (fresh.as_path(), MatchKind::Guid), (full.as_path(), MatchKind::Login), (older.as_path(), MatchKind::Login)],
+            "чужая база отброшена; по умолчанию (первая) — совпавшая по GUID или адресу, по логину — ниже, хоть и полнее"
+        );
         assert!(!found.iter().any(|c| c.path == foreign));
+        // Надёжных совпадений нет — по умолчанию, как раньше, самая полная.
+        let found = find_candidates(&[older.clone(), full.clone()], host, "savvidi", &server);
+        let got: Vec<(&Path, MatchKind)> = found.iter().map(|c| (c.path.as_path(), c.kind)).collect();
+        assert_eq!(got, vec![(full.as_path(), MatchKind::Login), (older.as_path(), MatchKind::Login)]);
+        assert!(MatchKind::Guid.is_reliable() && MatchKind::Email.is_reliable() && !MatchKind::Login.is_reliable());
         assert!(host_databases(&root, "mail.other.ru").is_empty());
         let _ = std::fs::remove_dir_all(root.parent().unwrap());
     }
@@ -321,6 +352,18 @@ mod tests {
         // В базе только адрес (старая запись), сервер сообщил GUID — дописать GUID.
         let email_only = MailboxIdentity { mailbox_guid: None, email: Some("a@x.ru".into()) };
         assert_eq!(decide(&email_only, &info(Some("a@x.ru"), Some(GUID))), Verdict::Same { write: Some(MailboxIdentity { mailbox_guid: Some(GUID.into()), email: None }) });
+        // GUID в базе нет, записан другой адрес — чужая база (как в мастере): ни GUID, ни адрес
+        // не записываются, иначе база молча стала бы базой другого ящика.
+        assert_eq!(decide(&email_only, &info(Some("b@x.ru"), Some(GUID))), Verdict::Other);
+        assert_eq!(decide(&email_only, &info(Some("b@x.ru"), None)), Verdict::Other);
+        // Сервер не сообщил адрес — сравнивать нечем: GUID дописывается.
+        assert_eq!(decide(&email_only, &info(None, Some(GUID))), Verdict::Same { write: Some(MailboxIdentity { mailbox_guid: Some(GUID.into()), email: None }) });
+        // GUID записан, а сервер его не сообщил — решает адрес.
+        assert_eq!(decide(&full, &info(Some("b@x.ru"), None)), Verdict::Other);
+        assert_eq!(decide(&full, &info(Some("A@x.ru"), None)), Verdict::Same { write: None });
+        // В базе только GUID — адрес дописывается.
+        let guid_only = MailboxIdentity { mailbox_guid: Some(GUID.into()), email: None };
+        assert_eq!(decide(&guid_only, &info(Some("b@x.ru"), Some(GUID))), Verdict::Same { write: Some(MailboxIdentity { mailbox_guid: None, email: Some("b@x.ru".into()) }) });
         let g = IdentityGuard::default();
         assert!(!g.blocked());
         g.block();

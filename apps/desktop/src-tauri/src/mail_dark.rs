@@ -1,18 +1,34 @@
 //! Письма в тёмных тонах (замечание 6 обкатки): перекраска цветов очищенного HTML письма.
 //!
 //! Тело остаётся одним HTML: каждый распознанный цвет письма заменяется на
-//! `var(--aiowa-dN, исходный цвет)`. Пока переменная не определена (светлый лист, печать и её
-//! предпросмотр), браузер берёт исходный цвет, и письмо выглядит ровно как задумано. В тёмном
+//! `var(--aiowa-<метка>-dN, исходный цвет)`. Пока переменная не определена (светлый лист, печать и
+//! её предпросмотр), браузер берёт исходный цвет, и письмо выглядит ровно как задумано. В тёмном
 //! режиме рамка письма (`BodyFrame.svelte`) определяет переменные палитрой [`DarkBody::colors`]:
-//! N-й элемент — тёмный вариант переменной `--aiowa-dN`. Вторая копия тела не нужна: тело с
-//! `data:`-картинками не уходит в окно дважды, а смена темы перекрашивает письмо без перезагрузки.
+//! N-й элемент — тёмный вариант переменной `--aiowa-<метка>-dN`, метка — [`DarkBody::tag`]. Вторая
+//! копия тела не нужна: тело с `data:`-картинками не уходит в окно дважды, а смена темы
+//! перекрашивает письмо без перезагрузки.
 //!
-//! Что перекрашивается: атрибут `bgcolor` у частей таблицы и `color` у `<font>` (они переносятся
-//! в начало `style` той же переменной, так что стиль элемента по-прежнему главнее), а в `style` —
-//! `color`, `background-color`, цвет в `background`, `border-color` и `border-*-color`, цвет в
-//! `border` и `border-*`. `<style>` письма ammonia вырезает целиком, других таблиц стилей нет.
-//! Картинки (`<img>`, `url(…)` в фоне) не трогаются; `transparent`, `inherit`, `currentColor`,
-//! полностью прозрачные цвета и прочие ключевые слова остаются как есть.
+//! Метка — 16 случайных шестнадцатеричных цифр, одна на запуск приложения (ключи SipHash из
+//! `RandomState`, а не время). Пока процесс жив, одно и то же письмо собирается одинаково, и
+//! перечитанная беседа не перезагружает рамки писем (srcdoc не меняется). Письмо пишется задолго до
+//! неё, а в рамке нет скриптов, так что узнать и угадать её письму нечем, поэтому
+//! объявить у себя переменную палитры и подменить ею цвета (у себя и потомков, в тёмном показе,
+//! светлом или при печати) письму нечем — как бы браузер ни разобрал его `style`.
+//!
+//! Что перекрашивается: атрибут `bgcolor` у частей таблицы, `color` у `<font>` и `color` у `<hr>`
+//! (браузер красит им рамку и фон линии — здесь это рамка). Атрибуты переносятся в начало `style`
+//! той же переменной, так что стиль элемента по-прежнему главнее. В `style` — `color`,
+//! `background-color`, цвет в `background`, `border-color` и `border-*-color`, цвет в `border` и
+//! `border-*`. `<style>` письма ammonia вырезает целиком, других таблиц стилей нет. Картинки
+//! (`<img>`, `url(…)` в фоне) не трогаются; `transparent`, `inherit`, `currentColor`, полностью
+//! прозрачные цвета и прочие ключевые слова остаются как есть.
+//!
+//! Сверх того, для гигиены, объявления пользовательских свойств (`--*`) письма убираются — из
+//! `style` и из `<style>`, если он когда-нибудь дойдёт до сюда; имя сверяется без комментариев и с
+//! раскрытыми CSS-экранированиями (`--aiowa\-d0` — это `--aiowa-d0`). At-правила в `style`
+//! (`@x{…}`) убираются вместе с блоком, разбор идёт дальше сразу за ним, как у браузера. Защита от
+//! подмены на этом не держится: разбор здесь приближённый, и обходы вроде
+//! `@x{}--aiowa-d0:red` находились раз за разом, а имя с меткой не подделать.
 //!
 //! Как (HSL, оттенок и насыщенность сохраняются, меняется светлота):
 //! - фон: светлый (L > 0,5) отражается в тёмный, белый становится цветом тёмного листа; тёмный
@@ -23,27 +39,34 @@
 //!
 //! Затем контраст: фон элемента затемняется, пока текст на нём (свой или унаследованный) не
 //! наберёт 4,5:1, а свой текст элемента осветляется до 4,5:1 к итоговому фону. Унаследованные
-//! цвета берутся из стека открытых элементов. Не добирается (полупрозрачный текст) — остаётся
-//! лучшее, что вышло.
+//! цвета берутся из стека открытых элементов; у ссылок и цитат без своего цвета текст — как его
+//! задаёт тёмный лист (`a`, `blockquote` в `darkmail.svelte.ts`). Не добирается (полупрозрачный
+//! текст) — остаётся лучшее, что вышло. Подбор идёт циклом по светлоте, поэтому итог по каждому
+//! набору (цвет, роль, фон, текст) запоминается в палитре: большие таблицы повторяют одни и те же
+//! пары цветов в тысячах ячеек.
 //!
 //! Вход — вывод ammonia (`clean_html`): имена тегов и атрибутов в нижнем регистре, значения в
 //! двойных кавычках с экранированием, без комментариев и сырого текста, у пустых элементов нет
-//! закрывающих тегов. Всё, кроме изменённых или добавленных атрибутов `style`, копируется байт в
-//! байт. HTML с переменными уходит только в окно (показ и печать) и на сервер не отправляется:
-//! цитаты и черновики собираются из базы и с сервера заново.
+//! закрывающих тегов. Всё, кроме изменённых или добавленных атрибутов `style` и убранных
+//! пользовательских свойств, копируется байт в байт. HTML с переменными уходит только в окно
+//! (показ и печать) и на сервер не отправляется: цитаты и черновики собираются из базы и с сервера
+//! заново.
 
 use std::collections::HashMap;
+use std::hash::{BuildHasher, RandomState};
 
-/// Префикс переменных палитры; тот же собирает `darkmail.svelte.ts` окна.
-const VAR_PREFIX: &str = "--aiowa-d";
+/// Начало имён переменных палитры: дальше метка, `-d` и номер (`--aiowa-<метка>-dN`); так же их
+/// собирает `darkmail.svelte.ts` окна.
+const VAR_PREFIX: &str = "--aiowa-";
 /// Минимальный контраст текста к фону в тёмном режиме (WCAG AA для обычного текста).
 const MIN_CONTRAST: f64 = 4.5;
 /// Шаг подбора светлоты при добивании контраста.
 const STEP: f64 = 0.01;
-/// Лист тёмного режима, его текст и ссылки — те же, что в `darkmail.svelte.ts` окна.
+/// Лист тёмного режима, его текст, ссылки и текст цитат — те же, что в `darkmail.svelte.ts` окна.
 const SHEET_BG: [u8; 3] = [0x2b, 0x2b, 0x2b];
 const SHEET_TEXT: [u8; 3] = [0xe6, 0xe6, 0xe6];
 const SHEET_LINK: [u8; 3] = [0x60, 0xcd, 0xff];
+const SHEET_QUOTE: [u8; 3] = [0xad, 0xad, 0xad];
 /// Светлота рамок в тёмном режиме: не темнее и не светлее.
 const BORDER_L_MIN: f64 = 0.25;
 const BORDER_L_MAX: f64 = 0.6;
@@ -57,14 +80,18 @@ const VOID: &[&str] = &["area", "base", "basefont", "bgsound", "br", "col", "emb
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DarkBody {
     pub(crate) html: String,
-    /// `#rrggbb` или `#rrggbbaa`; индекс — номер переменной `--aiowa-dN`.
+    /// `#rrggbb` или `#rrggbbaa`; индекс — номер переменной `--aiowa-<метка>-dN`.
     pub(crate) colors: Vec<String>,
+    /// Метка имён переменных этого построения: 16 шестнадцатеричных цифр в нижнем регистре.
+    pub(crate) tag: String,
 }
 
-/// Перекрасить очищенный HTML: заменить цвета переменными и собрать их тёмную палитру.
+/// Перекрасить очищенный HTML: заменить цвета переменными и собрать их тёмную палитру. Имена
+/// переменных — с новой непредсказуемой меткой ([`fresh_tag`]) на каждый вызов.
 pub(crate) fn darken(html: &str) -> DarkBody {
+    let tag = fresh_tag();
     let mut out = String::with_capacity(html.len() + html.len() / 16);
-    let mut palette = Palette::default();
+    let mut palette = Palette::new(&tag);
     let root = Ctx { tag: String::new(), text: Rgba::rgb(SHEET_TEXT), bg: Rgba::rgb(SHEET_BG) };
     let mut stack: Vec<Ctx> = Vec::new();
     let mut rest = 0;
@@ -76,6 +103,7 @@ pub(crate) fn darken(html: &str) -> DarkBody {
             break;
         };
         let raw = &html[lt..=gt];
+        let mut sheet = false;
         match parse_tag(raw) {
             Tag::End(name) => {
                 // Вывод ammonia вложен правильно; лишний закрывающий тег стек не трогает.
@@ -88,6 +116,7 @@ pub(crate) fn darken(html: &str) -> DarkBody {
                 let parent = stack.last().unwrap_or(&root);
                 let (rewritten, ctx) = element(raw, &name, &attrs, parent, &mut palette);
                 out.push_str(rewritten.as_deref().unwrap_or(raw));
+                sheet = name == "style";
                 if !VOID.contains(&name.as_str()) {
                     stack.push(ctx);
                 }
@@ -95,9 +124,23 @@ pub(crate) fn darken(html: &str) -> DarkBody {
             Tag::Other => out.push_str(raw),
         }
         rest = gt + 1;
+        if sheet {
+            // Таблица стилей — сырой текст до `</style`: без пользовательских свойств, остальное как есть.
+            let close = html.as_bytes()[rest..].windows(7).position(|w| w.eq_ignore_ascii_case(b"</style")).map_or(html.len(), |p| rest + p);
+            out.push_str(&strip_sheet_custom_props(&html[rest..close]));
+            rest = close;
+        }
     }
     out.push_str(&html[rest..]);
-    DarkBody { html: out, colors: palette.list }
+    DarkBody { html: out, colors: palette.list, tag }
+}
+
+/// Метка имён переменных: 64 бита SipHash с ключами `RandomState` (случайными от ОС), одна на
+/// процесс. Без ключей итог не предсказать, а значит, и не подставить заранее в письмо; при этом
+/// повторная сборка того же письма даёт тот же HTML, и рамка с ним не перезагружается.
+fn fresh_tag() -> String {
+    static TAG: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    TAG.get_or_init(|| format!("{:016x}", RandomState::new().hash_one(0u8))).clone()
 }
 
 // --- цвет ------------------------------------------------------------------------------------
@@ -683,43 +726,190 @@ fn encode_attr(s: &str) -> String {
 
 // --- разбор style ----------------------------------------------------------------------------
 
-/// Части `s[from..to]` на верхнем уровне (вне скобок и кавычек) между разделителями `sep`.
+/// Части `s[from..to]` на верхнем уровне между разделителями `sep` (скобки разделителями не
+/// бывают) — по обходу [`walk_top`]: вне скобок `()`, `[]`, `{}`, строк в кавычках, комментариев и
+/// адресов `url(…)` без кавычек.
+///
+/// Это приближение к разбору браузера, а не его копия: обычные случаи (кавычки, комментарии,
+/// `url(…)`, скобки в значениях) делятся так же, но полного совпадения с браузером здесь нет и не
+/// обещается — у него свои правила для at-правил, вложенных правил, плохих объявлений и причуд
+/// токенизатора. Если разбор где-то разойдётся, плохо будет только перекраске этой части; подменить
+/// переменные палитры письму не даёт не этот разбор, а непредсказуемая метка в их именах
+/// ([`fresh_tag`]).
 fn split_top(s: &str, from: usize, to: usize, sep: impl Fn(char) -> bool) -> Vec<(usize, usize)> {
     let mut out = Vec::new();
-    let mut depth = 0usize;
-    let mut quote: Option<char> = None;
-    let mut escaped = false;
     let mut start = from;
-    for (i, c) in s[from..to].char_indices() {
-        let i = from + i;
-        if escaped {
-            escaped = false;
-            continue;
-        }
-        match c {
-            '\\' => escaped = true,
-            c if quote == Some(c) => quote = None,
-            _ if quote.is_some() => {}
-            '"' | '\'' => quote = Some(c),
-            '(' => depth += 1,
-            ')' => depth = depth.saturating_sub(1),
-            c if depth == 0 && sep(c) => {
-                if i > start {
-                    out.push((start, i));
-                }
-                start = i + c.len_utf8();
+    walk_top(s, from, to, |i, c, depth, next| {
+        if depth == 0 && !matches!(c, '(' | '[' | '{' | ')' | ']' | '}') && sep(c) {
+            if i > start {
+                out.push((start, i));
             }
-            _ => {}
+            start = next;
         }
-    }
+        true
+    });
     if to > start {
         out.push((start, to));
     }
     out
 }
 
+/// Обход `s[from..to]` по токенам CSS, как их примерно видит браузер: строки в кавычках (перевод
+/// строки обрывает строку), комментарии `/* */`, CSS-экранирования и адреса `url(…)` без кавычек
+/// (в них `/*`, кавычки и скобки — просто символы адреса) пропускаются целиком, для каждого
+/// прочего символа вызывается `visit(начало, символ, глубина скобок до него, конец)`; `false` из
+/// `visit` останавливает обход.
+///
+/// Скобки считаются одним счётчиком: лишняя закрывающая другого вида его уменьшает, у браузера —
+/// нет. Поэтому счётчик не больше настоящей вложенности.
+fn walk_top(s: &str, from: usize, to: usize, mut visit: impl FnMut(usize, char, usize, usize) -> bool) {
+    let t = &s[..to];
+    let b = t.as_bytes();
+    let mut depth = 0usize;
+    // Начало имени, которое идёт сразу перед `i`: `url` перед `(` открывает адрес без кавычек.
+    let mut name = from;
+    let mut i = from;
+    while let Some(c) = t[i..].chars().next() {
+        let mut in_name = is_name_char(c);
+        // Конец куска, который пропускается целиком.
+        let mut whole = None;
+        match c {
+            '\\' => {
+                whole = escape_end(t, i);
+                in_name |= whole.is_some();
+            }
+            '/' if b.get(i + 1) == Some(&b'*') => whole = Some(skip_comment(b, i)),
+            '"' | '\'' => whole = Some(skip_string(b, i)),
+            '(' if is_url_function(t, name, i) => whole = url_end(b, i + 1),
+            _ => {}
+        }
+        let next = match whole {
+            Some(e) => e,
+            None => {
+                let next = i + c.len_utf8();
+                if !visit(i, c, depth, next) {
+                    return;
+                }
+                match c {
+                    '(' | '[' | '{' => depth += 1,
+                    ')' | ']' | '}' => depth = depth.saturating_sub(1),
+                    _ => {}
+                }
+                next
+            }
+        };
+        if !in_name {
+            name = next;
+        }
+        i = next;
+    }
+}
+
+/// С `i` начинается at-правило: `@` и сразу имя. `@` без имени у браузера — просто символ.
+fn is_at_keyword(s: &str, i: usize) -> bool {
+    s.as_bytes().get(i) == Some(&b'@') && starts_ident(s, i + 1)
+}
+
+/// С `i` начинается имя CSS: `--`, или после необязательного `-` буква, `_`, не ASCII или
+/// экранирование (`\` не перед переводом строки).
+fn starts_ident(s: &str, i: usize) -> bool {
+    let b = s.as_bytes();
+    let first = |j: usize| match b.get(j) {
+        Some(&c) if c.is_ascii_alphabetic() || c == b'_' || !c.is_ascii() => true,
+        Some(b'\\') => b.get(j + 1).is_some_and(|&c| !is_newline(c)),
+        _ => false,
+    };
+    match b.get(i) {
+        Some(b'-') => b.get(i + 1) == Some(&b'-') || first(i + 1),
+        _ => first(i),
+    }
+}
+
+/// Конец at-правила, начатого `@` в `from`: сразу за `}` его блока, или `to`, если блока до `to`
+/// нет либо он не закрыт (правило без блока кончается на `;`, а по ним части `style` уже
+/// поделены).
+fn at_rule_end(s: &str, from: usize, to: usize) -> usize {
+    let mut end = to;
+    let mut open = false;
+    walk_top(s, from, to, |_, c, depth, next| {
+        match c {
+            '{' if depth == 0 => open = true,
+            // Глубина до `}` блока — 1, или 0, если лишняя закрывающая внутри уже сбила счётчик.
+            '}' if open && depth <= 1 => {
+                end = next;
+                return false;
+            }
+            _ => {}
+        }
+        true
+    });
+    end
+}
+
+/// Перевод строки для CSS (`\r\n` браузер считает одним `\n`).
+fn is_newline(b: u8) -> bool {
+    matches!(b, b'\n' | b'\r' | b'\x0c')
+}
+
+/// Символ имени CSS: буква, цифра, `-`, `_` или не ASCII.
+fn is_name_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '-' || c == '_' || !c.is_ascii()
+}
+
+/// Конец CSS-экранирования вне строки, начатого `\` в `i`: до шести шестнадцатеричных цифр и один
+/// пробел за ними или один любой символ. `None` — за `\` перевод строки или конец текста: это не
+/// экранирование, а одиночный `\`.
+fn escape_end(s: &str, i: usize) -> Option<usize> {
+    let b = s.as_bytes();
+    let first = s[i + 1..].chars().next()?;
+    if matches!(first, '\n' | '\r' | '\x0c') {
+        return None;
+    }
+    if !first.is_ascii_hexdigit() {
+        return Some(i + 1 + first.len_utf8());
+    }
+    let mut j = i + 1;
+    while j < b.len() && j - i <= 6 && b[j].is_ascii_hexdigit() {
+        j += 1;
+    }
+    Some(match b.get(j) {
+        Some(b'\r') if b.get(j + 1) == Some(&b'\n') => j + 2,
+        Some(&c) if c == b' ' || c == b'\t' || is_newline(c) => j + 1,
+        _ => j,
+    })
+}
+
+/// `(` в `paren` открывает функцию `url`: перед ней имя `url` (в любом регистре, в том числе через
+/// экранирования), и это не `#url` и не `@url` — у браузера это другие токены, и скобка после них
+/// обычная.
+fn is_url_function(s: &str, name: usize, paren: usize) -> bool {
+    let raw = &s[name..paren];
+    !raw.is_empty() && raw.len() <= 32 && !matches!(s.as_bytes().get(name.wrapping_sub(1)), Some(b'#' | b'@')) && css_unescape(raw).eq_ignore_ascii_case("url")
+}
+
+/// Конец адреса `url(` без кавычек, начатого сразу за `(` в `from`: за первой `)` вне
+/// экранирования или конец текста — так браузер дочитывает и верный адрес, и неверный (с
+/// пробелами, кавычками или `(` внутри). `None` — адрес в кавычках: это обычная функция.
+fn url_end(b: &[u8], from: usize) -> Option<usize> {
+    let mut i = from;
+    while i < b.len() && (b[i] == b' ' || b[i] == b'\t' || is_newline(b[i])) {
+        i += 1;
+    }
+    if matches!(b.get(i), Some(b'"' | b'\'')) {
+        return None;
+    }
+    while i < b.len() {
+        match b[i] {
+            b')' => return Some(i + 1),
+            b'\\' if !b.get(i + 1).copied().is_some_and(is_newline) => i += 2,
+            _ => i += 1,
+        }
+    }
+    Some(b.len())
+}
+
 /// Чем свойство красит и сколько у него цветов.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Role {
     Text,
     Bg,
@@ -756,17 +946,33 @@ struct Decl {
     effect: Option<Rgba>,
 }
 
-/// Разбор `style`: цветные объявления и диапазоны чужих `--aiowa-*` (их убираем).
+/// Разбор `style`: цветные объявления и диапазоны, которые убираем, — объявления пользовательских
+/// свойств и at-правила с их блоками.
 fn parse_style(s: &str) -> (Vec<Decl>, Vec<(usize, usize)>) {
     let mut decls = Vec::new();
     let mut drop = Vec::new();
-    for (ds, de) in split_top(s, 0, s.len(), |c| c == ';') {
+    for (mut ds, de) in split_top(s, 0, s.len(), |c| c == ';') {
+        // At-правило в `style` браузер выбрасывает вместе с блоком и читает дальше сразу за `}`,
+        // без `;`: в `@x{}--aiowa-d0:red` объявление у него отдельное. Здесь так же: правило
+        // убирается, разбор части идёт с конца его блока.
+        loop {
+            let at = skip_blank(s.as_bytes(), ds).min(de);
+            if at >= de || !is_at_keyword(s, at) {
+                break;
+            }
+            let end = at_rule_end(s, at, de);
+            drop.push((at, end));
+            ds = end;
+        }
+        if ds >= de {
+            continue;
+        }
         let Some(colon) = split_top(s, ds, de, |c| c == ':').first().map(|&(_, e)| e) else { continue };
         if colon >= de {
             continue;
         }
-        let name = s[ds..colon].trim().to_ascii_lowercase();
-        if name.starts_with("--aiowa-") {
+        let name = decl_name(&s[ds..colon]);
+        if name.starts_with("--") {
             drop.push((ds, de));
             continue;
         }
@@ -800,6 +1006,185 @@ fn split_important(s: &str, from: usize, to: usize) -> (usize, bool) {
     (to, false)
 }
 
+/// Имя свойства так, как его видит браузер: без комментариев, с раскрытыми CSS-экранированиями
+/// (`--aiowa\-d0` — это `--aiowa-d0`, `c\6f lor` — `color`), ASCII в нижнем регистре.
+fn decl_name(raw: &str) -> String {
+    let mut s = String::with_capacity(raw.len());
+    let mut rest = raw;
+    while let Some(p) = rest.find("/*") {
+        s.push_str(&rest[..p]);
+        rest = rest[p + 2..].find("*/").map_or("", |e| &rest[p + 2 + e + 2..]);
+    }
+    s.push_str(rest);
+    css_unescape(s.trim_matches(|c: char| c.is_ascii_whitespace())).to_ascii_lowercase()
+}
+
+/// Раскрыть CSS-экранирования: `\` и до шести шестнадцатеричных цифр (с одним пробелом после) или
+/// `\` и любой другой символ. Ноль, суррогаты и коды за пределом Unicode — U+FFFD, как в браузере.
+fn css_unescape(s: &str) -> String {
+    if !s.contains('\\') {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut it = s.chars().peekable();
+    while let Some(c) = it.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        let mut code = 0u32;
+        let mut digits = 0;
+        while digits < 6
+            && let Some(d) = it.peek().and_then(|c| c.to_digit(16))
+        {
+            code = code * 16 + d;
+            digits += 1;
+            it.next();
+        }
+        if digits == 0 {
+            out.push(it.next().unwrap_or('\u{fffd}'));
+            continue;
+        }
+        out.push(char::from_u32(code).filter(|&c| c != '\0').unwrap_or('\u{fffd}'));
+        if let Some(&w) = it.peek()
+            && matches!(w, ' ' | '\t' | '\n' | '\r' | '\x0c')
+        {
+            it.next();
+            if w == '\r' && it.peek() == Some(&'\n') {
+                it.next();
+            }
+        }
+    }
+    out
+}
+
+/// Конец комментария `/* */`, начатого в `i` (без закрытия — конец текста).
+fn skip_comment(b: &[u8], i: usize) -> usize {
+    b[i + 2..].windows(2).position(|w| w == b"*/").map_or(b.len(), |p| i + 2 + p + 2)
+}
+
+/// Конец строки в кавычках, начатой в `i`. Перевод строки (`\n`, `\r`, `\x0c`) обрывает её, как в
+/// браузере, и сам в строку не входит; `\` с переводом строки — продолжение строки (`\r\n` — один
+/// перевод).
+fn skip_string(b: &[u8], i: usize) -> usize {
+    let mut j = i + 1;
+    while j < b.len() {
+        match b[j] {
+            b'\\' if b[j + 1..].starts_with(b"\r\n") => j += 3,
+            b'\\' => j += 2,
+            c if is_newline(c) => return j,
+            c if c == b[i] => return j + 1,
+            _ => j += 1,
+        }
+    }
+    b.len()
+}
+
+/// Пробелы и комментарии с `i`.
+fn skip_blank(b: &[u8], mut i: usize) -> usize {
+    loop {
+        if i < b.len() && b[i].is_ascii_whitespace() {
+            i += 1;
+        } else if b[i.min(b.len())..].starts_with(b"/*") {
+            i = skip_comment(b, i);
+        } else {
+            return i.min(b.len());
+        }
+    }
+}
+
+/// Объявление пользовательского свойства, начатое в `from` (внутри блока правила): его конец —
+/// за `;` или перед `}` своего уровня. `None` — здесь не такое объявление.
+fn custom_decl_end(css: &str, from: usize) -> Option<usize> {
+    let b = css.as_bytes();
+    let p = skip_blank(b, from);
+    let mut q = p;
+    while q < b.len() {
+        match b[q] {
+            b'\\' => q += 2,
+            b':' | b';' | b'{' | b'}' => break,
+            c if c.is_ascii_whitespace() => break,
+            b'/' if b.get(q + 1) == Some(&b'*') => break,
+            _ => q += 1,
+        }
+    }
+    let q = q.min(b.len());
+    if !decl_name(&css[p..q]).starts_with("--") || b.get(skip_blank(b, q)) != Some(&b':') {
+        return None;
+    }
+    // Значение пользовательского свойства может нести любые скобки, в том числе `{}`.
+    let mut i = skip_blank(b, q) + 1;
+    let mut nest = 0usize;
+    while i < b.len() {
+        match b[i] {
+            b'/' if b.get(i + 1) == Some(&b'*') => {
+                i = skip_comment(b, i);
+                continue;
+            }
+            b'"' | b'\'' => {
+                i = skip_string(b, i);
+                continue;
+            }
+            b'\\' => i += 1,
+            b'(' | b'[' | b'{' => nest += 1,
+            b')' | b']' => nest = nest.saturating_sub(1),
+            b'}' if nest == 0 => return Some(i),
+            b'}' => nest -= 1,
+            b';' if nest == 0 => return Some(i + 1),
+            _ => {}
+        }
+        i += 1;
+    }
+    Some(b.len())
+}
+
+/// Таблица стилей без объявлений пользовательских свойств в блоках правил; остальное как есть.
+fn strip_sheet_custom_props(css: &str) -> String {
+    let b = css.as_bytes();
+    let mut out = String::with_capacity(css.len());
+    let mut copied = 0;
+    let mut depth = 0usize;
+    // Позиция сразу за `{`, `;` или `}`: здесь может начаться объявление.
+    let mut item_start = false;
+    let mut i = 0;
+    while i < b.len() {
+        if item_start && depth > 0 {
+            item_start = false;
+            if let Some(end) = custom_decl_end(css, i) {
+                out.push_str(&css[copied..i]);
+                copied = end;
+                i = end;
+                item_start = true;
+                continue;
+            }
+        }
+        match b[i] {
+            b'/' if b.get(i + 1) == Some(&b'*') => {
+                i = skip_comment(b, i);
+                continue;
+            }
+            b'"' | b'\'' => {
+                i = skip_string(b, i);
+                continue;
+            }
+            b'\\' => i += 1,
+            b'{' => {
+                depth += 1;
+                item_start = true;
+            }
+            b'}' => {
+                depth = depth.saturating_sub(1);
+                item_start = true;
+            }
+            b';' => item_start = true,
+            _ => {}
+        }
+        i += 1;
+    }
+    out.push_str(&css[copied..]);
+    out
+}
+
 /// Итог по ролям с учётом `!important`: последнее важное, иначе последнее объявление.
 fn winner(decls: &[Decl], role: Role) -> Option<Option<Rgba>> {
     decls.iter().rfind(|d| d.role == role && d.important).or_else(|| decls.iter().rfind(|d| d.role == role)).map(|d| d.effect)
@@ -814,22 +1199,59 @@ struct Ctx {
     bg: Rgba,
 }
 
+/// Ключ кэша преобразования: роль и точные биты каналов исходного цвета, фона и текста.
+type ConvKey = (Role, [u64; 4], [u64; 4], [u64; 4]);
+
+fn bits(c: Rgba) -> [u64; 4] {
+    [c.r.to_bits(), c.g.to_bits(), c.b.to_bits(), c.a.to_bits()]
+}
+
 #[derive(Default)]
 struct Palette {
+    /// Имя переменной без номера: `--aiowa-<метка>-d`.
+    prefix: String,
     index: HashMap<String, usize>,
     list: Vec<String>,
+    /// Готовые тёмные цвета по (роль, исходный, фон, текст).
+    cache: HashMap<ConvKey, Rgba>,
 }
 
 impl Palette {
-    /// `var(--aiowa-dN, исходный)`: одинаковые тёмные цвета делят одну переменную.
+    fn new(tag: &str) -> Self {
+        Self { prefix: format!("{VAR_PREFIX}{tag}-d"), ..Self::default() }
+    }
+
+    /// Тёмный вариант цвета `c` в роли `role`. `bg` — фон, к которому светлеет текст (`Text`), или
+    /// фон под элементом (`Bg`); `text` — текст, под который темнеет фон (`Bg`). Что роли не нужно,
+    /// в ключ не идёт.
+    ///
+    /// С кэшем: подбор контраста — цикл по светлоте с HSL и яркостью на каждом шаге, а письма из
+    /// больших таблиц (выгрузки, отчёты на мегабайты) повторяют одни и те же пары цветов в тысячах
+    /// ячеек; с кэшем каждая пара считается один раз на письмо. Ключ — точные биты каналов, так что
+    /// итог тот же, что без кэша.
+    fn dark(&mut self, role: Role, c: Rgba, bg: Rgba, text: Rgba) -> Rgba {
+        let none = Rgba { r: 0.0, g: 0.0, b: 0.0, a: 0.0 };
+        let (bg, text) = match role {
+            Role::Text => (bg, none),
+            Role::Bg => (bg, text),
+            Role::Border => (none, none),
+        };
+        *self.cache.entry((role, bits(c), bits(bg), bits(text))).or_insert_with(|| match role {
+            Role::Text => dark_text(c, bg),
+            Role::Bg => dark_bg(c, text, bg),
+            Role::Border => dark_border(c),
+        })
+    }
+
+    /// `var(--aiowa-<метка>-dN, исходный)`: одинаковые тёмные цвета делят одну переменную.
     fn var(&mut self, dark: Rgba, fallback: &str) -> String {
         let hex = dark.hex();
-        let Palette { index, list } = self;
+        let Palette { prefix, index, list, .. } = self;
         let n = *index.entry(hex.clone()).or_insert_with(|| {
             list.push(hex);
             list.len() - 1
         });
-        format!("var({VAR_PREFIX}{n}, {fallback})")
+        format!("var({prefix}{n}, {fallback})")
     }
 }
 
@@ -839,6 +1261,8 @@ fn element(raw: &str, tag: &str, attrs: &[Attr], parent: &Ctx, palette: &mut Pal
     let value = |a: &Attr| a.value.map(|(s, e)| decode_attr(&raw[s..e]));
     let attr_bg = if TABLE_PARTS.contains(&tag) { attr("bgcolor").and_then(value).as_deref().and_then(parse_legacy_color) } else { None };
     let attr_text = if tag == "font" { attr("color").and_then(value).as_deref().and_then(parse_legacy_color) } else { None };
+    // `<hr color>` браузер переводит в сплошную рамку и фон линии этого цвета: это рамка.
+    let attr_rule = if tag == "hr" { attr("color").and_then(value).as_deref().and_then(parse_legacy_color) } else { None };
     let style_attr = attr("style");
     let style = style_attr.and_then(value).unwrap_or_default();
     let (decls, drop) = parse_style(&style);
@@ -846,15 +1270,27 @@ fn element(raw: &str, tag: &str, attrs: &[Attr], parent: &Ctx, palette: &mut Pal
     // Стиль главнее атрибутов: атрибут решает, только если стиль о роли молчит.
     let own_bg = winner(&decls, Role::Bg).unwrap_or(attr_bg);
     let own_text = winner(&decls, Role::Text).unwrap_or(attr_text);
+    // Текст без своего цвета: у ссылок и цитат его задаёт тёмный лист (`a`, `blockquote` в
+    // `darkmail.svelte.ts`), у прочих он унаследован. От него же считается контраст фонов внутри.
+    let sheet_text = match tag {
+        "a" => Rgba::rgb(SHEET_LINK),
+        "blockquote" => Rgba::rgb(SHEET_QUOTE),
+        _ => parent.text,
+    };
     // Свой текст сначала светлеет к фону в первом приближении (оттенок фона дороже), а фон
     // темнеет, только если тексту не хватило и белого или текст унаследован.
     let base = own_bg.map(|c| base_bg(c).over(parent.bg)).unwrap_or(parent.bg);
-    let probe = own_text.map(|c| dark_text(c, base).over(base)).unwrap_or(parent.text);
-    let bg = own_bg.map(|c| dark_bg(c, probe, parent.bg).over(parent.bg)).unwrap_or(parent.bg);
+    let probe = match own_text {
+        Some(c) => palette.dark(Role::Text, c, base, base).over(base),
+        None => sheet_text,
+    };
+    let bg = match own_bg {
+        Some(c) => palette.dark(Role::Bg, c, parent.bg, probe).over(parent.bg),
+        None => parent.bg,
+    };
     let text = match own_text {
-        Some(c) => dark_text(c, bg).over(bg),
-        None if tag == "a" => Rgba::rgb(SHEET_LINK),
-        None => parent.text,
+        Some(c) => palette.dark(Role::Text, c, bg, bg).over(bg),
+        None => sheet_text,
     };
     let ctx = Ctx { tag: tag.to_string(), text, bg };
 
@@ -862,19 +1298,26 @@ fn element(raw: &str, tag: &str, attrs: &[Attr], parent: &Ctx, palette: &mut Pal
     for d in &decls {
         for &(s, e, c) in &d.colors {
             let dark = match d.role {
-                Role::Text => dark_text(c, bg),
-                Role::Bg => dark_bg(c, probe, parent.bg),
-                Role::Border => dark_border(c),
+                Role::Text => palette.dark(Role::Text, c, bg, bg),
+                Role::Bg => palette.dark(Role::Bg, c, parent.bg, probe),
+                Role::Border => palette.dark(Role::Border, c, bg, text),
             };
             edits.push((s, e, palette.var(dark, &style[s..e])));
         }
     }
     let mut prefix = Vec::new();
     if let Some(c) = attr_bg {
-        prefix.push(format!("background-color: {}", palette.var(dark_bg(c, probe, parent.bg), &Rgba { a: 1.0, ..c }.hex())));
+        let dark = palette.dark(Role::Bg, c, parent.bg, probe);
+        prefix.push(format!("background-color: {}", palette.var(dark, &Rgba { a: 1.0, ..c }.hex())));
     }
     if let Some(c) = attr_text {
-        prefix.push(format!("color: {}", palette.var(dark_text(c, bg), &Rgba { a: 1.0, ..c }.hex())));
+        let dark = palette.dark(Role::Text, c, bg, bg);
+        prefix.push(format!("color: {}", palette.var(dark, &Rgba { a: 1.0, ..c }.hex())));
+    }
+    if let Some(c) = attr_rule {
+        let dark = palette.dark(Role::Border, c, bg, text);
+        let var = palette.var(dark, &Rgba { a: 1.0, ..c }.hex());
+        prefix.push(format!("border-color: {var}; background-color: {var}"));
     }
     if edits.is_empty() && prefix.is_empty() {
         return (None, ctx);
@@ -913,20 +1356,25 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
+    /// Начало ссылки на переменную палитры этого тела: `var(--aiowa-<метка>-d`.
+    fn open(body: &DarkBody) -> String {
+        format!("var({VAR_PREFIX}{}-d", body.tag)
+    }
+
     /// Светлый показ: каждая переменная — свой запасной цвет.
-    fn light(html: &str) -> String {
-        substitute(html, |_, fallback| fallback.to_string())
+    fn light(body: &DarkBody) -> String {
+        substitute(body, |_, fallback| fallback.to_string())
     }
 
     /// Тёмный показ: каждая переменная — её цвет из палитры.
     fn dark(body: &DarkBody) -> String {
-        substitute(&body.html, |n, _| body.colors[n].clone())
+        substitute(body, |n, _| body.colors[n].clone())
     }
 
-    fn substitute(html: &str, f: impl Fn(usize, &str) -> String) -> String {
+    fn substitute(body: &DarkBody, f: impl Fn(usize, &str) -> String) -> String {
         let mut out = String::new();
-        let mut rest = html;
-        let open = format!("var({VAR_PREFIX}");
+        let mut rest = body.html.as_str();
+        let open = open(body);
         while let Some(p) = rest.find(&open) {
             out.push_str(&rest[..p]);
             let tail = &rest[p + open.len()..];
@@ -952,7 +1400,7 @@ mod tests {
 
     /// Тёмные цвета переменных по порядку появления в HTML.
     fn vars(body: &DarkBody) -> Vec<Rgba> {
-        let open = format!("var({VAR_PREFIX}");
+        let open = open(body);
         body.html.match_indices(&open).map(|(p, _)| {
             let tail = &body.html[p + open.len()..];
             let n: usize = tail[..tail.find(',').unwrap()].parse().unwrap();
@@ -968,7 +1416,7 @@ mod tests {
     fn named_and_hex_colors() {
         let b = darken(r#"<p style="color:black">a</p><p style="color: #000">b</p><p style="COLOR:#000000">c</p>"#);
         assert_eq!(b.colors, vec!["#e6e6e6"], "чёрный текст становится текстом листа, одна переменная на всех");
-        assert_eq!(light(&b.html), r#"<p style="color:black">a</p><p style="color: #000">b</p><p style="COLOR:#000000">c</p>"#);
+        assert_eq!(light(&b), r#"<p style="color:black">a</p><p style="color: #000">b</p><p style="COLOR:#000000">c</p>"#);
         let b = darken(r#"<div style="background-color:white">a</div><div style="background:#FFF">b</div>"#);
         assert_eq!(b.colors, vec!["#2b2b2b"], "белый фон становится цветом листа");
         let b = darken(r#"<p style="color:#fff">a</p>"#);
@@ -996,7 +1444,7 @@ mod tests {
         assert_eq!(b.colors[0], "#e6e6e6");
         assert!(b.colors[1].len() == 9 && b.colors[1].ends_with("80"), "прозрачность сохраняется: {}", b.colors[1]);
         assert!(b.colors[2].len() == 9 && b.colors[2].ends_with("80"), "{}", b.colors[2]);
-        assert_eq!(light(&b.html), r#"<p style="color: rgb(0, 0, 0)">a</p><p style="color:rgb(0 0 0 / 50%)">b</p><p style="background-color: rgba(255,255,255,0.5)">c</p>"#);
+        assert_eq!(light(&b), r#"<p style="color: rgb(0, 0, 0)">a</p><p style="color:rgb(0 0 0 / 50%)">b</p><p style="background-color: rgba(255,255,255,0.5)">c</p>"#);
         assert_eq!(parse_css_color("hsl(0, 100%, 50%)"), Some(Rgba::rgb([255, 0, 0])));
         assert_eq!(parse_css_color("hsla(120deg 100% 25% / 1)"), Some(Rgba::rgb([0, 128, 0])));
         assert_eq!(parse_css_color("rgb(100%, 0%, 0%)"), Some(Rgba::rgb([255, 0, 0])));
@@ -1081,10 +1529,10 @@ mod tests {
         assert_eq!(tags(&b.html), tags(&clean), "теги и их порядок те же");
         assert_eq!(text(&b.html), text(&clean), "текст тот же");
         assert_eq!(b.html.matches(r#"src="data:image/png;base64,iVBORw0KGgo=""#).count(), 1, "картинка не тронута");
-        assert!(b.html.contains("url(data:image/png;base64,iVBORw0KGgo=) var(--aiowa-d"), "фоновая картинка не тронута: {}", b.html);
-        assert!(b.html.contains("font-family:&quot;Calibri&quot;,sans-serif;color:var(--aiowa-d"), "кавычки в style экранированы как были: {}", b.html);
+        assert!(b.html.contains(&format!("url(data:image/png;base64,iVBORw0KGgo=) {}", open(&b))), "фоновая картинка не тронута: {}", b.html);
+        assert!(b.html.contains(&format!("font-family:&quot;Calibri&quot;,sans-serif;color:{}", open(&b))), "кавычки в style экранированы как были: {}", b.html);
         // Светлый показ — исходные цвета: в стиле те же значения, атрибуты перенесены в начало стиля.
-        let light = light(&b.html);
+        let light = light(&b);
         assert!(light.contains(r##"bgcolor="#F2F2F2" style="background-color: #f2f2f2; border-collapse:collapse""##), "{light}");
         assert!(light.contains(r##"<font color="#7f7f7f" size="2" style="color: #7f7f7f">"##), "{light}");
         assert!(light.contains("border:solid windowtext 1.0pt;background:#DDEBF7"), "{light}");
@@ -1095,10 +1543,10 @@ mod tests {
     #[test]
     fn important_and_attribute_order_are_kept() {
         let b = darken(r#"<p style="color:#333 !important;background-color:#fff!IMPORTANT">x</p>"#);
-        assert!(b.html.contains("color:var(--aiowa-d0, #333) !important;background-color:var(--aiowa-d1, #fff)!IMPORTANT"), "{}", b.html);
+        assert!(b.html.contains(&format!("color:{o}0, #333) !important;background-color:{o}1, #fff)!IMPORTANT", o = open(&b))), "{}", b.html);
         // Стиль элемента главнее атрибута: атрибут идёт первым, стиль после него.
         let b = darken(r##"<td bgcolor="#ffffff" style="background-color:#ffff00">x</td>"##);
-        assert_eq!(light(&b.html), r##"<td bgcolor="#ffffff" style="background-color: #ffffff; background-color:#ffff00">x</td>"##);
+        assert_eq!(light(&b), r##"<td bgcolor="#ffffff" style="background-color: #ffffff; background-color:#ffff00">x</td>"##);
         // У div атрибут bgcolor ничего не красит — и не переносится.
         let src = r##"<div bgcolor="#ffffff">x</div><span color="red">y</span>"##;
         assert_eq!(darken(src).html, src);
@@ -1110,12 +1558,12 @@ mod tests {
     #[test]
     fn borders_and_shorthands() {
         let b = darken(r#"<td style="border:solid windowtext 1.0pt;border-color:#ccc #000;border-top:1px dotted rgb(255, 255, 255)">x</td>"#);
-        assert_eq!(b.html.matches("var(--aiowa-d").count(), 4, "{}", b.html);
+        assert_eq!(b.html.matches(&open(&b)).count(), 4, "{}", b.html);
         for c in vars(&b) {
             let l = c.hsl().2;
             assert!((BORDER_L_MIN - 0.01..=BORDER_L_MAX + 0.01).contains(&l), "рамка в среднем диапазоне: {}", c.hex());
         }
-        assert!(b.html.contains("border-top:1px dotted var(--aiowa-d"), "{}", b.html);
+        assert!(b.html.contains(&format!("border-top:1px dotted {}", open(&b))), "{}", b.html);
         assert!(b.html.contains(", rgb(255, 255, 255))"), "{}", b.html);
     }
 
@@ -1136,7 +1584,207 @@ mod tests {
     fn own_custom_properties_are_dropped() {
         let b = darken(r#"<p style="--aiowa-d0:red;color:#000">x</p>"#);
         assert!(!b.html.contains("red"), "{}", b.html);
-        assert_eq!(light(&b.html), r#"<p style=";color:#000">x</p>"#);
+        assert_eq!(light(&b), r#"<p style=";color:#000">x</p>"#);
+    }
+
+    #[test]
+    fn escaped_and_foreign_custom_properties_are_dropped() {
+        // Для браузера `--aiowa\-d0`, `\2d-aiowa-d2` и имя после комментария — те же `--aiowa-dN`;
+        // чужие `--*` тоже убираются.
+        let src = r#"<div style="--aiowa\-d0:red;--brand:#f00;color:#000"><p style="/* x */--aiowa-d1: blue; \2d-aiowa-d2:green;color:#333">x</p><span style="&#45;-aiowa-d3:red">y</span></div>"#;
+        let b = darken(src);
+        assert_eq!(light(&b), r#"<div style=";;color:#000"><p style=";;color:#333">x</p><span style="">y</span></div>"#);
+        assert_eq!(b.html.matches("--").count(), b.html.matches(&open(&b)).count(), "других `--` не осталось: {}", b.html);
+        // `;` и `:` в комментарии не делят объявления.
+        let b = darken(r#"<p style="/* ; */--aiowa-d0:red;color:#000">x</p>"#);
+        assert_eq!(light(&b), r#"<p style=";color:#000">x</p>"#);
+        // Имя с экранированием распознаётся и для перекраски.
+        let b = darken(r#"<p style="c\6f lor:#000">x</p>"#);
+        assert_eq!(b.colors, vec!["#e6e6e6"]);
+
+        assert_eq!(decl_name(" --aiowa\\-d0 "), "--aiowa-d0");
+        assert_eq!(decl_name("\\2d\\2d aiowa-d0"), "--aiowa-d0");
+        assert_eq!(decl_name("/**/C\\OLOR/* */"), "color");
+        assert_eq!(css_unescape("\\0 a\\110000\\"), "\u{fffd}a\u{fffd}\u{fffd}");
+    }
+
+    #[test]
+    fn palette_names_carry_a_process_tag() {
+        let src = r#"<p style="color:#000">x</p>"#;
+        let (a, b) = (darken(src), darken(src));
+        assert!(a.tag.len() == 16 && a.tag.bytes().all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c)), "{}", a.tag);
+        assert_eq!(a.html, format!(r#"<p style="color:var(--aiowa-{}-d0, #000)">x</p>"#, a.tag));
+        // Повторная сборка того же письма — тот же HTML: окно не перезагрузит рамку при перечитывании.
+        assert_eq!((a.tag.as_str(), a.html.as_str()), (b.tag.as_str(), b.html.as_str()));
+        assert_eq!(a.colors, b.colors);
+        // Метка случайная, а не постоянная константа кода: у разных ключей RandomState она разная.
+        let other = format!("{:016x}", RandomState::new().hash_one(0u8));
+        assert_ne!(other, a.tag, "метка берётся из случайных ключей, не из кода");
+    }
+
+    #[test]
+    fn mail_cannot_declare_palette_variables() {
+        // Письмо объявляет старое имя без метки и правильное по форме имя с чужой меткой — у предка
+        // (для потомков) и у себя. Часть объявлений гигиена убирает, а то, что она не узнаёт
+        // (`x{}` перед именем: браузер с вложенными правилами прочтёт за ним отдельное объявление;
+        // `\40 x{}` — экранированная `@`, не at-правило), остаётся — но имён палитры нет нигде.
+        let foreign = "--aiowa-0123456789abcdef-d0";
+        let src = format!(
+            r#"<div style="--aiowa-d0:red;{foreign}:red;x{{}}{foreign}:red;\40 x{{}}--aiowa-0123456789abcdef-d1:red;color:#000"><p style="{foreign}:red;x{{}}--aiowa-d1:red;background:#fff;color:#333">x</p><font color="black">y</font></div>"#
+        );
+        let clean = r#"<div style="color:#000"><p style="background:#fff;color:#333">x</p><font color="black">y</font></div>"#;
+        let (b, c) = (darken(&src), darken(clean));
+        assert_ne!(b.tag, "0123456789abcdef");
+        assert!(b.html.contains(&format!("x{{}}{foreign}:red")), "подделка пережила разбор, но ничего не значит: {}", b.html);
+        let own = format!("{VAR_PREFIX}{}-", b.tag);
+        let refs = b.html.matches(&own).count();
+        assert_eq!(refs, b.html.matches(&open(&b)).count(), "имена с меткой — только в своих ссылках var(…): {}", b.html);
+        assert_eq!(refs, vars(&c).len());
+        assert_eq!(vars(&b), vars(&c), "цвета те же, что у письма без объявлений");
+        assert_eq!(b.colors, c.colors);
+    }
+
+    #[test]
+    fn at_rules_in_style_are_dropped_with_their_block() {
+        // За блоком at-правила браузер читает отдельное объявление: оно убирается, цвет за ним
+        // перекрашивается.
+        let b = darken(r#"<p style="@x{}--aiowa-d0:red;color:#000">x</p>"#);
+        assert_eq!(light(&b), r#"<p style=";color:#000">x</p>"#);
+        assert_eq!(b.colors, vec!["#e6e6e6"], "{}", b.html);
+        assert!(!b.html.contains("red") && !b.html.contains('@'), "{}", b.html);
+
+        // Пробелы и комментарии перед правилом, вложенные блоки, `}` в строке, правила подряд, цвет
+        // сразу за блоком, правило без блока и с незакрытым блоком (у браузера он до конца).
+        for (style, after) in [
+            (" /* c */ @media print { a { color: red } }--x:1;color:#000", " /* c */ ;color:#000"),
+            ("@x{a:'}'}--aiowa-d0:red;color:#000", ";color:#000"),
+            ("@a{}@b{x:y}color:#000", "color:#000"),
+            ("@import x;--aiowa-d0:red;color:#000", ";;color:#000"),
+            ("@\\78{(})}--x:1;color:#000", ";color:#000"),
+        ] {
+            let b = darken(&format!(r#"<p style="{style}">x</p>"#));
+            assert_eq!(light(&b), format!(r#"<p style="{after}">x</p>"#), "{style}");
+            assert_eq!(b.colors, vec!["#e6e6e6"], "{style}: {}", b.html);
+        }
+        let b = darken(r#"<p style="@x{--aiowa-d0:red;color:#000">x</p>"#);
+        assert_eq!(b.html, r#"<p style="">x</p>"#);
+        assert!(b.colors.is_empty());
+        // `@` без имени — не at-правило, а `@` внутри значения правило не начинает.
+        for src in [r#"<p style="@ {}--x:1">x</p>"#, r#"<p style="color:#000 @x{}">x</p>"#] {
+            assert_eq!(darken(src).html, src);
+        }
+    }
+
+    #[test]
+    fn style_is_split_like_the_browser() {
+        // `/*` в `url(…)` без кавычек — часть адреса, а не комментарий: следующее объявление цвета
+        // перекрашивается как обычно.
+        let src = r#"<p style="background:url(http://x/*y);color:#000">x</p>"#;
+        let b = darken(src);
+        assert_eq!(b.colors, vec!["#e6e6e6"], "{}", b.html);
+        assert_eq!(light(&b), src);
+        // Кавычки и скобки в адресе без кавычек — тоже символы адреса (у браузера неверный адрес
+        // дочитывается до `)`), `URL` и имя с экранированием — тот же `url`. Комментарий в прочих
+        // скобках — комментарий, кавычка в нём строку не открывает. Адрес в кавычках — обычная
+        // функция, `#url(` — не функция: `)` в строке скобку не закрывает.
+        for value in ["url(a'b)", "URL(a(b)", r"u\72 l(a&quot;b)", "rgb(0 0 0/* ' */)", "url( &quot;a)b&quot;)", "#url(&quot;)&quot;)"] {
+            let b = darken(&format!(r#"<p style="background:{value};--aiowa-d0:red;color:#000">x</p>"#));
+            assert_eq!(light(&b), format!(r#"<p style="background:{value};;color:#000">x</p>"#), "{value}");
+            assert_eq!(b.colors, vec!["#e6e6e6"], "{value}: {}", b.html);
+        }
+
+        // Перевод строки обрывает строку в кавычках (у браузера — плохая строка), дальше снова
+        // объявления: пользовательское свойство за ним убирается.
+        for (nl, raw) in [("\n", "\n"), ("&#13;", "\r"), ("&#12;", "\x0c"), ("\r\n", "\r\n")] {
+            let b = darken(&format!(r#"<p style="font-family:'a{nl};--aiowa-d0:red;'">x</p>"#));
+            assert_eq!(b.html, format!(r#"<p style="font-family:'a{raw};;'">x</p>"#), "{nl:?}");
+        }
+        // `\` с переводом строки — продолжение строки: свойство внутри неё не объявление.
+        for nl in ["\n", "\r\n", "&#13;&#10;"] {
+            let src = format!(r#"<p style="font-family:'a\{nl};--aiowa-d0:red;'">x</p>"#);
+            assert_eq!(darken(&src).html, src, "{nl:?}");
+        }
+
+        // `{}` и `[]` в значении — блоки: `;` в них не делит, объявление убирается целиком.
+        let b = darken(r#"<p style="--x:{a;b};--y:[c;d];color:#000">x</p>"#);
+        assert_eq!(light(&b), r#"<p style=";;color:#000">x</p>"#);
+        assert_eq!(b.colors, vec!["#e6e6e6"]);
+    }
+
+    #[test]
+    fn custom_properties_are_dropped_from_style_sheets() {
+        // ammonia `<style>` вырезает, но если он дойдёт, пользовательских свойств в нём не будет.
+        let src = r#"<style>p{--aiowa-d0:red;color:blue} :root{ --x: {a:b; c:d}; --y:1 } @media print{a{--aiowa\-d1:red}} q{content:";--z:1"} a:hover{color:#000}</STYLE><p style="color:#000">x</p>"#;
+        let b = darken(src);
+        assert_eq!(light(&b), r#"<style>p{color:blue} :root{} @media print{a{}} q{content:";--z:1"} a:hover{color:#000}</STYLE><p style="color:#000">x</p>"#);
+        assert_eq!(b.colors, vec!["#e6e6e6"], "тег после таблицы стилей перекрашен как обычно");
+        // Без закрывающего тега — до конца текста.
+        assert_eq!(darken("<style>p{--x:1}").html, "<style>p{}");
+    }
+
+    #[test]
+    fn hr_color_is_a_border() {
+        let b = darken(r##"<hr color="#000000"><hr color="red" style="border-color:#00f"><div color="#000">x</div>"##);
+        assert_eq!(light(&b), r##"<hr color="#000000" style="border-color: #000000; background-color: #000000"><hr color="red" style="border-color: #ff0000; background-color: #ff0000; border-color:#00f"><div color="#000">x</div>"##);
+        let v = vars(&b);
+        assert_eq!(v.len(), 5);
+        for c in &v {
+            let l = c.hsl().2;
+            assert!((BORDER_L_MIN - 0.01..=BORDER_L_MAX + 0.01).contains(&l), "линия как рамка: {}", c.hex());
+        }
+        assert_eq!(v[0], dark_border(Rgba::rgb([0, 0, 0])), "чёрная линия — средне-серая, а не текст листа");
+    }
+
+    #[test]
+    fn quote_text_is_the_sheet_quote_color() {
+        // Цитата без своего цвета: текст в ней — цвет цитаты тёмного листа, и фон внутри темнеет под
+        // него, а не под более светлый текст листа.
+        let inside = vars(&darken(r#"<blockquote><div style="background:#ffff00">x</div></blockquote>"#))[0];
+        let outside = vars(&darken(r#"<div style="background:#ffff00">x</div>"#))[0];
+        let ratio = contrast(Rgba::rgb(SHEET_QUOTE), inside);
+        assert!(ratio >= MIN_CONTRAST, "текст цитаты на {}: {ratio:.2}", inside.hex());
+        assert!(contrast(Rgba::rgb(SHEET_QUOTE), outside) < MIN_CONTRAST, "вне цитаты фон подобран под текст листа: {}", outside.hex());
+        // Свой фон цитаты — тоже под её текст.
+        let own = vars(&darken(r#"<blockquote style="background:#ffffcc">x</blockquote>"#))[0];
+        assert!(contrast(Rgba::rgb(SHEET_QUOTE), own) >= MIN_CONTRAST, "{}", own.hex());
+        // Свой цвет текста цитаты главнее листа.
+        let b = darken(r#"<blockquote style="color:#000"><div style="background:#ffff00">x</div></blockquote>"#);
+        let v = vars(&b);
+        assert!(contrast(v[0], v[1]) >= MIN_CONTRAST, "{:?}", b.colors);
+    }
+
+    #[test]
+    fn conversion_cache_gives_the_same_colors() {
+        let mut p = Palette::default();
+        let (c, bg, t) = (Rgba::rgb([0x1f, 0x49, 0x7d]), sheet(), Rgba::rgb(SHEET_TEXT));
+        assert_eq!(p.dark(Role::Text, c, bg, t), dark_text(c, bg));
+        assert_eq!(p.dark(Role::Bg, c, bg, t), dark_bg(c, t, bg));
+        assert_eq!(p.dark(Role::Border, c, bg, t), dark_border(c));
+        assert_eq!(p.cache.len(), 3);
+        // Повтор — из кэша; то, что роли не нужно, ключ не меняет.
+        assert_eq!(p.dark(Role::Text, c, bg, Rgba::rgb([1, 2, 3])), dark_text(c, bg));
+        assert_eq!(p.dark(Role::Border, c, Rgba::rgb([1, 2, 3]), Rgba::rgb([4, 5, 6])), dark_border(c));
+        assert_eq!(p.cache.len(), 3);
+        // Тот же цвет на другом фоне — другой ключ и свой итог.
+        let yellow = Rgba::rgb([0x40, 0x40, 0x00]);
+        assert_eq!(p.dark(Role::Text, c, yellow, t), dark_text(c, yellow));
+        assert_eq!(p.cache.len(), 4);
+
+        // Большая таблица: каждая ячейка получает те же цвета, что одна такая ячейка отдельно, а тот же
+        // цвет текста вне жёлтой ячейки — свой, как без кэша.
+        let cell = r#"<td style="background:#ffff00"><span style="color:#808080">x</span></td>"#;
+        let tail = r#"<span style="color:#808080">y</span>"#;
+        let one = vars(&darken(&format!("<table><tbody><tr>{cell}</tr></tbody></table>")));
+        let alone = vars(&darken(tail));
+        let many = darken(&format!("<table><tbody><tr>{}</tr></tbody></table>{tail}", cell.repeat(500)));
+        let v = vars(&many);
+        assert_eq!(v.len(), 1001);
+        for pair in v[..1000].chunks(2) {
+            assert_eq!(pair, &one[..]);
+        }
+        assert_eq!(v[1000], alone[0]);
+        assert_ne!(v[1000], one[1], "текст на жёлтом и на листе — разные цвета");
+        assert_eq!(many.colors.len(), 3, "одинаковые тёмные цвета делят переменную");
     }
 
     #[test]
@@ -1153,7 +1801,7 @@ mod tests {
     fn malformed_input_is_copied() {
         for src in ["<p style=\"color:#000\"", "a < b", "<>", "</>", "<!x>", "<p style='color:red'>x</p>", "<td bgcolor=fff>x</td>"] {
             let b = darken(src);
-            assert_eq!(light(&b.html).replace("background-color: #0f0f0f; ", "").replace(" style=\"background-color: #0f0f0f\"", ""), src, "{src}");
+            assert_eq!(light(&b).replace("background-color: #0f0f0f; ", "").replace(" style=\"background-color: #0f0f0f\"", ""), src, "{src}");
         }
     }
 }

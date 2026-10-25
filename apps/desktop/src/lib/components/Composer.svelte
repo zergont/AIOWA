@@ -713,7 +713,7 @@
         </div>
         {#if original.body_html != null}
           <!-- Исходное письмо — как в карточке по настройке «Вид»: тёмные тона только для показа, в цитату на сервер идёт тело с сервера. -->
-          <BodyFrame html={original.body_html} title="Исходное письмо" dark={windowIsDark() && darkMailByDefault()} darkColors={original.dark_colors} />
+          <BodyFrame html={original.body_html} title="Исходное письмо" dark={windowIsDark() && darkMailByDefault()} darkColors={original.dark_colors} darkTag={original.dark_tag} />
         {:else if origLoading}
           <div class="orig-note caption"><span class="spinner" aria-hidden="true"></span> Загружаю исходное письмо…</div>
         {:else if origError}

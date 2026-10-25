@@ -89,6 +89,8 @@ jobs:
       # tauri build: фронтенд (beforeBuildCommand), приложение, установщик NSIS (каждый .exe — через
       # sign.ps1), затем подпись установщика ключом обновлений (createUpdaterArtifacts) — файл .sig.
       # Без ключа сборка падает на последнем шаге: такой выпуск установленные копии не примут.
+      # Ключ не от той пары tauri-cli только предупреждает («does not match the public key») и
+      # сборку не роняет — здесь это отказ; номер ключа в .sig ещё раз сверяет шаг перед релизом.
       - name: Сборка
         working-directory: apps/desktop
         env:
@@ -100,7 +102,18 @@ jobs:
             Write-Error "Нет секрета TAURI_SIGNING_PRIVATE_KEY: без подписи обновления выпуск не собирается"
             exit 1
           }
-          npx tauri build --ci
+          $log = Join-Path $env:RUNNER_TEMP 'tauri-build.log'
+          # Вывод — и в журнал CI, и в файл для проверки; строки stderr — как текст (tauri-cli пишет
+          # туда и ход сборки, это не ошибки: исход — только код выхода).
+          $ErrorActionPreference = 'Continue'
+          npx tauri build --ci 2>&1 | ForEach-Object { "$_" } | Tee-Object -FilePath $log
+          $code = $LASTEXITCODE
+          $ErrorActionPreference = 'Stop'
+          if ($code -ne 0) { exit $code }
+          if (Select-String -Path $log -SimpleMatch -Quiet -Pattern 'does not match the public key') {
+            Write-Error "Ключ обновлений в секрете TAURI_SIGNING_PRIVATE_KEY не от пары к открытому ключу plugins.updater.pubkey: такой выпуск отвергнут все установленные копии"
+            exit 1
+          }
 
       - name: latest.json и «что нового»
         id: files
@@ -139,6 +152,47 @@ jobs:
           Get-FileHash $exe.FullName -Algorithm SHA256 | ForEach-Object { Write-Host "SHA256 $($exe.Name): $($_.Hash)" }
           "exe=$($exe.FullName)" >> $env:GITHUB_OUTPUT
           "sig=$sig" >> $env:GITHUB_OUTPUT
+
+      # Подпись обновления сверяется так же, как её проверит приложение, до того как выпуск
+      # опубликован: номер ключа (keynum) в .sig равен номеру открытого ключа из tauri.conf.json, а
+      # доверенный комментарий подписи несёт версию выпуска (requireSignedVersion). Открытый ключ в
+      # конфиге и .sig — base64 от текстовых файлов minisign; вторая строка каждого — снова base64:
+      # 2 байта алгоритма, 8 байт номера ключа, дальше ключ или подпись. Сравниваются байты как есть
+      # (KeyNum), а в сообщениях номер — как его печатают minisign и `tauri signer` («minisign public
+      # key: …»): те же 8 байт числом little-endian, то есть в обратном порядке, hex в верхнем регистре.
+      - name: Подпись обновления — тем ключом и с версией
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          SIG: ${{ steps.files.outputs.sig }}
+        run: |
+          function Read-Minisign([string]$b64, [string]$what) {
+            try {
+              $text = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($b64.Trim()))
+              $lines = @($text -split "`r?`n")
+              $bytes = [Convert]::FromBase64String($lines[1].Trim())
+            } catch {
+              throw "$what не читается как файл minisign в base64: $($_.Exception.Message)"
+            }
+            if ($bytes.Length -lt 10) { throw "${what}: во второй строке меньше 10 байт" }
+            [pscustomobject]@{
+              KeyNum = [BitConverter]::ToString($bytes, 2, 8)
+              KeyId  = -join ($bytes[9..2] | ForEach-Object { $_.ToString('X2') })
+              Lines  = $lines
+            }
+          }
+          $conf = Get-Content apps/desktop/src-tauri/tauri.conf.json -Raw | ConvertFrom-Json
+          $pub = Read-Minisign $conf.plugins.updater.pubkey 'Открытый ключ plugins.updater.pubkey'
+          $sig = Read-Minisign (Get-Content $env:SIG -Raw) "Подпись $env:SIG"
+          if ($sig.KeyNum -ne $pub.KeyNum) {
+            Write-Error "Установщик подписан не тем ключом: номер ключа подписи $($sig.KeyId), открытого ключа $($pub.KeyId). Секрет TAURI_SIGNING_PRIVATE_KEY не от пары к plugins.updater.pubkey — такой выпуск отвергнут все установленные копии"
+            exit 1
+          }
+          $trusted = $sig.Lines | Where-Object { $_ -like 'trusted comment:*' } | Select-Object -First 1
+          if (-not $trusted -or -not (($trusted -split "`t") -contains "version:$($env:VERSION)")) {
+            Write-Error "В подписи нет версии $($env:VERSION) (requireSignedVersion): установленные копии её отвергнут"
+            exit 1
+          }
+          Write-Host "Подпись обновления: ключ $($sig.KeyId) совпадает с открытым, версия $($env:VERSION) подписана"
 
       # Сначала черновик со всеми файлами, потом публикация: адрес releases/latest не должен указать
       # на выпуск, у которого ещё нет latest.json или установщика. Повторный запуск по той же метке

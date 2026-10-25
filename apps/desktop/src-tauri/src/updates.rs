@@ -18,7 +18,10 @@
 //! Настройки — в `sync_state` базы: `desktop.update_auto_check` (по умолчанию включено) и
 //! `desktop.update_last_check_ms` (последняя удачная проверка). Фоновая проверка идёт только в режиме
 //! почты: через минуту после старта и затем раз в сутки; найденная версия — событие
-//! `update-available` окну. Ход загрузки и установки — событие `update-progress`.
+//! `update-available` окну. Неудачная фоновая проверка (GitHub закрыт, нет сети) повторяется с
+//! нарастающей паузой — 6 ч, 12 ч, затем раз в сутки (`retry_after_ms`), — а в журнал попадает
+//! предупреждением только первая неудача подряд. Ход загрузки и установки — событие
+//! `update-progress`.
 //!
 //! Журнал: только версии и коды ошибок, без адресов и текста ответов.
 
@@ -29,7 +32,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_updater::{Update, UpdaterExt};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use url::Url;
 
 pub(crate) const AUTO_CHECK_KEY: &str = "desktop.update_auto_check";
@@ -45,8 +48,9 @@ const FIRST_CHECK_DELAY: Duration = Duration::from_secs(60);
 /// Как часто фоновая задача смотрит, не пора ли проверить снова (по часам, а не по таймеру сна:
 /// после сна компьютера проверка не сдвигается на сутки).
 const TICK: Duration = Duration::from_secs(60 * 60);
+const HOUR_MS: i64 = 60 * 60 * 1000;
 /// Повторная проверка — раз в сутки после последней удачной.
-const CHECK_EVERY_MS: i64 = 24 * 60 * 60 * 1000;
+const CHECK_EVERY_MS: i64 = 24 * HOUR_MS;
 /// Срок запроса `latest.json`.
 const CHECK_TIMEOUT: Duration = Duration::from_secs(30);
 /// Загрузка установщика без срока (медленный канал), но без данных дольше этого — отказ.
@@ -106,6 +110,15 @@ struct Inner {
     available: Option<Update>,
     /// Последняя удачная проверка, когда базы нет (режим первого запуска).
     last_check_ms: Option<i64>,
+    /// Неудачные фоновые проверки подряд; любая удачная проверка сбрасывает.
+    backoff: Option<Backoff>,
+}
+
+/// Неудачные фоновые проверки подряд: когда была последняя и сколько их.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Backoff {
+    last_ms: i64,
+    count: u32,
 }
 
 #[derive(Default)]
@@ -165,9 +178,34 @@ fn record_check(app: &AppHandle, at_ms: i64) {
     }
 }
 
-/// Пора ли фоновой проверке: удачной ещё не было, прошли сутки или часы переведены назад.
+/// Пора ли проверке по последней удачной: её ещё не было, прошли сутки или часы переведены назад.
 fn due(last_ok_ms: Option<i64>, now_ms: i64) -> bool {
     last_ok_ms.is_none_or(|t| now_ms < t || now_ms - t >= CHECK_EVERY_MS)
+}
+
+/// Пауза после `count` неудачных фоновых проверок подряд: 6 ч, 12 ч, затем сутки. Сервер, закрытый
+/// сейчас (GitHub недоступен из сети предприятия), через час скорее всего закрыт так же.
+fn retry_after_ms(count: u32) -> i64 {
+    match count {
+        0 => 0,
+        1 => 6 * HOUR_MS,
+        2 => 12 * HOUR_MS,
+        _ => CHECK_EVERY_MS,
+    }
+}
+
+/// Пора ли фоновой проверке: по последней удачной (`due`) и, если перед этим были неудачи подряд,
+/// выдержана пауза после последней из них (часы переведены назад — пора).
+fn background_due(last_ok_ms: Option<i64>, backoff: Option<Backoff>, now_ms: i64) -> bool {
+    due(last_ok_ms, now_ms) && backoff.is_none_or(|b| now_ms < b.last_ms || now_ms - b.last_ms >= retry_after_ms(b.count))
+}
+
+/// Записать неудачу фоновой проверки; возвращает, сколько их теперь подряд.
+fn note_background_failure(st: &UpdatesState, at_ms: i64) -> u32 {
+    let mut inner = st.lock();
+    let count = inner.backoff.map_or(0, |b| b.count).saturating_add(1);
+    inner.backoff = Some(Backoff { last_ms: at_ms, count });
+    count
 }
 
 fn now_ms() -> i64 {
@@ -328,8 +366,10 @@ fn emit_progress(app: &AppHandle, stage: &'static str, downloaded: u64, total: O
 
 // --- проверка --------------------------------------------------------------------------------
 
-/// Запрос `latest.json`. Удачная проверка запоминается (время — в базе); найденная версия
-/// заменяет прежнюю и уходит окну событием.
+/// Запрос `latest.json`. Удачная проверка запоминается (время — в базе) и сбрасывает счёт
+/// фоновых неудач; найденная версия заменяет прежнюю и уходит окну событием. Неудача фоновой
+/// проверки идёт в счёт пауз (`retry_after_ms`), и предупреждение в журнал пишется только при
+/// первой подряд; неудача по кнопке — всегда.
 async fn check(app: &AppHandle, background: bool) -> Result<Option<UpdateInfoDto>, Failure> {
     let st = app.state::<UpdatesState>();
     let _one = st.check_lock.lock().await;
@@ -340,9 +380,22 @@ async fn check(app: &AppHandle, background: bool) -> Result<Option<UpdateInfoDto
     };
     let found = found.map_err(|e| {
         let f = Failure::from_error(&e);
-        f.log("проверка");
+        if background {
+            let failures = note_background_failure(&st, now_ms());
+            let retry_h = retry_after_ms(failures) / HOUR_MS;
+            if failures == 1 {
+                warn!(code = f.code, status = ?f.status, retry_h, "обновление: фоновая проверка не удалась, следующая — с паузой");
+            } else {
+                debug!(code = f.code, status = ?f.status, failures, retry_h, "обновление: фоновая проверка снова не удалась");
+            }
+        } else {
+            f.log("проверка");
+        }
         f
     })?;
+    if let Some(b) = st.lock().backoff.take() {
+        info!(failures = b.count, background, "обновление: проверка снова удалась");
+    }
     record_check(app, now_ms());
     let info = found.as_ref().map(info_of);
     match &info {
@@ -359,16 +412,21 @@ async fn check(app: &AppHandle, background: bool) -> Result<Option<UpdateInfoDto
 }
 
 /// Фоновая проверка (только режим почты): через минуту после старта, если включена, затем раз в
-/// час смотрит, прошли ли сутки с последней удачной. Неудачная проверка повторится через час.
+/// час смотрит, прошли ли сутки с последней удачной. Неудачная проверка повторится не раньше
+/// чем через 6 ч, следующая — через 12 ч, дальше — раз в сутки (`background_due`).
 pub(crate) fn start(app: AppHandle) {
     tauri::async_runtime::spawn(async move {
         tokio::time::sleep(FIRST_CHECK_DELAY).await;
         let mut first = true;
         loop {
             let prefs = load_prefs(&app);
-            let busy = app.state::<UpdatesState>().installing.load(Ordering::SeqCst);
-            if prefs.auto_check && !busy && (first || due(prefs.last_check_ms, now_ms())) {
-                // Отказ уже в журнале; окну фоновая ошибка не нужна.
+            let (busy, backoff) = {
+                let st = app.state::<UpdatesState>();
+                let backoff = st.lock().backoff;
+                (st.installing.load(Ordering::SeqCst), backoff)
+            };
+            if prefs.auto_check && !busy && (first || background_due(prefs.last_check_ms, backoff, now_ms())) {
+                // Отказ уже учтён в `check` (журнал и пауза); окну фоновая ошибка не нужна.
                 let _ = check(&app, true).await;
             }
             first = false;
@@ -545,6 +603,42 @@ mod tests {
         assert!(!due(Some(now - CHECK_EVERY_MS + 1), now));
         assert!(due(Some(now - CHECK_EVERY_MS), now));
         assert!(due(Some(now + 60_000), now), "часы переведены назад");
+    }
+
+    /// Расписание фоновых проверок при закрытом сервере: фоновая задача просыпается раз в час
+    /// (`TICK`), а повтор после неудачи — через 6 ч, затем 12 ч, затем раз в сутки; удачная
+    /// проверка сбрасывает счёт.
+    #[test]
+    fn failed_background_checks_back_off() {
+        let st = UpdatesState::default();
+        let t0 = 1_761_390_000_000;
+        let tick = TICK.as_millis() as i64;
+        // Удачной проверки ещё не было, сервер недоступен: моменты фоновых проверок за трое суток.
+        let mut attempts = vec![t0];
+        assert_eq!(note_background_failure(&st, t0), 1, "первая проверка после старта не удалась");
+        let mut now = t0;
+        while now < t0 + 3 * CHECK_EVERY_MS {
+            now += tick;
+            if background_due(None, st.lock().backoff, now) {
+                attempts.push(now);
+                note_background_failure(&st, now);
+            }
+        }
+        let gaps_h: Vec<i64> = attempts.windows(2).map(|w| (w[1] - w[0]) / HOUR_MS).collect();
+        assert_eq!(gaps_h, vec![6, 12, 24, 24], "пауза нарастает до суток, а не каждый час");
+        assert_eq!(st.lock().backoff.map(|b| b.count), Some(5));
+
+        // Пауза считается от последней неудачи; до неё — рано, ровно в срок — пора.
+        let b = Backoff { last_ms: t0, count: 1 };
+        assert!(!background_due(None, Some(b), t0 + 6 * HOUR_MS - 1));
+        assert!(background_due(None, Some(b), t0 + 6 * HOUR_MS));
+        assert!(background_due(None, Some(b), t0 - 1), "часы переведены назад");
+        // Без неудач — как раньше: раз в сутки после удачной.
+        assert!(background_due(None, None, t0));
+        assert!(!background_due(Some(t0), None, t0 + HOUR_MS));
+        // После удачной проверки сутки ждут и при старом счёте неудач.
+        assert!(!background_due(Some(t0), Some(Backoff { last_ms: t0 - CHECK_EVERY_MS, count: 3 }), t0 + HOUR_MS));
+        assert_eq!((retry_after_ms(0), retry_after_ms(1), retry_after_ms(2), retry_after_ms(9)), (0, 6 * HOUR_MS, 12 * HOUR_MS, CHECK_EVERY_MS));
     }
 
     #[test]

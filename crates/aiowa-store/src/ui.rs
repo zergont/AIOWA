@@ -102,15 +102,17 @@ fn head_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<MessageHead> {
     })
 }
 
+/// Начало текста самого свежего письма беседы `?1` в папке `?2` (см. `fill_previews`). Тот же
+/// текст проверяет на план тест: запрос должен идти по индексу `items_conv_folder`.
+const PREVIEW_SQL: &str = "SELECT preview FROM items WHERE conversation_pk = ?1 AND folder_pk = ?2 AND deleted = 0
+ ORDER BY COALESCE(received_at, sent_at) DESC, item_pk DESC LIMIT 1";
+
 /// Дописывает строкам бесед начало текста самого свежего письма беседы в папке `folder_pk`
 /// (третья строка списка). Запрос на строку страницы, а не подзапрос в выборке страницы: так он
 /// идёт только для отданных строк и по индексу `items_conv_folder` (беседа, папка) читает лишь
 /// письма беседы в этой папке. Тот же порядок, что у `last_received_at` в `conversation_folders`.
 pub(crate) fn fill_previews(c: &Connection, folder_pk: i64, rows: &mut [ConversationRow]) -> rusqlite::Result<()> {
-    let mut st = c.prepare_cached(
-        "SELECT preview FROM items WHERE conversation_pk = ?1 AND folder_pk = ?2 AND deleted = 0
-         ORDER BY COALESCE(received_at, sent_at) DESC, item_pk DESC LIMIT 1",
-    )?;
+    let mut st = c.prepare_cached(PREVIEW_SQL)?;
     for row in rows {
         row.preview = st.query_row(params![row.conversation_pk, folder_pk], |r| r.get::<_, Option<String>>(0)).optional()?.flatten().filter(|p| !p.trim().is_empty());
     }
@@ -345,11 +347,13 @@ mod tests {
     #[test]
     fn preview_query_uses_conversation_folder_index() {
         let s = tmp_store("preview-plan");
+        // План того самого запроса, что идёт в `fill_previews` (с параметрами, как там).
         let plan = s
-            .debug_query(
-                "EXPLAIN QUERY PLAN SELECT preview FROM items WHERE conversation_pk = 1 AND folder_pk = 2 AND deleted = 0
-                 ORDER BY COALESCE(received_at, sent_at) DESC, item_pk DESC LIMIT 1",
-            )
+            .with_conn(|c| {
+                let mut st = c.prepare(&format!("EXPLAIN QUERY PLAN {PREVIEW_SQL}"))?;
+                let rows = st.query_map(params![1, 2], |r| r.get::<_, String>("detail"))?;
+                Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+            })
             .unwrap()
             .join("\n");
         assert!(plan.contains("items_conv_folder"), "{plan}");

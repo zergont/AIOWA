@@ -153,6 +153,7 @@ pub struct FolderStats {
 
 #[derive(Debug, Clone)]
 pub struct StoreStats {
+    /// Файл базы с журналами `-wal` и `-shm` (`identity::db_files_bytes`).
     pub db_bytes: u64,
     pub items: i64,
     pub bodies: i64,
@@ -160,7 +161,9 @@ pub struct StoreStats {
     pub attachments: i64,
     pub attachments_fetched: i64,
     pub attachments_with_text: i64,
-    pub attachment_cache_bytes: i64,
+    /// Каталог кэша вложений на диске целиком (`identity::dir_bytes`), а не сумма размеров по
+    /// строкам базы: кэш общий для всех учётных записей базы.
+    pub attachment_cache_bytes: u64,
     pub folders: Vec<FolderStats>,
 }
 
@@ -404,7 +407,8 @@ impl Store {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
-        let attachments_dir = path.parent().map(|d| d.join("attachments")).unwrap_or_else(|| PathBuf::from("attachments"));
+        // Каталог кэша — тот же, что считают вкладка «Данные» и сводка чужих баз.
+        let attachments_dir = identity::attachments_dir_for(&path);
         let conn = Connection::open(&path)?;
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
@@ -429,24 +433,16 @@ impl Store {
         &self.attachments_dir
     }
 
-    /// Место на диске под кэш вложений, байт: файлы в каталоге кэша (нет каталога — 0).
+    /// Место на диске под кэш вложений, байт: каталог кэша со вложенными (нет каталога — 0).
+    /// Тот же подсчёт, что у вкладки «Данные» (`identity::dir_bytes`): цифры в окне не расходятся.
     pub fn attachment_cache_bytes(&self) -> u64 {
-        let Ok(entries) = std::fs::read_dir(&self.attachments_dir) else { return 0 };
-        entries.filter_map(|e| e.ok()).filter_map(|e| e.metadata().ok()).filter(|m| m.is_file()).map(|m| m.len()).sum()
+        identity::dir_bytes(&self.attachments_dir)
     }
 
-    /// Размер базы на диске, байт: файл базы и журналы `-wal` и `-shm` рядом с ним.
+    /// Размер базы на диске, байт: файл базы и журналы `-wal` и `-shm` рядом с ним
+    /// (`identity::db_files_bytes`, как у вкладки «Данные»).
     pub fn disk_size_bytes(&self) -> u64 {
-        let base = self.path.as_os_str().to_owned();
-        ["", "-wal", "-shm"]
-            .iter()
-            .filter_map(|suffix| {
-                let mut p = base.clone();
-                p.push(suffix);
-                std::fs::metadata(PathBuf::from(p)).ok()
-            })
-            .map(|m| m.len())
-            .sum()
+        identity::db_files_bytes(&self.path)
     }
 
     fn with_conn<T>(&self, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
@@ -1531,17 +1527,20 @@ impl Store {
 
     // --- статистика ---------------------------------------------------------
 
+    /// Счётчики учётной записи. Размеры на диске — как у вкладки «Данные» и строки состояния:
+    /// база с `-wal` и `-shm` (при любом имени файла базы) и каталог кэша вложений целиком.
     pub fn stats(&self, account: AccountId) -> Result<StoreStats> {
-        let db_bytes = std::fs::metadata(&self.path).map(|m| m.len()).unwrap_or(0) + std::fs::metadata(self.path.with_extension("db-wal")).map(|m| m.len()).unwrap_or(0);
+        let db_bytes = self.disk_size_bytes();
+        let attachment_cache_bytes = self.attachment_cache_bytes();
         self.with_conn(|c| {
             let items: i64 = c.query_row("SELECT COUNT(*) FROM items WHERE account_id = ?1 AND deleted = 0", params![account.0], |r| r.get(0))?;
             let bodies: i64 = c.query_row("SELECT COUNT(*) FROM bodies b JOIN items i ON i.item_pk = b.item_pk WHERE i.account_id = ?1 AND i.deleted = 0", params![account.0], |r| r.get(0))?;
             let conversations: i64 = c.query_row("SELECT COUNT(*) FROM conversations WHERE account_id = ?1 AND item_count > 0", params![account.0], |r| r.get(0))?;
-            let (attachments, attachments_fetched, attachments_with_text, attachment_cache_bytes): (i64, i64, i64, i64) = c.query_row(
-                "SELECT COUNT(*), COALESCE(SUM(a.fetched_at IS NOT NULL), 0), COALESCE(SUM(a.text_state = 1), 0), COALESCE(SUM(CASE WHEN a.local_path IS NOT NULL THEN a.size ELSE 0 END), 0)
+            let (attachments, attachments_fetched, attachments_with_text): (i64, i64, i64) = c.query_row(
+                "SELECT COUNT(*), COALESCE(SUM(a.fetched_at IS NOT NULL), 0), COALESCE(SUM(a.text_state = 1), 0)
                  FROM attachments a JOIN items i ON i.item_pk = a.item_pk WHERE i.account_id = ?1 AND i.deleted = 0 AND a.is_inline = 0",
                 params![account.0],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )?;
             let mut st = c.prepare(
                 "SELECT f.display_name, f.distinguished, f.total_count, f.sync_complete,
@@ -2429,6 +2428,7 @@ mod tests {
         assert!(path.starts_with(s.attachments_dir()));
         assert_eq!(s.attachment_cache_bytes(), b"%PDF fake".len() as u64, "кэш — это файлы каталога вложений");
         assert!(s.disk_size_bytes() >= std::fs::metadata(s.path()).unwrap().len());
+        assert_eq!(s.stats(acc).unwrap().attachment_cache_bytes, b"%PDF fake".len() as u64, "`stats` — тот же подсчёт");
         assert!(s.attachments_to_fetch(acc, fpk, None, i64::MAX, 10).unwrap().iter().all(|t| t.server_id != "att1"));
 
         let hits = s.search(acc, "шлепанц", 10).unwrap();
@@ -2461,6 +2461,27 @@ mod tests {
         s.store_full_messages(acc, fpk, &[msg2]).unwrap();
         assert_eq!(s.attachments_of_item(a1.item_pk).unwrap().len(), 1);
         assert!(s.search(acc, "шлепанц", 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn stats_sizes_match_data_tab_for_any_file_name() {
+        // Не `mail.db`: журнал — `dev.sqlite-wal`, а не `dev.db-wal`.
+        let dir = std::env::temp_dir().join(format!("aiowa-store-test-stats-size-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let s = Store::open(dir.join("dev.sqlite")).unwrap();
+        let acc = s.account("h", "u").unwrap();
+        assert_eq!(s.attachments_dir(), identity::attachments_dir_for(s.path()));
+        std::fs::create_dir_all(s.attachments_dir().join("sub")).unwrap();
+        std::fs::write(s.attachments_dir().join("sub").join("x.bin"), [0u8; 11]).unwrap();
+        let mut wal = s.path().as_os_str().to_owned();
+        wal.push("-wal");
+        assert!(Path::new(&wal).is_file(), "журнал открытой базы рядом с ней");
+        let st = s.stats(acc).unwrap();
+        assert_eq!(st.db_bytes, identity::db_files_bytes(s.path()));
+        assert!(st.db_bytes > std::fs::metadata(s.path()).unwrap().len(), "журналы посчитаны");
+        assert_eq!(st.attachment_cache_bytes, 11, "каталог кэша на диске со вложенными, хотя строк вложений в базе нет");
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

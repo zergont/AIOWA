@@ -8,7 +8,9 @@
    * Все базы на диске (вкладка «Данные» настроек): ящик или логин, путь, размер (база с журналами
    * и кэш вложений), писем, последняя синхронизация, отметка текущей. Пока вкладка открыта, список
    * перечитывается раз в несколько секунд — цифры идут вместе с синхронизацией. Не текущую базу
-   * можно открыть в Проводнике и удалить (каталог целиком, с подтверждением).
+   * можно открыть в Проводнике и удалить (каталог целиком, с подтверждением). Остаток неполного
+   * удаления (`leftover`) — отдельная строка «Остаток удалённой базы» с размером: его тоже можно
+   * открыть и удалить повторно.
    */
   interface Props {
     /** Свежий размер текущей базы и её кэша вложений — для строк над списком. */
@@ -48,6 +50,8 @@
 
   let actionError = $state<{ path: string; text: string } | null>(null);
   let notice = $state<string | null>(null);
+  /** Ошибка удаления, когда строки той базы в списке уже нет (каталог переименован в остаток). */
+  let removeError = $state<string | null>(null);
   let asking = $state<string | null>(null);
   const deleteBtns: Record<string, HTMLButtonElement | null> = {};
   let cancelBtn = $state<HTMLButtonElement | null>(null);
@@ -79,16 +83,25 @@
     if (deleting) return;
     deleting = true;
     actionError = null;
+    removeError = null;
+    let failed: string | null = null;
     try {
       const freed = await dataApi.remove(s.path);
       asking = null;
-      notice = `База удалена, освобождено ${bytesText(freed)}`;
+      notice = `${s.leftover ? "Остаток удалён" : "База удалена"}, освобождено ${bytesText(freed)}`;
     } catch (e) {
-      actionError = { path: s.path, text: errorMessage(e) };
+      failed = errorMessage(e);
+      actionError = { path: s.path, text: failed };
     } finally {
       deleting = false;
     }
     await load();
+    // База удалилась не до конца: каталог уже переименован в остаток, и строки с прежним путём в
+    // списке нет — ошибку показываем над списком, а остаток виден отдельной строкой.
+    if (failed && !stores?.some((x) => x.path === s.path)) {
+      asking = null;
+      removeError = `Удалено не до конца: ${failed}. Остаток показан в списке, его можно удалить ещё раз.`;
+    }
   }
 
   /** На кнопках вопроса: Esc закрывает вопрос, а не окно настроек целиком. */
@@ -101,6 +114,11 @@
   }
 
   const KIND_TEXT = (s: StoreInfo) => (s.has_guid ? "ящик записан в базе" : "база старой версии: ящик узнаётся по логину");
+  /** Подсказка к размеру: у остатка «база» — уцелевшие файлы базы, остальное — что ещё в каталоге. */
+  const SIZE_TITLE = (s: StoreInfo) =>
+    s.leftover
+      ? `Файлы базы: ${bytesText(s.db_bytes)}, остальное: ${bytesText(s.cache_bytes)}`
+      : `База с журналами: ${bytesText(s.db_bytes)}, кэш вложений: ${bytesText(s.cache_bytes)}`;
 
   let timer: ReturnType<typeof setInterval> | undefined;
   onMount(() => {
@@ -118,6 +136,9 @@
   {#if notice}
     <p class="ok-line" role="status">{notice}</p>
   {/if}
+  {#if removeError}
+    <p class="err" role="alert">{removeError}</p>
+  {/if}
   {#if !stores}
     {#if loadError}
       <p class="err" role="alert">Список баз не загрузился: {loadError}</p>
@@ -129,10 +150,16 @@
       {#each stores as s (s.path)}
         <li class="store" class:current={s.current}>
           <div class="store-head">
-            <span class="owner">{storeOwner(s)}</span>
+            {#if s.leftover}
+              <!-- Ящик остатка — имя его каталога: базу остатка бэкенд не открывает. -->
+              <span class="owner">Остаток удалённой базы</span>
+              {#if s.logins.length}<span class="sub">{s.logins.join(", ")}</span>{/if}
+            {:else}
+              <span class="owner">{storeOwner(s)}</span>
+            {/if}
             {#if s.current}<span class="badge">текущая</span>{/if}
             <span class="spacer"></span>
-            <span class="size" title="База с журналами: {bytesText(s.db_bytes)}, кэш вложений: {bytesText(s.cache_bytes)}">{bytesText(s.total_bytes)}</span>
+            <span class="size" title={SIZE_TITLE(s)}>{bytesText(s.total_bytes)}</span>
           </div>
           <p class="mono path">{s.dir}</p>
           {#if s.error}
@@ -150,11 +177,17 @@
             </div>
             {#if asking === s.path}
               <div class="box" role="alertdialog" aria-labelledby="{uid}-del-title" aria-describedby="{uid}-del-text">
-                <p class="box-title" id="{uid}-del-title">Удалить эту базу?</p>
+                <p class="box-title" id="{uid}-del-title">{s.leftover ? "Удалить остаток?" : "Удалить эту базу?"}</p>
                 <div id="{uid}-del-text">
-                  <p class="text">Каталог базы будет удалён целиком — {bytesText(s.total_bytes)}:</p>
-                  <p class="mono path">{s.dir}</p>
-                  <p class="text">Письма на сервере это не трогает. Если база понадобится снова, почта скачается с сервера заново.</p>
+                  {#if s.leftover}
+                    <p class="text">Остаток каталога будет удалён целиком — {bytesText(s.total_bytes)}:</p>
+                    <p class="mono path">{s.dir}</p>
+                    <p class="text">Письма на сервере это не трогает.</p>
+                  {:else}
+                    <p class="text">Каталог базы будет удалён целиком — {bytesText(s.total_bytes)}:</p>
+                    <p class="mono path">{s.dir}</p>
+                    <p class="text">Письма на сервере это не трогает. Если база понадобится снова, почта скачается с сервера заново.</p>
+                  {/if}
                 </div>
                 {#if actionError?.path === s.path}
                   <p class="err" role="alert">{actionError.text}</p>
@@ -162,7 +195,7 @@
                 <div class="row">
                   <button class="btn danger" onclick={() => void remove(s)} onkeydown={onConfirmKey} disabled={deleting}>
                     {#if deleting}<span class="spinner" aria-hidden="true"></span>{/if}
-                    {deleting ? "Удаляю…" : "Удалить базу"}
+                    {deleting ? "Удаляю…" : s.leftover ? "Удалить остаток" : "Удалить базу"}
                   </button>
                   <button class="btn" bind:this={cancelBtn} onclick={cancel} onkeydown={onConfirmKey} disabled={deleting}>Отмена</button>
                 </div>
@@ -239,6 +272,14 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+    user-select: text;
+  }
+  .sub {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--fg-3);
     user-select: text;
   }
   .badge {

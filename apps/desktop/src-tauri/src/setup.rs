@@ -6,10 +6,11 @@
 //! логин, как `aiowa set-password`), пишет `config.json` с блоком `initial` и перезапускает
 //! приложение — оно поднимается в режиме почты с новой учётной записью.
 //!
-//! Проверка входа — отдельная сессия (не транспорт процесса): вход и два лёгких запроса
-//! (иерархия папок и сведения о ящике, `sessiondata.ashx`) — не дольше 60 с, затем выход
-//! (всегда, с отдельным пределом 5 с). Пароль живёт только в `SecretString` и в журнал не
-//! попадает. Тексты ошибок — фиксированные фразы для пользователя.
+//! Проверка входа — отдельная сессия (не транспорт процесса): вход и лёгкие запросы — иерархия
+//! папок, а в мастере ещё сведения о ящике (`sessiondata.ashx`, для поиска его базы; смене
+//! пароля они не нужны) — не дольше 60 с, затем выход (всегда, с отдельным пределом 5 с). Пароль
+//! живёт только в `SecretString` и в журнал не попадает. Тексты ошибок — фиксированные фразы для
+//! пользователя.
 //!
 //! Одна база на ящик (`mailbox.rs`): после удачной проверки мастер ищет на диске базы этого
 //! ящика и показывает их на шаге «Синхронизация» — «Продолжить с этой базой» (по умолчанию) или
@@ -130,7 +131,8 @@ pub(crate) struct LoginCheckDto {
     pub(crate) host: Option<String>,
     /// Ящик, в который выполнен вход, если сервер сообщил (`sessiondata.ashx`).
     pub(crate) mailbox: Option<MailboxDto>,
-    /// Базы этого ящика на диске: сначала полнее. Мастер предлагает продолжить с первой.
+    /// Базы этого ящика на диске: сначала совпавшие по GUID или адресу, затем только по логину;
+    /// внутри — сначала полнее. Мастер предлагает продолжить с первой.
     pub(crate) stores: Vec<CandidateDto>,
     /// Путь новой базы, если начать с нуля (каталог из адреса ящика).
     pub(crate) new_db_path: Option<String>,
@@ -266,13 +268,17 @@ pub(crate) fn describe_login_error(e: &TransportError, host: &str) -> String {
 /// (иначе каждая повисшая проверка оставляла бы на сервере живую сессию). Остаётся узкая щель:
 /// срок может истечь внутри `connect` уже после удачного auth.owa (на редиректах) — транспорта
 /// ещё нет, выйти нечем; закрыть её можно, только если `connect` отдаст транспорт до входа.
+///
+/// Сведений о ящике не запрашивает: смене пароля они не нужны, а лишний запрос — лишняя нагрузка
+/// на сервер и лишний повод не уложиться в срок.
 pub(crate) async fn check_login(host: &str, user: &str, password: SecretString) -> LoginCheckDto {
-    check_login_with_mailbox(host, user, password).await.0
+    check_session(host, user, password, false).await.0
 }
 
-/// То же, плюс сведения о ящике (адрес и GUID) для поиска его базы: запрашиваются после
-/// иерархии в том же сроке; не пришли — `None`, проверка входа от этого не проваливается.
-async fn check_login_with_mailbox(host: &str, user: &str, password: SecretString) -> (LoginCheckDto, Option<MailboxInfo>) {
+/// Проверочная сессия. `want_mailbox` — ещё и сведения о ящике (адрес и GUID) для поиска его
+/// базы (мастер): запрашиваются после иерархии в том же сроке; не пришли — `None`, проверка входа
+/// от этого не проваливается. Без `want_mailbox` — всегда `None`, запроса нет.
+async fn check_session(host: &str, user: &str, password: SecretString, want_mailbox: bool) -> (LoginCheckDto, Option<MailboxInfo>) {
     let creds = Credentials { host: host.to_string(), user: user.to_string(), password };
     let timed_out = || {
         warn!(host, "проверка входа не уложилась в {} с", LOGIN_CHECK_TIMEOUT.as_secs());
@@ -290,7 +296,7 @@ async fn check_login_with_mailbox(host: &str, user: &str, password: SecretString
     };
     let hierarchy = tokio::time::timeout_at(deadline, t.sync_folder_hierarchy(None)).await;
     let info = match &hierarchy {
-        Ok(Ok(_)) => match tokio::time::timeout_at(deadline, t.mailbox_info()).await {
+        Ok(Ok(_)) if want_mailbox => match tokio::time::timeout_at(deadline, t.mailbox_info()).await {
             Ok(Ok(info)) => Some(info),
             Ok(Err(e)) => {
                 warn!(error = %e, "сведения о ящике при проверке входа не получены");
@@ -322,7 +328,7 @@ async fn check_login_with_mailbox(host: &str, user: &str, password: SecretString
     }
 }
 
-/// Проверка входа под замком процесса (одна за раз).
+/// Проверка входа под замком процесса (одна за раз), без сведений о ящике (смена пароля).
 pub(crate) async fn check_login_locked(setup: &SetupState, host: &str, user: &str, password: SecretString) -> LoginCheckDto {
     let _one = setup.login_lock.lock().await;
     check_login(host, user, password).await
@@ -414,7 +420,7 @@ pub(crate) async fn setup_test_login(host: String, user: String, password: Strin
     }
     let (mut dto, info) = {
         let _one = setup.login_lock.lock().await;
-        check_login_with_mailbox(&host, &user, password).await
+        check_session(&host, &user, password, true).await
     };
     if !dto.ok {
         return Ok(dto);

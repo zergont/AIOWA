@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onDestroy, onMount, tick } from "svelte";
+  import { tick } from "svelte";
   import { api, errorMessage, type Folder } from "../api";
   import { DND_CONVERSATIONS, ICON, folderNameError, isInsideDeleted, readDragPayload, type DragPayload } from "../actions";
   import { focusBack, type Anchor } from "../popover";
@@ -36,38 +36,65 @@
   // --- свёрнутые ветки: хранятся в базе учётной записи (folders_collapsed_get / _set) ---------------
   // В базе — серверные идентификаторы папок, окну приходят локальные ключи; удалённые на сервере
   // папки бэкенд выбрасывает сам. Пока список не прочитан, строки дерева не рисуются: иначе дерево
-  // на миг показалось бы развёрнутым целиком. Сохранение — с задержкой, одной записью на серию щелчков.
+  // на миг показалось бы развёрнутым целиком. Сохранение — сразу после щелчка (запись — одна строка
+  // sync_state): отложенная запись терялась, если окно закрывали в первые доли секунды.
+  //
+  // Читается список, когда дерево из пустого стало непустым, — при старте, если папки уже есть, или
+  // когда их принесла первая синхронизация. Пока папок в базе нет, серверные идентификаторы не во
+  // что перевести, и прочитанный тогда список был бы пуст (в базе он при этом не теряется).
 
   let collapsed = $state<Set<number>>(new Set());
   let collapsedLoaded = $state(false);
-  const SAVE_DELAY_MS = 300;
-  let saveTimer: ReturnType<typeof setTimeout> | undefined;
+  /** Запись в полёте и щелчок во время неё: свежий набор уходит следующей записью, по одной за раз. */
+  let saveRunning = false;
   let savePending = false;
+  /** Номер последнего чтения: ответ более раннего, пришедший позже, не применяется. */
+  let readSeq = 0;
+  /** Папки были при прошлом прогоне эффекта ниже (не реактивно: только для сравнения). */
+  let hadFolders = false;
 
-  onMount(() => {
+  $effect(() => {
+    const has = folders.length > 0;
+    if (has && !hadFolders) readCollapsed();
+    hadFolders = has;
+  });
+
+  function readCollapsed() {
+    const seq = ++readSeq;
+    collapsedLoaded = false;
     api
       .foldersCollapsedGet()
-      .then((pks) => (collapsed = new Set(pks)))
+      .then((pks) => {
+        if (seq === readSeq) collapsed = new Set(pks);
+      })
       .catch((e) => console.warn("folders_collapsed_get:", errorMessage(e)))
-      .finally(() => (collapsedLoaded = true));
-  });
+      .finally(() => {
+        if (seq === readSeq) collapsedLoaded = true;
+      });
+  }
 
   function setCollapsed(next: Set<number>) {
     collapsed = next;
     savePending = true;
-    clearTimeout(saveTimer);
-    saveTimer = setTimeout(flushCollapsed, SAVE_DELAY_MS);
+    void saveCollapsed();
   }
 
-  /** Записать несохранённое сейчас (по таймеру, при уходе со страницы и при размонтировании). */
-  function flushCollapsed() {
-    clearTimeout(saveTimer);
-    if (!savePending) return;
-    savePending = false;
-    api.foldersCollapsedSet([...collapsed]).catch((e) => console.warn("folders_collapsed_set:", errorMessage(e)));
+  /**
+   * Записать свёрнутые ветки сейчас. Записи не обгоняют друг друга: пока одна в полёте, следующие
+   * щелчки только помечают набор, и по её ответу уходит одна запись с последним состоянием.
+   */
+  async function saveCollapsed() {
+    if (saveRunning) return;
+    saveRunning = true;
+    try {
+      while (savePending) {
+        savePending = false;
+        await api.foldersCollapsedSet([...collapsed]).catch((e) => console.warn("folders_collapsed_set:", errorMessage(e)));
+      }
+    } finally {
+      saveRunning = false;
+    }
   }
-
-  onDestroy(flushCollapsed);
 
   interface Node {
     folder: Folder;
@@ -437,7 +464,7 @@
   }
 </script>
 
-<svelte:window ondragend={onDragEnd} ondrop={onDragEnd} onpagehide={flushCollapsed} />
+<svelte:window ondragend={onDragEnd} ondrop={onDragEnd} />
 
 {#snippet editRow(depth: number)}
   <div class="row editing" style="--depth: {depth}" role="none">

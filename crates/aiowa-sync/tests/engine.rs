@@ -85,6 +85,8 @@ struct Fake {
     recent_calls: Mutex<Vec<String>>,
     /// Первый `SyncFolderItems` ждёт теста (см. [`Gate`]).
     gate: Mutex<Option<Arc<Gate>>>,
+    /// Изменения дерева для следующего инкрементального `SyncFolderHierarchy` (один раз).
+    hierarchy_next: Mutex<Option<Vec<FolderChange>>>,
 }
 
 impl Fake {
@@ -99,6 +101,7 @@ impl Fake {
             recent: Mutex::new(None),
             recent_calls: Mutex::new(vec![]),
             gate: Mutex::new(None),
+            hierarchy_next: Mutex::new(None),
         })
     }
 
@@ -114,7 +117,8 @@ impl Fake {
 impl MailTransport for Fake {
     async fn sync_folder_hierarchy(&self, state: Option<&SyncState>) -> TResult<FolderChanges> {
         if state.is_some() {
-            return Ok(FolderChanges { state: SyncState("H1".into()), changes: vec![], includes_last: true });
+            let changes = self.hierarchy_next.lock().unwrap().take().unwrap_or_default();
+            return Ok(FolderChanges { state: SyncState("H1".into()), changes, includes_last: true });
         }
         Ok(FolderChanges {
             state: SyncState("H1".into()),
@@ -571,6 +575,41 @@ async fn invalid_state_triggers_resync() {
 
 // --- свежие письма первыми и события по ходу прогона -------------------------------------------
 
+/// Дерево, в котором только удалили папку (upsert-ов нет), — тоже изменение: окно получает
+/// `FoldersApplied`. Дерево без изменений события не даёт.
+#[tokio::test]
+async fn hierarchy_with_only_deletes_is_reported() {
+    let store = test_store("hierarchy-deletes");
+    let account = store.account("fake", "u").unwrap();
+    let fake = Fake::new();
+    let events = Arc::new(Mutex::new(Vec::<SyncEvent>::new()));
+    let sink = events.clone();
+    let progress: aiowa_sync::ProgressFn = Arc::new(move |e: &SyncEvent| sink.lock().unwrap().push(e.clone()));
+    let engine = Engine::new(fake.clone(), store.clone(), account, Arc::new(AtomicBool::new(false))).on_progress(progress);
+    let applied = |events: &Mutex<Vec<SyncEvent>>| {
+        events
+            .lock()
+            .unwrap()
+            .drain(..)
+            .filter_map(|e| match e {
+                SyncEvent::FoldersApplied { upserts, deletes } => Some((upserts, deletes)),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+
+    assert_eq!(engine.sync_hierarchy().await.unwrap(), 4);
+    assert_eq!(applied(&events), vec![(4, 0)]);
+
+    *fake.hierarchy_next.lock().unwrap() = Some(vec![FolderChange::Delete(FolderId { id: "F-PROJ".into(), change_key: None })]);
+    assert_eq!(engine.sync_hierarchy().await.unwrap(), 0, "upsert-ов нет");
+    assert_eq!(applied(&events), vec![(0, 1)], "одно удаление — событие есть");
+    assert!(store.resolve_folder(account, "Проекты").unwrap().is_none(), "папка помечена удалённой");
+
+    assert_eq!(engine.sync_hierarchy().await.unwrap(), 0);
+    assert!(applied(&events).is_empty(), "без изменений события нет");
+}
+
 fn only_inbox() -> SyncOptions {
     SyncOptions { folders: FolderSelection::Named(vec!["inbox".into(), "sentitems".into()]), fetch_bodies: false, fetch_attachments: false, ..SyncOptions::default() }
 }
@@ -627,7 +666,7 @@ async fn recent_page_first_then_full_sync_without_duplicates() {
     // Порядок событий: дерево → свежая страница → полная выгрузка; пачки с изменениями — событиями.
     let ev = events.lock().unwrap().clone();
     let pos = |f: &dyn Fn(&SyncEvent) -> bool| ev.iter().position(f).unwrap_or(usize::MAX);
-    let tree = pos(&|e| matches!(e, SyncEvent::FoldersApplied { upserts: 4 }));
+    let tree = pos(&|e| matches!(e, SyncEvent::FoldersApplied { upserts: 4, deletes: 0 }));
     let recent_stage = pos(&|e| matches!(e, SyncEvent::Stage { stage: SyncStage::Recent, folder: Some(_) }));
     let recent = pos(&|e| matches!(e, SyncEvent::ItemsApplied { recent: true, changed: 3, .. }));
     let items_stage = pos(&|e| matches!(e, SyncEvent::Stage { stage: SyncStage::Items, .. }));

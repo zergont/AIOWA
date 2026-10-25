@@ -93,25 +93,39 @@ pub fn data_root() -> PathBuf {
     std::env::var_os("LOCALAPPDATA").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(".")).join("AIOWA")
 }
 
-/// Базы под каталогом `root`: `<root>\<сервер>\<ящик>\mail.db`, по пути. Каталоги, которые
-/// удаляются (`*.deleting-*`), пропускаются.
-pub fn scan_databases(root: &Path) -> Vec<PathBuf> {
+/// Каталоги `<root>\<сервер>\*` (без сортировки).
+fn mailbox_dirs(root: &Path) -> Vec<PathBuf> {
     let dirs = |p: &Path| -> Vec<PathBuf> {
         std::fs::read_dir(p).map(|rd| rd.filter_map(|e| e.ok()).filter(|e| e.file_type().is_ok_and(|t| t.is_dir())).map(|e| e.path()).collect()).unwrap_or_default()
     };
-    let mut out: Vec<PathBuf> = dirs(root)
-        .iter()
-        .flat_map(|host| dirs(host))
-        .filter(|d| !d.file_name().is_some_and(|n| n.to_string_lossy().contains(DELETING_MARK)))
-        .map(|d| d.join("mail.db"))
-        .filter(|p| p.is_file())
-        .collect();
+    dirs(root).iter().flat_map(|host| dirs(host)).collect()
+}
+
+/// Базы под каталогом `root`: `<root>\<сервер>\<ящик>\mail.db`, по пути. Каталоги, которые
+/// удаляются (`<ящик>.deleting-<время>`), сюда не входят: их перечисляет `scan_leftovers`.
+pub fn scan_databases(root: &Path) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = mailbox_dirs(root).into_iter().filter(|d| !is_deleting_dir(d)).map(|d| d.join("mail.db")).filter(|p| p.is_file()).collect();
+    out.sort();
+    out
+}
+
+/// Остатки неполного удаления под `root`: каталоги `<root>\<сервер>\<ящик>.deleting-<время>`
+/// (переименованы перед удалением, но удалены не до конца — файл держала другая программа), по
+/// пути. Вкладка «Данные» показывает их, чтобы место не терялось незаметно.
+pub fn scan_leftovers(root: &Path) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = mailbox_dirs(root).into_iter().filter(|d| is_deleting_dir(d)).collect();
     out.sort();
     out
 }
 
 /// Метка каталога базы, который сейчас удаляется (переименован перед удалением).
 pub const DELETING_MARK: &str = ".deleting-";
+
+/// Каталог переименован перед удалением: `<имя>.deleting-<цифры>`.
+pub fn is_deleting_dir(dir: &Path) -> bool {
+    let Some(name) = dir.file_name().map(|n| n.to_string_lossy()) else { return false };
+    name.rsplit_once(DELETING_MARK).is_some_and(|(base, stamp)| !base.is_empty() && !stamp.is_empty() && stamp.bytes().all(|b| b.is_ascii_digit()))
+}
 
 /// Путь журнала SQLite рядом с базой: `mail.db` + `-wal` → `mail.db-wal`.
 fn sidecar(db: &Path, suffix: &str) -> PathBuf {
@@ -120,7 +134,8 @@ fn sidecar(db: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(s)
 }
 
-/// Размер базы на диске: файл и журналы `-wal` и `-shm` (нет файла — 0).
+/// Размер базы на диске: файл и журналы `-wal` и `-shm` (нет файла — 0). Один подсчёт для
+/// строки состояния, настроек и вкладки «Данные» (`Store::disk_size_bytes` зовёт его же).
 pub fn db_files_bytes(db: &Path) -> u64 {
     ["", "-wal", "-shm"].iter().filter_map(|suffix| std::fs::metadata(sidecar(db, suffix)).ok()).filter(|m| m.is_file()).map(|m| m.len()).sum()
 }
@@ -130,7 +145,8 @@ pub fn attachments_dir_for(db: &Path) -> PathBuf {
     db.parent().map(|d| d.join("attachments")).unwrap_or_else(|| PathBuf::from("attachments"))
 }
 
-/// Размер каталога со всеми вложенными (нет каталога — 0). Ссылки не разыменовываются.
+/// Размер каталога со всеми вложенными (нет каталога — 0). Ссылки не разыменовываются. Кэш
+/// вложений считается только так (`Store::attachment_cache_bytes` зовёт его же).
 pub fn dir_bytes(dir: &Path) -> u64 {
     let Ok(entries) = std::fs::read_dir(dir) else { return 0 };
     entries
@@ -337,6 +353,9 @@ mod tests {
         std::fs::write(att.join("1-a.txt"), b"12345").unwrap();
         std::fs::write(att.join("sub").join("2-b.txt"), b"123").unwrap();
         assert_eq!(read_summary(&path).unwrap().cache_bytes, 8);
+        // Размеры у открытой базы (строка состояния, настройки) — тем же подсчётом, что у сводки.
+        assert_eq!(store.attachment_cache_bytes(), 8, "вложенный каталог кэша тоже считается");
+        assert_eq!(store.disk_size_bytes(), db_files_bytes(&path));
 
         // Закрытая база: журналов нет, чтение их не создаёт и файл не меняет.
         drop(store);
@@ -414,9 +433,16 @@ mod tests {
             }
         }
         std::fs::write(root.join("mail.x.ru").join("mail.db"), b"").unwrap();
+        // Остаток удаления без файла базы (удалились только журналы) и ящик, в имени которого
+        // метка есть, но без отметки времени, — не остаток, а обычный ящик.
+        std::fs::create_dir_all(root.join("mail.x.ru").join("ivanov_x.ru.deleting-1761390000000").join("attachments")).unwrap();
+        std::fs::create_dir_all(root.join("mail.x.ru").join("a.deleting-b")).unwrap();
+        std::fs::write(root.join("mail.x.ru").join("a.deleting-b").join("mail.db"), b"").unwrap();
         let found = scan_databases(&root);
-        assert_eq!(found, vec![root.join("mail.x.ru").join("ivanov_x.ru").join("mail.db"), root.join("mail.y.ru").join("petrov").join("mail.db")]);
+        assert_eq!(found, vec![root.join("mail.x.ru").join("a.deleting-b").join("mail.db"), root.join("mail.x.ru").join("ivanov_x.ru").join("mail.db"), root.join("mail.y.ru").join("petrov").join("mail.db")]);
         assert!(scan_databases(&root.join("нет")).is_empty());
+        assert_eq!(scan_leftovers(&root), vec![root.join("mail.x.ru").join("ivanov_x.ru.deleting-1761390000000"), root.join("mail.y.ru").join("old.deleting-1")], "остатки удаления видны отдельно");
+        assert!(!is_deleting_dir(Path::new(".deleting-1")) && !is_deleting_dir(Path::new("x.deleting-")) && !is_deleting_dir(Path::new("x.deleting-1a")));
         let _ = std::fs::remove_dir_all(&root);
     }
 

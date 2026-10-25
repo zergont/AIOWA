@@ -1,7 +1,7 @@
 <script lang="ts">
   import { untrack } from "svelte";
   import { api, errorMessage, isExternalLink } from "../api";
-  import { DARK_SHEET_CSS, darkPaletteCss } from "../darkmail.svelte";
+  import { DARK_SHEET_CSS, darkPaletteCss, isDarkTag } from "../darkmail.svelte";
   import { layerOpen } from "../hotkeys";
 
   interface Props {
@@ -10,17 +10,19 @@
     title?: string;
     /** Ctrl+P при фокусе внутри фрейма: печатать письмо, а не окно целиком. Без него клавиша просто гасится. */
     onprint?: () => void;
-    /** Показать в тёмных тонах; действует, только если у тела есть палитра `darkColors`. */
+    /** Показать в тёмных тонах; действует, только если у тела есть палитра `darkColors` и метка `darkTag`. */
     dark?: boolean;
     /** Тёмная палитра тела (`Message.dark_colors`); нет — только светлый лист. */
     darkColors?: string[] | null;
+    /** Метка имён переменных палитры (`Message.dark_tag`); нет — только светлый лист. */
+    darkTag?: string | null;
   }
-  let { html, title = "Текст письма", onprint, dark = false, darkColors = null }: Props = $props();
+  let { html, title = "Текст письма", onprint, dark = false, darkColors = null, darkTag = null }: Props = $props();
 
   // Тёмный лист — класс на корне документа рамки. Его ставит окно снаружи (рамка с
   // allow-same-origin), скриптов внутри рамки нет и CSP не меняется; смена темы не перезагружает письмо.
-  const darkOn = $derived(dark && darkColors != null);
-  const palette = $derived(darkPaletteCss(darkColors));
+  const darkOn = $derived(dark && darkColors != null && isDarkTag(darkTag));
+  const palette = $derived(darkPaletteCss(darkColors, darkTag));
 
   // Письмо живёт в изолированном фрейме: без скриптов, без внешних ресурсов, своя «бумага».
   // Инлайновые картинки приходят уже как data: (подставляет бэкенд), поэтому cid: в CSP не нужен.

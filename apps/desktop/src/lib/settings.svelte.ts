@@ -33,12 +33,19 @@ export function syncEveryMs(live: boolean, intervalMin: number): number {
 // --- тема ------------------------------------------------------------------------------------
 // Токены (tokens.css) переключаются атрибутом data-theme на корне: "light" и "dark" — явный выбор,
 // без атрибута — как в Windows. Выбор дублируется в localStorage, чтобы main.ts поставил его до
-// первой отрисовки (settings_get приходит позже, и окно не должно мигнуть системной темой).
+// первой отрисовки (settings_get приходит позже, и окно не должно мигнуть системной темой). Рядом
+// лежит выбор «письма в тёмной теме»: иначе письмо, открытое до ответа settings_get, на миг
+// показалось бы в тёмных тонах (значение по умолчанию) и тут же перекрасилось на светлый лист.
 
 const THEME_KEY = "aiowa.theme";
+const DARK_MAIL_KEY = "aiowa.darkMail";
 
 function isTheme(v: unknown): v is Theme {
   return v === "system" || v === "light" || v === "dark";
+}
+
+function isDarkMail(v: unknown): v is DarkMail {
+  return v === "dark" || v === "light";
 }
 
 function setThemeAttr(theme: Theme) {
@@ -57,7 +64,7 @@ function setThemeAttr(theme: Theme) {
   }
 }
 
-/** Тема из прошлого запуска — до монтирования приложения. */
+/** Тема и выбор «письма в тёмной теме» из прошлого запуска — до монтирования приложения. */
 export function restoreTheme() {
   try {
     const t = localStorage.getItem(THEME_KEY);
@@ -66,8 +73,10 @@ export function restoreTheme() {
       // Письма (тёмные тона) тоже сразу по прошлой теме, а не по системной до ответа settings_get.
       prefs.theme = t;
     }
+    const d = localStorage.getItem(DARK_MAIL_KEY);
+    if (isDarkMail(d)) prefs.darkMail = d;
   } catch {
-    /* хранилище недоступно — остаётся системная тема */
+    /* хранилище недоступно — остаются системная тема и тёмные письма до ответа settings_get */
   }
 }
 
@@ -81,13 +90,23 @@ export function applyTheme(theme: Theme) {
   }
 }
 
+/** Письма в тёмной теме: в общую копию и в localStorage — для restoreTheme на следующем старте. */
+function applyDarkMail(darkMail: DarkMail) {
+  prefs.darkMail = darkMail;
+  try {
+    localStorage.setItem(DARK_MAIL_KEY, darkMail);
+  } catch {
+    /* не страшно: на следующем старте выбор поставит settings_get */
+  }
+}
+
 /** Перенести в общую копию то, что пришло от бэкенда (целиком или изменённой частью). */
 export function adoptSettings(s: SettingsPatch) {
   if (s.auto_read_ms != null) prefs.autoReadMs = s.auto_read_ms;
   if (s.sync_interval_min != null) prefs.syncIntervalMin = s.sync_interval_min;
   if (s.toasts != null) prefs.toasts = s.toasts;
   if (isTheme(s.theme)) applyTheme(s.theme);
-  if (s.dark_mail === "dark" || s.dark_mail === "light") prefs.darkMail = s.dark_mail;
+  if (isDarkMail(s.dark_mail)) applyDarkMail(s.dark_mail);
 }
 
 /** Настройки на старте окна; старый бэкенд без команды — остаются значения по умолчанию. */

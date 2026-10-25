@@ -75,10 +75,15 @@ export interface Message {
   body_state: number;
   body_html: string | null;
   /**
-   * Тёмная палитра тела: цвета письма в `body_html` — `var(--aiowa-dN, исходный)`, N-й цвет здесь
-   * (`mail_dark.rs`). Нет у старого бэкенда — письмо показывается только на светлом листе.
+   * Тёмная палитра тела: цвета письма в `body_html` — `var(--aiowa-<метка>-dN, исходный)`, N-й цвет
+   * здесь (`mail_dark.rs`). Нет у старого бэкенда — письмо показывается только на светлом листе.
    */
   dark_colors?: string[] | null;
+  /**
+   * Метка имён переменных палитры в `body_html`: 16 шестнадцатеричных цифр, новая на каждую сборку
+   * письма, чтобы письмо не могло объявить переменную палитры само. Нет — только светлый лист.
+   */
+  dark_tag?: string | null;
   body_is_text: boolean;
   is_truncated: boolean;
   recipients: Recipient[];

@@ -211,7 +211,8 @@
   const inArchive = $derived(archiveFolderPk != null && archiveFolderPk === folderPk);
   let menu = $state<{ targets: Conversation[]; anchor: Anchor } | null>(null);
   let picker = $state<{ targets: Conversation[]; anchor: Anchor } | null>(null);
-  let confirm = $state<{ targets: Conversation[]; anchor: Anchor } | null>(null);
+  /** `detach` — удаление навсегда значком строки: перед ним строка уходит из множественного выбора (см. quick). */
+  let confirm = $state<{ targets: Conversation[]; anchor: Anchor; detach?: Conversation } | null>(null);
   let actionError = $state<string | null>(null);
   /**
    * Беседы, по которым идёт команда: повторный запуск по той же беседе не нужен, а действия над
@@ -313,18 +314,27 @@
     }
   }
 
-  /** Удаление: из «Удалённых» или с Shift — навсегда, с подтверждением; иначе сразу в «Удалённые» (с окном отмены). */
-  function requestDelete(ts: Conversation[], permanent: boolean, anchor: Anchor) {
+  /**
+   * Удаление: из «Удалённых» или с Shift — навсегда, с подтверждением; иначе сразу в «Удалённые» (с окном отмены).
+   * `detach` — удаляется одна строка значком: из множественного выбора она уходит только тогда, когда
+   * удаление действительно выполняется (после «Удалить навсегда», не при открытии вопроса).
+   */
+  function requestDelete(ts: Conversation[], permanent: boolean, anchor: Anchor, detach?: Conversation) {
     if (!ts.length) return;
-    if (inDeleted || permanent) confirm = { targets: ts, anchor };
-    else void run(ts, { kind: "delete", permanent: false }, anchor);
+    if (inDeleted || permanent) confirm = { targets: ts, anchor, detach };
+    else {
+      if (detach) detachFromSelection(detach);
+      void run(ts, { kind: "delete", permanent: false }, anchor);
+    }
   }
 
   function confirmDelete() {
     const d = confirm;
     confirm = null;
     focusBack(scroller);
-    if (d) void run(d.targets, { kind: "delete", permanent: true }, d.anchor);
+    if (!d) return;
+    if (d.detach) detachFromSelection(d.detach);
+    void run(d.targets, { kind: "delete", permanent: true }, d.anchor);
   }
 
   function cancelPopups() {
@@ -378,9 +388,22 @@
   }
 
   /**
+   * Беседа уходит из папки действием над ней одной (значок строки), а она в множественном выборе:
+   * сначала снять её с выбора тем же путём, что Ctrl+щелчок. Иначе родитель убрал бы строку из
+   * набора, рассчитывая на действие над всем выбором: от «Выбрано 2» осталась бы одна беседа без
+   * писем в области чтения, а курсор на ней перескочил бы к соседней строке вместо оставшегося выбора.
+   * Вне выбора или при одиночном выборе ничего не делает: строка уходит обычным путём (открытая —
+   * с переходом к соседней).
+   */
+  function detachFromSelection(c: Conversation) {
+    if (multi && sel.has(c.conversation_pk)) toggleOne(c);
+  }
+
+  /**
    * Быстрое действие справа — над одной этой беседой, даже если она в множественном выборе (значок
    * стоит на строке). Те же действия и та же обработка, что у меню: окно отмены, вопрос о папке архива,
-   * ошибка над списком. Удаление с Shift и в «Удалённых» — навсегда, с подтверждением.
+   * ошибка над списком. Удаление с Shift и в «Удалённых» — навсегда, с подтверждением. Архив и удаление
+   * выбранной строки сначала снимают её с выбора (`detachFromSelection`), остальной выбор остаётся.
    */
   function quick(e: MouseEvent, c: Conversation, kind: "read" | "flag" | "archive" | "delete") {
     e.stopPropagation();
@@ -397,10 +420,12 @@
         void run([c], { kind: "flag", flagged: !l.anyFlagged }, btn);
         break;
       case "archive":
-        if (!inArchive) void run([c], { kind: "archive" }, btn);
+        if (inArchive) break;
+        detachFromSelection(c);
+        void run([c], { kind: "archive" }, btn);
         break;
       case "delete":
-        requestDelete([c], e.shiftKey, btn);
+        requestDelete([c], e.shiftKey, btn, c);
         break;
     }
   }
@@ -873,6 +898,19 @@
   .quick .act {
     width: 24px;
     height: 24px;
+  }
+  /*
+   * Значок под мышью: строка под ним уже подсвечена тем же --bg-hover (а выбранная — --bg-selected),
+   * и полупрозрачная подложка значка почти сливалась с ней. Значок поднимается слоем — непрозрачная
+   * поверхность с обводкой, — так видно, на каком из четырёх мышь, в обеих темах; нажатие — та же
+   * поверхность с подложкой нажатия поверх.
+   */
+  .quick .act:hover:not(:disabled) {
+    background: var(--bg-layer-alt);
+    box-shadow: inset 0 0 0 1px var(--stroke-2);
+  }
+  .quick .act:active:not(:disabled) {
+    background: linear-gradient(var(--bg-pressed), var(--bg-pressed)), var(--bg-layer-alt);
   }
   .row:hover .quick,
   .scroller.kbd:focus-within .row.focused .quick {

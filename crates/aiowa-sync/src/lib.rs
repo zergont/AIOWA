@@ -8,7 +8,7 @@
 //! с места остановки без потерь и без дублей. О каждой записи в базу (дерево, свежая страница,
 //! пачка с изменениями) движок сообщает событием: окно показывает данные по ходу прогона.
 
-use aiowa_core::{AccountId, FolderId, FolderRef, ItemChange, ItemId, SyncState};
+use aiowa_core::{AccountId, FolderChange, FolderId, FolderRef, ItemChange, ItemId, SyncState};
 use aiowa_extract::Extraction;
 use aiowa_store::{AttachmentText, AttachmentTodo, Store, StoreError, SyncFolder, FETCH_FAILED};
 use aiowa_transport::{ItemFetchShape, ItemResult, MailTransport, TransportError};
@@ -170,9 +170,10 @@ pub enum SyncEvent {
     Progress { stage: SyncStage, folder: Option<String>, done: u64, total: Option<u64> },
     /// Ошибка, не прервавшая синхронизацию (отвергнутая пачка тел, нескачанное вложение).
     Warning { stage: SyncStage, folder: Option<String>, message: String },
-    /// Дерево папок записано в базу, `upserts` папок создано или изменено (имена, счётчики):
-    /// окну пора перечитать дерево. Без изменений не отправляется.
-    FoldersApplied { upserts: usize },
+    /// Дерево папок записано в базу: `upserts` папок создано или изменено (имена, счётчики),
+    /// `deletes` помечено удалёнными. Окну пора перечитать дерево. Отправляется при любых
+    /// изменениях дерева, в том числе только удалениях; без изменений — нет.
+    FoldersApplied { upserts: usize, deletes: usize },
     /// Письма папки записаны в базу: свежая страница (`recent`) или пачка `SyncFolderItems`, в
     /// которой что-то изменилось (пустые пачки события не дают). `changed` — создано, обновлено,
     /// удалено и пометок прочтения вместе. Окну пора перечитать список этой папки.
@@ -292,6 +293,7 @@ impl Engine {
         let mut state = self.store.get_state(self.account, "hierarchy")?.map(SyncState);
         let mut reset_once = false;
         let mut total = 0usize;
+        let mut deletes = 0usize;
         let mut rounds = 0u32;
         loop {
             self.check_cancel()?;
@@ -314,6 +316,7 @@ impl Engine {
                 Err(e) => return Err(e),
             };
             total += self.store.apply_hierarchy_batch(self.account, &changes.changes, &changes.state)?;
+            deletes += changes.changes.iter().filter(|c| matches!(c, FolderChange::Delete(_))).count();
             rounds += 1;
             let done = changes.includes_last || changes.changes.is_empty() || rounds >= 50;
             state = Some(changes.state);
@@ -321,10 +324,11 @@ impl Engine {
                 break;
             }
         }
-        info!(folders = total, "иерархия папок синхронизирована");
+        info!(folders = total, deleted = deletes, "иерархия папок синхронизирована");
         self.emit(SyncEvent::Progress { stage: SyncStage::Hierarchy, folder: None, done: total as u64, total: Some(total as u64) });
-        if total > 0 {
-            self.emit(SyncEvent::FoldersApplied { upserts: total });
+        // Удаление папки на сервере (без upsert-ов) тоже меняет дерево в окне.
+        if total > 0 || deletes > 0 {
+            self.emit(SyncEvent::FoldersApplied { upserts: total, deletes });
         }
         Ok(total)
     }

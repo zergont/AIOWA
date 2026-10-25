@@ -43,11 +43,11 @@ const KEYRING_SERVICE: &str = "AIOWA";
 #[derive(Parser)]
 #[command(name = "aiowa", version, about = "AIOWA: оффлайн клиент Exchange. Этап 1: синхронизация и поиск из консоли")]
 struct Cli {
-    /// Хост OWA, например mail.example.com
-    #[arg(long, env = "AIOWA_HOST")]
+    /// Хост OWA, например mail.example.com (обязателен для всех команд, кроме db-summary)
+    #[arg(long, env = "AIOWA_HOST", default_value = "", hide_default_value = true)]
     host: String,
-    /// Логин как в форме OWA: DOMAIN\user или user@domain
-    #[arg(long, env = "AIOWA_USER")]
+    /// Логин как в форме OWA: DOMAIN\user или user@domain (обязателен для всех команд, кроме db-summary)
+    #[arg(long, env = "AIOWA_USER", default_value = "", hide_default_value = true)]
     user: String,
     /// Путь к базе; по умолчанию %LOCALAPPDATA%\AIOWA\<host>\<user>\mail.db
     #[arg(long, env = "AIOWA_DB")]
@@ -475,13 +475,79 @@ enum Cmd {
         record: bool,
     },
     /// Сводка базы без сети и без изменения файлов (как вкладка «Данные» окна): учётные записи,
-    /// письма, последняя синхронизация, размер, есть ли личность ящика
+    /// письма, последняя синхронизация, размер, есть ли личность ящика. --host и --user не нужны:
+    /// база — по --db, а без --db и без учётной записи — все базы под %LOCALAPPDATA%\AIOWA
     DbSummary,
+}
+
+/// Сервер и логин нужны всем командам, кроме db-summary: та читает базу по пути без сети.
+fn require_account(cli: &Cli) -> Result<()> {
+    if matches!(cli.cmd, Cmd::DbSummary) {
+        return Ok(());
+    }
+    if cli.host.trim().is_empty() {
+        bail!("не задан сервер: --host или переменная AIOWA_HOST");
+    }
+    if cli.user.trim().is_empty() {
+        bail!("не задан логин: --user или переменная AIOWA_USER");
+    }
+    Ok(())
+}
+
+/// Что показывает `db-summary`.
+#[derive(Debug, PartialEq, Eq)]
+enum SummaryTarget {
+    /// Одна база: по `--db`, иначе по учётной записи (`--host` и `--user`).
+    One(PathBuf),
+    /// Без `--db` и без учётной записи — все базы под %LOCALAPPDATA%\AIOWA и остатки неполного
+    /// удаления, как вкладка «Данные».
+    All,
+}
+
+fn db_summary_target(cli: &Cli) -> SummaryTarget {
+    match &cli.db {
+        Some(db) => SummaryTarget::One(db.clone()),
+        None if cli.host.trim().is_empty() || cli.user.trim().is_empty() => SummaryTarget::All,
+        None => SummaryTarget::One(default_db_path(&cli.host, &cli.user)),
+    }
 }
 
 /// Наличие и длина значения без самого значения.
 fn presence(v: Option<&str>) -> String {
     v.map(|s| format!("есть ({} симв.)", s.chars().count())).unwrap_or_else(|| "нет".into())
+}
+
+/// `aiowa db-summary`: сводка одной базы по пути, без сети и без изменения файлов. GUID, адрес и
+/// логины — только наличием и длиной, путь — как есть.
+fn print_db_summary(db_path: &std::path::Path) -> Result<()> {
+    let started = std::time::Instant::now();
+    let s = aiowa_store::read_summary(db_path)?;
+    let id = s.identity();
+    println!(
+        "База {}: учётных записей {}, писем {}, последняя синхронизация {}, база {:.1} МБ, кэш вложений {:.1} МБ, GUID {}, адрес {}; прочитано за {} мс",
+        db_path.display(),
+        s.accounts.len(),
+        s.items,
+        s.last_sync_ms.map(|ms| fmt_date(jiff::Timestamp::from_millisecond(ms).ok())).unwrap_or_else(|| "нет".into()),
+        s.db_bytes as f64 / 1e6,
+        s.cache_bytes as f64 / 1e6,
+        presence(id.mailbox_guid.as_deref()),
+        presence(id.email.as_deref()),
+        started.elapsed().as_millis()
+    );
+    for (i, a) in s.accounts.iter().enumerate() {
+        println!(
+            "  учётная запись {}: сервер {}, логин {} симв. (без домена {} симв.), писем {}, GUID {}, адрес {}",
+            i + 1,
+            a.host,
+            a.login.chars().count(),
+            aiowa_store::login_key(&a.login).chars().count(),
+            a.items,
+            presence(a.identity.mailbox_guid.as_deref()),
+            presence(a.identity.email.as_deref())
+        );
+    }
+    Ok(())
 }
 
 /// `aiowa mailbox`: вход, сведения о ящике, форма ответов (по `--probe`), выход — всегда.
@@ -2264,6 +2330,7 @@ fn main() -> Result<()> {
 async fn real_main() -> Result<()> {
     init_tracing();
     let cli = Cli::parse();
+    require_account(&cli)?;
 
     match &cli.cmd {
         Cmd::SetPassword => {
@@ -3157,35 +3224,25 @@ async fn real_main() -> Result<()> {
             outcome?;
         }
         Cmd::Mailbox { probe, record } => mailbox_command(&cli, &db_path, *probe, *record).await?,
-        Cmd::DbSummary => {
-            let started = std::time::Instant::now();
-            let s = aiowa_store::read_summary(&db_path)?;
-            let id = s.identity();
-            println!(
-                "База {}: учётных записей {}, писем {}, последняя синхронизация {}, база {:.1} МБ, кэш вложений {:.1} МБ, GUID {}, адрес {}; прочитано за {} мс",
-                db_path.display(),
-                s.accounts.len(),
-                s.items,
-                s.last_sync_ms.map(|ms| fmt_date(jiff::Timestamp::from_millisecond(ms).ok())).unwrap_or_else(|| "нет".into()),
-                s.db_bytes as f64 / 1e6,
-                s.cache_bytes as f64 / 1e6,
-                presence(id.mailbox_guid.as_deref()),
-                presence(id.email.as_deref()),
-                started.elapsed().as_millis()
-            );
-            for (i, a) in s.accounts.iter().enumerate() {
-                println!(
-                    "  учётная запись {}: сервер {}, логин {} симв. (без домена {} симв.), писем {}, GUID {}, адрес {}",
-                    i + 1,
-                    a.host,
-                    a.login.chars().count(),
-                    aiowa_store::login_key(&a.login).chars().count(),
-                    a.items,
-                    presence(a.identity.mailbox_guid.as_deref()),
-                    presence(a.identity.email.as_deref())
-                );
+        Cmd::DbSummary => match db_summary_target(&cli) {
+            SummaryTarget::All => {
+                let root = aiowa_store::identity::data_root();
+                let paths = aiowa_store::identity::scan_databases(&root);
+                if paths.is_empty() {
+                    println!("Баз под {} нет", root.display());
+                }
+                for path in &paths {
+                    // Одна непрочитанная база не мешает показать остальные.
+                    if let Err(e) = print_db_summary(path) {
+                        println!("База {}: не читается: {e}", path.display());
+                    }
+                }
+                for dir in aiowa_store::identity::scan_leftovers(&root) {
+                    println!("Остаток удаления {}: {:.1} МБ, не удалено до конца", dir.display(), aiowa_store::identity::dir_bytes(&dir) as f64 / 1e6);
+                }
             }
-        }
+            SummaryTarget::One(path) => print_db_summary(&path)?,
+        },
         Cmd::Notify { seconds, folders, rows_only } => {
             let store = Store::open(&db_path)?;
             let account = store.account(&cli.host, &cli.user)?;
@@ -3365,6 +3422,58 @@ mod tests {
         // Западный пояс в кэше (`…T04:00:00Z`) — те же даты.
         assert!(updated_span(true, ms("2026-10-26T04:00:00Z"), ms("2026-10-26T00:00:00Z")).is_err());
         assert!(updated_span(true, ms("2026-10-26T04:00:00Z"), ms("2026-10-27T00:00:00Z")).is_ok());
+    }
+
+    /// Разбор как `Cli::try_parse_from`, но без переменных окружения `AIOWA_HOST`, `AIOWA_USER`,
+    /// `AIOWA_DB`: у разработчика они бывают заданы (spike/.env.local), а тесты проверяют именно
+    /// отсутствие ключей.
+    fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
+        use clap::{CommandFactory, FromArgMatches};
+        let cmd = ["host", "user", "db"].into_iter().fold(Cli::command(), |c, id| c.mut_arg(id, |a| a.env(None::<&'static str>)));
+        Cli::from_arg_matches(&cmd.try_get_matches_from(args)?)
+    }
+
+    #[test]
+    fn db_summary_needs_no_account() {
+        // Как есть, с окружением: db-summary без --host и --user разбирается и проходит проверку.
+        let cli = Cli::try_parse_from(["aiowa", "db-summary"]).expect("db-summary без --host и --user");
+        assert!(matches!(cli.cmd, Cmd::DbSummary));
+        assert!(require_account(&cli).is_ok());
+
+        let cli = parse(&["aiowa", "db-summary"]).unwrap();
+        assert_eq!((cli.host.as_str(), cli.user.as_str(), cli.db.as_ref()), ("", "", None));
+        assert!(require_account(&cli).is_ok());
+    }
+
+    #[test]
+    fn other_commands_require_account() {
+        // Разбор проходит (у ключей пустое значение по умолчанию), отказ — понятной ошибкой после него.
+        let cli = parse(&["aiowa", "login"]).expect("разбор login без --host и --user");
+        let e = require_account(&cli).unwrap_err().to_string();
+        assert!(e.contains("не задан сервер") && e.contains("--host") && e.contains("AIOWA_HOST"), "{e}");
+        let cli = parse(&["aiowa", "--host", "mail.x.ru", "stats"]).unwrap();
+        let e = require_account(&cli).unwrap_err().to_string();
+        assert!(e.contains("не задан логин") && e.contains("--user") && e.contains("AIOWA_USER"), "{e}");
+        // Одни пробелы — тоже не задано.
+        assert!(require_account(&parse(&["aiowa", "--host", " ", "--user", "u", "login"]).unwrap()).is_err());
+        assert!(require_account(&parse(&["aiowa", "--host", "mail.x.ru", "--user", "u", "login"]).unwrap()).is_ok());
+    }
+
+    #[test]
+    fn db_summary_reads_one_database_or_lists_all() {
+        let target = |args: &[&str]| db_summary_target(&parse(args).unwrap());
+        let db = PathBuf::from(r"D:\x\mail.db");
+        assert_eq!(target(&["aiowa", "db-summary"]), SummaryTarget::All);
+        assert_eq!(target(&["aiowa", "--host", "mail.x.ru", "db-summary"]), SummaryTarget::All, "учётная запись неполная");
+        assert_eq!(target(&["aiowa", "--user", "u", "db-summary"]), SummaryTarget::All);
+        assert_eq!(target(&["aiowa", "--host", " ", "--user", "u", "db-summary"]), SummaryTarget::All);
+        assert_eq!(target(&["aiowa", "--db", r"D:\x\mail.db", "db-summary"]), SummaryTarget::One(db.clone()));
+        assert_eq!(target(&["aiowa", "--host", "mail.x.ru", "--user", "u", "--db", r"D:\x\mail.db", "db-summary"]), SummaryTarget::One(db), "--db важнее учётной записи");
+        assert_eq!(
+            target(&["aiowa", "--host", "mail.x.ru", "--user", r"NGENERGO\savvidi", "db-summary"]),
+            SummaryTarget::One(default_db_path("mail.x.ru", r"NGENERGO\savvidi")),
+            "по учётной записи — тот же путь, что у окна"
+        );
     }
 
     #[test]

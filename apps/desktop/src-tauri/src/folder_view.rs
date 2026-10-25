@@ -11,7 +11,9 @@ use tracing::debug;
 /// Ключ в `sync_state`: JSON-массив серверных идентификаторов свёрнутых папок.
 pub(crate) const COLLAPSED_FOLDERS_KEY: &str = "desktop.collapsed_folders";
 
-/// Свёрнутые папки (локальные ключи) — окно читает их при старте, до первой отрисовки дерева.
+/// Свёрнутые папки (локальные ключи) — окно читает их до первой отрисовки строк дерева: при старте
+/// или, если папок ещё нет, когда их принесла первая синхронизация (пока таблица папок пуста,
+/// ответ пуст, а сохранённый список не трогается).
 #[tauri::command]
 pub(crate) fn folders_collapsed_get(state: State<'_, AppState>) -> CmdResult<Vec<i64>> {
     let pks = state.store.folder_list_state(state.account, COLLAPSED_FOLDERS_KEY).map_err(err)?;
@@ -19,8 +21,9 @@ pub(crate) fn folders_collapsed_get(state: State<'_, AppState>) -> CmdResult<Vec
     Ok(pks)
 }
 
-/// Сохранить свёрнутые папки целиком (окно зовёт с небольшой задержкой после сворачивания или
-/// разворачивания). Неизвестные и удалённые папки пропускаются.
+/// Сохранить свёрнутые папки целиком (окно зовёт сразу после сворачивания или разворачивания,
+/// записи по одной: щелчки во время записи уходят следующей одним набором). Неизвестные и удалённые
+/// папки пропускаются.
 #[tauri::command]
 pub(crate) fn folders_collapsed_set(folder_pks: Vec<i64>, state: State<'_, AppState>) -> CmdResult<()> {
     let saved = state.store.set_folder_list_state(state.account, COLLAPSED_FOLDERS_KEY, &folder_pks).map_err(|e| format!("Не удалось сохранить вид дерева папок: {e}"))?;

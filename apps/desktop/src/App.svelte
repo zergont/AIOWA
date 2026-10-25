@@ -913,7 +913,8 @@
   /**
    * Множественный выбор после перечитывания списка: беседы, которых больше нет, уходят из выбора;
    * осталась одна — она открывается, не осталось ни одной — выбор снимается (иначе панель
-   * «Выбрано N» показывала бы пустой набор).
+   * «Выбрано N» показывала бы пустой набор). Живое обновление перед этим дочитывает список до
+   * выбранных бесед, сдвинутых новой почтой за конец страницы (`liveReachSelection`).
    */
   function pruneSelection(rows: Conversation[]) {
     if (selectedPks.size <= 1) return;
@@ -1267,10 +1268,15 @@
   // Бэкенд по ходу прогона шлёт sync-live (не чаще раза в 2,5 с): дерево записано, в каких папках
   // записаны письма. Окно мягко перечитывает дерево, открытый список и открытую беседу: выбор,
   // раскрытые письма, прокрутка (её держит список) и множественный выбор остаются, пустые
-  // состояния уходят сами. Пока идёт команда записи или загрузка списка, обновление ждёт;
-  // при открытом композере беседа под ним не перечитывается. Полное перечитывание — по концу прогона.
+  // состояния уходят сами. Пока идёт команда записи, загрузка списка или открыто окно отмены,
+  // обновление ждёт; при открытом композере беседа под ним не перечитывается. Полное
+  // перечитывание — по концу прогона.
 
-  /** Задержка, за которую сливаются события, пришедшие вместе (folders-changed и sync-live). */
+  /**
+   * Задержка живого обновления: за неё сливаются близкие события, а прогон «только дерево» (после
+   * команды с папкой) успевает закончиться и прислать свой folders-changed — тогда дерево по
+   * sync-live второй раз не перечитывается.
+   */
   const LIVE_DELAY_MS = 150;
   /** Повтор, пока пользователь занят. */
   const LIVE_RETRY_MS = 1000;
@@ -1300,9 +1306,76 @@
     }, ms);
   }
 
-  /** Пользователь что-то делает: команда записи, загрузка списка, отправка или открытие черновика. */
+  /**
+   * Пользователь что-то делает: команда записи, загрузка списка, отправка или открытие черновика.
+   * Открытое окно отмены — тоже: удаление, перенос или архив ещё не ушли на сервер, и прогон, прочитавший
+   * папку до них, вернул бы перенесённую беседу в список до подтверждения переноса.
+   */
   function liveBusy(): boolean {
-    return liveRunning || writesInFlight > 0 || loadingList || composerBusy !== null || composeLoading !== null;
+    return liveRunning || writesInFlight > 0 || loadingList || staged !== null || composerBusy !== null || composeLoading !== null;
+  }
+
+  /** Сколько страниц живое обновление дочитывает за раз, разыскивая выбранные беседы за концом списка. */
+  const LIVE_SELECTION_PAGES = 5;
+
+  /** Беседа a стоит в списке ниже b: свежие первыми, при равном времени выше больший ключ (порядок базы). */
+  function sortsBelow(a: Conversation, b: Conversation): boolean {
+    const am = a.last_received_ms ?? -Infinity;
+    const bm = b.last_received_ms ?? -Infinity;
+    return am !== bm ? am < bm : a.conversation_pk < b.conversation_pk;
+  }
+
+  /**
+   * Живое обновление перечитывает список тем же объёмом, что показан, а новая почта сверху сдвигает
+   * строки вниз: выбранные беседы у конца страницы в перечитанное не попадают, хотя из папки не ушли,
+   * и pruneSelection сняла бы их с выбора. Пока множественный выбор держит такие беседы (по прежнему
+   * месту — ниже последней перечитанной строки), список дочитывается страницами, как прокруткой, — до
+   * них, но не больше LIVE_SELECTION_PAGES страниц. Пропавшие выше конца страницы действительно ушли
+   * из папки: их снимет pruneSelection. `old` — список до перечитывания. false — список за это время
+   * сменился или его грузит кто-то ещё (другая папка, догрузка прокруткой): чистить выбор сейчас нельзя.
+   */
+  async function liveReachSelection(folderPk: number, old: Conversation[]): Promise<boolean> {
+    if (selectedPks.size <= 1 || !hasMore) return true;
+    const shown = conversations;
+    const have = new Set(shown.map((c) => c.conversation_pk));
+    let lost = old.filter((c) => selectedPks.has(c.conversation_pk) && !have.has(c.conversation_pk));
+    if (!lost.length) return true;
+    if (loadingList) return false;
+    // Догрузка прокруткой (loadMore) ждёт, пока список дочитывается здесь: иначе строки задвоились бы.
+    loadingList = true;
+    const more: Conversation[] = [];
+    let last: Conversation | undefined = shown[shown.length - 1];
+    let fetched = false;
+    let full = true;
+    try {
+      for (let page = 0; page < LIVE_SELECTION_PAGES; page++) {
+        const tail = last;
+        if (!tail || tail.last_received_ms == null) {
+          full = false;
+          break;
+        }
+        lost = lost.filter((c) => !have.has(c.conversation_pk) && sortsBelow(c, tail));
+        if (!lost.length) break;
+        const next = await api.conversations(folderPk, { ms: tail.last_received_ms, pk: tail.conversation_pk }, PAGE);
+        if (conversations !== shown || selectedFolder?.folder_pk !== folderPk) return false;
+        fetched = true;
+        for (const c of next) {
+          if (have.has(c.conversation_pk)) continue;
+          have.add(c.conversation_pk);
+          more.push(c);
+        }
+        last = next[next.length - 1];
+        full = next.length === PAGE;
+        if (!full) break;
+      }
+    } finally {
+      loadingList = false;
+    }
+    if (fetched) {
+      if (more.length) conversations = [...shown, ...more];
+      hasMore = full;
+    }
+    return true;
   }
 
   async function liveRefresh() {
@@ -1315,13 +1388,22 @@
     liveWant = { folders: false, pks: new Set() };
     liveRunning = true;
     try {
-      // Дерево обычно уже перечитано по folders-changed, пришедшему вместе с этим событием.
+      // Во время полного прогона дерево перечитывается здесь: folders-changed он не шлёт. Прогон
+      // «только дерево» шлёт его по концу, сразу за этим событием, — тогда дерево уже перечитано.
       if (want.folders && Date.now() - foldersReloadedAt > LIVE_RETRY_MS) await reloadFolders();
       const folderPk = selectedFolder?.folder_pk;
       if (folderPk == null || !want.pks.has(folderPk)) return;
+      const old = conversations;
       const rows = await reloadList();
       if (!rows) return;
-      pruneSelection(rows);
+      // Множественный выбор чистится по списку, дочитанному до выбранных бесед, а не по одной странице.
+      // Список сменился по ходу — повтор чуть позже (другая папка его не пройдёт).
+      if (!(await liveReachSelection(folderPk, old))) {
+        liveWant.pks.add(folderPk);
+        scheduleLive(LIVE_RETRY_MS);
+        return;
+      }
+      pruneSelection(conversations);
       if (!selected || selectedPks.size > 1) return;
       const pk = selected.conversation_pk;
       const same = rows.find((c) => c.conversation_pk === pk);

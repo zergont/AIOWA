@@ -2,7 +2,8 @@
 //! свёрнутые ветки дерева папок). Окно работает с локальными ключами `folder_pk`, а в базе лежат
 //! серверные идентификаторы папок (JSON-массив строк): так состояние переживает пересоздание базы,
 //! где у тех же папок будут другие ключи. Папки, которых больше нет (удалены на сервере или
-//! локально), из списка выбрасываются.
+//! локально), из списка выбрасываются, но только когда дерево в базе есть: пока в ней нет ни одной
+//! живой папки (новая база, иерархия ещё не выгружена), список не трогается.
 
 use crate::{Result, Store};
 use aiowa_core::AccountId;
@@ -23,8 +24,10 @@ fn parse_ids(raw: Option<&str>) -> Vec<String> {
 
 impl Store {
     /// Папки из списка под ключом `key` в виде локальных ключей не удалённых папок, в порядке
-    /// списка. Нет ключа или значение негодное — пусто. Если часть папок исчезла, список в базе
-    /// тут же переписывается без них.
+    /// списка. Нет ключа или значение негодное — пусто. Если часть папок исчезла (помечена
+    /// удалённой или её нет в непустом дереве), список в базе тут же переписывается без них.
+    /// Живых папок в базе нет вовсе (дерево ещё не выгружено) — пусто, а список остаётся как был:
+    /// иначе первый же показ окна до синхронизации иерархии стёр бы его.
     pub fn folder_list_state(&self, account: AccountId, key: &str) -> Result<Vec<i64>> {
         let raw = self.get_state(account, key)?;
         let ids = parse_ids(raw.as_deref());
@@ -32,6 +35,9 @@ impl Store {
             return Ok(Vec::new());
         }
         let live = self.with_conn(|c| Ok(live_folders(c, account)?))?;
+        if live.is_empty() {
+            return Ok(Vec::new());
+        }
         let kept: Vec<&String> = ids.iter().filter(|id| live.contains_key(id.as_str())).collect();
         if kept.len() != ids.len() {
             let value = serde_json::to_string(&kept).map_err(|e| crate::StoreError::Other(e.to_string()))?;
@@ -113,6 +119,38 @@ mod tests {
         assert_eq!(s.set_folder_list_state(acc, KEY, &[]).unwrap(), 0);
         assert_eq!(s.get_state(acc, KEY).unwrap().as_deref(), Some("[]"));
         assert!(s.folder_list_state(acc, KEY).unwrap().is_empty());
+    }
+
+    #[test]
+    fn folder_list_is_kept_until_folders_exist() {
+        let s = tmp_store("viewstate-empty");
+        let acc = s.account("h", "u").unwrap();
+        let saved = r#"["F-Альфа","F-Бета"]"#;
+
+        // Новая база, дерева ещё нет: выдача пуста, сохранённый список не тронут.
+        s.set_state(acc, KEY, Some(saved)).unwrap();
+        assert!(s.folder_list_state(acc, KEY).unwrap().is_empty());
+        assert_eq!(s.get_state(acc, KEY).unwrap().as_deref(), Some(saved));
+
+        // Папки в базе есть, но все помечены удалёнными — живых нет, тоже не трогаем.
+        s.upsert_folders(acc, &[folder("Альфа", None)]).unwrap();
+        s.mark_folder_deleted(acc, &FolderId { id: "F-Альфа".into(), change_key: None }).unwrap();
+        assert!(s.folder_list_state(acc, KEY).unwrap().is_empty());
+        assert_eq!(s.get_state(acc, KEY).unwrap().as_deref(), Some(saved));
+
+        // Дерево пришло: «Бета» на месте, «Альфа» удалена, «Гамма» в списке, но её в дереве нет —
+        // удалённая и отсутствующая выпадают, список переписан.
+        s.upsert_folders(acc, &[folder("Бета", None)]).unwrap();
+        s.set_state(acc, KEY, Some(r#"["F-Гамма","F-Альфа","F-Бета"]"#)).unwrap();
+        let beta = s.resolve_folder(acc, "Бета").unwrap().unwrap().folder_pk;
+        assert_eq!(s.folder_list_state(acc, KEY).unwrap(), vec![beta]);
+        assert_eq!(s.get_state(acc, KEY).unwrap().as_deref(), Some(r#"["F-Бета"]"#));
+
+        // Ключ другой учётной записи в той же базе: у неё папок нет — её список цел.
+        let other = s.account("h", "другой").unwrap();
+        s.set_state(other, KEY, Some(saved)).unwrap();
+        assert!(s.folder_list_state(other, KEY).unwrap().is_empty());
+        assert_eq!(s.get_state(other, KEY).unwrap().as_deref(), Some(saved));
     }
 
     #[test]
