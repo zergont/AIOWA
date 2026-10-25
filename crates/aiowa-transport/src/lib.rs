@@ -4,7 +4,7 @@
 //! Уровень абстракции: операции схемы EWS, а не HTTP. Транспорт сам отвечает за
 //! сессию, повторный вход и ограничение параллелизма.
 
-use aiowa_core::{FolderChanges, FolderId, FolderRef, ItemChanges, ItemId, MessageFull, Participant, SyncState};
+use aiowa_core::{FolderChanges, FolderId, FolderRef, ItemChanges, ItemId, MessageFull, MessageMeta, Participant, SyncState};
 pub use aiowa_core::{
     Attendee, CalendarEvent, CalendarEventDetails, CalendarItemChanges, CalendarItemType, ComposeKind, DirectoryPerson, DraftContent, FreeBusy, MeetingMessageKind, MeetingRequestInfo, MeetingResponse,
     NewCalendarItem, OutgoingAttachment, OutgoingMessage, PersonKind, ResponseType, Signature,
@@ -297,6 +297,16 @@ pub trait MailTransport: Send + Sync {
     /// Изменения элементов папки пачкой до `max_changes` (сервер ограничивает 512).
     /// При `with_meta` создания и обновления приходят с метаданными списка.
     async fn sync_folder_items(&self, folder: &FolderRef, state: Option<&SyncState>, max_changes: u32, with_meta: bool) -> Result<ItemChanges>;
+
+    /// Последние письма папки, свежие первыми (`FindItem` с сортировкой по `DateTimeReceived` по
+    /// убыванию): до `max` писем с теми же метаданными и идентификаторами, что у `sync_folder_items`
+    /// с `with_meta`. Нужен первой синхронизации папки, чтобы свежая почта появилась в окне до
+    /// полной выгрузки. По умолчанию — отказ `Protocol` (транспорт без такой операции): движок
+    /// тогда выгружает папку обычным порядком.
+    async fn find_recent_items(&self, folder: &FolderRef, max: u32) -> Result<Vec<MessageMeta>> {
+        let _ = (folder, max);
+        Err(TransportError::Protocol { op: "FindItem".into(), status: 0, raw: "транспорт не умеет выбирать последние письма папки".into() })
+    }
 
     /// Элементы по идентификаторам. Реализация сама режет на допустимые пачки.
     /// Результат той же длины и в том же порядке, что `ids`; отказ по одному элементу

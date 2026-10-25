@@ -81,6 +81,9 @@ pub struct Faults {
     /// Перед следующим запросом к `service.svc` сервер меняет канарейку сессии: старая в заголовке
     /// клиента становится недействительной (отказ CSRF-защиты, § 5b).
     pub rotate_canary_next: bool,
+    /// Первый запрос этой операции ждёт сигнала теста ([`Hold`]), остальные запросы идут своим
+    /// ходом: долгий запрос синхронизации не должен задерживать команды окна.
+    pub hold_op: Option<(String, Arc<Hold>)>,
 }
 
 /// Запрос, задержанный сервером до сигнала теста.
@@ -595,6 +598,9 @@ impl Mailbox {
         if req.method != "POST" || req.path != "/owa/service.svc" {
             return None;
         }
+        if self.faults.hold_op.as_ref().is_some_and(|(op, _)| req.query("action") == Some(op.as_str())) {
+            return self.faults.hold_op.take().map(|(_, h)| Wait::Hold(h));
+        }
         let g = self.faults.gather.as_mut().filter(|g| req.query("action") == Some(g.op.as_str()))?;
         g.left -= 1;
         let barrier = g.barrier.clone();
@@ -658,6 +664,7 @@ impl Mailbox {
         let result = match op.as_str() {
             "SyncFolderHierarchy" => self.sync_folder_hierarchy(body),
             "SyncFolderItems" => self.sync_folder_items(body),
+            "FindItem" => self.find_item(body),
             "GetFolder" => self.get_folder(body),
             "GetItem" => self.get_item(body),
             "GetAttachment" => self.get_attachment(body),
@@ -860,6 +867,67 @@ impl Mailbox {
             "Changes": { "Changes": changes },
             "SyncState": encode_state(&format!("F:{folder_id}"), &json!(known)),
             "TotalCount": 0
+        })])
+    }
+
+    /// § 5m: `FindItem` писем одной папки — `IdOnly` с `AdditionalProperties`, `Traversal: Shallow`,
+    /// страница `IndexedPageView` (`Offset`, `MaxEntriesReturned`), сортировка `SortResults` по
+    /// `DateTimeReceived`. Ответ в форме, снятой с сервера: `RootFolder` с `Items`,
+    /// `TotalItemsInView`, `IncludesLastItemInRange` и `IndexedPagingOffset` (смещение следующей страницы).
+    fn find_item(&mut self, body: &Value) -> Result<Vec<Value>, String> {
+        const TYPE: &str = "FindItemResponseMessage:#Exchange";
+        let shape = body.get("ItemShape").ok_or("нет ItemShape")?;
+        if shape.get("BaseShape").and_then(Value::as_str) != Some("IdOnly") {
+            return Err("фейк: FindItem писем только с BaseShape IdOnly".into());
+        }
+        let fields = additional_properties(shape)?;
+        for f in &fields {
+            field_key(f)?;
+        }
+        if body.get("Traversal").and_then(Value::as_str) != Some("Shallow") {
+            return Err("фейк: Traversal должен быть Shallow".into());
+        }
+        let parents = body.get("ParentFolderIds").and_then(Value::as_array).ok_or("нет ParentFolderIds")?;
+        let [base] = parents.as_slice() else { return Err("фейк: FindItem по одной папке".into()) };
+        let Some(folder_id) = self.resolve_base_folder(base)? else {
+            return Ok(vec![error_message(TYPE, "ErrorFolderNotFound", "The specified folder could not be found in the store.")]);
+        };
+        let paging = body.get("Paging").ok_or("нет Paging")?;
+        match ty(paging) {
+            Some("IndexedPageView:#Exchange") => {}
+            None => return Err(ABSTRACT_CLASS.into()),
+            Some(other) => return Err(format!("фейк: Paging {other} не поддерживается")),
+        }
+        if paging.get("BasePoint").and_then(Value::as_str) != Some("Beginning") {
+            return Err("фейк: BasePoint только Beginning".into());
+        }
+        let offset = paging.get("Offset").and_then(Value::as_u64).unwrap_or(0) as usize;
+        let max = paging.get("MaxEntriesReturned").and_then(Value::as_u64).ok_or("нет MaxEntriesReturned")? as usize;
+        let sort = body.get("SortOrder").and_then(Value::as_array).ok_or("нет SortOrder")?;
+        let [order] = sort.as_slice() else { return Err("фейк: сортировка по одному полю".into()) };
+        if ty(order) != Some("SortResults:#Exchange") || order.pointer("/Path/__type").and_then(Value::as_str) != Some("PropertyUri:#Exchange") {
+            return Err(ABSTRACT_CLASS.into());
+        }
+        if !matches!(order.pointer("/Path/FieldURI").and_then(Value::as_str), Some("item:DateTimeReceived" | "DateTimeReceived")) {
+            return Err("фейк: сортировка только по DateTimeReceived".into());
+        }
+        let descending = match order.get("Order").and_then(Value::as_str) {
+            Some("Descending") => true,
+            Some("Ascending") => false,
+            other => return Err(format!("фейк: Order {other:?}")),
+        };
+        let mut items: Vec<&FakeItem> = self.items_in(&folder_id);
+        // Момент получения — ISO-строка с `Z`: лексикографический порядок совпадает с хронологическим.
+        items.sort_by(|a, b| a.received.cmp(&b.received).then(a.id.cmp(&b.id)));
+        if descending {
+            items.reverse();
+        }
+        let total = items.len();
+        let page = items.iter().skip(offset).take(max).map(|it| self.message_json(it, Shape::IdOnly, &fields, u64::MAX)).collect::<Result<Vec<_>, _>>()?;
+        let next = offset + page.len();
+        Ok(vec![json!({
+            "__type": TYPE, "ResponseCode": "NoError", "ResponseClass": "Success", "HighlightTerms": null,
+            "RootFolder": { "IncludesLastItemInRange": next >= total, "IndexedPagingOffset": next, "TotalItemsInView": total, "Groups": null, "Items": page }
         })])
     }
 

@@ -1,16 +1,19 @@
 //! Движок синхронизации: транспорт → хранилище.
 //!
-//! Порядок: иерархия папок → элементы выбранных папок (метаданные, пачками до 512)
-//! → тела за окно `body_days` (пачками `GetItem`) → вложения тех же писем (по одному,
+//! Порядок: иерархия папок → свежие письма папок, которые ещё ни разу не синхронизировались
+//! (последняя страница по дате, `FindItem`) → элементы выбранных папок (метаданные, пачками до
+//! 512) → тела за окно `body_days` (пачками `GetItem`) → вложения тех же писем (по одному,
 //! с извлечением текста) → вытеснение кэша вложений по квоте. Состояние синхронизации
 //! пишется в одной транзакции с изменениями пачки, поэтому прерванный запуск продолжается
-//! с места остановки без потерь и без дублей.
+//! с места остановки без потерь и без дублей. О каждой записи в базу (дерево, свежая страница,
+//! пачка с изменениями) движок сообщает событием: окно показывает данные по ходу прогона.
 
-use aiowa_core::{AccountId, FolderId, FolderRef, ItemId, SyncState};
+use aiowa_core::{AccountId, FolderId, FolderRef, ItemChange, ItemId, SyncState};
 use aiowa_extract::Extraction;
 use aiowa_store::{AttachmentText, AttachmentTodo, Store, StoreError, SyncFolder, FETCH_FAILED};
 use aiowa_transport::{ItemFetchShape, ItemResult, MailTransport, TransportError};
 use jiff::{SignedDuration, Timestamp};
+use std::collections::HashSet;
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -70,6 +73,9 @@ pub struct SyncOptions {
     pub max_pages: u32,
     /// Контрольная точка WAL каждые N пачек.
     pub checkpoint_every: usize,
+    /// Свежие письма первыми: у папки без состояния синхронизации до полной выгрузки берётся
+    /// последняя страница из стольких писем по дате получения (0 = не брать).
+    pub recent_first: u32,
 }
 
 impl Default for SyncOptions {
@@ -86,6 +92,7 @@ impl Default for SyncOptions {
             body_batch: 25,
             max_pages: 0,
             checkpoint_every: 20,
+            recent_first: 100,
         }
     }
 }
@@ -109,6 +116,11 @@ pub struct SyncReport {
     pub attachments_with_text: usize,
     pub cache_files_evicted: usize,
     pub cache_bytes_evicted: u64,
+    /// Писем свежих страниц (`FindItem`) у папок, синхронизируемых впервые.
+    pub recent_items: usize,
+    /// Писем свежих страниц, которых полная выгрузка не прислала (на сервере их уже нет):
+    /// помечены удалёнными, входят и в `items_deleted`.
+    pub recent_vanished: usize,
     pub elapsed: Duration,
 }
 
@@ -137,6 +149,8 @@ pub struct FetchedAttachment {
 pub enum SyncStage {
     /// Иерархия папок.
     Hierarchy,
+    /// Свежие письма папки, синхронизируемой впервые (`FindItem`, последняя страница по дате).
+    Recent,
     /// Метаданные писем папки (`SyncFolderItems`).
     Items,
     /// Тела писем за окно.
@@ -156,6 +170,13 @@ pub enum SyncEvent {
     Progress { stage: SyncStage, folder: Option<String>, done: u64, total: Option<u64> },
     /// Ошибка, не прервавшая синхронизацию (отвергнутая пачка тел, нескачанное вложение).
     Warning { stage: SyncStage, folder: Option<String>, message: String },
+    /// Дерево папок записано в базу, `upserts` папок создано или изменено (имена, счётчики):
+    /// окну пора перечитать дерево. Без изменений не отправляется.
+    FoldersApplied { upserts: usize },
+    /// Письма папки записаны в базу: свежая страница (`recent`) или пачка `SyncFolderItems`, в
+    /// которой что-то изменилось (пустые пачки события не дают). `changed` — создано, обновлено,
+    /// удалено и пометок прочтения вместе. Окну пора перечитать список этой папки.
+    ItemsApplied { folder_pk: i64, folder: String, changed: usize, recent: bool },
 }
 
 /// Приёмник событий хода. Вызывается из асинхронного контекста, должен быть быстрым.
@@ -222,6 +243,15 @@ impl Engine {
         let mut report = SyncReport { folders_in_hierarchy: self.sync_hierarchy().await?, ..Default::default() };
         let plan = self.plan_folders(&opts.folders)?;
         info!(folders = plan.len(), names = %plan.iter().map(|f| f.name.as_str()).collect::<Vec<_>>().join(", "), "папки к синхронизации");
+
+        // Свежие письма первыми: последние страницы всех впервые синхронизируемых папок (в порядке
+        // плана, «Входящие» первыми) — до полных выгрузок, которые на большом ящике идут десятки минут.
+        if opts.recent_first > 0 {
+            for f in &plan {
+                self.check_cancel()?;
+                self.fetch_recent(f, opts.recent_first, &mut report).await?;
+            }
+        }
 
         for f in &plan {
             self.check_cancel()?;
@@ -293,7 +323,131 @@ impl Engine {
         }
         info!(folders = total, "иерархия папок синхронизирована");
         self.emit(SyncEvent::Progress { stage: SyncStage::Hierarchy, folder: None, done: total as u64, total: Some(total as u64) });
+        if total > 0 {
+            self.emit(SyncEvent::FoldersApplied { upserts: total });
+        }
         Ok(total)
+    }
+
+    /// Последняя страница писем папки, которую ещё ни разу не синхронизировали (нет состояния
+    /// `SyncFolderItems`): `FindItem` по дате получения по убыванию, письма — в базу как обычные
+    /// заголовки, без состояния папки. Полная выгрузка потом присылает те же письма `Create`-ами
+    /// с теми же идентификаторами, и они ложатся поверх (upsert по идентификатору: без дублей,
+    /// тело, вложения и место в индексе сохраняются, флаги — как на сервере в момент выгрузки).
+    ///
+    /// Идентификаторы страницы запоминаются в `sync_state` (`recent_pending.<папка>`): письмо,
+    /// которого полная выгрузка так и не прислала, к её концу сверяется с сервером и, если его там
+    /// уже нет (удалено или перенесено, пока шла выгрузка), помечается удалённым (`drop_vanished`).
+    /// Прерванный запуск продолжает с тем же списком. Отказ сервера синхронизацию не останавливает:
+    /// папка просто выгружается обычным порядком.
+    async fn fetch_recent(&self, folder: &SyncFolder, max: u32, report: &mut SyncReport) -> Result<()> {
+        let folder_pk = folder.folder_pk;
+        let name = folder.name.as_str();
+        if folder.total_count == 0 || self.store.folder_sync_state(folder_pk)?.is_some() || !self.load_pending(folder_pk)?.is_empty() {
+            return Ok(());
+        }
+        self.emit(SyncEvent::Stage { stage: SyncStage::Recent, folder: Some(name.to_string()) });
+        let folder_ref = FolderRef::Id(FolderId { id: folder.server_id.clone(), change_key: None });
+        let started = std::time::Instant::now();
+        let metas = match self.transport.find_recent_items(&folder_ref, max).await {
+            Ok(m) => m,
+            Err(e) => {
+                warn!(folder = name, error = %e, "свежие письма не получены, папка выгружается обычным порядком");
+                return Ok(());
+            }
+        };
+        if metas.is_empty() {
+            return Ok(());
+        }
+        // Сначала список, потом письма: запуск, прерванный между ними, оставит лишь лишние
+        // идентификаторы (их пометка удалёнными ничего не найдёт), а не письма без учёта.
+        let pending: HashSet<String> = metas.iter().map(|m| m.item_id.id.clone()).collect();
+        self.save_pending(folder_pk, &pending)?;
+        let changes: Vec<ItemChange> = metas.into_iter().map(ItemChange::Create).collect();
+        let stats = self.store.apply_item_changes(self.account, folder_pk, &changes)?;
+        report.recent_items += changes.len();
+        report.items_created += stats.created;
+        report.items_updated += stats.updated;
+        let n = changes.len() as u64;
+        self.emit(SyncEvent::Progress { stage: SyncStage::Recent, folder: Some(name.to_string()), done: n, total: Some(n) });
+        self.emit(SyncEvent::ItemsApplied { folder_pk, folder: name.to_string(), changed: changes.len(), recent: true });
+        info!(folder = name, items = changes.len(), created = stats.created, updated = stats.updated, ms = started.elapsed().as_millis() as u64, "свежие письма папки записаны");
+        Ok(())
+    }
+
+    fn pending_key(folder_pk: i64) -> String {
+        format!("recent_pending.{folder_pk}")
+    }
+
+    /// Идентификаторы свежей страницы папки, которых полная выгрузка ещё не прислала.
+    fn load_pending(&self, folder_pk: i64) -> Result<HashSet<String>> {
+        Ok(self.store.get_state(self.account, &Self::pending_key(folder_pk))?.map(|v| v.lines().filter(|l| !l.is_empty()).map(String::from).collect()).unwrap_or_default())
+    }
+
+    /// Пустой список хранится пустой строкой (`get_state` не читает NULL).
+    fn save_pending(&self, folder_pk: i64, ids: &HashSet<String>) -> Result<()> {
+        let value = ids.iter().map(String::as_str).collect::<Vec<_>>().join("\n");
+        Ok(self.store.set_state(self.account, &Self::pending_key(folder_pk), Some(&value))?)
+    }
+
+    /// Конец выгрузки папки: снять с учёта свежую страницу (`drop_vanished`) и сообщить окну,
+    /// если что-то пропало.
+    async fn finish_recent(&self, folder: &SyncFolder, pending: &mut HashSet<String>, report: &mut SyncReport) -> Result<()> {
+        let n = self.drop_vanished(folder, pending).await?;
+        if n > 0 {
+            report.recent_vanished += n;
+            report.items_deleted += n;
+            self.emit(SyncEvent::ItemsApplied { folder_pk: folder.folder_pk, folder: folder.name.clone(), changed: n, recent: false });
+        }
+        Ok(())
+    }
+
+    /// Полная выгрузка папки дошла до конца: письма свежей страницы, которых она так и не
+    /// прислала, скорее всего удалены или перенесены на сервере за время выгрузки (у перенесённого
+    /// письма новый идентификатор, старый сервер больше не знает). Проверяются только письма, которые
+    /// всё ещё лежат в этой папке (перенесённое из окна живёт в другой), и удалёнными помечаются только
+    /// те, по которым сервер ответил `ErrorItemNotFound`: отсутствие в выгрузке само по себе не довод
+    /// (список пишется после пачки, и прерванный между ними запуск оставил бы в нём уже присланные
+    /// письма). Сервер не ответил — список остаётся до следующей синхронизации. Возвращает, сколько помечено.
+    async fn drop_vanished(&self, folder: &SyncFolder, pending: &mut HashSet<String>) -> Result<usize> {
+        if pending.is_empty() {
+            return Ok(0);
+        }
+        let mut candidates: Vec<ItemId> = Vec::new();
+        for id in pending.iter() {
+            if let Some((pk, false)) = self.store.item_pk_by_server_id(self.account, id)?
+                && self.store.item_ref(pk)?.is_some_and(|r| r.folder_pk == folder.folder_pk)
+            {
+                candidates.push(ItemId { id: id.clone(), change_key: None });
+            }
+        }
+        let mut vanished: Vec<ItemId> = Vec::new();
+        if !candidates.is_empty() {
+            let transport = self.transport.clone();
+            let ids = candidates.clone();
+            let checked = with_retry("GetItem", || {
+                let t = transport.clone();
+                let ids = ids.clone();
+                async move { t.get_items(&ids, ItemFetchShape::Meta).await }
+            })
+            .await;
+            match checked {
+                Ok(results) => vanished.extend(results.into_iter().filter_map(|r| match r {
+                    ItemResult::Failed { id, code, .. } if code == "ErrorItemNotFound" => Some(id),
+                    _ => None,
+                })),
+                Err(SyncError::Transport(e)) => {
+                    warn!(folder = folder.name.as_str(), candidates = candidates.len(), error = %e, "письма свежей страницы не проверены, повтор при следующей синхронизации");
+                    return Ok(0);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        let n = if vanished.is_empty() { 0 } else { self.store.mark_items_deleted(self.account, &vanished)? };
+        pending.clear();
+        self.save_pending(folder.folder_pk, pending)?;
+        info!(folder = folder.name.as_str(), checked = candidates.len(), vanished = n, "свежая страница сверена с полной выгрузкой");
+        Ok(n)
     }
 
     async fn sync_items(&self, folder: &SyncFolder, opts: &SyncOptions, report: &mut SyncReport) -> Result<()> {
@@ -304,6 +458,8 @@ impl Engine {
         // При полной выгрузке ожидаемый объём известен из счётчика папки; при инкрементальной — нет.
         let expected = if state.is_none() { Some(folder.total_count.max(0) as u64) } else { None };
         let mut processed = 0u64;
+        // Свежая страница, которую полная выгрузка ещё не подтвердила (`fetch_recent`).
+        let mut pending = self.load_pending(folder_pk)?;
         self.emit(SyncEvent::Stage { stage: SyncStage::Items, folder: Some(name.to_string()) });
         let mut reset_once = false;
         let mut pages = 0u32;
@@ -360,16 +516,35 @@ impl Engine {
             processed += changes.changes.len() as u64;
             self.emit(SyncEvent::Progress { stage: SyncStage::Items, folder: Some(name.to_string()), done: processed, total: expected });
             info!(folder = name, page = pages, changes = changes.changes.len(), created = stats.created, updated = stats.updated, deleted = stats.deleted, read_flags = stats.read_flags, elapsed_s = started.elapsed().as_secs(), "пачка применена");
+            let changed = stats.created + stats.updated + stats.deleted + stats.read_flags;
+            if changed > 0 {
+                self.emit(SyncEvent::ItemsApplied { folder_pk, folder: name.to_string(), changed, recent: false });
+            }
+            if !pending.is_empty() {
+                let before = pending.len();
+                for ch in &changes.changes {
+                    let id = match ch {
+                        ItemChange::Create(m) | ItemChange::Update(m) => &m.item_id.id,
+                        ItemChange::Delete(id) | ItemChange::ReadFlag { item_id: id, .. } => &id.id,
+                    };
+                    pending.remove(id);
+                }
+                if pending.len() != before {
+                    self.save_pending(folder_pk, &pending)?;
+                }
+            }
             if (pages as usize).is_multiple_of(opts.checkpoint_every) {
                 self.store.checkpoint()?;
             }
             if changes.includes_last {
+                self.finish_recent(folder, &mut pending, report).await?;
                 break;
             }
             if empty_streak >= 3 || same_state_streak >= 3 {
                 if empty_streak >= 3 {
                     // Пустая выдача трижды подряд: сервер больше ничего не отдаёт, считаем папку завершённой.
                     self.store.set_folder_sync_state(folder_pk, state.as_ref(), true)?;
+                    self.finish_recent(folder, &mut pending, report).await?;
                     break;
                 }
                 return Err(SyncError::StuckFolder(name.to_string(), same_state_streak));

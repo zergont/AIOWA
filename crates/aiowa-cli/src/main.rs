@@ -4,7 +4,7 @@
 //! подсказки адресов, справочник организации (FindPeople, ResolveNames, ExpandDL), календарь
 //! (окно событий, одно событие, создание, изменение и удаление события, письмо о встрече),
 //! проверка поля Reply-To, живая проверка черновиков (создание, чтение, изменение, удаление
-//! вложения, удаление).
+//! вложения, удаление), проверка выборки последних писем папки (FindItem по дате).
 //! Пароль хранится в диспетчере учётных данных Windows и не передаётся аргументом.
 
 use aiowa_core::{
@@ -215,6 +215,17 @@ enum Cmd {
         /// Сколько свежих писем взять (не больше 25 — одна пачка GetItem)
         #[arg(long, default_value_t = 25)]
         limit: usize,
+    },
+    /// Проверка выборки последних писем папки без записи (FindItem с IndexedPageView и сортировкой
+    /// по DateTimeReceived по убыванию): формы перебираются, печатаются только ключи, счётчики,
+    /// длины, порядок дат и совпадение идентификаторов с локальной базой, без содержимого
+    RecentProbe {
+        /// Папки через запятую: известные имена (inbox, sentitems) или отображаемые
+        #[arg(long, default_value = "inbox")]
+        folders: String,
+        /// Писем на страницу
+        #[arg(long, default_value_t = 50)]
+        limit: u32,
     },
     /// Отправить новое письмо: черновик (CreateItem) → вложения (CreateAttachment) → отправка (SendItem).
     /// Без --yes-i-know только печатает план
@@ -1497,6 +1508,159 @@ async fn draft_check_flow(t: &OwaTransport, store: &Arc<Store>, account: Account
     }
 }
 
+// ---------------------------------------------------------------------------
+// Последние письма папки (`aiowa recent-probe`, § 5m): только чтение, без значений в выводе
+
+/// Формы `FindItem` для пробы поверх `protocol::find_recent_items_body`: подпись, версия схемы, тело.
+fn recent_probe_forms(folder: &FolderRef, limit: u32) -> Vec<(&'static str, &'static str, serde_json::Value)> {
+    use aiowa_transport_owa::protocol;
+    let base = protocol::find_recent_items_body(folder, limit, 0);
+    let mut bare_sort = base.clone();
+    bare_sort["SortOrder"][0]["Path"]["FieldURI"] = serde_json::json!("DateTimeReceived");
+    let mut list_shape = base.clone();
+    list_shape["ItemShape"] = serde_json::json!({ "__type": "ItemResponseShape:#Exchange", "BaseShape": "IdOnly" });
+    list_shape["ShapeName"] = serde_json::json!("MailListItem");
+    vec![
+        ("V2017_08_18, IdOnly + свойства SyncFolderItems, IndexedPageView, SortResults item:DateTimeReceived", protocol::V_2017, base.clone()),
+        ("Exchange2013, та же форма", protocol::V_2013, base),
+        ("V2017_08_18, сортировка по DateTimeReceived без префикса", protocol::V_2017, bare_sort),
+        ("V2017_08_18, ShapeName MailListItem без AdditionalProperties", protocol::V_2017, list_shape),
+    ]
+}
+
+/// Итог одной формы: форма ответа, порядок дат, совпадение с базой. `true` — сервер принял форму.
+fn describe_recent(store: &Store, account: AccountId, folder_pk: i64, v: &serde_json::Value, limit: u32, prev_last: Option<(&str, Option<jiff::Timestamp>)>) -> Result<Option<(String, Option<jiff::Timestamp>)>> {
+    use aiowa_transport_owa::protocol;
+    let msgs = protocol::response_messages(v);
+    let Some(first) = msgs.first() else {
+        println!("    нет ResponseMessages: {}", protocol::json_shape(v, 2));
+        return Ok(None);
+    };
+    if let Some((code, _)) = protocol::message_error(first) {
+        println!("    отказ в сообщении ответа: {code}");
+        return Ok(None);
+    }
+    let root = first.get("RootFolder").unwrap_or(first);
+    let keys = |x: Option<&serde_json::Value>| x.and_then(serde_json::Value::as_object).map(|o| o.keys().cloned().collect::<Vec<_>>().join(",")).unwrap_or_default();
+    println!("    сообщение: {} {}; ключи [{}]; RootFolder [{}]", protocol::str_of(first, "__type").unwrap_or("?"), protocol::str_of(first, "ResponseCode").unwrap_or("?"), keys(Some(first)), keys(first.get("RootFolder")));
+    println!(
+        "    TotalItemsInView {:?}, IncludesLastItemInRange {:?}, IndexedPagingOffset {:?}",
+        protocol::i64_of(root, "TotalItemsInView"),
+        root.get("IncludesLastItemInRange").and_then(serde_json::Value::as_bool),
+        protocol::i64_of(root, "IndexedPagingOffset")
+    );
+    let raw = root.get("Items").and_then(serde_json::Value::as_array).cloned().unwrap_or_default();
+    let union: Vec<String> = protocol::key_union(&raw).into_iter().map(|(k, n)| format!("{k}:{n}")).collect();
+    println!("    элементов {}; ключи элементов (ключ:сколько) {}", raw.len(), union.join(" "));
+    let found = protocol::parse_find_items(first, limit);
+    let items = &found.items;
+    let id_lens: Vec<usize> = items.iter().map(|m| m.item_id.id.len()).collect();
+    let ck_lens: Vec<usize> = items.iter().filter_map(|m| m.item_id.change_key.as_ref().map(String::len)).collect();
+    let now = jiff::Timestamp::now();
+    let age_h = |t: Option<jiff::Timestamp>| t.map(|t| t.duration_until(now).as_secs() / 3600);
+    let violations = items.windows(2).filter(|w| matches!((w[0].received_at, w[1].received_at), (Some(a), Some(b)) if a < b)).count();
+    let no_date = items.iter().filter(|m| m.received_at.is_none()).count();
+    println!(
+        "    разобрано {} (includes_last {}); длина Id {}–{}, ChangeKey {}–{}; без даты {}, нарушений порядка по убыванию {}; самое свежее {:?} ч назад, самое старое {:?} ч назад",
+        items.len(),
+        found.includes_last,
+        id_lens.iter().min().unwrap_or(&0),
+        id_lens.iter().max().unwrap_or(&0),
+        ck_lens.iter().min().unwrap_or(&0),
+        ck_lens.iter().max().unwrap_or(&0),
+        no_date,
+        violations,
+        age_h(items.first().and_then(|m| m.received_at)),
+        age_h(items.last().and_then(|m| m.received_at))
+    );
+    let n = |f: &dyn Fn(&aiowa_core::MessageMeta) -> bool| items.iter().filter(|m| f(m)).count();
+    println!(
+        "    поля: тема {}, отправитель {}, Sender {}, DisplayTo {}, беседа {}, InternetMessageId {}, класс {}, начало текста {}, размер {}, ParentFolderId {}; непрочитанных {}, с флагом {}, с вложениями {}, черновиков {}",
+        n(&|m| m.subject.is_some()),
+        n(&|m| m.from.is_some()),
+        n(&|m| m.sender.is_some()),
+        n(&|m| m.display_to.is_some()),
+        n(&|m| m.conversation_id.is_some()),
+        n(&|m| m.internet_message_id.is_some()),
+        n(&|m| m.item_class.is_some()),
+        n(&|m| m.preview.is_some()),
+        n(&|m| m.size.is_some()),
+        n(&|m| m.parent_folder_id.is_some()),
+        n(&|m| !m.is_read),
+        n(&|m| m.flag == aiowa_core::FlagStatus::Flagged),
+        n(&|m| m.has_attachments),
+        n(&|m| m.is_draft)
+    );
+    // Те же ли идентификаторы, что у SyncFolderItems: письма уже в базе (база — копия синхронизированной).
+    let (mut in_db, mut deleted, mut same_ck, mut same_read, mut same_flag, mut same_folder) = (0, 0, 0, 0, 0, 0);
+    for m in items {
+        if let Some((pk, is_deleted)) = store.item_pk_by_server_id(account, &m.item_id.id)? {
+            in_db += 1;
+            if is_deleted {
+                deleted += 1;
+            }
+            if let Some(r) = store.item_ref(pk)? {
+                same_ck += usize::from(r.id.change_key == m.item_id.change_key);
+                same_read += usize::from(r.is_read == m.is_read);
+                same_flag += usize::from(r.is_flagged == (m.flag == aiowa_core::FlagStatus::Flagged));
+                same_folder += usize::from(r.folder_pk == folder_pk);
+            }
+        }
+    }
+    println!("    в локальной базе по Id: {in_db} из {} (удалённых {deleted}); совпали ChangeKey {same_ck}, прочитанность {same_read}, флаг {same_flag}, папка {same_folder}", items.len());
+    if let Some((prev_id, prev_date)) = prev_last {
+        let overlap = items.iter().any(|m| m.item_id.id == prev_id);
+        let continues = match (prev_date, items.first().and_then(|m| m.received_at)) {
+            (Some(a), Some(b)) => b <= a,
+            _ => false,
+        };
+        println!("    стык со страницей 1: последнее письмо первой страницы во второй {}, первое второй не новее последнего первой {}", if overlap { "есть" } else { "нет" }, if continues { "да" } else { "нет" });
+    }
+    Ok(items.last().map(|m| (m.item_id.id.clone(), m.received_at)))
+}
+
+/// `aiowa recent-probe`: по каждой папке — формы `FindItem` по очереди, затем вторая страница
+/// первой принятой формой. Только чтение; в выводе нет тем, адресов и имён.
+async fn recent_probe(t: &OwaTransport, store: &Store, account: AccountId, folders: &str, limit: u32) -> Result<()> {
+    let limit = limit.clamp(1, 1000);
+    for name in folders.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        let f = store.resolve_folder(account, name)?.ok_or_else(|| anyhow!("папка «{name}» не найдена в локальной базе"))?;
+        println!("Папка {name} (#{}, писем по счётчику {}), страница {limit}:", f.folder_pk, f.total_count);
+        let folder_ref = FolderRef::Id(FolderId { id: f.server_id.clone(), change_key: None });
+        let mut accepted: Option<(&str, serde_json::Value, String, Option<jiff::Timestamp>)> = None;
+        for (label, version, body) in recent_probe_forms(&folder_ref, limit) {
+            let started = std::time::Instant::now();
+            let result = t.call("FindItem", version, body.clone()).await;
+            let ms = started.elapsed().as_millis();
+            match result {
+                Err(e) => println!("  {label}: отказ {} за {ms} мс", transport_error_code(&e)),
+                Ok(v) => {
+                    println!("  {label}: ответ за {ms} мс");
+                    if let Some((last_id, last_date)) = describe_recent(store, account, f.folder_pk, &v, limit, None)?
+                        && accepted.is_none()
+                    {
+                        accepted = Some((version, body, last_id, last_date));
+                    }
+                }
+            }
+        }
+        let Some((version, mut body, last_id, last_date)) = accepted else {
+            println!("  ни одна форма не принята");
+            continue;
+        };
+        body["Paging"]["Offset"] = serde_json::json!(limit);
+        let started = std::time::Instant::now();
+        match t.call("FindItem", version, body).await {
+            Err(e) => println!("  вторая страница (Offset {limit}): отказ {}", transport_error_code(&e)),
+            Ok(v) => {
+                println!("  вторая страница (Offset {limit}, {version}): ответ за {} мс", started.elapsed().as_millis());
+                describe_recent(store, account, f.folder_pk, &v, limit, Some((&last_id, last_date)))?;
+            }
+        }
+    }
+    Ok(())
+}
+
 fn keyring_entry(user: &str) -> Result<keyring::Entry> {
     keyring::Entry::new(KEYRING_SERVICE, user).map_err(|e| anyhow!("keyring: {e}"))
 }
@@ -2094,10 +2258,12 @@ async fn real_main() -> Result<()> {
             transport.logoff().await.ok();
             let report = result.map_err(|e| anyhow!("синхронизация прервана: {e}"))?;
             println!(
-                "Готово за {:.1} с: папок в иерархии {}, синхронизировано {}, пачек {}, писем создано {} / обновлено {} / удалено {}, флагов {}, тел загружено {} (ошибок {}, исчезло на сервере {}), вложений скачано {} ({:.1} МБ, с текстом {}, ошибок {}), из кэша вытеснено {} файлов ({:.1} МБ).\nБаза: {}",
+                "Готово за {:.1} с: папок в иерархии {}, синхронизировано {}, свежих писем первыми {} (исчезло до конца выгрузки {}), пачек {}, писем создано {} / обновлено {} / удалено {}, флагов {}, тел загружено {} (ошибок {}, исчезло на сервере {}), вложений скачано {} ({:.1} МБ, с текстом {}, ошибок {}), из кэша вытеснено {} файлов ({:.1} МБ).\nБаза: {}",
                 report.elapsed.as_secs_f32(),
                 report.folders_in_hierarchy,
                 report.folders_synced,
+                report.recent_items,
+                report.recent_vanished,
                 report.pages,
                 report.items_created,
                 report.items_updated,
@@ -2470,6 +2636,14 @@ async fn real_main() -> Result<()> {
             let account = store.account(&cli.host, &cli.user)?;
             let t = connect(&cli).await?;
             let result = reply_to_probe(&t, &store, account, folder, *limit).await;
+            t.logoff().await.ok();
+            result?;
+        }
+        Cmd::RecentProbe { folders, limit } => {
+            let store = Store::open(&db_path)?;
+            let account = store.account(&cli.host, &cli.user)?;
+            let t = connect(&cli).await?;
+            let result = recent_probe(&t, &store, account, folders, *limit).await;
             t.logoff().await.ok();
             result?;
         }

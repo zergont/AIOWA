@@ -9,8 +9,8 @@ pub mod notify;
 pub mod protocol;
 
 use aiowa_core::{
-    CalendarEvent, CalendarEventDetails, CalendarItemChanges, ComposeKind, DirectoryPerson, DraftContent, FolderChanges, FolderId, FolderRef, ItemChanges, ItemId, MeetingRequestInfo, MeetingResponse, NewCalendarItem,
-    OutgoingAttachment, OutgoingMessage, Signature, SyncState,
+    CalendarEvent, CalendarEventDetails, CalendarItemChanges, ComposeKind, DirectoryPerson, DraftContent, FolderChanges, FolderId, FolderRef, ItemChanges, ItemId, MeetingRequestInfo, MeetingResponse, MessageMeta,
+    NewCalendarItem, OutgoingAttachment, OutgoingMessage, Signature, SyncState,
 };
 use aiowa_transport::{
     async_trait, AttachmentContent, Credentials, DeleteMode, FolderCounts, ItemFetchShape, ItemResult, MailTransport, NotificationEvent, NotificationKind, Result, ServerInfo, StreamEnd, SubscriptionRequest,
@@ -1391,6 +1391,16 @@ impl MailTransport for OwaTransport {
         let msg = Self::first_message("SyncFolderItems", &v)?;
         let (state, changes, includes_last) = protocol::parse_item_changes(&msg, max);
         Ok(ItemChanges { state, changes, includes_last })
+    }
+
+    async fn find_recent_items(&self, folder: &FolderRef, max: u32) -> Result<Vec<MessageMeta>> {
+        let max = max.clamp(1, 1000);
+        let started = Instant::now();
+        let v = self.call("FindItem", protocol::V_2017, protocol::find_recent_items_body(folder, max, 0)).await?;
+        let msg = Self::first_message("FindItem", &v)?;
+        let found = protocol::parse_find_items(&msg, max);
+        debug!(requested = max, items = found.items.len(), raw = found.raw_count, total_in_view = ?found.total_in_view, includes_last = found.includes_last, ms = started.elapsed().as_millis() as u64, "FindItem: последние письма папки");
+        Ok(found.items)
     }
 
     async fn get_items(&self, ids: &[ItemId], shape: ItemFetchShape) -> Result<Vec<ItemResult>> {
