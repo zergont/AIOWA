@@ -50,8 +50,10 @@
     if (inDrafts && onopendraft) onopendraft(c);
   }
 
-  // Простая виртуализация: рисуем только строки в окне прокрутки плюс запас.
-  const ROW = 72;
+  // Простая виртуализация: рисуем только строки в окне прокрутки плюс запас. Высота строки одна на
+  // все строки (три строки текста: отправитель, тема, начало текста) — от неё считаются окно,
+  // прокрутка к строке-курсору и подгрузка страниц; в CSS она приходит переменной --row.
+  const ROW = 84;
   let scroller = $state<HTMLDivElement | null>(null);
   let scrollTop = $state(0);
   let viewport = $state(800);
@@ -359,6 +361,57 @@
     picker = picker ? null : { targets, anchor: e.currentTarget as HTMLElement };
   }
 
+  // --- значки строки: флажок выбора слева, быстрые действия справа ------------------------------
+  // Видны при наведении на строку; быстрые действия — ещё и у строки-курсора, пока по списку ходят
+  // клавишами (`kbd`), флажки — у всех строк, пока выбор множественный. Значки лежат поверх строки
+  // (position: absolute) и текст не сдвигают: под быстрыми действиями гаснет конец начала текста.
+
+  /** По списку ходят клавишами: у строки-курсора видны быстрые действия. Мышь над списком — снова по наведению. */
+  let kbd = $state(false);
+
+  /** Флажок слева: добавить беседу к выбору или убрать из него — как Ctrl+щелчок. */
+  function onCheck(e: MouseEvent, c: Conversation) {
+    e.stopPropagation();
+    menu = null;
+    focusBack(scroller);
+    toggleOne(c);
+  }
+
+  /**
+   * Быстрое действие справа — над одной этой беседой, даже если она в множественном выборе (значок
+   * стоит на строке). Те же действия и та же обработка, что у меню: окно отмены, вопрос о папке архива,
+   * ошибка над списком. Удаление с Shift и в «Удалённых» — навсегда, с подтверждением.
+   */
+  function quick(e: MouseEvent, c: Conversation, kind: "read" | "flag" | "archive" | "delete") {
+    e.stopPropagation();
+    const btn = e.currentTarget as HTMLElement;
+    const l = conversationActionLabels([c], inDeleted);
+    menu = null;
+    picker = null;
+    focusBack(scroller);
+    switch (kind) {
+      case "read":
+        void run([c], { kind: "read", read: l.anyUnread }, btn);
+        break;
+      case "flag":
+        void run([c], { kind: "flag", flagged: !l.anyFlagged }, btn);
+        break;
+      case "archive":
+        if (!inArchive) void run([c], { kind: "archive" }, btn);
+        break;
+      case "delete":
+        requestDelete([c], e.shiftKey, btn);
+        break;
+    }
+  }
+
+  function checkTitle(checked: boolean): string {
+    if (!checked) return "Добавить к выбору";
+    return sel.size > 1 ? "Убрать из выбора" : "Беседа выбрана; отметь ещё, чтобы выбрать несколько";
+  }
+
+  const deleteTitle = $derived(inDeleted ? hint("Удалить навсегда…", "list-delete") : `${hint("Удалить", "list-delete")}; с Shift — навсегда`);
+
   const confirmTitle = $derived(confirm && confirm.targets.length > 1 ? `Удалить ${conversationsText(confirm.targets.length)} навсегда?` : "Удалить беседу навсегда?");
   const confirmText = $derived(confirm && confirm.targets.length > 1 ? "Письма этих бесед в текущей папке исчезнут с сервера, вернуть их будет нельзя." : "Письма этой беседы в текущей папке исчезнут с сервера, вернуть их будет нельзя.");
 
@@ -406,6 +459,7 @@
   function moveFocus(next: number, extend: boolean) {
     const c = conversations[next];
     if (!c) return;
+    kbd = true;
     ensureVisible(next);
     if (extend) selectRange(c);
     else selectOne(c);
@@ -474,7 +528,21 @@
   </div>
 {/if}
 
-<div class="scroller" bind:this={scroller} onscroll={onScroll} role="listbox" aria-label="Беседы" aria-multiselectable="true" tabindex="0" onkeydown={onKey} aria-busy={busy.size > 0}>
+<div
+  class="scroller"
+  class:multi
+  class:kbd
+  style="--row: {ROW}px"
+  bind:this={scroller}
+  onscroll={onScroll}
+  onpointermove={() => (kbd = false)}
+  role="listbox"
+  aria-label="Беседы"
+  aria-multiselectable="true"
+  tabindex="0"
+  onkeydown={onKey}
+  aria-busy={busy.size > 0}
+>
   {#if conversations.length === 0 && !loading}
     <div class="empty">
       <p>В этой папке пока нет бесед.</p>
@@ -485,12 +553,14 @@
       {#each slice as c, i (c.conversation_pk)}
         {@const inSel = sel.has(c.conversation_pk)}
         {@const focused = selected?.conversation_pk === c.conversation_pk}
+        {@const l = conversationActionLabels([c], inDeleted)}
+        {@const rowBusy = busy.has(c.conversation_pk)}
         <div
           class="row"
           class:selected={inSel}
           class:focused
           class:unread={c.unread_count > 0}
-          class:busy={busy.has(c.conversation_pk)}
+          class:busy={rowBusy}
           style="top: {(start + i) * ROW}px"
           role="option"
           aria-selected={inSel}
@@ -502,6 +572,9 @@
           oncontextmenu={(e) => onRowContextMenu(e, c)}
           ondragstart={(e) => onDragStart(e, c)}
         >
+          <button class="check" class:on={inSel} role="checkbox" aria-checked={inSel} aria-label={inSel ? "Убрать беседу из выбора" : "Добавить беседу к выбору"} title={checkTitle(inSel)} tabindex="-1" onclick={(e) => onCheck(e, c)} ondblclick={(e) => e.stopPropagation()}>
+            <svg width="12" height="12" viewBox="0 0 12 12" aria-hidden="true"><path d="M2.5 6.2 5 8.7l4.5-5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" /></svg>
+          </button>
           <div class="line1">
             <span class="people">{participantsLabel(c) || "(без отправителя)"}</span>
             {#if c.total_count > 1}<span class="count">{c.total_count}</span>{/if}
@@ -516,6 +589,23 @@
               <svg class="flag" width="13" height="13" viewBox="0 0 16 16" aria-label="С флагом"><path d={ICON.flag} fill="currentColor" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round" /></svg>
             {/if}
           </div>
+          <div class="line3">
+            <span class="preview">{c.preview ?? ""}</span>
+          </div>
+          <span class="quick">
+            <button class="act" onclick={(e) => quick(e, c, "read")} ondblclick={(e) => e.stopPropagation()} disabled={rowBusy} aria-label={l.read} title={l.read} tabindex="-1">
+              <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path d={l.anyUnread ? ICON.read : ICON.unread} fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round" /></svg>
+            </button>
+            <button class="act" class:on={l.anyFlagged} onclick={(e) => quick(e, c, "flag")} ondblclick={(e) => e.stopPropagation()} disabled={rowBusy} aria-label={l.flag} title={l.flag} tabindex="-1">
+              <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path d={ICON.flag} fill={l.anyFlagged ? "currentColor" : "none"} stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round" /></svg>
+            </button>
+            <button class="act" onclick={(e) => quick(e, c, "archive")} ondblclick={(e) => e.stopPropagation()} disabled={rowBusy || inArchive} aria-label={l.archive} title={inArchive ? "Беседа уже в архиве" : hint(l.archive, "archive")} tabindex="-1">
+              <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path d={ICON.archive} fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round" /></svg>
+            </button>
+            <button class="act danger" onclick={(e) => quick(e, c, "delete")} ondblclick={(e) => e.stopPropagation()} disabled={rowBusy} aria-label={l.delete} title={deleteTitle} tabindex="-1">
+              <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path d={ICON.delete} fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round" /></svg>
+            </button>
+          </span>
         </div>
       {/each}
     </div>
@@ -651,12 +741,18 @@
   .spacer {
     position: relative;
   }
+  /*
+   * Строка беседы: три строки текста (20 + 20 + 24 px с зазорами 2 px, поля 8 px сверху и 7 px
+   * снизу плюс граница 1 px — это ROW в скрипте). Слева поле 36 px: полоска курсора, флажок
+   * выбора (у первой строки) и точка непрочитанного (посередине). Третья строка выше текста в ней:
+   * на её месте справа встают быстрые действия, не задевая тему.
+   */
   .row {
     position: absolute;
     left: 0;
     right: 0;
-    height: 72px;
-    padding: 12px var(--space-4) 12px 20px;
+    height: var(--row);
+    padding: 8px var(--space-4) 7px 36px;
     display: flex;
     flex-direction: column;
     justify-content: center;
@@ -677,7 +773,7 @@
   .row.focused::before {
     content: "";
     position: absolute;
-    left: 6px;
+    left: 3px;
     top: 16px;
     bottom: 16px;
     width: 3px;
@@ -687,7 +783,7 @@
   .row.unread::after {
     content: "";
     position: absolute;
-    left: 8px;
+    left: 17px;
     top: 50%;
     width: 7px;
     height: 7px;
@@ -695,15 +791,96 @@
     border-radius: 50%;
     background: var(--unread);
   }
-  .row.unread.focused::after {
-    left: 12px;
-  }
   .line1,
-  .line2 {
+  .line2,
+  .line3 {
     display: flex;
     align-items: center;
     gap: var(--space-2);
     min-width: 0;
+  }
+  .line3 {
+    height: 24px;
+  }
+  .preview {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font: var(--text-caption);
+    color: var(--fg-3);
+  }
+  /* Флажок выбора: у первой строки, над точкой непрочитанного; кнопка 24 px, квадрат 14 px. */
+  .check {
+    position: absolute;
+    left: 8px;
+    top: 6px;
+    width: 24px;
+    height: 24px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: var(--radius-control);
+    color: transparent;
+    opacity: 0;
+    transition: opacity var(--dur-fast) var(--ease-in);
+  }
+  .check::before {
+    content: "";
+    position: absolute;
+    left: 5px;
+    top: 5px;
+    width: 14px;
+    height: 14px;
+    box-sizing: border-box;
+    border: 1px solid var(--fg-3);
+    border-radius: 3px;
+    background: var(--bg-layer-alt);
+  }
+  .check svg {
+    position: relative;
+  }
+  .check.on {
+    color: var(--fg-on-accent);
+  }
+  .check.on::before {
+    border-color: var(--accent);
+    background: var(--accent);
+  }
+  .check:hover::before {
+    border-color: var(--fg-1);
+  }
+  .check.on:hover::before {
+    border-color: var(--accent-hover);
+    background: var(--accent-hover);
+  }
+  .row:hover .check,
+  .scroller.multi .check {
+    opacity: 1;
+  }
+  /* Быстрые действия: справа на месте конца третьей строки; начало текста под ними гаснет. */
+  .quick {
+    position: absolute;
+    right: var(--space-3);
+    bottom: 7px;
+    height: 24px;
+    display: inline-flex;
+    align-items: center;
+    gap: 2px;
+    visibility: hidden;
+  }
+  .quick .act {
+    width: 24px;
+    height: 24px;
+  }
+  .row:hover .quick,
+  .scroller.kbd:focus-within .row.focused .quick {
+    visibility: visible;
+  }
+  .row:hover .preview,
+  .scroller.kbd:focus-within .row.focused .preview {
+    mask-image: linear-gradient(to left, transparent 108px, #000 132px);
   }
   .people {
     flex: 1;

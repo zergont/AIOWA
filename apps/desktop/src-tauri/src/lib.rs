@@ -65,7 +65,8 @@ mod config;
 mod data;
 mod directory;
 mod folders;
-mod live;
+mod live;,
+mod folder_view;
 mod logging;
 mod mailbox;
 mod navigation;
@@ -174,6 +175,8 @@ struct ConversationDto {
     has_attachments: bool,
     /// В беседе (в любой папке) есть письмо с флагом «к исполнению».
     has_flagged: bool,
+    /// Начало текста самого свежего письма беседы в этой папке (третья строка списка).
+    preview: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -265,6 +268,8 @@ struct SearchHitDto {
     folder_name: Option<String>,
     snippet: String,
     attachment_name: Option<String>,
+    /// Начало текста письма: строка результата показывает его, когда фрагмента нет.
+    preview: Option<String>,
 }
 
 /// Ключ сопоставления `src="cid:…"` с `Content-ID` вложения: без схемы `cid:`, URL-декодирован,
@@ -495,6 +500,7 @@ fn conversations(state: State<'_, AppState>, folder_pk: i64, after_ms: Option<i6
             last_received_ms: ms(r.last_received_at),
             has_attachments: r.has_attachments,
             has_flagged: r.has_flagged,
+            preview: r.preview,
         })
         .collect())
 }
@@ -538,6 +544,7 @@ fn search(state: State<'_, AppState>, query: String, limit: Option<usize>) -> Cm
             folder_name: h.folder_name,
             snippet: h.snippet,
             attachment_name: h.attachment_name,
+            preview: h.preview,
         });
     }
     Ok(out)
@@ -820,7 +827,10 @@ pub fn run() {
             data::data_stores,
             data::data_usage,
             data::data_store_open_dir,
-            data::data_store_delete
+            data::data_store_delete,
+            // Свёрнутые ветки дерева папок (folder_view.rs).
+            folder_view::folders_collapsed_get,
+            folder_view::folders_collapsed_set
         ])
         .build(tauri::generate_context!())
         .expect("ошибка запуска приложения");

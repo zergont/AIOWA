@@ -28,6 +28,8 @@ export interface Conversation {
   has_attachments: boolean;
   /** В беседе есть письмо с флагом (в любой папке). */
   has_flagged: boolean;
+  /** Начало текста самого свежего письма беседы в этой папке (третья строка); нет у заглушки беседы, открытой из поиска. */
+  preview?: string | null;
 }
 
 export interface Recipient {
@@ -109,6 +111,8 @@ export interface SearchHit {
   folder_name: string | null;
   snippet: string;
   attachment_name: string | null;
+  /** Начало текста письма: показывается, когда фрагмента с совпадениями нет. */
+  preview?: string | null;
 }
 
 /** Этап синхронизации; совпадает с `StageDto` в src-tauri/src/sync.rs. */
@@ -684,6 +688,10 @@ export const api = {
   folderRename: (folderPk: number, name: string) => invoke<Folder>("folder_rename", { folderPk, name }),
   /** permanent=false — в «Удалённые» вместе с подпапками и письмами, permanent=true — навсегда. */
   folderDelete: (folderPk: number, permanent: boolean) => invoke<void>("folder_delete", { folderPk, permanent }),
+  /** Свёрнутые ветки дерева папок из базы учётной записи (удалённые на сервере папки выброшены). */
+  foldersCollapsedGet: () => invoke<number[]>("folders_collapsed_get"),
+  /** Сохранить свёрнутые ветки целиком; в базе — серверные идентификаторы папок. */
+  foldersCollapsedSet: (folderPks: number[]) => invoke<void>("folders_collapsed_set", { folderPks }),
 
   // --- композер ----------------------------------------------------------------------------
   /** Заготовка композера: для ответа/пересылки itemPk — исходное письмо. */

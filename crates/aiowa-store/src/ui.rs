@@ -102,6 +102,21 @@ fn head_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<MessageHead> {
     })
 }
 
+/// Дописывает строкам бесед начало текста самого свежего письма беседы в папке `folder_pk`
+/// (третья строка списка). Запрос на строку страницы, а не подзапрос в выборке страницы: так он
+/// идёт только для отданных строк и по индексу `items_conv_folder` (беседа, папка) читает лишь
+/// письма беседы в этой папке. Тот же порядок, что у `last_received_at` в `conversation_folders`.
+pub(crate) fn fill_previews(c: &Connection, folder_pk: i64, rows: &mut [ConversationRow]) -> rusqlite::Result<()> {
+    let mut st = c.prepare_cached(
+        "SELECT preview FROM items WHERE conversation_pk = ?1 AND folder_pk = ?2 AND deleted = 0
+         ORDER BY COALESCE(received_at, sent_at) DESC, item_pk DESC LIMIT 1",
+    )?;
+    for row in rows {
+        row.preview = st.query_row(params![row.conversation_pk, folder_pk], |r| r.get::<_, Option<String>>(0)).optional()?.flatten().filter(|p| !p.trim().is_empty());
+    }
+    Ok(())
+}
+
 /// Дописывает заголовкам адреса `Reply-To` из `recipients` (kind 4) отдельным запросом на письмо:
 /// заголовков в беседе десятки, строк Reply-To почти никогда нет.
 fn fill_reply_to(c: &Connection, heads: &mut [MessageHead]) -> rusqlite::Result<()> {
@@ -125,7 +140,7 @@ impl Store {
                    AND (?3 IS NULL OR cf.last_received_at < ?3 OR (cf.last_received_at = ?3 AND cf.conversation_pk < ?4))
                  ORDER BY cf.last_received_at DESC, cf.conversation_pk DESC LIMIT ?5"
             ))?;
-            let rows: Vec<ConversationRow> = st
+            let mut rows: Vec<ConversationRow> = st
                 .query_map(params![folder_pk, account.0, after.map(|a| a.last_received_at), after.map(|a| a.conversation_pk).unwrap_or(i64::MAX), limit as i64], |r| {
                     Ok(ConversationRow {
                         conversation_pk: r.get(0)?,
@@ -137,9 +152,11 @@ impl Store {
                         last_received_at: ms_ts(r.get::<_, Option<i64>>(5)?),
                         has_attachments: r.get::<_, i64>(6)? != 0,
                         has_flagged: r.get::<_, i64>(7)? != 0,
+                        preview: None,
                     })
                 })?
                 .collect::<std::result::Result<Vec<_>, _>>()?;
+            fill_previews(c, folder_pk, &mut rows)?;
             let mut people = c.prepare_cached(
                 "SELECT COALESCE(from_name, from_email) FROM items WHERE conversation_pk = ?1 AND deleted = 0
                  ORDER BY COALESCE(received_at, sent_at) DESC LIMIT 30",
@@ -234,5 +251,123 @@ impl Store {
     /// Папка, в которой лежит письмо (для беседы, собранной из нескольких папок).
     pub fn folder_name(&self, folder_pk: i64) -> Result<Option<String>> {
         self.with_conn(|c| Ok(c.query_row("SELECT display_name FROM folders WHERE folder_pk = ?1", params![folder_pk], |r| r.get(0)).optional()?))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aiowa_core::{ConversationId, Folder, FolderId, Importance, ItemChange, ItemId, MessageMeta};
+
+    fn tmp_store(tag: &str) -> Store {
+        let dir = std::env::temp_dir().join(format!("aiowa-store-test-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        Store::open(dir.join("mail.db")).unwrap()
+    }
+
+    fn folder(name: &str, dist: Option<&str>) -> Folder {
+        Folder {
+            id: FolderId { id: format!("F-{name}"), change_key: Some("ck".into()) },
+            parent_id: None,
+            display_name: name.to_string(),
+            distinguished: dist.map(String::from),
+            folder_class: Some("IPF.Note".into()),
+            total_count: 0,
+            unread_count: 0,
+            child_folder_count: 0,
+        }
+    }
+
+    fn meta(id: &str, received: &str, conv: &str, preview: Option<&str>) -> MessageMeta {
+        MessageMeta {
+            item_id: ItemId { id: id.to_string(), change_key: Some("c".into()) },
+            parent_folder_id: None,
+            conversation_id: Some(ConversationId(conv.to_string())),
+            internet_message_id: Some(format!("<{id}@x>")),
+            item_class: Some("IPM.Note".into()),
+            subject: Some("Договор".into()),
+            from: None,
+            sender: None,
+            display_to: None,
+            received_at: Some(received.parse().unwrap()),
+            sent_at: None,
+            last_modified_at: None,
+            is_read: false,
+            is_draft: false,
+            has_attachments: false,
+            importance: Importance::Normal,
+            flag: Default::default(),
+            size: Some(100),
+            preview: preview.map(String::from),
+        }
+    }
+
+    #[test]
+    fn conversation_rows_carry_preview_of_latest_message_in_folder() {
+        let s = tmp_store("preview");
+        let acc = s.account("h", "u").unwrap();
+        s.upsert_folders(acc, &[folder("Входящие", Some("inbox")), folder("Отправленные", Some("sentitems"))]).unwrap();
+        let (inbox, _) = s.folder_by_distinguished(acc, "inbox").unwrap().unwrap();
+        let (sent, _) = s.folder_by_distinguished(acc, "sentitems").unwrap().unwrap();
+        s.apply_item_changes(
+            acc,
+            inbox,
+            &[
+                ItemChange::Create(meta("A", "2026-10-01T10:00:00Z", "c1", Some("Первое письмо"))),
+                ItemChange::Create(meta("B", "2026-10-02T10:00:00Z", "c1", Some("Ответ Анны"))),
+                ItemChange::Create(meta("E", "2026-09-01T10:00:00Z", "c2", Some("   "))),
+                ItemChange::Create(meta("N", "2026-08-01T10:00:00Z", "c3", None)),
+            ],
+        )
+        .unwrap();
+        // Самое свежее письмо беседы — в «Отправленных»: на строку «Входящих» оно не влияет.
+        s.apply_item_changes(acc, sent, &[ItemChange::Create(meta("S", "2026-10-03T10:00:00Z", "c1", Some("Мой ответ")))]).unwrap();
+
+        let page = s.conversations_page(acc, inbox, None, 10).unwrap();
+        let previews: Vec<Option<&str>> = page.iter().map(|c| c.preview.as_deref()).collect();
+        assert_eq!(previews, vec![Some("Ответ Анны"), None, None], "свежее письмо папки; пробелы и NULL — без начала текста");
+        assert_eq!(s.list_conversations(acc, inbox, 10).unwrap()[0].preview.as_deref(), Some("Ответ Анны"), "и в выдаче без курсора");
+        assert_eq!(s.conversations_page(acc, sent, None, 10).unwrap()[0].preview.as_deref(), Some("Мой ответ"));
+
+        // Следующая страница по курсору тоже с началом текста.
+        let first = &page[0];
+        let cursor = ConversationCursor { last_received_at: first.last_received_at.unwrap().as_millisecond(), conversation_pk: first.conversation_pk };
+        let next = s.conversations_page(acc, inbox, Some(cursor), 1).unwrap();
+        assert_eq!(next.len(), 1);
+        assert_eq!(next[0].preview, None);
+
+        // Свежее письмо удалено: строка показывает начало предыдущего.
+        let b: i64 = s.debug_query("SELECT item_pk FROM items WHERE server_id = 'B'").unwrap()[1].parse().unwrap();
+        s.mark_deleted_local(&[b]).unwrap();
+        assert_eq!(s.conversations_page(acc, inbox, None, 10).unwrap()[0].preview.as_deref(), Some("Первое письмо"));
+    }
+
+    #[test]
+    fn preview_query_uses_conversation_folder_index() {
+        let s = tmp_store("preview-plan");
+        let plan = s
+            .debug_query(
+                "EXPLAIN QUERY PLAN SELECT preview FROM items WHERE conversation_pk = 1 AND folder_pk = 2 AND deleted = 0
+                 ORDER BY COALESCE(received_at, sent_at) DESC, item_pk DESC LIMIT 1",
+            )
+            .unwrap()
+            .join("\n");
+        assert!(plan.contains("items_conv_folder"), "{plan}");
+    }
+
+    #[test]
+    fn search_hits_carry_preview() {
+        let s = tmp_store("preview-search");
+        let acc = s.account("h", "u").unwrap();
+        s.upsert_folders(acc, &[folder("Входящие", Some("inbox"))]).unwrap();
+        let (inbox, _) = s.folder_by_distinguished(acc, "inbox").unwrap().unwrap();
+        s.apply_item_changes(acc, inbox, &[ItemChange::Create(meta("A", "2026-10-01T10:00:00Z", "c1", Some("Начало письма")))]).unwrap();
+        // Полнотекстовый поиск по теме: тела нет, фрагмент пуст — строка покажет начало текста.
+        let hits = s.search(acc, "договор", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].preview.as_deref(), Some("Начало письма"));
+        // Поиск только операторами (без текста) — тоже.
+        let hits = s.search(acc, "папка:входящие", 10).unwrap();
+        assert_eq!(hits[0].preview.as_deref(), Some("Начало письма"));
     }
 }

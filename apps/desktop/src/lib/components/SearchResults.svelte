@@ -47,7 +47,12 @@
       <div class="topic">{h.subject || "(без темы)"}</div>
       <div class="snippet caption">
         {#if h.attachment_name}<span class="file">{h.attachment_name}</span>{/if}
-        {#each parts(h.snippet) as p}{#if p.hit}<mark>{p.text}</mark>{:else}{p.text}{/if}{/each}
+        {#if h.snippet.trim() || h.attachment_name}
+          {#each parts(h.snippet) as p}{#if p.hit}<mark>{p.text}</mark>{:else}{p.text}{/if}{/each}
+        {:else if h.preview}
+          <!-- Фрагмента нет (тело не загружено, совпадение в теме или отправителе) — начало текста письма. -->
+          <span class="preview">{h.preview}</span>
+        {/if}
       </div>
       {#if h.folder_name}<div class="folder caption">{h.folder_name}</div>{/if}
     </div>
@@ -129,6 +134,9 @@
     line-clamp: 2;
     -webkit-box-orient: vertical;
     overflow: hidden;
+  }
+  .preview {
+    color: var(--fg-3);
   }
   mark {
     background: var(--accent-soft);
