@@ -50,7 +50,7 @@ dependencies = [
 
 [[package]]
 name = "aiowa-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "aiowa-core",
  "aiowa-store",
@@ -71,7 +71,7 @@ dependencies = [
 
 [[package]]
 name = "aiowa-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "jiff",
  "serde",
@@ -80,7 +80,7 @@ dependencies = [
 
 [[package]]
 name = "aiowa-desktop"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "aiowa-core",
  "aiowa-store",
@@ -103,6 +103,7 @@ dependencies = [
  "tauri-build",
  "tauri-plugin-notification",
  "tauri-plugin-single-instance",
+ "tauri-plugin-updater",
  "tokio",
  "tracing",
  "tracing-appender",
@@ -114,7 +115,7 @@ dependencies = [
 
 [[package]]
 name = "aiowa-extract"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "calamine",
  "encoding_rs",
@@ -126,7 +127,7 @@ dependencies = [
 
 [[package]]
 name = "aiowa-store"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "aiowa-core",
  "jiff",
@@ -140,7 +141,7 @@ dependencies = [
 
 [[package]]
 name = "aiowa-sync"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "aiowa-core",
  "aiowa-extract",
@@ -154,7 +155,7 @@ dependencies = [
 
 [[package]]
 name = "aiowa-transport"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "aiowa-core",
  "async-trait",
@@ -168,7 +169,7 @@ dependencies = [
 
 [[package]]
 name = "aiowa-transport-owa"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "aiowa-core",
  "aiowa-store",
@@ -1580,6 +1581,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "filetime"
+version = "0.2.29"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5c287a33c7f0a620c38e641e7f60827713987b3c0f26e8ddc9462cc69cf75759"
+dependencies = [
+ "cfg-if",
+ "libc",
+]
+
+[[package]]
 name = "find-msvc-tools"
 version = "0.1.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2868,6 +2879,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6877bb514081ee2a7ff5ef9de3281f14a4dd4bceac4c09388074a6b5df8a139a"
 
 [[package]]
+name = "minisign-verify"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "871285dc19d8d0ebe0eef3d0e99a205f2a71363b122632cbbfa4a6c370a960ce"
+
+[[package]]
 name = "miniz_oxide"
 version = "0.8.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3263,6 +3280,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "objc2-osa-kit"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f112d1746737b0da274ef79a23aac283376f335f4095a083a267a082f21db0c0"
+dependencies = [
+ "bitflags 2.13.2",
+ "objc2",
+ "objc2-app-kit",
+ "objc2-foundation",
+]
+
+[[package]]
 name = "objc2-quartz-core"
 version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3399,6 +3428,20 @@ checksum = "9aa2b01e1d916879f73a53d01d1d6cee68adbb31d6d9177a8cfce093cced1d50"
 dependencies = [
  "futures-core",
  "pin-project-lite",
+]
+
+[[package]]
+name = "osakit"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "732c71caeaa72c065bb69d7ea08717bd3f4863a4f451402fc9513e29dbd5261b"
+dependencies = [
+ "objc2",
+ "objc2-foundation",
+ "objc2-osa-kit",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -4792,6 +4835,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "tar"
+version = "0.4.46"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3f6221d9a6003c78398e3b239969f352578258df48c8eb051caadae0015bc840"
+dependencies = [
+ "filetime",
+ "libc",
+ "xattr",
+]
+
+[[package]]
 name = "target-lexicon"
 version = "0.12.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4962,6 +5016,38 @@ dependencies = [
  "tracing",
  "windows-sys 0.61.2",
  "zbus",
+]
+
+[[package]]
+name = "tauri-plugin-updater"
+version = "2.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7259989d4fe11b2bf51f7d671642249b1837c4ae2da1430dc713ae38f98ceeec"
+dependencies = [
+ "base64 0.22.1",
+ "dirs",
+ "flate2",
+ "futures-util",
+ "http",
+ "infer",
+ "libc",
+ "log",
+ "minisign-verify",
+ "osakit",
+ "percent-encoding",
+ "reqwest",
+ "semver",
+ "serde",
+ "serde_json",
+ "tar",
+ "tauri",
+ "tauri-plugin",
+ "tempfile",
+ "thiserror 2.0.21",
+ "time",
+ "tokio",
+ "url",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6259,6 +6345,16 @@ dependencies = [
  "libc",
  "once_cell",
  "pkg-config",
+]
+
+[[package]]
+name = "xattr"
+version = "1.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "32e45ad4206f6d2479085147f02bc2ef834ac85886624a23575ae137c8aa8156"
+dependencies = [
+ "libc",
+ "rustix",
 ]
 
 [[package]]

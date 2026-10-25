@@ -52,7 +52,7 @@ if ($thumb) {
 $signArgs += $File
 
 Write-Host "[sign] подписываю $name"
-& $signtool @args
+& $signtool @signArgs
 if ($LASTEXITCODE -ne 0) {
     Write-Error "[sign] signtool завершился с кодом $LASTEXITCODE ($name)"
     exit $LASTEXITCODE

@@ -6,6 +6,7 @@
   import { focusBack } from "../popover";
   import { hint, isTopLayer, layer } from "../hotkeys";
   import SignatureDialog from "./SignatureDialog.svelte";
+  import AboutUpdates from "./AboutUpdates.svelte";
 
   /**
    * Окно настроек (шестерёнка в верхней панели, Ctrl+,). Значения применяются сразу через
@@ -21,7 +22,7 @@
   }
   let { syncing, onsync, unsavedDraft = false, onclose }: Props = $props();
 
-  type SectionId = "account" | "sync" | "reading" | "notify" | "signature" | "view" | "data";
+  type SectionId = "account" | "sync" | "reading" | "notify" | "signature" | "view" | "data" | "about";
   const SECTIONS: { id: SectionId; label: string }[] = [
     { id: "account", label: "Учётная запись" },
     { id: "sync", label: "Синхронизация" },
@@ -30,6 +31,7 @@
     { id: "signature", label: "Подпись" },
     { id: "view", label: "Вид" },
     { id: "data", label: "Данные" },
+    { id: "about", label: "О программе" },
   ];
 
   const uid = $props.id();
@@ -410,7 +412,10 @@
     </div>
 
     <div class="panel" role="tabpanel" id={panelId} aria-labelledby={tabId(current)}>
-      {#if !s}
+      <!-- «О программе» не зависит от настроек: видна, даже если они не загрузились. -->
+      {#if current === "about"}
+        <AboutUpdates />
+      {:else if !s}
         {#if loadError}
           <p class="err" role="alert">Настройки не загрузились: {loadError}</p>
           <button class="btn" onclick={() => void load()}>Повторить</button>

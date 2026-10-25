@@ -49,6 +49,12 @@ tauri-plugin-notification = "2"
 tauri-plugin-single-instance = "2"
 # Журнал в файл с ежедневной ротацией (`logging.rs`): у собранного приложения нет консоли.
 tracing-appender = "0.2"
+# Обновление из приложения (`updates.rs`): `latest.json` релиза GitHub, загрузка установщика, проверка
+# подписи ключом обновлений (minisign) и запуск установщика NSIS. TLS системный (Schannel), как у
+# транспорта OWA: без rustls и ring; zip не нужен — обновление приходит самим установщиком `.exe`.
+# Прокси — системный. Команды плагина окну не открыты (capability не даёт `updater:*`): окно зовёт
+# только свои команды `updates_*`.
+tauri-plugin-updater = { version = "2.14", default-features = false, features = ["native-tls", "system-proxy"] }
 
 # Выключение браузерных клавиш WebView2 в главном окне (`lib.rs`, `disable_browser_accelerator_keys`).
 # Версии — те же, что у wry и tauri в Cargo.lock: `PlatformWebview::controller` отдаёт тип webview2-com.

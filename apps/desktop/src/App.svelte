@@ -23,6 +23,7 @@
   import Settings from "./lib/components/Settings.svelte";
   import { addDays, sameDay, startOfDay, viewRange, type CalendarViewKind } from "./lib/calendar";
   import { loadSettings, prefs, syncEveryMs as syncPeriodMs } from "./lib/settings.svelte";
+  import { setUpdateGuard } from "./lib/updates.svelte";
 
   interface Props {
     /**
@@ -376,6 +377,29 @@
       error = errorMessage(e);
     }
   }
+
+  /**
+   * Перед установкой обновления (приложение закроется само): несохранённое письмо — тот же выбор,
+   * что при закрытии окна (askClose композера); идёт отправка или сохранение — подождать.
+   * false — не устанавливать.
+   */
+  async function beforeUpdateInstall(): Promise<boolean> {
+    if (!compose) return true;
+    if (composerBusy) {
+      error = busyText();
+      return false;
+    }
+    if (!composerDirty) return true;
+    section = "mail";
+    await tick();
+    const ref = composerRef;
+    if (!ref) {
+      error = "Сохраните или закройте письмо в композере и повторите установку";
+      return false;
+    }
+    return (await ref.askClose()) != null;
+  }
+  setUpdateGuard(beforeUpdateInstall);
 
   const PAGE = 100;
   /**

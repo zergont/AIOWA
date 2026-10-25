@@ -36,6 +36,10 @@
 //! перезапускает процесс — тот поднимается в режиме почты. База учётной записи не открылась —
 //! тоже мастер, с текстом ошибки (`app_mode().boot_error`), а не падение на каждом старте.
 //! Настройки окна (`settings.rs`) лежат в `sync_state` базы.
+//!
+//! Обновление приложения (`updates.rs`): проверка `latest.json` релиза GitHub, загрузка установщика
+//! с проверкой подписи ключом обновлений и установка. Перед запуском установщика — те же шаги
+//! выхода, что в `RunEvent::Exit` (`MailServices::shutdown`): установщик закрывает процесс сам.
 
 use aiowa_core::{AccountId, BodyType};
 use aiowa_store::ui::{ConversationCursor, MessageHead};
@@ -67,6 +71,7 @@ mod settings;
 mod setup;
 mod staged;
 mod sync;
+mod updates;
 mod write;
 
 /// Лимит одной инлайновой картинки: больше не скачиваем и не подставляем.
@@ -546,6 +551,21 @@ struct MailServices {
     reminders: Arc<reminders::RemindersState>,
 }
 
+impl MailServices {
+    /// Штатный выход служб почты. Сессия на сервере одна на процесс: закрыть канал уведомлений,
+    /// отправить на сервер отложенные действия (окно отмены ещё не истекло), остановить
+    /// синхронизацию и выйти из сессии, иначе сервер накапливает сессии до MapiExceptionSessionLimit.
+    /// Блокирует: вызывается с главного потока (`RunEvent::Exit`) или из блокирующего потока перед
+    /// запуском установщика обновления (`updates.rs`), который закрывает процесс без `RunEvent::Exit`.
+    /// Повторный вызов ничего не делает: каждая служба уже остановлена.
+    fn shutdown(&self, app: &tauri::AppHandle) {
+        self.reminders.shutdown();
+        self.notify.shutdown();
+        staged::commit_all_blocking(app);
+        self.sync.shutdown();
+    }
+}
+
 /// Открывает базу учётной записи и строит состояния почты. Блок мастера (`initial`) применяется
 /// к базе здесь, до первого чтения настроек. Ошибка — текст для окна: процесс не падает, а
 /// стартует мастером с этим текстом (иначе негодный путь в конфиге ронял бы каждый запуск).
@@ -644,6 +664,8 @@ pub fn run() {
         .plugin(navigation::guard())
         // Тосты Windows о новых письмах показывает канал уведомлений из Rust; команд плагина окно не зовёт.
         .plugin(tauri_plugin_notification::init())
+        // Обновление приложения: окно зовёт команды `updates_*` (`updates.rs`), не команды плагина.
+        .plugin(tauri_plugin_updater::Builder::new().build())
         // Предпросмотр вложений: файл и база читаются не в потоке окна. Отдаются только файлы кэша
         // вложений текущей учётной записи по числовому ключу (`preview::serve`). В режиме первого
         // запуска базы нет — 503.
@@ -672,11 +694,14 @@ pub fn run() {
         .manage(calendar::CalendarState::default())
         .manage(calendar_write::CalendarWriteState::default())
         .manage(directory::DirectoryState::default())
+        .manage(updates::UpdatesState::default())
         .manage(CloseState::default());
     let services = match mail {
         Some(parts) => {
             let services = MailServices { sync: parts.sync.clone(), notify: parts.notify.clone(), reminders: parts.reminders.clone() };
             builder = builder.manage(parts.state).manage(parts.sync).manage(parts.notify).manage(parts.reminders);
+            // Шаги выхода перед установщиком обновления (`updates.rs`) берут службы отсюда.
+            builder = builder.manage(services.clone());
             Some(services)
         }
         None => None,
@@ -695,6 +720,8 @@ pub fn run() {
                 if let Some(s) = &services {
                     s.notify.refresh_unread(app.handle());
                     s.reminders.start(app.handle().clone());
+                    // Фоновая проверка обновлений: через минуту и раз в сутки, если не выключена.
+                    updates::start(app.handle().clone());
                 }
                 Ok(())
             }
@@ -774,23 +801,24 @@ pub fn run() {
             settings::settings_set,
             settings::settings_change_password,
             settings::settings_forget_account,
-            settings::settings_open_data_dir
+            settings::settings_open_data_dir,
+            // обновление приложения (updates.rs)
+            updates::updates_status,
+            updates::updates_check,
+            updates::updates_set_auto,
+            updates::updates_install
         ])
         .build(tauri::generate_context!())
         .expect("ошибка запуска приложения");
     app.run(move |app, event| {
-        // Сессия на сервере одна на процесс: при выходе закрыть канал уведомлений, отправить на
-        // сервер отложенные действия (окно отмены ещё не истекло), остановить синхронизацию и
-        // выйти из сессии, иначе сервер накапливает сессии до MapiExceptionSessionLimit.
-        // В режиме первого запуска останавливать нечего. Перезапуск после мастера и «Забыть
-        // учётную запись» идёт через этот же выход (`AppHandle::request_restart`).
+        // Сессия на сервере одна на процесс: при выходе остановить службы почты и выйти из сессии
+        // (`MailServices::shutdown`). В режиме первого запуска останавливать нечего. Перезапуск
+        // после мастера и «Забыть учётную запись» идёт через этот же выход
+        // (`AppHandle::request_restart`); установка обновления — нет, она зовёт те же шаги сама.
         if let tauri::RunEvent::Exit = event
             && let Some(s) = &services
         {
-            s.reminders.shutdown();
-            s.notify.shutdown();
-            staged::commit_all_blocking(app);
-            s.sync.shutdown();
+            s.shutdown(app);
         }
     });
 }
