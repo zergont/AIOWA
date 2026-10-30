@@ -17,6 +17,7 @@
   import StatusBar from "./lib/components/StatusBar.svelte";
   import Logo from "./lib/components/Logo.svelte";
   import Composer, { type CloseReason } from "./lib/components/Composer.svelte";
+  import type { LocalDraft } from "./lib/api";
   import ConfirmPopover from "./lib/components/ConfirmPopover.svelte";
   import CalendarView from "./lib/components/CalendarView.svelte";
   import MiniMonth from "./lib/components/MiniMonth.svelte";
@@ -190,6 +191,8 @@
 
   /** Открытая заготовка; новая заготовка — новый экземпляр композера ({#key}). */
   let compose = $state<ComposeContext | null>(null);
+  /** Локальные черновики с прошлого запуска или закрытые без связи: полоса внизу предлагает открыть. */
+  let unsavedDrafts = $state<LocalDraft[]>([]);
   /** Беседа, над карточками которой стоит композер ответа; у нового письма null. */
   let composeConversationPk = $state<number | null>(null);
   let composerDirty = $state(false);
@@ -276,6 +279,56 @@
     return composerBusy === "send" ? "Подожди: письмо отправляется" : "Подожди: черновик сохраняется";
   }
 
+  // --- локальные черновики (письма, пережившие падение, закрытие окна или отсутствие связи) ---
+
+  async function refreshLocalDrafts() {
+    try {
+      const list = await api.composeLocalList();
+      // Открытый сейчас композер хранит свой черновик сам: в полосе он не нужен.
+      unsavedDrafts = list.filter((d) => d.draft_id !== compose?.restore?.draft_id);
+    } catch (e) {
+      console.warn("compose_local_list:", errorMessage(e));
+    }
+  }
+
+  /** Открыть локальный черновик в композере: заготовка по виду письма (оригинал удалён — как новое письмо), поверх — сохранённый текст. */
+  async function restoreDraft(d: LocalDraft) {
+    if (composeLoading || composerBusy) return;
+    section = "mail";
+    if (compose && composerDirty) {
+      await tick();
+      const reason = composerRef ? await composerRef.askClose() : "cancel";
+      if (reason == null) return;
+    }
+    composeLoading = "compose";
+    try {
+      let ctx: ComposeContext;
+      try {
+        ctx = await api.composeContext(d.kind, d.reference_item_pk);
+      } catch (e) {
+        console.warn("compose_context для локального черновика:", errorMessage(e));
+        ctx = await api.composeContext("new", null);
+      }
+      compose = { ...ctx, to: d.to, cc: d.cc, bcc: d.bcc, subject: d.subject, body_html: d.body_html, restore: d };
+      composeConversationPk = null;
+      composerDirty = true;
+      unsavedDrafts = unsavedDrafts.filter((x) => x.draft_id !== d.draft_id);
+    } catch (e) {
+      error = errorMessage(e);
+    } finally {
+      composeLoading = null;
+    }
+  }
+
+  async function dropLocalDraft(d: LocalDraft) {
+    try {
+      await api.composeLocalDrop(d.draft_id);
+      unsavedDrafts = unsavedDrafts.filter((x) => x.draft_id !== d.draft_id);
+    } catch (e) {
+      error = errorMessage(e);
+    }
+  }
+
   async function loadCompose(kind: ComposeKind, itemPk: number | null, conversationPk: number | null, draft = false, to: ComposeRecipient[] = []) {
     if (composeLoading || composerBusy) return;
     composeLoading = draft ? "draft" : "compose";
@@ -319,6 +372,10 @@
     if (reason === "sent") showNotice("Отправлено");
     else if (reason === "draft") showNotice("Черновик сохранён в «Черновиках» на сервере");
     else if (reason === "discard") showNotice("Черновик удалён");
+    else if (reason === "local") {
+      showNotice("Нет связи: письмо сохранено в приложении, открыть его можно из полосы внизу или при следующем запуске");
+      void refreshLocalDrafts();
+    }
     // Отправленное появляется в «Отправленных», а черновик приходит в «Черновики» или уходит из них
     // после синхронизации этих папок.
     if (reason === "sent") syncComposeFolders([sentFolderPk, draftsFolderPk]);
@@ -1559,6 +1616,7 @@
         account = await api.accountInfo();
         void loadDirectoryCaps();
         await loadFolders();
+        void refreshLocalDrafts();
         syncStatus = await api.syncStatus();
         wasRunning = syncStatus.running;
         // Автозапуск при старте: окно сначала показывает базу, потом тянет новое. Первый старт
@@ -1701,7 +1759,15 @@
   {/if}
 
   {#if closeRequest}
-    <ConfirmPopover anchor={closeRequest} align="start" title="Закрыть окно?" text={composerBusy ? "Отправка или сохранение ещё идёт: письмо может не уйти, черновик — не сохраниться." : "Набранное письмо будет потеряно."} confirmLabel="Закрыть" onconfirm={confirmClose} oncancel={() => (closeRequest = null)} />
+    <ConfirmPopover anchor={closeRequest} align="start" title="Закрыть окно?" text={composerBusy ? "Отправка или сохранение ещё идёт: письмо может не уйти, черновик — не сохраниться." : "Набранное письмо останется в приложении: его предложат открыть при следующем запуске."} confirmLabel="Закрыть" onconfirm={confirmClose} oncancel={() => (closeRequest = null)} />
+  {/if}
+
+  {#if unsavedDrafts.length && !compose}
+    <div class="restore-bar" role="status">
+      <span class="restore-text">Несохранённое письмо{unsavedDrafts.length > 1 ? ` (${unsavedDrafts.length})` : ""}: «{unsavedDrafts[0].subject || "без темы"}»</span>
+      <button class="restore-btn" onclick={() => void restoreDraft(unsavedDrafts[0])}>Открыть</button>
+      <button class="restore-btn" onclick={() => void dropLocalDraft(unsavedDrafts[0])}>Удалить</button>
+    </div>
   {/if}
 
   {#if error}
@@ -1920,6 +1986,36 @@
   .status {
     grid-area: status;
     min-width: 0;
+  }
+
+  .restore-bar {
+    position: fixed;
+    left: 50%;
+    bottom: 36px;
+    transform: translateX(-50%);
+    background: var(--bg-card);
+    color: var(--fg-1);
+    border: 1px solid var(--stroke-2);
+    border-radius: var(--radius-card);
+    box-shadow: var(--shadow-16);
+    padding: var(--space-2) var(--space-3);
+    display: flex;
+    gap: var(--space-3);
+    align-items: center;
+    max-width: 70vw;
+    z-index: 5;
+  }
+  .restore-text {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .restore-btn {
+    color: var(--accent);
+    white-space: nowrap;
+  }
+  .restore-btn:hover {
+    text-decoration: underline;
   }
 
   .error-bar {

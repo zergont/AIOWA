@@ -265,6 +265,8 @@ export interface ComposeContext {
   body_html?: string | null;
   /** Открыт существующий черновик (compose_open_draft); у новой заготовки отсутствует. */
   draft?: DraftInfo | null;
+  /** Восстановленный локальный черновик (окно собрало заготовку из него): его id, файлы и черновик на сервере. */
+  restore?: LocalDraft | null;
 }
 
 export interface ComposeRequest {
@@ -284,6 +286,50 @@ export interface ComposeRequest {
   draft_server_id?: string | null;
   /** Серверные вложения черновика, убранные в композере (AttachmentId). */
   removed_attachment_ids?: string[];
+  /** Локальный черновик этого композера: после отправки бэкенд убирает его сам. */
+  local_draft_id?: string | null;
+}
+
+/**
+ * Локальный черновик композера (`local_drafts` в базе): текст письма, переживающий падение и
+ * закрытие окна при любой связи. Окно пишет его через compose_local_save раз в одну-две секунды.
+ */
+export interface LocalDraft {
+  draft_id: string;
+  kind: ComposeKind;
+  reference_item_pk: number | null;
+  draft_server_id: string | null;
+  subject: string;
+  to: ComposeRecipient[];
+  cc: ComposeRecipient[];
+  bcc: ComposeRecipient[];
+  body_html: string;
+  attachments: PickedFile[];
+  removed_attachment_ids: string[];
+  updated_ms: number;
+}
+
+/** Отказ команд композера (compose_send, compose_save_draft, compose_autosave): текст и подсказки окну. */
+export interface ComposeFail {
+  message: string;
+  /** Повтор того же действия может помочь. */
+  retry: boolean;
+  /** Причина — связь, а не отказ сервера: автосохранение повторится само. */
+  network: boolean;
+}
+
+function isComposeFail(e: unknown): e is ComposeFail {
+  return !!e && typeof e === "object" && "message" in e && "retry" in e && "network" in e;
+}
+
+/** Стоит ли предлагать «Повторить» по ошибке команды композера; строки без признаков — да, как раньше. */
+export function failRetryable(e: unknown): boolean {
+  return isComposeFail(e) ? e.retry : true;
+}
+
+/** Ошибка команды композера из-за связи (сервер недоступен, обрыв, таймаут). */
+export function failNetwork(e: unknown): boolean {
+  return isComposeFail(e) ? e.network : false;
 }
 
 /** Ответ attachment_preview_url: адрес файла в кэше по протоколу aiowa-att и годится ли тип для показа в окне. */
@@ -720,6 +766,11 @@ export const api = {
   composeAutosave: (req: ComposeRequest, draftServerId: string | null) => invoke<DraftRef>("compose_autosave", { req, draftServerId }),
   /** Удалить черновик: на сервере — в «Удалённые», локально — сразу из «Черновиков». */
   composeDiscardDraft: (draftServerId: string) => invoke<void>("compose_discard_draft", { draftServerId }),
+  /** Локальный черновик композера в базе (переживает падение и закрытие окна). */
+  composeLocalSave: (draft: LocalDraft) => invoke<void>("compose_local_save", { draft }),
+  composeLocalDrop: (draftId: string) => invoke<void>("compose_local_drop", { draftId }),
+  /** Локальные черновики, оставшиеся с прошлого запуска, свежие первыми. */
+  composeLocalList: () => invoke<LocalDraft[]>("compose_local_list"),
   /** Подсказки адресатов по началу адреса или слову имени. */
   recipientsSuggest: (prefix: string, limit?: number) => invoke<RecipientSuggestion[]>("recipients_suggest", { prefix, limit: limit ?? null }),
   /**

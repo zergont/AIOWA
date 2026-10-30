@@ -10,6 +10,7 @@
 
 pub mod calendar;
 pub mod directory;
+pub mod drafts;
 pub mod identity;
 pub mod query;
 pub mod schema;
@@ -31,6 +32,7 @@ use tracing::{debug, info, warn};
 
 pub use calendar::{reminder_state_key, CachedTimeZone, CalendarRow, ReminderMark, ReminderRow, ReminderState, OWA_TIME_ZONE_KEY, OWA_TIME_ZONE_TTL_MS};
 pub use directory::ContactLocalStats;
+pub use drafts::LocalDraft;
 pub use identity::{login_key, read_summary, DbAccount, DbSummary, MailboxIdentity};
 pub use schema::{FETCH_FAILED, TEXT_FAILED, TEXT_OK, TEXT_PENDING, TEXT_UNSUPPORTED};
 

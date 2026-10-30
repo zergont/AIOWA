@@ -32,18 +32,19 @@
 use crate::ondemand::{describe_transport, is_stale_object, timed_out};
 use crate::sync::SyncState;
 use crate::{build_message, err, prepare_attachments, AppState, CmdResult, ComposeRecipientDto, InlineMap, MessageDto, ParticipantDto, RecipientDto};
-use aiowa_core::{AccountId, AttachmentMeta, BodyType, ComposeKind, Importance, ItemId, MessageFull, OutgoingAttachment, OutgoingMessage, Participant};
+use aiowa_core::{AccountId, AttachmentMeta, BodyType, ComposeKind, DistinguishedFolder, FolderRef, Importance, ItemId, MessageFull, MessageMeta, OutgoingAttachment, OutgoingMessage, Participant};
 use aiowa_store::ui::RecipientRow;
-use aiowa_store::{AttachmentRow, Store};
-use aiowa_transport::{DeleteMode, ItemFetchShape, ItemResult, MailTransport, WriteResult};
+use aiowa_store::{AttachmentRow, LocalDraft as StoredDraft, Store};
+use aiowa_transport::{DeleteMode, ItemFetchShape, ItemResult, MailTransport, TransportError, WriteResult};
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tauri::{AppHandle, Manager, State};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 /// Таймаут создания черновика (`CreateItem`) и обновления подписи.
 const CREATE_TIMEOUT: Duration = Duration::from_secs(60);
@@ -69,6 +70,59 @@ const SIGNATURE_AUTO_KEY: &str = "desktop.signature_auto";
 
 /// Текст для окна, когда черновик создан, а дальше не вышло.
 const DRAFT_KEPT: &str = "Письмо не отправлено, черновик сохранён на сервере в «Черновиках»";
+
+/// Отказ команды композера для окна: текст и что с ним делать. Окно показывает «Повторить»
+/// только при `retry`, а при `network` само повторяет автосохранение и говорит, что текст пока
+/// только в окне (docs/obkatka.md п. 22).
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub(crate) struct ComposeFail {
+    pub message: String,
+    /// Повтор того же действия может помочь: сеть, занятый сервер, истёкшая сессия, устаревший ключ.
+    pub retry: bool,
+    /// Причина — связь, а не отказ сервера или проверка в окне.
+    pub network: bool,
+}
+
+impl ComposeFail {
+    /// Отказ, который повтором не лечится: проверка запроса, база, удалённый оригинал.
+    fn fixed(message: impl Into<String>) -> Self {
+        Self { message: message.into(), retry: false, network: false }
+    }
+
+    fn retryable(message: impl Into<String>) -> Self {
+        Self { message: message.into(), retry: true, network: false }
+    }
+
+    fn from_transport(e: &TransportError) -> Self {
+        let network = e.is_network();
+        let retry = network || e.is_retryable() || e.needs_reauth() || is_stale_object(e) || matches!(e, TransportError::Protocol { .. });
+        Self { message: describe_transport(e), retry, network }
+    }
+
+    fn timed_out(limit: Duration) -> Self {
+        Self { message: timed_out(limit), retry: true, network: true }
+    }
+
+    /// Вход на сервер не удался: без пароля или с отклонённым паролем повтор не поможет.
+    fn connect(e: &crate::sync::ConnectError) -> Self {
+        match e {
+            crate::sync::ConnectError::Connect(t) => Self::from_transport(t),
+            other => Self::fixed(other.to_string()),
+        }
+    }
+
+    /// Текст с предисловием: «Письмо не отправлено, текст остался в этом окне. Нет связи…».
+    fn prefixed(mut self, prefix: &str) -> Self {
+        self.message = format!("{prefix}. {}", self.message);
+        self
+    }
+}
+
+impl From<String> for ComposeFail {
+    fn from(message: String) -> Self {
+        Self::fixed(message)
+    }
+}
 
 /// Состояние композера: один замок на отправку и сохранение черновика, последние известные
 /// ключи изменений черновиков, с которыми работало окно (окно передаёт только серверный `Id`), и
@@ -217,6 +271,99 @@ pub(crate) struct ComposeRequest {
     /// Серверные вложения черновика, убранные в композере (`AttachmentId`).
     #[serde(default)]
     removed_attachment_ids: Vec<String>,
+    /// Локальный черновик этого композера (`compose_local_save`): после отправки он не нужен.
+    #[serde(default)]
+    local_draft_id: Option<String>,
+}
+
+/// Локальный черновик композера для окна (`local_drafts` в базе): всё, что нужно, чтобы открыть
+/// письмо заново после падения или закрытия окна.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct LocalDraftDto {
+    draft_id: String,
+    kind: ComposeKindDto,
+    reference_item_pk: Option<i64>,
+    draft_server_id: Option<String>,
+    #[serde(default)]
+    subject: String,
+    #[serde(default)]
+    to: Vec<ComposeRecipientDto>,
+    #[serde(default)]
+    cc: Vec<ComposeRecipientDto>,
+    #[serde(default)]
+    bcc: Vec<ComposeRecipientDto>,
+    #[serde(default)]
+    body_html: String,
+    #[serde(default)]
+    attachments: Vec<PickedFile>,
+    #[serde(default)]
+    removed_attachment_ids: Vec<String>,
+    #[serde(default)]
+    updated_ms: i64,
+}
+
+impl LocalDraftDto {
+    fn to_row(&self) -> CmdResult<StoredDraft> {
+        let json = |v: &dyn erased_ser::Ser| v.to_json();
+        Ok(StoredDraft {
+            draft_id: self.draft_id.trim().to_string(),
+            kind: match self.kind {
+                ComposeKindDto::New => "new",
+                ComposeKindDto::Reply => "reply",
+                ComposeKindDto::ReplyAll => "reply_all",
+                ComposeKindDto::Forward => "forward",
+            }
+            .to_string(),
+            reference_item_pk: self.reference_item_pk,
+            draft_server_id: self.draft_server_id.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(String::from),
+            subject: self.subject.clone(),
+            to_json: json(&self.to)?,
+            cc_json: json(&self.cc)?,
+            bcc_json: json(&self.bcc)?,
+            body_html: self.body_html.clone(),
+            attachments_json: json(&self.attachments)?,
+            removed_json: json(&self.removed_attachment_ids)?,
+            created_at: 0,
+            updated_at: 0,
+        })
+    }
+
+    fn from_row(d: StoredDraft) -> Self {
+        fn list<T: serde::de::DeserializeOwned>(s: &str) -> Vec<T> {
+            serde_json::from_str(s).unwrap_or_default()
+        }
+        Self {
+            draft_id: d.draft_id,
+            kind: match d.kind.as_str() {
+                "reply" => ComposeKindDto::Reply,
+                "reply_all" => ComposeKindDto::ReplyAll,
+                "forward" => ComposeKindDto::Forward,
+                _ => ComposeKindDto::New,
+            },
+            reference_item_pk: d.reference_item_pk,
+            draft_server_id: d.draft_server_id,
+            subject: d.subject,
+            to: list(&d.to_json),
+            cc: list(&d.cc_json),
+            bcc: list(&d.bcc_json),
+            body_html: d.body_html,
+            attachments: list(&d.attachments_json),
+            removed_attachment_ids: list(&d.removed_json),
+            updated_ms: d.updated_at,
+        }
+    }
+}
+
+/// Сериализация в JSON с текстом ошибки окна (serde не знает про `CmdResult`).
+mod erased_ser {
+    pub(super) trait Ser {
+        fn to_json(&self) -> super::CmdResult<String>;
+    }
+    impl<T: serde::Serialize> Ser for T {
+        fn to_json(&self) -> super::CmdResult<String> {
+            serde_json::to_string(self).map_err(|e| format!("локальный черновик не сериализован: {e}"))
+        }
+    }
 }
 
 /// Итог отправки или сохранения черновика.
@@ -253,7 +400,7 @@ pub(crate) struct RecipientSuggestionDto {
 }
 
 /// Файл из диалога выбора вложений.
-#[derive(Serialize)]
+#[derive(Serialize, Debug, Clone, Deserialize, PartialEq, Eq)]
 pub(crate) struct PickedFile {
     path: String,
     name: String,
@@ -534,13 +681,26 @@ fn store_signature(store: &Store, account: AccountId, sig: &SignatureDto) -> Cmd
     store.set_state(account, SIGNATURE_AUTO_KEY, Some(if sig.auto_add { "1" } else { "0" })).map_err(err)
 }
 
-/// Вид письма для транспорта: у ответа и пересылки — идентификатор оригинала из базы.
-fn compose_kind(store: &Store, kind: ComposeKindDto, reference_item_pk: Option<i64>) -> CmdResult<ComposeKind> {
+/// Вид письма для транспорта: у ответа и пересылки — идентификатор оригинала из базы. Если
+/// черновик уже на сервере (`existing`), оригинал нужен только для цитаты: удалённый оригинал
+/// не мешает ни обновить, ни отправить черновик — вид становится `New`.
+fn compose_kind(store: &Store, kind: ComposeKindDto, reference_item_pk: Option<i64>, existing: bool) -> CmdResult<ComposeKind> {
     if !kind.needs_reference() {
         return Ok(ComposeKind::New);
     }
-    let pk = reference_item_pk.ok_or_else(|| "Не указано исходное письмо".to_string())?;
-    let reference = store.item_ref(pk).map_err(err)?.ok_or_else(|| "Исходное письмо удалено".to_string())?.id;
+    let pk = match reference_item_pk {
+        Some(pk) => pk,
+        None if existing => return Ok(ComposeKind::New),
+        None => return Err("Не указано исходное письмо".to_string()),
+    };
+    let reference = match store.item_ref(pk).map_err(err)? {
+        Some(r) => r.id,
+        None if existing => {
+            warn!(reference_pk = pk, "исходное письмо удалено, черновик на сервере остаётся: продолжаем без оригинала");
+            return Ok(ComposeKind::New);
+        }
+        None => return Err("Исходное письмо удалено".to_string()),
+    };
     Ok(match kind {
         ComposeKindDto::Reply => ComposeKind::Reply { reference },
         ComposeKindDto::ReplyAll => ComposeKind::ReplyAll { reference },
@@ -551,7 +711,7 @@ fn compose_kind(store: &Store, kind: ComposeKindDto, reference_item_pk: Option<i
 
 /// Всё, что нужно транспорту: вид, письмо, файлы (прочитаны в блокирующем потоке).
 async fn prepare(state: &AppState, req: &ComposeRequest, require_recipient: bool) -> CmdResult<(ComposeKind, OutgoingMessage, Vec<OutgoingAttachment>)> {
-    let kind = compose_kind(&state.store, req.kind, req.reference_item_pk)?;
+    let kind = compose_kind(&state.store, req.kind, req.reference_item_pk, draft_id_of(req).is_some())?;
     let msg = outgoing(req, require_recipient)?;
     let paths = req.attachments.clone();
     let files = if paths.is_empty() { Vec::new() } else { tauri::async_runtime::spawn_blocking(move || load_attachments(&paths)).await.map_err(err)?? };
@@ -658,18 +818,22 @@ fn drop_local_draft(app: &AppHandle, store: &Store, account: AccountId, server_i
 // --- сеть ----------------------------------------------------------------------------------
 
 /// Один сетевой шаг под таймаутом: ошибка транспорта сбрасывает мёртвую сессию и превращается
-/// в текст для пользователя.
-async fn step<T>(sync: &SyncState, what: &'static str, limit: Duration, fut: impl Future<Output = aiowa_transport::Result<T>>) -> CmdResult<T> {
+/// в отказ для окна (`ComposeFail`). В журнале — шаг, длительность и цепочка причин.
+async fn step<T>(sync: &SyncState, what: &'static str, limit: Duration, fut: impl Future<Output = aiowa_transport::Result<T>>) -> Result<T, ComposeFail> {
+    let started = Instant::now();
     match tokio::time::timeout(limit, fut).await {
-        Ok(Ok(v)) => Ok(v),
+        Ok(Ok(v)) => {
+            debug!(step = what, ms = started.elapsed().as_millis() as u64, "шаг композера");
+            Ok(v)
+        }
         Ok(Err(e)) => {
-            warn!(step = what, error = %e, "шаг композера отклонён");
+            warn!(step = what, ms = started.elapsed().as_millis() as u64, error = %e.chain(), "шаг композера отклонён");
             sync.invalidate_on(&e).await;
-            Err(describe_transport(&e))
+            Err(ComposeFail::from_transport(&e))
         }
         Err(_) => {
-            warn!(step = what, "шаг композера не уложился в таймаут");
-            Err(timed_out(limit))
+            warn!(step = what, limit_s = limit.as_secs(), "шаг композера не уложился в таймаут");
+            Err(ComposeFail::timed_out(limit))
         }
     }
 }
@@ -698,7 +862,7 @@ async fn server_files(sync: &SyncState, transport: &impl MailTransport, item: &I
     match step(sync, "GetItem", REREAD_TIMEOUT, transport.get_draft(item)).await {
         Ok(draft) => Some(draft.file_attachments().map(|a| DraftAttachmentDto::of(a, None)).collect()),
         Err(why) => {
-            warn!(why, "вложения черновика не перечитаны после изменения");
+            warn!(why = %why.message, "вложения черновика не перечитаны после изменения");
             None
         }
     }
@@ -707,18 +871,27 @@ async fn server_files(sync: &SyncState, transport: &impl MailTransport, item: &I
 /// Дописывает к телу обновляемого черновика цитату оригинала (ответ, ответ всем, пересылка):
 /// `UpdateItem` заменяет тело целиком, а сервер цитирует только при создании. Тело оригинала
 /// читается с сервера полностью (`ItemNormalizedBody`: в базе только `UniqueBody`, без истории
-/// переписки) и запоминается в `ComposeState`. Не вышло — ошибка: без цитаты черновик не обновляется.
-async fn append_quote(state: &AppState, sync: &SyncState, transport: &impl MailTransport, cs: &ComposeState, req: &ComposeRequest, msg: &mut OutgoingMessage) -> CmdResult<()> {
+/// переписки) и запоминается в `ComposeState`. Сервер не ответил — ошибка: без цитаты черновик не
+/// обновляется. Оригинала больше нет (удалён в базе или на сервере) — черновик обновляется без
+/// цитаты: сохранённый черновик не должен зависеть от исходного письма (п. 22 обкатки).
+async fn append_quote(state: &AppState, sync: &SyncState, transport: &impl MailTransport, cs: &ComposeState, req: &ComposeRequest, msg: &mut OutgoingMessage) -> Result<(), ComposeFail> {
     let (true, Some(pk)) = (req.kind.needs_reference(), req.reference_item_pk) else { return Ok(()) };
     let quote = match cs.cached_quote(pk) {
         Some(q) => q,
         None => {
-            let reference = state.store.item_ref(pk).map_err(err)?.ok_or_else(|| "Исходное письмо удалено — цитату не собрать, черновик не обновлён".to_string())?.id;
+            let Some(reference) = state.store.item_ref(pk).map_err(err)?.map(|r| r.id) else {
+                warn!(reference_pk = pk, "исходное письмо удалено: черновик обновляется без цитаты");
+                return Ok(());
+            };
             let got = step(sync, "GetItem", CREATE_TIMEOUT, transport.get_items(std::slice::from_ref(&reference), ItemFetchShape::WithFullBody)).await?;
             let q = match got.into_iter().next() {
                 Some(ItemResult::Ok(m)) => Arc::new(quote_from_full(&m)?),
-                Some(ItemResult::Failed { code, .. }) => return Err(format!("Исходное письмо не прочитано с сервера ({code}) — цитату не собрать, черновик не обновлён")),
-                None => return Err("Сервер не вернул исходное письмо — цитату не собрать, черновик не обновлён".into()),
+                Some(ItemResult::Failed { code, .. }) if code == ITEM_NOT_FOUND => {
+                    warn!(reference_pk = pk, "исходного письма нет на сервере: черновик обновляется без цитаты");
+                    return Ok(());
+                }
+                Some(ItemResult::Failed { code, .. }) => return Err(ComposeFail::retryable(format!("Исходное письмо не прочитано с сервера ({code}) — цитату не собрать, черновик не обновлён"))),
+                None => return Err(ComposeFail::retryable("Сервер не вернул исходное письмо — цитату не собрать, черновик не обновлён")),
             };
             cs.remember_quote(pk, q.clone());
             q
@@ -731,7 +904,7 @@ async fn append_quote(state: &AppState, sync: &SyncState, transport: &impl MailT
 /// Чем кончилась запись черновика с вложениями (`write_draft`), если не всем.
 enum DraftFailure {
     /// Черновика на сервере нет или он не обновлён: ошибка команды.
-    Before(String),
+    Before(ComposeFail),
     /// Черновик есть (`id`), а с вложениями не вышло; `touched` — вложения могли измениться.
     After { id: ItemId, why: String, touched: bool },
 }
@@ -763,7 +936,7 @@ async fn write_draft(state: &AppState, sync: &SyncState, transport: &impl MailTr
                 cs.remember(&id);
                 current = id;
             }
-            Err(why) => return Err(DraftFailure::After { id: current, why, touched }),
+            Err(why) => return Err(DraftFailure::After { id: current, why: why.message, touched }),
         }
     }
     if !removed.is_empty() {
@@ -772,7 +945,7 @@ async fn write_draft(state: &AppState, sync: &SyncState, transport: &impl MailTr
                 cs.remember(&id);
                 current = id;
             }
-            Err(why) => return Err(DraftFailure::After { id: current, why, touched }),
+            Err(why) => return Err(DraftFailure::After { id: current, why: why.message, touched }),
         }
     }
     Ok((current, touched))
@@ -792,7 +965,7 @@ fn with_reference(kind: ComposeKind, reference: ItemId) -> ComposeKind {
 /// бывает усечённым (после нашей же пометки «прочитано») или устаревшим (письмо изменили в OWA,
 /// на него уже ответили): с таким `ReferenceItemId` сервер отвечает `ErrorStaleObject`
 /// (docs/obkatka.md п. 19). Полный ключ записывается в базу.
-async fn fresh_reference(state: &AppState, sync: &SyncState, transport: &impl MailTransport, pk: i64) -> CmdResult<ItemId> {
+async fn fresh_reference(state: &AppState, sync: &SyncState, transport: &impl MailTransport, pk: i64) -> Result<ItemId, ComposeFail> {
     let stored = state.store.item_ref(pk).map_err(err)?.ok_or_else(|| "Исходное письмо удалено".to_string())?.id;
     let mut got = step(sync, "GetItem", REREAD_TIMEOUT, transport.refresh_item_ids(std::slice::from_ref(&stored))).await?;
     match got.pop() {
@@ -805,12 +978,12 @@ async fn fresh_reference(state: &AppState, sync: &SyncState, transport: &impl Ma
             }
             Ok(id)
         }
-        Some(WriteResult::Failed { code, .. }) if code == ITEM_NOT_FOUND => Err("Исходное письмо удалено на сервере".into()),
+        Some(WriteResult::Failed { code, .. }) if code == ITEM_NOT_FOUND => Err(ComposeFail::fixed("Исходное письмо удалено на сервере")),
         Some(WriteResult::Failed { code, message, .. }) => {
             warn!(reference_pk = pk, code, message = %message, "сервер не отдал идентификатор исходного письма");
-            Err(format!("Исходное письмо не прочитано с сервера ({code})"))
+            Err(ComposeFail::retryable(format!("Исходное письмо не прочитано с сервера ({code})")))
         }
-        None => Err("Сервер не вернул идентификатор исходного письма".into()),
+        None => Err(ComposeFail::retryable("Сервер не вернул идентификатор исходного письма")),
     }
 }
 
@@ -820,11 +993,14 @@ const ITEM_NOT_FOUND: &str = "ErrorItemNotFound";
 /// `CreateItem` черновика. У ответа и пересылки ключ оригинала (`reference_pk`) сначала
 /// перечитывается с сервера; если сервер всё же ответил `ErrorStaleObject` (письмо изменилось
 /// между запросами), ещё одна попытка с заново перечитанным ключом, и только потом ошибка.
-async fn create_draft_fresh(state: &AppState, sync: &SyncState, transport: &impl MailTransport, kind: ComposeKind, msg: &OutgoingMessage, reference_pk: Option<i64>) -> CmdResult<ItemId> {
+/// Обрыв после отправки `CreateItem` (исход неизвестен): черновик ищется в «Черновиках» по теме и
+/// времени, чтобы повтор не создал второй; не нашёлся — ошибка с повтором.
+async fn create_draft_fresh(state: &AppState, sync: &SyncState, transport: &impl MailTransport, kind: ComposeKind, msg: &OutgoingMessage, reference_pk: Option<i64>) -> Result<ItemId, ComposeFail> {
     let kind = match reference_pk {
         Some(pk) if kind.reference().is_some() => with_reference(kind, fresh_reference(state, sync, transport, pk).await?),
         _ => kind,
     };
+    let started = Timestamp::now();
     match tokio::time::timeout(CREATE_TIMEOUT, transport.create_draft(&kind, msg)).await {
         Ok(Ok(id)) => Ok(id),
         Ok(Err(e)) if is_stale_object(&e) && reference_pk.is_some() => {
@@ -833,16 +1009,57 @@ async fn create_draft_fresh(state: &AppState, sync: &SyncState, transport: &impl
             let kind = with_reference(kind, fresh_reference(state, sync, transport, pk).await?);
             step(sync, "CreateItem", CREATE_TIMEOUT, transport.create_draft(&kind, msg)).await
         }
-        Ok(Err(e)) => {
-            warn!(step = "CreateItem", ?reference_pk, error = %e, "шаг композера отклонён");
+        Ok(Err(e)) if matches!(e, TransportError::Network(_)) => {
+            warn!(step = "CreateItem", ?reference_pk, error = %e.chain(), "обрыв после отправки CreateItem: исход неизвестен, ищу черновик в «Черновиках»");
             sync.invalidate_on(&e).await;
-            Err(describe_transport(&e))
+            match adopt_recent_draft(transport, &msg.subject, started).await {
+                Some(id) => {
+                    info!(?reference_pk, ck_len = id.change_key_len(), "черновик найден в «Черновиках» после обрыва, продолжаем с ним");
+                    Ok(id)
+                }
+                None => Err(ComposeFail::from_transport(&e)),
+            }
+        }
+        Ok(Err(e)) => {
+            warn!(step = "CreateItem", ?reference_pk, error = %e.chain(), "шаг композера отклонён");
+            sync.invalidate_on(&e).await;
+            Err(ComposeFail::from_transport(&e))
         }
         Err(_) => {
-            warn!(step = "CreateItem", ?reference_pk, "шаг композера не уложился в таймаут");
-            Err(timed_out(CREATE_TIMEOUT))
+            warn!(step = "CreateItem", ?reference_pk, limit_s = CREATE_TIMEOUT.as_secs(), "шаг композера не уложился в таймаут");
+            Err(ComposeFail::timed_out(CREATE_TIMEOUT))
         }
     }
+}
+
+/// Черновик, который сервер мог создать по оборванному `CreateItem`: самый свежий в «Черновиках»
+/// с той же темой, изменённый не раньше начала попытки (с запасом на расхождение часов). Поиск —
+/// `FindItem` последних писем папки (§ 5m), без новых форм запросов. Сбой поиска — `None`.
+async fn adopt_recent_draft(transport: &impl MailTransport, subject: &str, started: Timestamp) -> Option<ItemId> {
+    let folder = FolderRef::Distinguished(DistinguishedFolder::Drafts);
+    match tokio::time::timeout(REREAD_TIMEOUT, transport.find_recent_items(&folder, 20)).await {
+        Ok(Ok(metas)) => pick_adopted(&metas, subject, started),
+        Ok(Err(e)) => {
+            warn!(error = %e.chain(), "черновик после обрыва не найден: FindItem отклонён");
+            None
+        }
+        Err(_) => {
+            warn!("черновик после обрыва не найден: FindItem не уложился в таймаут");
+            None
+        }
+    }
+}
+
+/// Выбор черновика по теме и времени среди последних писем «Черновиков» (чистая часть `adopt_recent_draft`).
+fn pick_adopted(metas: &[MessageMeta], subject: &str, started: Timestamp) -> Option<ItemId> {
+    let since = started - jiff::SignedDuration::from_secs(60);
+    let stamp = |m: &MessageMeta| m.last_modified_at.or(m.received_at).or(m.sent_at);
+    metas
+        .iter()
+        .filter(|m| m.subject.as_deref().unwrap_or("").trim() == subject.trim())
+        .filter(|m| stamp(m).is_some_and(|t| t >= since))
+        .max_by_key(|m| stamp(m))
+        .map(|m| m.item_id.clone())
 }
 
 /// Ошибка транспорта на `SendItem`, при которой письмо могло уйти: обрыв связи (в том числе при
@@ -890,7 +1107,7 @@ async fn reconcile(sync: &SyncState, transport: &impl MailTransport, item: &Item
     match step(sync, "GetItem", CREATE_TIMEOUT, transport.get_draft(item)).await {
         Ok(draft) => reconcile_with(&draft.attachments, removed, files),
         Err(why) => {
-            warn!(why, "черновик не прочитан перед изменением вложений, они меняются без сверки");
+            warn!(why = %why.message, "черновик не прочитан перед изменением вложений, они меняются без сверки");
             (files, removed)
         }
     }
@@ -902,16 +1119,21 @@ async fn reconcile(sync: &SyncState, transport: &impl MailTransport, item: &Item
 /// на сервере (`draft_server_id`), он обновляется вместо создания, новые файлы прикладываются,
 /// убранные удаляются, и уходит он же.
 #[tauri::command]
-pub(crate) async fn compose_send(req: ComposeRequest, app: AppHandle, state: State<'_, AppState>, sync: State<'_, Arc<SyncState>>, cs: State<'_, ComposeState>) -> CmdResult<SendReport> {
-    let _busy = cs.sending.try_lock().map_err(|_| "Отправка уже идёт".to_string())?;
+pub(crate) async fn compose_send(req: ComposeRequest, app: AppHandle, state: State<'_, AppState>, sync: State<'_, Arc<SyncState>>, cs: State<'_, ComposeState>) -> Result<SendReport, ComposeFail> {
+    const NOT_SENT: &str = "Письмо не отправлено, текст остался в этом окне";
+    let _busy = cs.sending.try_lock().map_err(|_| ComposeFail::fixed("Отправка уже идёт"))?;
     let (kind, msg, files) = prepare(&state, &req, true).await?;
     let existing = draft_id_of(&req);
     let attached = files.len();
     let (to, cc, bcc) = (msg.to.len(), msg.cc.len(), msg.bcc.len());
-    let transport = sync.transport().await.map_err(|e| e.to_string())?;
+    let started = Instant::now();
+    let transport = sync.transport().await.map_err(|e| ComposeFail::connect(&e).prefixed(NOT_SENT))?;
     let (current, touched) = match write_draft(&state, &sync, &transport, &cs, &req, (kind, msg, files), existing.as_deref()).await {
         Ok(v) => v,
-        Err(DraftFailure::Before(why)) => return Err(why),
+        Err(DraftFailure::Before(why)) => {
+            warn!(kind = ?req.kind, ?existing, ms = started.elapsed().as_millis() as u64, why = %why.message, retry = why.retry, "отправка: черновик не создан или не обновлён");
+            return Err(why.prefixed(NOT_SENT));
+        }
         Err(DraftFailure::After { id, why, touched }) => {
             let files = if touched { server_files(&sync, &transport, &id).await } else { None };
             return Ok(kept(why).with_draft(draft_ref(&state, &id), files));
@@ -925,17 +1147,18 @@ pub(crate) async fn compose_send(req: ComposeRequest, app: AppHandle, state: Sta
                 cs.forget(sid);
                 drop_local_draft(&app, &state.store, state.account, sid);
             }
-            info!(kind = ?req.kind, to, cc, bcc, attachments = attached, existing_draft = existing.is_some(), "письмо отправлено");
+            forget_local_draft(&state.store, req.local_draft_id.as_deref());
+            info!(kind = ?req.kind, to, cc, bcc, attachments = attached, existing_draft = existing.is_some(), ms = started.elapsed().as_millis() as u64, "письмо отправлено");
             Ok(SendReport { sent: true, ..SendReport::default() })
         }
         // Обрыв связи или неразобранный ответ: запрос мог дойти, письмо могло уйти.
         Ok(Err(e)) if outcome_unknown(&e) => {
-            warn!(error = %e, "SendItem без ответа, исход неизвестен");
+            warn!(error = %e.chain(), ms = started.elapsed().as_millis() as u64, "SendItem без ответа, исход неизвестен");
             sync.invalidate_on(&e).await;
             Ok(maybe_sent(describe_transport(&e)).with_draft(draft_ref(&state, &current), None))
         }
         Ok(Err(e)) => {
-            warn!(error = %e, "SendItem отклонён");
+            warn!(error = %e.chain(), ms = started.elapsed().as_millis() as u64, "SendItem отклонён");
             sync.invalidate_on(&e).await;
             let files = if touched { server_files(&sync, &transport, &current).await } else { None };
             Ok(kept(describe_transport(&e)).with_draft(draft_ref(&state, &current), files))
@@ -973,7 +1196,7 @@ pub(crate) async fn compose_open_draft(item_pk: i64, state: State<'_, AppState>,
         }
         None => {
             let transport = sync.transport().await.map_err(|e| e.to_string())?;
-            let draft = step(&sync, "GetItem", CREATE_TIMEOUT, transport.get_draft(&local.id)).await?;
+            let draft = step(&sync, "GetItem", CREATE_TIMEOUT, transport.get_draft(&local.id)).await.map_err(|f| f.message)?;
             if draft.is_truncated {
                 warn!(item_pk, body_chars = draft.body_html.chars().count(), "черновик с сервера обрезан, в композере не открывается");
                 return Err("Черновик слишком большой для правки в AIOWA: сервер отдал его обрезанным, и сохранение записало бы обрезанный текст обратно. Откройте его в OWA".into());
@@ -1006,14 +1229,15 @@ pub(crate) async fn compose_open_draft(item_pk: i64, state: State<'_, AppState>,
 /// получателей (`UpdateItem`); вложения не трогает — их меняют открытие и отправка. Получатели не
 /// обязательны. Возвращает серверный идентификатор для следующих вызовов и отправки.
 #[tauri::command]
-pub(crate) async fn compose_autosave(req: ComposeRequest, draft_server_id: Option<String>, state: State<'_, AppState>, sync: State<'_, Arc<SyncState>>, cs: State<'_, ComposeState>) -> CmdResult<DraftRef> {
-    let _busy = cs.sending.try_lock().map_err(|_| "Отправка уже идёт".to_string())?;
+pub(crate) async fn compose_autosave(req: ComposeRequest, draft_server_id: Option<String>, state: State<'_, AppState>, sync: State<'_, Arc<SyncState>>, cs: State<'_, ComposeState>) -> Result<DraftRef, ComposeFail> {
+    let _busy = cs.sending.try_lock().map_err(|_| ComposeFail::fixed("Отправка уже идёт"))?;
     let existing = draft_server_id.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(String::from).or_else(|| draft_id_of(&req));
     let mut msg = outgoing(&req, false)?;
-    let transport = sync.transport().await.map_err(|e| e.to_string())?;
+    let started = Instant::now();
+    let transport = sync.transport().await.map_err(|e| ComposeFail::connect(&e))?;
     let id = match existing.as_deref() {
         None => {
-            let kind = compose_kind(&state.store, req.kind, req.reference_item_pk)?;
+            let kind = compose_kind(&state.store, req.kind, req.reference_item_pk, false)?;
             create_draft_fresh(&state, &sync, &transport, kind, &msg, req.reference_item_pk).await?
         }
         Some(sid) => {
@@ -1022,8 +1246,41 @@ pub(crate) async fn compose_autosave(req: ComposeRequest, draft_server_id: Optio
         }
     };
     cs.remember(&id);
-    info!(kind = ?req.kind, updated = existing.is_some(), to = msg.to.len(), cc = msg.cc.len(), bcc = msg.bcc.len(), "черновик автосохранён");
+    info!(kind = ?req.kind, updated = existing.is_some(), to = msg.to.len(), cc = msg.cc.len(), bcc = msg.bcc.len(), ms = started.elapsed().as_millis() as u64, "черновик автосохранён");
     Ok(draft_ref(&state, &id))
+}
+
+/// Локальный черновик композера: записывается окном раз в одну-две секунды после правок, чтобы
+/// текст письма пережил падение или закрытие окна при любой связи (п. 22 обкатки).
+#[tauri::command]
+pub(crate) fn compose_local_save(draft: LocalDraftDto, state: State<'_, AppState>) -> CmdResult<()> {
+    let row = draft.to_row()?;
+    if row.draft_id.is_empty() {
+        return Err("Не указан идентификатор локального черновика".into());
+    }
+    state.store.local_draft_save(state.account, &row).map_err(err)
+}
+
+/// Убрать локальный черновик: письмо отправлено, сохранено на сервере или отброшено.
+#[tauri::command]
+pub(crate) fn compose_local_drop(draft_id: String, state: State<'_, AppState>) -> CmdResult<()> {
+    forget_local_draft(&state.store, Some(&draft_id));
+    Ok(())
+}
+
+/// Локальные черновики, оставшиеся с прошлого запуска, свежие первыми: окно предлагает открыть их.
+#[tauri::command]
+pub(crate) fn compose_local_list(state: State<'_, AppState>) -> CmdResult<Vec<LocalDraftDto>> {
+    Ok(state.store.local_drafts(state.account).map_err(err)?.into_iter().map(LocalDraftDto::from_row).collect())
+}
+
+fn forget_local_draft(store: &Store, draft_id: Option<&str>) {
+    let Some(id) = draft_id.map(str::trim).filter(|s| !s.is_empty()) else { return };
+    match store.local_draft_drop(id) {
+        Ok(true) => debug!("локальный черновик убран"),
+        Ok(false) => {}
+        Err(e) => warn!(error = %e, "локальный черновик не убран"),
+    }
 }
 
 /// Удалить черновик: перенести в «Удалённые» (`DeleteItem` с `MoveToDeletedItems`, как обычное
@@ -1038,7 +1295,7 @@ pub(crate) async fn compose_discard_draft(draft_server_id: String, app: AppHandl
     }
     let transport = sync.transport().await.map_err(|e| e.to_string())?;
     let item = cs.item_id(sid);
-    let results = step(&sync, "DeleteItem", CREATE_TIMEOUT, transport.delete_items(std::slice::from_ref(&item), DeleteMode::ToDeletedItems)).await?;
+    let results = step(&sync, "DeleteItem", CREATE_TIMEOUT, transport.delete_items(std::slice::from_ref(&item), DeleteMode::ToDeletedItems)).await.map_err(|f| f.message)?;
     if let Some(WriteResult::Failed { code, .. }) = results.first()
         && code != "ErrorItemNotFound"
     {
@@ -1057,19 +1314,24 @@ pub(crate) async fn compose_discard_draft(draft_server_id: String, app: AppHandl
 /// Получатели не обязательны. В ответе — черновик (`draft`) и, если вложения менялись, их список
 /// на сервере; если текст сохранён, а с вложениями не вышло, — `message` с причиной.
 #[tauri::command]
-pub(crate) async fn compose_save_draft(req: ComposeRequest, state: State<'_, AppState>, sync: State<'_, Arc<SyncState>>, cs: State<'_, ComposeState>) -> CmdResult<SendReport> {
-    let _busy = cs.sending.try_lock().map_err(|_| "Отправка уже идёт".to_string())?;
+pub(crate) async fn compose_save_draft(req: ComposeRequest, state: State<'_, AppState>, sync: State<'_, Arc<SyncState>>, cs: State<'_, ComposeState>) -> Result<SendReport, ComposeFail> {
+    const NOT_SAVED: &str = "Черновик не сохранён на сервере, текст остался в этом окне";
+    let _busy = cs.sending.try_lock().map_err(|_| ComposeFail::fixed("Отправка уже идёт"))?;
     let (kind, msg, files) = prepare(&state, &req, false).await?;
     let existing = draft_id_of(&req);
     let attached = files.len();
-    let transport = sync.transport().await.map_err(|e| e.to_string())?;
+    let started = Instant::now();
+    let transport = sync.transport().await.map_err(|e| ComposeFail::connect(&e).prefixed(NOT_SAVED))?;
     let (id, touched, why) = match write_draft(&state, &sync, &transport, &cs, &req, (kind, msg, files), existing.as_deref()).await {
         Ok((id, touched)) => (id, touched, None),
-        Err(DraftFailure::Before(why)) => return Err(why),
+        Err(DraftFailure::Before(why)) => {
+            warn!(kind = ?req.kind, ?existing, ms = started.elapsed().as_millis() as u64, why = %why.message, retry = why.retry, "сохранение черновика не удалось");
+            return Err(why.prefixed(NOT_SAVED));
+        }
         Err(DraftFailure::After { id, why, touched }) => (id, touched, Some(why)),
     };
     let files = if touched { server_files(&sync, &transport, &id).await } else { None };
-    info!(kind = ?req.kind, attachments = attached, updated = existing.is_some(), attachments_failed = why.is_some(), "черновик сохранён на сервере");
+    info!(kind = ?req.kind, attachments = attached, updated = existing.is_some(), attachments_failed = why.is_some(), ms = started.elapsed().as_millis() as u64, "черновик сохранён на сервере");
     let message = why.map(|w| format!("Текст черновика сохранён, а вложения изменить не вышло. {w}"));
     Ok(SendReport { draft_saved: true, message, ..SendReport::default() }.with_draft(draft_ref(&state, &id), files))
 }
@@ -1111,7 +1373,7 @@ pub(crate) fn signature_set(html: String, auto_add: bool, state: State<'_, AppSt
 #[tauri::command]
 pub(crate) async fn signature_import_owa(state: State<'_, AppState>, sync: State<'_, Arc<SyncState>>) -> CmdResult<SignatureDto> {
     let transport = sync.transport().await.map_err(|e| e.to_string())?;
-    let found = step(&sync, "GetUserConfiguration", CREATE_TIMEOUT, transport.user_signature()).await?;
+    let found = step(&sync, "GetUserConfiguration", CREATE_TIMEOUT, transport.user_signature()).await.map_err(|f| f.message)?;
     let Some(owa) = found else { return Err("В настройках OWA подпись не задана".into()) };
     let sig = SignatureDto { html: crate::sanitize_html(&owa.html, &Arc::new(InlineMap::new())), auto_add: owa.auto_add };
     store_signature(&state.store, state.account, &sig)?;
@@ -1284,6 +1546,7 @@ mod tests {
             attachments: vec![],
             draft_server_id: None,
             removed_attachment_ids: vec![],
+            local_draft_id: None,
         };
         let msg = outgoing(&req, true).unwrap();
         assert_eq!(msg.subject, "Тема");
@@ -1340,6 +1603,69 @@ mod tests {
         assert_eq!(content_type_for("a.docx"), "application/vnd.openxmlformats-officedocument.wordprocessingml.document");
         assert_eq!(content_type_for("archive.tar.gz"), "application/octet-stream");
         assert_eq!(content_type_for("noext"), "application/octet-stream");
+    }
+
+    #[test]
+    fn compose_fail_flags_follow_transport_error() {
+        let net = ComposeFail::from_transport(&TransportError::Network("обрыв".into()));
+        assert!(net.retry && net.network);
+        let conn = ComposeFail::from_transport(&TransportError::Connect("нет соединения".into()));
+        assert!(conn.retry && conn.network);
+        let stale = ComposeFail::from_transport(&TransportError::Server { code: "ErrorStaleObject".into(), message: String::new() });
+        assert!(stale.retry && !stale.network, "ключ перечитывается, повтор поможет");
+        let rejected = ComposeFail::from_transport(&TransportError::Server { code: "ErrorInvalidRecipients".into(), message: String::new() });
+        assert!(!rejected.retry && !rejected.network);
+        let auth = ComposeFail::from_transport(&TransportError::AuthFailed("x".into()));
+        assert!(!auth.retry);
+        let fixed: ComposeFail = "Неверный адрес".to_string().into();
+        assert!(!fixed.retry && !fixed.network);
+        assert_eq!(ComposeFail::timed_out(Duration::from_secs(30)).prefixed("Письмо не отправлено, текст остался в этом окне").message, "Письмо не отправлено, текст остался в этом окне. Сервер не ответил за 30 с, повторите попытку");
+        let v = serde_json::to_value(&net).unwrap();
+        assert_eq!((v["retry"].as_bool(), v["network"].as_bool()), (Some(true), Some(true)));
+    }
+
+    #[test]
+    fn adopted_draft_is_newest_with_same_subject_after_attempt() {
+        let started = Timestamp::now();
+        let meta = |id: &str, subject: &str, secs_ago: i64| {
+            aiowa_core::MessageMeta {
+                item_id: ItemId { id: id.into(), change_key: Some("k".into()) },
+                parent_folder_id: None,
+                conversation_id: None,
+                internet_message_id: None,
+                item_class: None,
+                subject: Some(subject.into()),
+                from: None,
+                sender: None,
+                display_to: None,
+                received_at: None,
+                sent_at: None,
+                last_modified_at: (secs_ago != i64::MAX).then(|| started - jiff::SignedDuration::from_secs(secs_ago)),
+                is_read: true,
+                is_draft: true,
+                has_attachments: false,
+                importance: Importance::Normal,
+                flag: aiowa_core::FlagStatus::NotFlagged,
+                size: None,
+                preview: None,
+            }
+        };
+        let metas = vec![meta("old", "Тема", 3600), meta("other", "Другая", 5), meta("fresh", "Тема ", 10), meta("fresher", "Тема", 2), meta("nostamp", "Тема", i64::MAX)];
+        assert_eq!(pick_adopted(&metas, "Тема", started).map(|i| i.id), Some("fresher".into()), "самый свежий с той же темой, пробелы не в счёт");
+        assert_eq!(pick_adopted(&metas, "Нет такой", started), None);
+        assert_eq!(pick_adopted(&[meta("old", "Тема", 3600)], "Тема", started), None, "старый черновик с той же темой не берётся");
+    }
+
+    #[test]
+    fn local_draft_dto_round_trips_through_row() {
+        let dto: LocalDraftDto = serde_json::from_str(r#"{"draft_id":" d1 ","kind":"reply_all","reference_item_pk":5,"draft_server_id":"  ","subject":"s","to":[{"name":"Имя","email":"a@x.ru"}],"cc":[],"bcc":[],"body_html":"<p>t</p>","attachments":[{"path":"C:/a.pdf","name":"a.pdf","size":3}],"removed_attachment_ids":["att1"]}"#).unwrap();
+        let row = dto.to_row().unwrap();
+        assert_eq!((row.draft_id.as_str(), row.kind.as_str(), row.reference_item_pk, row.draft_server_id.as_deref()), ("d1", "reply_all", Some(5), None));
+        assert!(row.to_json.contains("a@x.ru") && row.attachments_json.contains("a.pdf") && row.removed_json.contains("att1"));
+        let back = LocalDraftDto::from_row(row);
+        assert_eq!(back.kind, ComposeKindDto::ReplyAll);
+        assert_eq!((back.to.len(), back.attachments.len(), back.removed_attachment_ids.len(), back.subject.as_str()), (1, 1, 1, "s"));
+        assert_eq!(back.attachments[0].size, 3);
     }
 
     #[test]

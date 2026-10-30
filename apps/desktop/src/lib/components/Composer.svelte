@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onDestroy, onMount, untrack } from "svelte";
-  import { api, errorMessage, formatSize, fullDate, isInlinePicture, messageNeedsFetch, personLabel, type ComposeContext, type ComposeRecipient, type ComposeRequest, type DraftAttachment, type DraftRef, type Message, type PickedFile, type SignatureDto } from "../api";
+  import { api, errorMessage, failNetwork, failRetryable, formatSize, fullDate, isInlinePicture, messageNeedsFetch, onSyncProgress, personLabel, type ComposeContext, type ComposeRecipient, type ComposeRequest, type DraftAttachment, type DraftRef, type Message, type PickedFile, type SignatureDto } from "../api";
   import { COMPOSE_TITLE, ICON } from "../actions";
   import { isValidEmail, mergeRecipients } from "../addresses";
   import { cleanDraftHtml, htmlToText, restoreDraftHtml } from "../html";
@@ -13,8 +13,11 @@
   import ChoicePopover from "./ChoicePopover.svelte";
   import SignatureDialog from "./SignatureDialog.svelte";
 
-  /** Почему композер закрылся: отправлено, сохранён черновик, черновик удалён, просто отменено. */
-  export type CloseReason = "sent" | "draft" | "discard" | "cancel";
+  /**
+   * Почему композер закрылся: отправлено, сохранён черновик, черновик удалён, просто отменено;
+   * `local` — связи нет, текст остался локальным черновиком (его предложат открыть).
+   */
+  export type CloseReason = "sent" | "draft" | "discard" | "cancel" | "local";
 
   interface Props {
     /** Заготовка от бэкенда; новая заготовка — новый экземпляр композера (родитель оборачивает в {#key}). */
@@ -48,8 +51,9 @@
     w?.(reason);
   }
 
-  /** Закрыть композер с причиной и сообщить её тому, кто ждёт askClose. */
+  /** Закрыть композер с причиной и сообщить её тому, кто ждёт askClose. Локальный черновик нужен только при `local`. */
   function finish(reason: CloseReason) {
+    if (reason !== "local") dropLocal();
     onclose(reason);
     settleClose(reason);
   }
@@ -104,7 +108,7 @@
   let subject = $state(untrack(() => ctx.subject));
   const startBody = untrack(() => initialBody(ctx));
   let body = $state(startBody);
-  let attachments = $state<PickedFile[]>([]);
+  let attachments = $state<PickedFile[]>(untrack(() => ctx.restore?.attachments ?? []));
   let signature = $state<SignatureDto>(untrack(() => ctx.signature));
   let original = $state<Message | null>(untrack(() => ctx.original));
 
@@ -112,11 +116,18 @@
   // Открытый черновик приходит с серверным id и вложениями; новое письмо получает id после первого
   // автосохранения. Отправка идёт по этому же черновику (draft_server_id), чтобы не плодить копии.
 
-  let draftRef = $state<DraftRef | null>(untrack(() => (ctx.draft ? { server_id: ctx.draft.server_id, change_key: ctx.draft.change_key ?? null, item_pk: ctx.draft.item_pk } : null)));
+  let draftRef = $state<DraftRef | null>(
+    untrack(() => {
+      if (ctx.draft) return { server_id: ctx.draft.server_id, change_key: ctx.draft.change_key ?? null, item_pk: ctx.draft.item_pk };
+      // Восстановленное письмо уже создавало черновик на сервере: следующее сохранение обновит его.
+      if (ctx.restore?.draft_server_id) return { server_id: ctx.restore.draft_server_id, change_key: null, item_pk: null };
+      return null;
+    }),
+  );
   /** Вложения черновика, уже лежащие на сервере. */
   let serverFiles = $state<DraftAttachment[]>(untrack(() => ctx.draft?.attachments ?? []));
   /** Серверные вложения, убранные крестиком: уйдут в removed_attachment_ids при сохранении или отправке. */
-  let removedServerIds = $state<string[]>([]);
+  let removedServerIds = $state<string[]>(untrack(() => ctx.restore?.removed_attachment_ids ?? []));
   const keptServerFiles = $derived(serverFiles.filter((f) => !removedServerIds.includes(f.server_id)));
   /** Список вложений черновика известен с сервера (открытый черновик или после сохранения с файлами). */
   let serverListed = $state(untrack(() => ctx.draft != null));
@@ -180,7 +191,8 @@
   const keyOf = (rs: ComposeRecipient[]) => rs.map((r) => r.email.trim().toLowerCase()).join(",");
   /** Разметка в том виде, как её сериализует браузер: правка одного форматирования (жирный, список) тоже правка. */
   const normHtml = (h: string) => new DOMParser().parseFromString(h, "text/html").body.innerHTML;
-  const init = untrack(() => ({ subject: ctx.subject, bodyText: htmlToText(startBody), bodyHtml: normHtml(startBody), to: keyOf(to), cc: keyOf(cc), bcc: keyOf(bcc) }));
+  // Восстановленный локальный черновик на сервере не сохранён: отсчёт правок — от пустого письма.
+  const init = untrack(() => (ctx.restore ? { subject: "", bodyText: "", bodyHtml: normHtml("<div><br></div>"), to: "", cc: "", bcc: "" } : { subject: ctx.subject, bodyText: htmlToText(startBody), bodyHtml: normHtml(startBody), to: keyOf(to), cc: keyOf(cc), bcc: keyOf(bcc) }));
   const isDirty = $derived(subject !== init.subject || keyOf(to) !== init.to || keyOf(cc) !== init.cc || keyOf(bcc) !== init.bcc || attachments.length > 0 || removedServerIds.length > 0 || htmlToText(body) !== init.bodyText || (body !== startBody && normHtml(body) !== init.bodyHtml));
   $effect(() => {
     dirty = isDirty;
@@ -283,6 +295,7 @@
       attachments: attachments.map((a) => a.path),
       draft_server_id: draftRef?.server_id ?? null,
       removed_attachment_ids: removedServerIds,
+      local_draft_id: localId,
     };
   }
 
@@ -322,16 +335,74 @@
   let lastSaveAt = 0;
   let autosaving = $state(false);
   let autosaveError = $state<string | null>(null);
+  /** Последний отказ автосохранения — из-за связи: окно повторит само, текст пока только здесь. */
+  let autosaveNetwork = $state(false);
+  /** Сетевых отказов подряд: пауза перед повтором растёт (60 с, 2, 4, 8 мин), сбрасывается удачей. */
+  let netFailures = $state(0);
   let savedAt = $state<number | null>(null);
   let autosavePromise: Promise<void> | null = null;
 
   $effect(() => {
     const key = snapshot;
     if (busy || autosaving || !isDirty || !nonEmpty || key === lastSavedKey || key === failedKey) return;
-    const wait = Math.max(AUTOSAVE_DELAY_MS, lastSaveAt + AUTOSAVE_GAP_MS - Date.now());
+    const gap = AUTOSAVE_GAP_MS * 2 ** Math.min(netFailures, 3);
+    const wait = Math.max(AUTOSAVE_DELAY_MS, lastSaveAt + gap - Date.now());
     const t = setTimeout(autosave, wait);
     return () => clearTimeout(t);
   });
+
+  // Связь вернулась (прогон синхронизации прошёл без ошибки): не ждать паузу, повторить сразу.
+  onMount(() => {
+    let unlisten: (() => void) | undefined;
+    void onSyncProgress((s) => {
+      if (!s.running && !s.last_error && autosaveNetwork && alive && !busy && !autosaving) autosave();
+    }).then((u) => (unlisten = u));
+    return () => unlisten?.();
+  });
+
+  // --- локальный черновик ------------------------------------------------------------------
+  // Текст, тема, получатели, файлы и ссылка на черновик сервера пишутся в базу приложения через
+  // полторы секунды после правки, при любой связи. Убирается при закрытии композера, кроме
+  // закрытия «связи нет, письмо осталось локально» (его предложат открыть).
+
+  const LOCAL_SAVE_DELAY_MS = 1500;
+  const localId = untrack(() => ctx.restore?.draft_id ?? crypto.randomUUID());
+  const localSnapshot = $derived(JSON.stringify([snapshot, attachments.map((a) => a.path), removedServerIds, draftRef?.server_id ?? null]));
+  let lastLocalKey = $state<string | null>(untrack(() => (ctx.restore ? JSON.stringify([snapshot, (ctx.restore.attachments ?? []).map((a) => a.path), ctx.restore.removed_attachment_ids ?? [], ctx.restore.draft_server_id ?? null]) : null)));
+
+  $effect(() => {
+    const key = localSnapshot;
+    if (!isDirty || !nonEmpty || key === lastLocalKey) return;
+    const t = setTimeout(() => void saveLocal(key), LOCAL_SAVE_DELAY_MS);
+    return () => clearTimeout(t);
+  });
+
+  async function saveLocal(key: string): Promise<void> {
+    if (!alive) return;
+    try {
+      await api.composeLocalSave({
+        draft_id: localId,
+        kind: ctx.kind,
+        reference_item_pk: ctx.reference_item_pk,
+        draft_server_id: draftRef?.server_id ?? null,
+        subject: subject.trim(),
+        to: clean(to),
+        cc: clean(cc),
+        bcc: clean(bcc),
+        body_html: restoreDraftHtml(body),
+        attachments: $state.snapshot(attachments),
+        removed_attachment_ids: $state.snapshot(removedServerIds),
+        updated_ms: Date.now(),
+      });
+      if (alive) lastLocalKey = key;
+    } catch (e) {
+      console.warn("compose_local_save:", errorMessage(e));
+    }
+  }
+
+  function dropLocal() {
+    void api.composeLocalDrop(localId).catch((e) => console.warn("compose_local_drop:", errorMessage(e)));
+  }
 
   /**
    * Сохранить текущее состояние на сервере, если оно отличается от сохранённого (или черновика ещё
@@ -361,6 +432,8 @@
       draftRef = ref;
       lastSavedKey = key;
       failedKey = null;
+      autosaveNetwork = false;
+      netFailures = 0;
       savedAt = Date.now();
       return null;
     } finally {
@@ -376,7 +449,14 @@
       .catch((e) => {
         if (!alive) return;
         autosaveError = errorMessage(e);
-        failedKey = key;
+        autosaveNetwork = failNetwork(e);
+        if (autosaveNetwork) {
+          // Связь: тот же снимок повторится сам (пауза растёт), правка не нужна.
+          netFailures += 1;
+          failedKey = null;
+        } else {
+          failedKey = key;
+        }
       })
       .finally(() => {
         autosavePromise = null;
@@ -422,6 +502,7 @@
     } catch (e) {
       if (!alive) return;
       error = errorMessage(e);
+      if (!failRetryable(e)) lastAction = null;
     } finally {
       if (alive) busy = null;
     }
@@ -446,6 +527,7 @@
     } catch (e) {
       if (!alive) return;
       error = errorMessage(e);
+      if (!failRetryable(e)) lastAction = null;
     } finally {
       if (alive) busy = null;
     }
@@ -478,7 +560,8 @@
   const cancelTitle = $derived(draftRef ? "Закрыть черновик?" : "Отменить текущее письмо?");
   const cancelText = $derived(
     (draftRef ? "Черновик уже в «Черновиках». Сохранить последние правки, закрыть без них или удалить черновик (он уйдёт в «Удалённые»)?" : "На сервере письма ещё нет: сохранить его в «Черновики» или не сохранять?") +
-      (pendingFiles ? " Новые файлы и убранные вложения сохранятся вместе с текстом." : ""),
+      (pendingFiles ? " Новые файлы и убранные вложения сохранятся вместе с текстом." : "") +
+      (autosaveNetwork ? " Связи с сервером сейчас нет: при сохранении письмо останется в приложении и будет предложено позже." : ""),
   );
   const cancelOptions = $derived(
     draftRef
@@ -520,7 +603,15 @@
       finish("draft");
     } catch (e) {
       if (!alive) return;
+      if (failNetwork(e)) {
+        // Сервер недоступен: текст остаётся локальным черновиком, его предложат открыть позже.
+        await saveLocal(localSnapshot);
+        if (!alive) return;
+        finish("local");
+        return;
+      }
       error = errorMessage(e);
+      if (!failRetryable(e)) lastAction = null;
       settleClose(null);
     } finally {
       if (alive) busy = null;
@@ -686,6 +777,8 @@
     {#if autosaving}
       <span class="spinner small" aria-hidden="true"></span>
       <span>Сохраняю…</span>
+    {:else if autosaveNetwork}
+      <span class="foot-failed">Нет связи: черновик пока только в этом окне, повторю сам</span>
     {:else if autosaveError}
       <span class="foot-failed">Черновик не сохранён: {autosaveError}</span>
     {:else if savedAt != null}

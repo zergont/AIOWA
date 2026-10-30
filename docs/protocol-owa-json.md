@@ -863,6 +863,24 @@ CLI: `aiowa directory [--query Q] [--resolve] [--prefix3] [--expand first|АДР
 Снято 30.10.2026: пачки по 25 идентификаторов, 207 ключей за ~2 с (9 запросов), один ключ перед
 ответом — ~170 мс. Транспорт: `MailTransport::refresh_item_ids`, форма `protocol::get_item_ids_body`.
 
+## 5o. Таймауты и повторы клиента (30.10.2026)
+
+Замеры журнала 24–28.10 (docs/obkatka.md п. 22): почти все сбои «error sending request» к серверу
+почты длились ровно 10,0 с — это был `connect_timeout` клиента, а Windows повторяет SYN на 1, 3, 7
+и 15 с. Теперь: `connect_timeout` 30 с, `pool_idle_timeout` 105 с (больше паузы таймеров
+календаря и синхронизации, чтобы не открывать соединение заново на каждый запрос),
+`tcp_keepalive` 30 с, таймаут ответа прежний (`OwaConfig::timeout`, 90 с).
+
+Повторы (`send_retrying`): соединение не установилось (reqwest `is_connect`: DNS, отказ порта,
+таймаут соединения, TLS) — запрос не ушёл, повтор до двух раз с паузой 1 и 2 с для любой операции;
+обрыв после отправки — один повтор только для идемпотентных операций (`is_idempotent`: всё, кроме
+`CreateItem`, `SendItem`, `CreateAttachment`, `DeleteAttachment`, `MoveItem`, `DeleteItem`,
+`CopyItem`, `CreateFolder`, `DeleteFolder`, `MoveFolder`, `UpdateFolder`, `EmptyFolder`,
+`SubscribeToNotification`, `UnsubscribeFromNotification`; записи календаря с `TimeZoneContext`
+пользователя тоже не повторяются — повтор разослал бы приглашения дважды); таймаут ответа не
+повторяется. Вход (`auth.owa`) повторяется только при неустановленном соединении: ушедший вход мог
+создать сессию. В ошибке транспорта эти случаи различимы: `Connect` и `Network`.
+
 ## 6. Что это значит для клиента
 
 1. Вход: POST формы, затем `sessiondata.ashx` даёт профиль, дерево папок и первую страницу входящих.

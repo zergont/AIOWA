@@ -12,7 +12,7 @@ use rusqlite::types::ValueRef;
 use rusqlite::Connection;
 use tracing::info;
 
-pub const CURRENT_VERSION: i64 = 5;
+pub const CURRENT_VERSION: i64 = 6;
 
 /// Состояния текста вложения (`attachments.text_state`).
 pub const TEXT_PENDING: i64 = 0;
@@ -359,6 +359,27 @@ pub fn register_functions(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
+/// Версия 6: локальные черновики композера (docs/obkatka.md п. 22).
+const V6_TABLES: &str = r#"
+CREATE TABLE IF NOT EXISTS local_drafts (
+  draft_id          TEXT PRIMARY KEY,
+  account_id        INTEGER NOT NULL REFERENCES accounts(account_id),
+  kind              TEXT NOT NULL,
+  reference_item_pk INTEGER,
+  draft_server_id   TEXT,
+  subject           TEXT NOT NULL DEFAULT '',
+  to_json           TEXT NOT NULL DEFAULT '[]',
+  cc_json           TEXT NOT NULL DEFAULT '[]',
+  bcc_json          TEXT NOT NULL DEFAULT '[]',
+  body_html         TEXT NOT NULL DEFAULT '',
+  attachments_json  TEXT NOT NULL DEFAULT '[]',
+  removed_json      TEXT NOT NULL DEFAULT '[]',
+  created_at        INTEGER NOT NULL,
+  updated_at        INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS local_drafts_account ON local_drafts(account_id, updated_at DESC);
+"#;
+
 pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
     let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     if version >= CURRENT_VERSION {
@@ -445,6 +466,22 @@ pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
             }
         }
         info!(elapsed_s = started.elapsed().as_secs_f32(), "схема базы обновлена до версии 5: кэш справочника");
+    }
+    if version < 6 {
+        conn.execute_batch("BEGIN IMMEDIATE;")?;
+        let result = (|| -> rusqlite::Result<()> {
+            conn.execute_batch(V6_TABLES)?;
+            conn.pragma_update(None, "user_version", 6)?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => conn.execute_batch("COMMIT;")?,
+            Err(e) => {
+                let _ = conn.execute_batch("ROLLBACK;");
+                return Err(e);
+            }
+        }
+        info!("схема базы обновлена до версии 6: локальные черновики");
     }
     Ok(())
 }
@@ -548,7 +585,14 @@ mod tests {
         migrate(&conn).unwrap();
         migrate(&conn).unwrap();
         let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(v, 5);
+        assert_eq!(v, CURRENT_VERSION);
+        // Версия 5 → 6 (локальные черновики) тоже повторяема.
+        conn.pragma_update(None, "user_version", 5).unwrap();
+        migrate(&conn).unwrap();
+        migrate(&conn).unwrap();
+        let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(v, 6);
+        assert_eq!(conn.query_row("SELECT count(*) FROM local_drafts", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
         let plan: String = conn
             .query_row("EXPLAIN QUERY PLAN SELECT COUNT(*) FROM items WHERE account_id = 1 AND lower(from_email) = 'a@x.ru'", [], |r| r.get::<_, String>(3))
             .unwrap();
