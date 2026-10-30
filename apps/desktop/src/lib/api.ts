@@ -882,6 +882,15 @@ export type Theme = "system" | "light" | "dark";
 export type DarkMail = "dark" | "light";
 
 /** Ответ `settings_get`; изменяемые поля меняются через `settings_set` по одному или пачкой. */
+export type ExternalImagesMode = "ask" | "never";
+
+/** Внешние картинки письма: `data:` по исходному адресу, сколько их в письме и сколько не загрузилось. */
+export interface ExternalImages {
+  images: Record<string, string>;
+  total: number;
+  failed: number;
+}
+
 export interface Settings {
   host: string;
   user: string;
@@ -900,6 +909,10 @@ export interface Settings {
   attachment_cache_mb: number;
   /** Вложения больше этого размера синхронизация не скачивает (только по клику), МБ. */
   max_attachment_mb: number;
+  /** Внешние картинки в письмах: `ask` — по кнопке (от доверенных — сразу), `never` — не загружать. */
+  external_images?: ExternalImagesMode;
+  /** Доверенные отправители внешних картинок (адреса в нижнем регистре). */
+  trusted_image_senders?: string[];
   db_path: string;
   db_size_bytes: number;
   cache_size_bytes: number;
@@ -911,7 +924,7 @@ export interface Settings {
 }
 
 /** Изменяемые поля настроек; `settings_set` принимает любое их подмножество. */
-export type SettingsPatch = Partial<Pick<Settings, "body_days" | "auto_read_ms" | "toasts" | "theme" | "sync_interval_min" | "attachment_cache_mb" | "max_attachment_mb" | "dark_mail">>;
+export type SettingsPatch = Partial<Pick<Settings, "body_days" | "auto_read_ms" | "toasts" | "theme" | "sync_interval_min" | "attachment_cache_mb" | "max_attachment_mb" | "dark_mail" | "external_images">>;
 
 /** Допустимые диапазоны числовых настроек (те же проверяет бэкенд в `settings_set`). */
 export const SETTINGS_LIMITS = {
@@ -1086,6 +1099,10 @@ export const api = {
   settingsGet: () => invoke<Settings>("settings_get"),
   /** Частичное обновление; бэкенд может вернуть свежие настройки целиком или ничего. */
   settingsSet: (patch: SettingsPatch) => invoke<Settings | null | void>("settings_set", { patch }),
+  /** Отправитель в список доверенных для внешних картинок (`trusted`) или из него; новые настройки. */
+  settingsTrustImageSender: (email: string, trusted: boolean) => invoke<Settings>("settings_trust_image_sender", { email, trusted }),
+  /** Внешние картинки письма (по кнопке или от доверенного отправителя); отказ — настройка «не загружать». */
+  externalImages: (itemPk: number) => invoke<ExternalImages>("external_images", { itemPk }),
   /** Проверить вход с новым паролем и при успехе сохранить его; при отказе пароль не меняется. */
   settingsChangePassword: (password: string) => invoke<void>("settings_change_password", { password }),
   /** Удалить пароль и учётную запись из конфига (база остаётся на диске) и перезапуститься в мастер. */

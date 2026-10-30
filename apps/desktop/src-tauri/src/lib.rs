@@ -68,6 +68,7 @@ mod compose;
 mod config;
 mod data;
 mod directory;
+mod external_images;
 mod folders;
 mod live;
 mod folder_view;
@@ -307,7 +308,7 @@ pub(crate) fn normalize_cid(raw: &str) -> String {
 
 /// MIME-тип картинки для `data:`-URI: из записи вложения, а если он неизвестен — по сигнатуре файла.
 /// Не картинка → `None` (в тело письма подставляются только изображения).
-fn image_mime(content_type: Option<&str>, bytes: &[u8]) -> Option<String> {
+pub(crate) fn image_mime(content_type: Option<&str>, bytes: &[u8]) -> Option<String> {
     if let Some(ct) = content_type {
         let ct = ct.split(';').next().unwrap_or(ct).trim().to_ascii_lowercase();
         if ct.starts_with("image/") {
@@ -743,6 +744,7 @@ pub fn run() {
         // Состояния без базы — в обоих режимах (обработчик закрытия окна читает `CloseState`).
         .manage(ondemand::OnDemand::default())
         .manage(write::WriteState::default())
+        .manage(external_images::ExternalImagesState::default())
         .manage(staged::StagedState::default())
         .manage(compose::ComposeState::default())
         .manage(calendar::CalendarState::default())
@@ -864,6 +866,8 @@ pub fn run() {
             settings::settings_get,
             settings::settings_set,
             settings::settings_change_password,
+            settings::settings_trust_image_sender,
+            external_images::external_images,
             settings::settings_forget_account,
             settings::settings_open_data_dir,
             // обновление приложения (updates.rs)

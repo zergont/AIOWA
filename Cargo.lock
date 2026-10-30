@@ -95,6 +95,7 @@ dependencies = [
  "keyring",
  "open",
  "percent-encoding",
+ "reqwest",
  "rfd",
  "secrecy",
  "serde",

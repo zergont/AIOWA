@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onDestroy, onMount, tick, untrack } from "svelte";
-  import { api, errorMessage, formatSize, SETTINGS_LIMITS, type DarkMail, type Settings, type SettingsPatch, type SignatureDto, type Theme } from "../api";
-  import { adoptSettings, AUTO_READ_DEFAULT_MS, AUTO_READ_INSTANT_MS, saveSettings, SYNC_INTERVAL_LIVE_MIN } from "../settings.svelte";
+  import { api, errorMessage, formatSize, SETTINGS_LIMITS, type DarkMail, type ExternalImagesMode, type Settings, type SettingsPatch, type SignatureDto, type Theme } from "../api";
+  import { adoptSettings, AUTO_READ_DEFAULT_MS, AUTO_READ_INSTANT_MS, saveSettings, SYNC_INTERVAL_LIVE_MIN, trustImageSender } from "../settings.svelte";
   import { bodyDaysText, owaUrl } from "../setup";
   import { focusBack } from "../popover";
   import { hint, isTopLayer, layer } from "../hotkeys";
@@ -126,6 +126,22 @@
     { id: "light", label: "Светлая" },
     { id: "dark", label: "Тёмная" },
   ];
+
+  const EXTERNAL_IMAGES: { id: ExternalImagesMode; label: string }[] = [
+    { id: "ask", label: "По кнопке «Показать»; от доверенных отправителей — сразу" },
+    { id: "never", label: "Не загружать совсем" },
+  ];
+
+  /** Убрать отправителя из доверенных для внешних картинок. */
+  async function untrustSender(email: string) {
+    try {
+      await trustImageSender(email, false);
+      if (s) s = { ...s, trusted_image_senders: (s.trusted_image_senders ?? []).filter((e) => e !== email) };
+      flash("Сохранено");
+    } catch (e) {
+      flash(errorMessage(e));
+    }
+  }
 
   const DARK_MAIL: { id: DarkMail; label: string }[] = [
     { id: "dark", label: "В тёмных тонах" },
@@ -544,6 +560,28 @@
             {/each}
           </div>
           <p class="hint">Отсчёт идёт, пока развёрнутое письмо видно на экране. «Не помечать» — только вручную: кнопкой на карточке или из меню списка.</p>
+        </fieldset>
+        <fieldset class="group">
+          <legend class="label">Внешние картинки в письмах</legend>
+          <div class="radios">
+            {#each EXTERNAL_IMAGES as o (o.id)}
+              <label class="radio">
+                <input type="radio" name="{uid}-extimages" value={o.id} checked={(s.external_images ?? "ask") === o.id} onchange={() => void update({ external_images: o.id })} />
+                {o.label}
+              </label>
+            {/each}
+          </div>
+          <p class="hint">Картинки по ссылке (логотипы, карты в квитанциях) — частый маяк: по их загрузке отправитель видит, что и когда письмо открыто. Поэтому они скрыты, пока не нажать «Показать». Загружает их приложение, без cookies и без адреса страницы, только изображения; в само письмо выход в интернет не открывается.</p>
+          {#if (s.trusted_image_senders ?? []).length}
+            <div class="label">Доверенные отправители</div>
+            <ul class="senders">
+              {#each s.trusted_image_senders ?? [] as e (e)}
+                <li><span class="mono">{e}</span><button class="btn small" onclick={() => void untrustSender(e)}>Убрать</button></li>
+              {/each}
+            </ul>
+          {:else}
+            <p class="hint">Доверенных отправителей нет: кнопка «Всегда от этого отправителя» на письме добавит сюда его адрес.</p>
+          {/if}
         </fieldset>
       {:else if current === "notify"}
         <h3 class="section-title">Уведомления</h3>
@@ -1090,5 +1128,30 @@
     to {
       transform: rotate(360deg);
     }
+  }
+  .btn.small {
+    height: 24px;
+    padding: 0 10px;
+    font: var(--text-caption);
+  }
+  .senders {
+    list-style: none;
+    margin: var(--space-1) 0 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-1);
+  }
+  .senders li {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+  }
+  .senders li .mono {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    user-select: text;
   }
 </style>

@@ -16,8 +16,15 @@
     darkColors?: string[] | null;
     /** Метка имён переменных палитры (`Message.dark_tag`); нет — только светлый лист. */
     darkTag?: string | null;
+    /**
+     * Внешние картинки, загруженные приложением по кнопке (п. 18 обкатки): исходный адрес из `src`
+     * → `data:`. Рамка подставляет их сама — CSP (`img-src data:`) не меняется.
+     */
+    images?: Record<string, string> | null;
+    /** Сколько в письме внешних картинок (`img` с `src` http/https) — после каждой загрузки рамки. */
+    onexternal?: (count: number) => void;
   }
-  let { html, title = "Текст письма", onprint, dark = false, darkColors = null, darkTag = null }: Props = $props();
+  let { html, title = "Текст письма", onprint, dark = false, darkColors = null, darkTag = null, images = null, onexternal }: Props = $props();
 
   // Тёмный лист — класс на корне документа рамки. Его ставит окно снаружи (рамка с
   // allow-same-origin), скриптов внутри рамки нет и CSP не меняется; смена темы не перезагружает письмо.
@@ -65,11 +72,39 @@ ${palette}
     applyDark(darkOn);
   });
 
+  /** Внешние картинки документа рамки: `img` с адресом http(s) — исходный или уже подставленный. */
+  function externalImgs(): HTMLImageElement[] {
+    const doc = frame?.contentDocument;
+    if (!doc) return [];
+    return Array.from(doc.images).filter((img) => /^https?:\/\//i.test(img.dataset.aiowaSrc ?? img.getAttribute("src") ?? ""));
+  }
+
+  /** Подставить загруженные картинки; исходный адрес остаётся в `data-aiowa-src`. */
+  function applyImages(map: Record<string, string> | null) {
+    if (!map) return;
+    let changed = false;
+    for (const img of externalImgs()) {
+      const src = img.dataset.aiowaSrc ?? img.getAttribute("src") ?? "";
+      const data = map[src];
+      if (data && img.getAttribute("src") !== data) {
+        img.dataset.aiowaSrc = src;
+        img.setAttribute("src", data);
+        changed = true;
+      }
+    }
+    if (changed) setTimeout(fit, 50);
+  }
+  $effect(() => {
+    applyImages(images);
+  });
+
   /** Каждая загрузка srcdoc — новый документ, обработчики вешаются заново. */
   function onFrameLoad() {
     // Выбор мог смениться, пока документ грузился: класс в разметке тогда устарел.
     applyDark(darkOn);
     fit();
+    onexternal?.(externalImgs().length);
+    applyImages(images);
     // Ссылки из письма открываются снаружи: иначе клик увёл бы сам фрейм на чужой сайт.
     frame?.contentDocument?.addEventListener("click", onFrameClick, true);
     // Клавиши из фрейма до окна не доходят: F5 и Ctrl+R перезагрузили бы окно и потеряли набранное письмо.

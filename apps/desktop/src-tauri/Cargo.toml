@@ -32,6 +32,8 @@ tokio.workspace = true
 base64.workspace = true
 percent-encoding.workspace = true
 url.workspace = true
+# Внешние картинки писем по кнопке (`external_images.rs`): отдельный клиент без cookies и Referer.
+reqwest.workspace = true
 # Открытие файлов и ссылок системным приложением: через ShellExecuteExW, а не через cmd/powershell.
 open = { version = "5", features = ["shellexecute-on-windows"] }
 # Системный диалог «Сохранить как». Без фич по умолчанию (они нужны только Linux: xdg-portal, wayland);

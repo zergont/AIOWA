@@ -4,7 +4,7 @@
  * Источник — `settings_get` бэкенда; здесь лежит реактивная копия, которую ведут App и окно настроек.
  */
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { api, errorMessage, type DarkMail, type Settings, type SettingsPatch, type Theme } from "./api";
+import { api, errorMessage, type DarkMail, type ExternalImagesMode, type Settings, type SettingsPatch, type Theme } from "./api";
 
 /** Значения по умолчанию — те же, что у бэкенда, пока ключа в базе нет. */
 export const AUTO_READ_DEFAULT_MS = 1500;
@@ -22,6 +22,10 @@ export const prefs = $state({
   theme: "system" as Theme,
   /** Письма в тёмной теме (`darkmail.svelte.ts`): в тёмных тонах или на светлом листе. */
   darkMail: "dark" as DarkMail,
+  /** Внешние картинки писем (п. 18 обкатки): по кнопке или не загружать совсем. */
+  externalImages: "ask" as ExternalImagesMode,
+  /** Отправители, чьи внешние картинки показываются сразу (адреса в нижнем регистре). */
+  trustedImageSenders: [] as string[],
 });
 
 /** Период таймера синхронизации, мс: при живом канале — не меньше 10 минут. */
@@ -101,12 +105,20 @@ function applyDarkMail(darkMail: DarkMail) {
 }
 
 /** Перенести в общую копию то, что пришло от бэкенда (целиком или изменённой частью). */
-export function adoptSettings(s: SettingsPatch) {
+export function adoptSettings(s: SettingsPatch & { trusted_image_senders?: string[] }) {
   if (s.auto_read_ms != null) prefs.autoReadMs = s.auto_read_ms;
   if (s.sync_interval_min != null) prefs.syncIntervalMin = s.sync_interval_min;
   if (s.toasts != null) prefs.toasts = s.toasts;
   if (isTheme(s.theme)) applyTheme(s.theme);
   if (isDarkMail(s.dark_mail)) applyDarkMail(s.dark_mail);
+  if (s.external_images === "ask" || s.external_images === "never") prefs.externalImages = s.external_images;
+  if (Array.isArray(s.trusted_image_senders)) prefs.trustedImageSenders = s.trusted_image_senders;
+}
+
+/** Отправитель в список доверенных для внешних картинок или из него; новая копия списка — сразу. */
+export async function trustImageSender(email: string, trusted: boolean): Promise<void> {
+  const fresh = await api.settingsTrustImageSender(email, trusted);
+  adoptSettings(fresh);
 }
 
 /** Настройки на старте окна; старый бэкенд без команды — остаются значения по умолчанию. */

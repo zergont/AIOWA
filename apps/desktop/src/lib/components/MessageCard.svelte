@@ -14,7 +14,7 @@
   import { focusBack } from "../popover";
   import { hint, keysOf } from "../hotkeys";
   import { printMessage } from "../print";
-  import { prefs } from "../settings.svelte";
+  import { prefs, trustImageSender } from "../settings.svelte";
   import { darkMailByDefault, MOON_ICON, SUN_ICON, windowIsDark } from "../darkmail.svelte";
   import FolderPicker from "./FolderPicker.svelte";
   import ConfirmPopover from "./ConfirmPopover.svelte";
@@ -130,6 +130,46 @@
   // В списке файлов всё, кроме инлайновых картинок: те уже стоят в теле письма.
   const files = $derived(message.attachments.filter((a) => !isInlinePicture(a)));
   const hasBody = $derived(message.body_html != null);
+
+  // --- внешние картинки (п. 18 обкатки): по кнопке, от доверенных отправителей — сразу ---------
+  /** Сколько в теле внешних картинок (сообщает рамка после загрузки). */
+  let extCount = $state(0);
+  /** Загруженные приложением картинки: исходный адрес → `data:`; null — не загружали. */
+  let extImages = $state<Record<string, string> | null>(null);
+  let extLoading = $state(false);
+  let extNote = $state<string | null>(null);
+  const senderKey = $derived((message.from_email ?? "").trim().toLowerCase());
+  const senderTrusted = $derived(senderKey.includes("@") && prefs.trustedImageSenders.includes(senderKey));
+  const extHidden = $derived(extCount > 0 && extImages === null && prefs.externalImages === "ask" && !senderTrusted);
+
+  async function loadExternal() {
+    if (extLoading) return;
+    extLoading = true;
+    extNote = null;
+    try {
+      const r = await api.externalImages(message.item_pk);
+      extImages = r.images;
+      if (r.failed) extNote = `Не загрузилось картинок: ${r.failed} из ${r.total}`;
+    } catch (e) {
+      extNote = errorMessage(e);
+    } finally {
+      extLoading = false;
+    }
+  }
+
+  function onExternal(count: number) {
+    extCount = count;
+    if (count > 0 && extImages === null && !extLoading && prefs.externalImages === "ask" && senderTrusted) void loadExternal();
+  }
+
+  async function trustSender() {
+    try {
+      await trustImageSender(senderKey, true);
+      void loadExternal();
+    } catch (e) {
+      extNote = errorMessage(e);
+    }
+  }
   const inDeleted = $derived(deletedFolderPk != null && message.folder_pk === deletedFolderPk);
 
   // --- догрузка тела и инлайновых картинок ----------------------------------
@@ -788,7 +828,15 @@
         </div>
       {/if}
       {#if hasBody}
-        <BodyFrame html={message.body_html ?? ""} dark={mailDark} darkColors={message.dark_colors} darkTag={message.dark_tag} onprint={() => void print()} />
+        {#if extHidden}
+          <div class="note status ext">
+            <span class="status-text caption">Внешние картинки скрыты: по ним отправитель узнал бы, что письмо открыто.</span>
+            <button class="btn" onclick={() => void loadExternal()} disabled={extLoading} aria-busy={extLoading}>{extLoading ? "Загружаю…" : "Показать"}</button>
+            {#if senderKey.includes("@")}<button class="btn" onclick={() => void trustSender()} disabled={extLoading} title="Картинки от {senderKey} показывать сразу; список — в настройках">Всегда от этого отправителя</button>{/if}
+          </div>
+        {/if}
+        {#if extNote}<div class="note status caption">{extNote}</div>{/if}
+        <BodyFrame html={message.body_html ?? ""} dark={mailDark} darkColors={message.dark_colors} darkTag={message.dark_tag} onprint={() => void print()} images={extImages} onexternal={onExternal} />
         {#if message.is_truncated}<div class="caption note">Письмо обрезано при загрузке.</div>{/if}
       {:else if message.body_state === 2}
         <div class="note status">

@@ -29,6 +29,13 @@ pub(crate) const DARK_MAIL_KEY: &str = "desktop.dark_mail";
 pub(crate) const SYNC_INTERVAL_KEY: &str = "desktop.sync_interval_min";
 pub(crate) const CACHE_MB_KEY: &str = "desktop.cache_mb";
 pub(crate) const MAX_ATTACHMENT_MB_KEY: &str = "desktop.max_attachment_mb";
+/// Внешние картинки писем (docs/obkatka.md п. 18): `ask` — по кнопке, от доверенных отправителей
+/// сразу; `never` — не загружать совсем.
+pub(crate) const EXTERNAL_IMAGES_KEY: &str = "desktop.external_images";
+/// Доверенные отправители внешних картинок: JSON-массив адресов в нижнем регистре.
+pub(crate) const TRUSTED_IMAGE_SENDERS_KEY: &str = "desktop.trusted_image_senders";
+/// Самое большее доверенных отправителей (список в настройках, не адресная книга).
+const TRUSTED_IMAGE_SENDERS_MAX: usize = 1000;
 
 const MIB: u64 = 1024 * 1024;
 
@@ -45,6 +52,7 @@ const MAX_ATTACHMENT_MB: RangeInclusive<u32> = 1..=200;
 
 const THEMES: &[&str] = &["system", "light", "dark"];
 const DARK_MAIL: &[&str] = &["dark", "light"];
+const EXTERNAL_IMAGES: &[&str] = &["ask", "never"];
 
 /// Настройки в значениях; по умолчанию — прежнее поведение (90 дней, 1,5 с, тосты, 2 мин, 2 ГБ, 25 МБ).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -58,11 +66,26 @@ pub(crate) struct Prefs {
     pub(crate) sync_interval_min: u32,
     pub(crate) cache_mb: u32,
     pub(crate) max_attachment_mb: u32,
+    /// `ask` | `never`.
+    pub(crate) external_images: String,
+    /// Адреса в нижнем регистре.
+    pub(crate) trusted_image_senders: Vec<String>,
 }
 
 impl Default for Prefs {
     fn default() -> Self {
-        Self { body_days: 90, auto_read_ms: 1500, toasts: true, theme: "system".into(), dark_mail: "dark".into(), sync_interval_min: 2, cache_mb: 2048, max_attachment_mb: 25 }
+        Self {
+            body_days: 90,
+            auto_read_ms: 1500,
+            toasts: true,
+            theme: "system".into(),
+            dark_mail: "dark".into(),
+            sync_interval_min: 2,
+            cache_mb: 2048,
+            max_attachment_mb: 25,
+            external_images: "ask".into(),
+            trusted_image_senders: Vec::new(),
+        }
     }
 }
 
@@ -84,6 +107,8 @@ impl Prefs {
             sync_interval_min: parse_in(get(SYNC_INTERVAL_KEY), &SYNC_INTERVAL_MIN, d.sync_interval_min),
             cache_mb: parse_in(get(CACHE_MB_KEY), &CACHE_MB, d.cache_mb),
             max_attachment_mb: parse_in(get(MAX_ATTACHMENT_MB_KEY), &MAX_ATTACHMENT_MB, d.max_attachment_mb),
+            external_images: get(EXTERNAL_IMAGES_KEY).filter(|t| EXTERNAL_IMAGES.contains(&t.as_str())).unwrap_or(d.external_images),
+            trusted_image_senders: get(TRUSTED_IMAGE_SENDERS_KEY).and_then(|j| serde_json::from_str::<Vec<String>>(&j).ok()).unwrap_or_default(),
         }
     }
 
@@ -126,6 +151,7 @@ pub(crate) struct SettingsPatch {
     #[serde(alias = "cache_mb")]
     pub(crate) attachment_cache_mb: Option<u32>,
     pub(crate) max_attachment_mb: Option<u32>,
+    pub(crate) external_images: Option<String>,
 }
 
 /// Что записать по проверенному патчу: ключи `sync_state` и тосты (через канал уведомлений).
@@ -173,6 +199,12 @@ pub(crate) fn plan(patch: &SettingsPatch) -> Result<PlannedWrites, String> {
     if let Some(v) = patch.max_attachment_mb {
         out.values.push((MAX_ATTACHMENT_MB_KEY, check_range("Лимит вложения (МБ)", v, &MAX_ATTACHMENT_MB)?.to_string()));
     }
+    if let Some(m) = &patch.external_images {
+        if !EXTERNAL_IMAGES.contains(&m.as_str()) {
+            return Err(format!("Внешние картинки: допустимо ask или never, получено {m}"));
+        }
+        out.values.push((EXTERNAL_IMAGES_KEY, m.clone()));
+    }
     Ok(out)
 }
 
@@ -206,6 +238,9 @@ pub(crate) struct SettingsDto {
     sync_interval_min: u32,
     attachment_cache_mb: u32,
     max_attachment_mb: u32,
+    /// Внешние картинки: `ask` — по кнопке (от доверенных — сразу), `never` — не загружать.
+    external_images: String,
+    trusted_image_senders: Vec<String>,
     db_path: String,
     db_size_bytes: u64,
     cache_size_bytes: u64,
@@ -230,6 +265,8 @@ fn snapshot(store: &Store, account: AccountId, host: &str, user: &str, dev_env: 
         sync_interval_min: p.sync_interval_min,
         attachment_cache_mb: p.cache_mb,
         max_attachment_mb: p.max_attachment_mb,
+        external_images: p.external_images,
+        trusted_image_senders: p.trusted_image_senders,
         db_path: store.path().display().to_string(),
         db_size_bytes: store.disk_size_bytes(),
         cache_size_bytes: store.attachment_cache_bytes(),
@@ -265,6 +302,41 @@ pub(crate) async fn settings_set(patch: SettingsPatch, app: AppHandle, state: St
     if !planned.values.is_empty() || planned.toasts.is_some() {
         info!(changed = ?planned.values.iter().map(|(k, _)| *k).collect::<Vec<_>>(), toasts = ?planned.toasts, "настройки изменены");
     }
+    let dto = snapshot_async(&state, &setup).await?;
+    if let Err(e) = app.emit("settings-changed", dto.clone()) {
+        warn!(error = %e, "не удалось отправить событие settings-changed");
+    }
+    Ok(dto)
+}
+
+/// Список доверенных отправителей внешних картинок с адресом `email` (`trusted`) или без него:
+/// адреса в нижнем регистре, без повторов, по алфавиту. Не похожий на адрес — ошибка.
+pub(crate) fn with_trusted_sender(list: &[String], email: &str, trusted: bool) -> Result<Vec<String>, String> {
+    let key = email.trim().to_lowercase();
+    if !crate::compose::looks_like_email(&key) {
+        return Err("Не похоже на адрес почты".into());
+    }
+    let mut out: Vec<String> = list.iter().map(|e| e.trim().to_lowercase()).filter(|e| !e.is_empty() && *e != key).collect();
+    if trusted {
+        if out.len() >= TRUSTED_IMAGE_SENDERS_MAX {
+            return Err(format!("В списке уже {TRUSTED_IMAGE_SENDERS_MAX} отправителей: уберите лишних в настройках"));
+        }
+        out.push(key);
+    }
+    out.sort();
+    out.dedup();
+    Ok(out)
+}
+
+/// «Всегда показывать картинки от этого отправителя» и удаление из списка в настройках: новый
+/// снимок настроек, он же — событием `settings-changed`.
+#[tauri::command]
+pub(crate) async fn settings_trust_image_sender(email: String, trusted: bool, app: AppHandle, state: State<'_, AppState>, setup: State<'_, SetupState>) -> CmdResult<SettingsDto> {
+    let current = Prefs::load(&state.store, state.account).trusted_image_senders;
+    let next = with_trusted_sender(&current, &email, trusted)?;
+    let json = serde_json::to_string(&next).map_err(err)?;
+    state.store.set_state(state.account, TRUSTED_IMAGE_SENDERS_KEY, Some(&json)).map_err(|e| format!("Не удалось сохранить настройку: {e}"))?;
+    info!(trusted, senders = next.len(), "доверенные отправители внешних картинок изменены");
     let dto = snapshot_async(&state, &setup).await?;
     if let Err(e) = app.emit("settings-changed", dto.clone()) {
         warn!(error = %e, "не удалось отправить событие settings-changed");
@@ -361,6 +433,24 @@ mod tests {
         assert!(plan(&SettingsPatch { dark_mail: Some("auto".into()), ..Default::default() }).is_err());
         let p: SettingsPatch = serde_json::from_str(r#"{"dark_mail":"dark"}"#).unwrap();
         assert_eq!(p.dark_mail.as_deref(), Some("dark"));
+    }
+
+    #[test]
+    fn external_images_setting_and_trusted_senders() {
+        let d = Prefs::from_lookup(lookup(&[]));
+        assert_eq!((d.external_images.as_str(), d.trusted_image_senders.len()), ("ask", 0), "по умолчанию — по кнопке, доверенных нет");
+        let p = Prefs::from_lookup(lookup(&[(EXTERNAL_IMAGES_KEY, "never"), (TRUSTED_IMAGE_SENDERS_KEY, r#"["a@x.ru"]"#)]));
+        assert_eq!((p.external_images.as_str(), p.trusted_image_senders), ("never", vec!["a@x.ru".to_string()]));
+        assert_eq!(Prefs::from_lookup(lookup(&[(EXTERNAL_IMAGES_KEY, "always"), (TRUSTED_IMAGE_SENDERS_KEY, "не json")])), d, "негодные значения — по умолчанию");
+        assert_eq!(plan(&SettingsPatch { external_images: Some("never".into()), ..Default::default() }).unwrap().values, vec![(EXTERNAL_IMAGES_KEY, "never".to_string())]);
+        assert!(plan(&SettingsPatch { external_images: Some("always".into()), ..Default::default() }).is_err());
+
+        let list = with_trusted_sender(&[], " Anna@Example.com ", true).unwrap();
+        assert_eq!(list, vec!["anna@example.com".to_string()]);
+        let list = with_trusted_sender(&list, "b@x.ru", true).unwrap();
+        assert_eq!(with_trusted_sender(&list, "ANNA@example.com", true).unwrap(), list, "повтор не добавляется");
+        assert_eq!(with_trusted_sender(&list, "anna@example.com", false).unwrap(), vec!["b@x.ru".to_string()]);
+        assert!(with_trusted_sender(&list, "не адрес", true).is_err());
     }
 
     #[test]
