@@ -143,6 +143,41 @@ impl Store {
         })
     }
 
+    /// Записать фото записи справочника (или отметку «фото нет»: `None` с временем запроса).
+    /// Записи с таким адресом нет — `false`, ничего не записано.
+    pub fn set_directory_photo(&self, account: AccountId, email: &str, photo: Option<&[u8]>) -> Result<bool> {
+        let key = email.trim().to_lowercase();
+        let now = now_ms();
+        self.with_conn(|c| Ok(c.execute("UPDATE directory_people SET photo = ?3, photo_at = ?4 WHERE account_id = ?1 AND email = ?2", params![account.0, key, photo, now])? > 0))
+    }
+
+    /// Фото записи из кэша: `Some((фото или None, когда запрашивалось))`, если фото запрашивалось;
+    /// запись есть, но фото не запрашивалось, или записи нет — `None`.
+    pub fn directory_photo(&self, account: AccountId, email: &str) -> Result<Option<(Option<Vec<u8>>, i64)>> {
+        let key = email.trim().to_lowercase();
+        self.with_conn(|c| {
+            Ok(c.query_row("SELECT photo, photo_at FROM directory_people WHERE account_id = ?1 AND email = ?2 AND photo_at IS NOT NULL", params![account.0, key], |r| Ok((r.get::<_, Option<Vec<u8>>>(0)?, r.get::<_, i64>(1)?))).optional()?)
+        })
+    }
+
+    /// Фото из кэша по списку адресов (только те, у кого фото есть): адрес в нижнем регистре → байты.
+    pub fn directory_photos(&self, account: AccountId, emails: &[String]) -> Result<Vec<(String, Vec<u8>)>> {
+        self.with_conn(|c| {
+            let mut st = c.prepare_cached("SELECT photo FROM directory_people WHERE account_id = ?1 AND email = ?2 AND photo IS NOT NULL")?;
+            let mut out = Vec::new();
+            for e in emails {
+                let key = e.trim().to_lowercase();
+                if key.is_empty() {
+                    continue;
+                }
+                if let Some(bytes) = st.query_row(params![account.0, key], |r| r.get::<_, Vec<u8>>(0)).optional()? {
+                    out.push((key, bytes));
+                }
+            }
+            Ok(out)
+        })
+    }
+
     /// Момент последней записи адреса в кэш справочника (миллисекунды UTC), если запись есть.
     pub fn directory_person_fetched_at(&self, account: AccountId, email: &str) -> Result<Option<i64>> {
         let key = email.trim().to_lowercase();
@@ -226,6 +261,28 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn directory_photo_cache_round_trip() {
+        let path = std::env::temp_dir().join(format!("aiowa-dir-photo-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let s = Store::open(&path).unwrap();
+        let acc = s.account("h", "u").unwrap();
+        let person = DirectoryPerson { display_name: Some("Имя".into()), email: Some("A@x.ru".into()), kind: PersonKind::Mailbox, title: None, department: None, company: None, office: None, business_phone: None, mobile_phone: None, alias: None };
+        assert!(!s.set_directory_photo(acc, "a@x.ru", Some(&[1, 2, 3])).unwrap(), "записи ещё нет");
+        assert!(s.replace_directory_person(acc, &person).unwrap());
+        assert_eq!(s.directory_photo(acc, "a@x.ru").unwrap(), None, "фото не запрашивалось");
+        assert!(s.set_directory_photo(acc, "A@x.ru", Some(&[1, 2, 3])).unwrap());
+        let (photo, at) = s.directory_photo(acc, "a@x.ru").unwrap().unwrap();
+        assert_eq!((photo.as_deref(), at > 0), (Some(&[1u8, 2, 3][..]), true));
+        assert_eq!(s.directory_photos(acc, &["a@x.ru".into(), "b@x.ru".into()]).unwrap(), vec![("a@x.ru".to_string(), vec![1, 2, 3])]);
+        // Повторная запись записи справочника фото не стирает; отметка «нет фото» — photo NULL, photo_at есть.
+        assert!(s.replace_directory_person(acc, &person).unwrap());
+        assert!(s.directory_photo(acc, "a@x.ru").unwrap().unwrap().0.is_some());
+        assert!(s.set_directory_photo(acc, "a@x.ru", None).unwrap());
+        assert_eq!(s.directory_photo(acc, "a@x.ru").unwrap().map(|(p, _)| p.is_none()), Some(true));
+        assert!(s.directory_photos(acc, &["a@x.ru".into()]).unwrap().is_empty());
+    }
     use aiowa_core::{DistinguishedFolder, Folder, FolderId, ItemChange, ItemId, MessageFull, MessageMeta, Participant, SyncState};
     use jiff::Timestamp;
 

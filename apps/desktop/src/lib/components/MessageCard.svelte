@@ -7,6 +7,8 @@
   import { onDestroy, untrack } from "svelte";
   import { api, errorMessage, formatSize, fullDate, isInlinePicture, isPreviewable, listDate, meetingKindOf, messageNeedsFetch, personLabel, senderResponseOf, type Attachment, type ComposeKind, type Folder, type MeetingInfo, type MeetingResponse, type Message, type ResponseType, LAST_VERB, lastVerbText, itemKindLabel, itemKindOf} from "../api";
   import { COMPOSE_ACTIONS, ICON, type ItemAction } from "../actions";
+  import { requestPhoto } from "../photos.svelte";
+  import Avatar from "./Avatar.svelte";
   import { meetingWhen } from "../calendar";
   import { contactCardOpener, copyText } from "../contact";
   import { focusBack } from "../popover";
@@ -57,6 +59,12 @@
     return when ? `${text} ${when}` : text;
   });
   const verbIcon = $derived(message.last_verb === LAST_VERB.forwarded ? ICON.forward : message.last_verb === LAST_VERB.repliedAll ? ICON.replyAll : ICON.reply);
+
+  // Фото отправителя: у развёрнутого письма — запрос к бэкенду (кэш не старше недели или сервер,
+  // по одному адресу за раз); у свёрнутого — только то, что уже есть в кэше окна.
+  $effect(() => {
+    if (expanded && message.from_email) requestPhoto(message.from_email);
+  });
 
   /** Не почтовый элемент (контакт, встреча, задача, заметка): подпись вида рядом с именем (п. 14 обкатки). */
   const kindBadge = $derived.by(() => {
@@ -505,11 +513,6 @@
     return list.map((p) => personLabel(p.name, p.email)).join(", ");
   }
 
-  function initials(name: string | null, email: string | null): string {
-    const s = (name || email || "?").trim();
-    const parts = s.split(/\s+/).filter(Boolean);
-    return parts.length >= 2 ? (parts[0][0] + parts[1][0]).toUpperCase() : s.slice(0, 2).toUpperCase();
-  }
 </script>
 
 <!-- Люди через запятую; с адресом — кнопка карточки контакта. В одну строку: иначе лишние пробелы перед запятыми. -->
@@ -530,7 +533,7 @@
   <div class="head">
     <!-- Клавиши имён (Enter, пробел) не должны сворачивать письмо: реагируем только на сам заголовок. -->
     <div class="head-main" onclick={ontoggle} role="button" tabindex="0" onkeydown={(e) => e.target === e.currentTarget && (e.key === "Enter" || e.key === " ") && ontoggle()} aria-expanded={expanded}>
-      <div class="avatar" aria-hidden="true">{initials(message.from_name, message.from_email)}</div>
+      <Avatar name={message.from_name} email={message.from_email} size={36} />
       <div class="who">
         <div class="from">
           {#if expanded && openContact && message.from_email}

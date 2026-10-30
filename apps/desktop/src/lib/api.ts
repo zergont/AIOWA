@@ -474,6 +474,8 @@ export interface ContactCard {
   from_cache: boolean;
   error?: string | null;
   local?: ContactLocal | null;
+  /** Фото из справочника как data:-адрес; null — фото нет или ещё не запрашивалось. */
+  photo_url?: string | null;
 }
 
 /** Запись справочника — список рассылки: его можно развернуть в участников. */
@@ -848,6 +850,10 @@ export const api = {
   directorySearch: (query: string, limit?: number, cacheOnly = false) => invoke<DirectorySearch>("directory_search", { query, limit: limit ?? null, cacheOnly }),
   /** Карточка контакта: справочник (кэш или сервер; `refresh` — заново с сервера) и счётчики переписки. */
   contactCard: (email: string, refresh = false) => invoke<ContactCard>("contact_card", { email, refresh }),
+  /** Фото из кэша справочника по адресам, без сети: адрес в нижнем регистре → data:-адрес. */
+  contactPhotos: (emails: string[]) => invoke<Record<string, string>>("contact_photos", { emails }),
+  /** Фото одного человека: кэш не старше недели или ResolveNames; null — фото нет или сервер недоступен. */
+  contactPhoto: (email: string) => invoke<string | null>("contact_photo", { email }),
   /** Участники списка рассылки (ExpandDL на сервере). */
   directoryExpand: (email: string) => invoke<DirectoryPerson[]>("directory_expand", { email }),
   /** Что умеет справочник на этом сервере: раскрытие списков рассылки бывает не реализовано (§ 5l). */

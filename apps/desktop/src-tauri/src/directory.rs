@@ -30,7 +30,7 @@ use crate::{err, AppState, CmdResult};
 use aiowa_core::{AccountId, DirectoryPerson, PersonKind};
 use aiowa_store::directory::directory_person_matches;
 use aiowa_store::{ContactLocalStats, Store};
-use aiowa_transport::{MailTransport, TransportError};
+use aiowa_transport::{MailTransport, ResolvedPerson, TransportError};
 use aiowa_transport_owa::OwaTransport;
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
@@ -162,6 +162,34 @@ pub(crate) struct ContactCardDto {
     from_cache: bool,
     error: Option<String>,
     local: ContactLocalDto,
+    /// Фото из справочника как `data:`-адрес (CSP окна не меняется); `None` — фото нет или не запрашивалось.
+    photo_url: Option<String>,
+}
+
+/// Срок годности фото в кэше: после него карточка или заголовок письма перечитают его с сервера.
+const PHOTO_TTL_MS: i64 = 7 * 24 * 3600 * 1000;
+
+/// `data:`-адрес картинки для окна; тип — по сигнатуре (JPEG, PNG, GIF, иначе JPEG).
+pub(crate) fn photo_data_url(bytes: &[u8]) -> String {
+    use base64::prelude::*;
+    let mime = if bytes.starts_with(&[0x89, b'P', b'N', b'G']) {
+        "image/png"
+    } else if bytes.starts_with(b"GIF8") {
+        "image/gif"
+    } else {
+        "image/jpeg"
+    };
+    format!("data:{mime};base64,{}", BASE64_STANDARD.encode(bytes))
+}
+
+/// Фото из кэша как `data:`-адрес, если оно есть.
+fn cached_photo_url(store: &Store, account: AccountId, key: &str) -> Option<String> {
+    store.directory_photo(account, key).ok().flatten().and_then(|(photo, _)| photo).map(|b| photo_data_url(&b))
+}
+
+/// Фото из найденных записей для адреса `key` (по основному адресу записи).
+fn photo_for(found: &[ResolvedPerson], key: &str) -> Option<Vec<u8>> {
+    found.iter().find(|r| r.person.email_key().as_deref() == Some(key)).and_then(|r| r.photo.clone()).or_else(|| found.iter().find_map(|r| r.photo.clone()))
 }
 
 // --- чистые функции (без базы и сети) --------------------------------------------------------
@@ -753,10 +781,12 @@ pub(crate) async fn contact_card(email: String, refresh: bool, state: State<'_, 
             if cached.is_none()
                 && let Some(alt) = card_alias(&key, &answer.keys)
             {
-                let (st, alt) = (store.clone(), alt.to_string());
+                let alt_key = alt.to_string();
+                let (st, alt) = (store.clone(), alt_key.clone());
                 let found = tauri::async_runtime::spawn_blocking(move || st.directory_person(account, &alt)).await.map_err(err)?.map_err(|e| format!("Ошибка локальной базы: {e}"))?;
                 if let Some(p) = found {
-                    return Ok(ContactCardDto { person: Some(p.into()), from_cache: true, error: None, local });
+                    let photo_url = cached_photo_url(&store, account, &alt_key);
+                    return Ok(ContactCardDto { person: Some(p.into()), from_cache: true, error: None, local, photo_url });
                 }
             }
             None
@@ -766,21 +796,31 @@ pub(crate) async fn contact_card(email: String, refresh: bool, state: State<'_, 
             let started = Instant::now();
             let deadline = started + SERVER_TIMEOUT;
             let fetched = match dir.transport(sync.inner(), deadline, SERVER_TIMEOUT).await {
-                Ok(t) => until(deadline, SERVER_TIMEOUT, t.resolve_names(&key, true)).await,
+                Ok(t) => until(deadline, SERVER_TIMEOUT, t.resolve_names_full(&key)).await,
                 Err(f) => Err(f),
             };
             match fetched {
                 Ok(found) => {
                     let total = found.len();
-                    let picked = pick_card(found, &key).map(|mut p| {
+                    let photo = photo_for(&found, &key);
+                    let picked = pick_card(found.into_iter().map(|r| r.person).collect(), &key).map(|mut p| {
                         p.kind = card_kind(p.kind, cached.as_ref().map(|c| c.kind));
                         p
                     });
                     info!(found = total, matched = picked.is_some(), refresh, ms = started.elapsed().as_millis() as u64, "справочник: карточка контакта с сервера");
                     let remember = card_answer(picked.as_ref());
                     if let Some(p) = picked {
-                        let (st, row) = (store.clone(), p.clone());
-                        let stored = tauri::async_runtime::spawn_blocking(move || st.replace_directory_person(account, &row)).await.map_err(err)?;
+                        let (st, row, photo_bytes, pkey) = (store.clone(), p.clone(), photo.clone(), key.clone());
+                        let stored = tauri::async_runtime::spawn_blocking(move || {
+                            let written = st.replace_directory_person(account, &row)?;
+                            if written {
+                                // Фото или отметка «фото нет» — вместе с записью.
+                                st.set_directory_photo(account, &pkey, photo_bytes.as_deref())?;
+                            }
+                            Ok::<bool, aiowa_store::StoreError>(written)
+                        })
+                        .await
+                        .map_err(err)?;
                         // Ответ запоминается, только если запись легла в кэш: иначе повторное
                         // открытие в течение `QUERY_TTL` показало бы пустую карточку.
                         let written = stored.unwrap_or_else(|e| {
@@ -790,7 +830,9 @@ pub(crate) async fn contact_card(email: String, refresh: bool, state: State<'_, 
                         if written && let Some(answer) = remember {
                             lock(&dir.queries).record_done(&ckey, Instant::now(), answer, false);
                         }
-                        return Ok(ContactCardDto { person: Some(p.into()), from_cache: false, error: None, local });
+                        info!(photo_bytes = photo.as_ref().map(Vec::len).unwrap_or(0), "справочник: фото карточки");
+                        let photo_url = photo.as_deref().map(photo_data_url);
+                        return Ok(ContactCardDto { person: Some(p.into()), from_cache: false, error: None, local, photo_url });
                     }
                     if let Some(answer) = remember {
                         lock(&dir.queries).record_done(&ckey, Instant::now(), answer, false);
@@ -805,7 +847,75 @@ pub(crate) async fn contact_card(email: String, refresh: bool, state: State<'_, 
             }
         }
     };
-    Ok(ContactCardDto { person: cached.map(DirectoryPersonDto::from), from_cache: true, error, local })
+    let photo_url = cached_photo_url(&store, account, &key);
+    Ok(ContactCardDto { person: cached.map(DirectoryPersonDto::from), from_cache: true, error, local, photo_url })
+}
+
+/// Фото из кэша справочника по списку адресов, без сети: адрес (в нижнем регистре) → `data:`-адрес.
+/// Для заголовков писем и подсказок: сервер по ним не спрашивается.
+#[tauri::command]
+pub(crate) async fn contact_photos(emails: Vec<String>, state: State<'_, AppState>) -> CmdResult<HashMap<String, String>> {
+    let (store, account) = (state.store.clone(), state.account);
+    let emails: Vec<String> = emails.into_iter().take(200).collect();
+    tauri::async_runtime::spawn_blocking(move || {
+        let found = store.directory_photos(account, &emails).map_err(|e| format!("Ошибка локальной базы: {e}"))?;
+        Ok(found.into_iter().map(|(k, b)| (k, photo_data_url(&b))).collect())
+    })
+    .await
+    .map_err(err)?
+}
+
+/// Фото одного человека: из кэша, если оно запрашивалось не старше недели (в том числе отметка
+/// «фото нет»), иначе `ResolveNames` с полными данными (одна запись за вызов, под замком адреса),
+/// запись в кэш и `data:`-адрес; адрес не SMTP или сервер недоступен — `None` без ошибки.
+#[tauri::command]
+pub(crate) async fn contact_photo(email: String, state: State<'_, AppState>, sync: State<'_, Arc<SyncState>>, dir: State<'_, DirectoryState>) -> CmdResult<Option<String>> {
+    let key = email.trim().to_lowercase();
+    if !looks_like_email(&key) {
+        return Ok(None);
+    }
+    let (store, account) = (state.store.clone(), state.account);
+    let gate = dir.locks.get(card_key(&key));
+    let _busy = gate.lock().await;
+    let cached = {
+        let (st, k) = (store.clone(), key.clone());
+        tauri::async_runtime::spawn_blocking(move || st.directory_photo(account, &k)).await.map_err(err)?.map_err(|e| format!("Ошибка локальной базы: {e}"))?
+    };
+    if let Some((photo, at)) = cached
+        && jiff::Timestamp::now().as_millisecond() - at < PHOTO_TTL_MS
+    {
+        return Ok(photo.map(|b| photo_data_url(&b)));
+    }
+    let deadline = Instant::now() + SERVER_TIMEOUT;
+    let fetched = match dir.transport(sync.inner(), deadline, SERVER_TIMEOUT).await {
+        Ok(t) => until(deadline, SERVER_TIMEOUT, t.resolve_names_full(&key)).await,
+        Err(f) => Err(f),
+    };
+    match fetched {
+        Ok(found) => {
+            let photo = photo_for(&found, &key);
+            let person = pick_card(found.into_iter().map(|r| r.person).collect(), &key);
+            let (st, k, bytes) = (store.clone(), key.clone(), photo.clone());
+            let stored = tauri::async_runtime::spawn_blocking(move || -> aiowa_store::Result<bool> {
+                if let Some(p) = person {
+                    st.replace_directory_person(account, &p)?;
+                }
+                st.set_directory_photo(account, &k, bytes.as_deref())
+            })
+            .await
+            .map_err(err)?;
+            if let Err(e) = stored {
+                warn!(error = %e, "справочник: фото не записано в кэш");
+            }
+            info!(photo_bytes = photo.as_ref().map(Vec::len).unwrap_or(0), "справочник: фото с сервера");
+            Ok(photo.as_deref().map(photo_data_url))
+        }
+        Err(f) => {
+            let why = dir.fail(&sync, "photo", &f, describe_transport).await;
+            warn!(why, "справочник: фото не получено");
+            Ok(None)
+        }
+    }
 }
 
 /// Участники списка рассылки (`ExpandDL`, один уровень: вложенные списки приходят записями вида

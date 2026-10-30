@@ -830,6 +830,8 @@ pub fn run() {
             compose::attachments_pick,
             directory::directory_search,
             directory::contact_card,
+            directory::contact_photos,
+            directory::contact_photo,
             directory::directory_expand,
             directory::directory_capabilities,
             calendar::calendar_events,

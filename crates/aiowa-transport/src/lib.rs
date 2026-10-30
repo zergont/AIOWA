@@ -182,6 +182,14 @@ impl WriteResult {
     }
 }
 
+/// Запись справочника вместе с фото из `ResolveNames` с полными данными.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedPerson {
+    pub person: DirectoryPerson,
+    /// Байты картинки (обычно JPEG), если у записи есть фото.
+    pub photo: Option<Vec<u8>>,
+}
+
 /// Содержимое вложения, скачанное с сервера.
 #[derive(Clone, PartialEq, Eq)]
 pub struct AttachmentContent {
@@ -495,6 +503,12 @@ pub trait MailTransport: Send + Sync {
     /// (`ErrorNameResolutionMultipleResults`, класс `Warning`) — успех со списком (сервер отдаёт
     /// до 100).
     async fn resolve_names(&self, query: &str, full_contact: bool) -> Result<Vec<DirectoryPerson>>;
+
+    /// Как `resolve_names(query, true)`, но вместе с фото из `Contact.Photo` ответа (base64):
+    /// `Some(bytes)` — фото есть, `None` — у записи фото нет. По умолчанию — без фото.
+    async fn resolve_names_full(&self, query: &str) -> Result<Vec<ResolvedPerson>> {
+        Ok(self.resolve_names(query, true).await?.into_iter().map(|person| ResolvedPerson { person, photo: None }).collect())
+    }
 
     /// Участники списка рассылки (`ExpandDL` по SMTP-адресу списка), один уровень: вложенные
     /// списки приходят записями вида `DistributionList`. Не список или нет доступа — `Server`.

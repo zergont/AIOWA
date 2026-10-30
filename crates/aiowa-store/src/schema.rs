@@ -12,7 +12,7 @@ use rusqlite::types::ValueRef;
 use rusqlite::Connection;
 use tracing::info;
 
-pub const CURRENT_VERSION: i64 = 8;
+pub const CURRENT_VERSION: i64 = 9;
 
 /// Состояния текста вложения (`attachments.text_state`).
 pub const TEXT_PENDING: i64 = 0;
@@ -521,6 +521,24 @@ pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
         }
         info!("схема базы обновлена до версии 8: не почтовые элементы не считаются непрочитанными");
     }
+    if version < 9 {
+        conn.execute_batch("BEGIN IMMEDIATE;")?;
+        let result = (|| -> rusqlite::Result<()> {
+            // Фото людей из справочника (ResolveNames) и отметка «фото нет» (photo_at без photo).
+            add_column_if_missing(conn, "directory_people", "photo", "BLOB")?;
+            add_column_if_missing(conn, "directory_people", "photo_at", "INTEGER")?;
+            conn.pragma_update(None, "user_version", 9)?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => conn.execute_batch("COMMIT;")?,
+            Err(e) => {
+                let _ = conn.execute_batch("ROLLBACK;");
+                return Err(e);
+            }
+        }
+        info!("схема базы обновлена до версии 9: фото в кэше справочника");
+    }
     Ok(())
 }
 
@@ -645,6 +663,7 @@ mod tests {
         assert_eq!(v, CURRENT_VERSION);
         assert_eq!(conn.query_row("SELECT count(*) FROM local_drafts", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
         assert!(has_column(&conn, "items", "last_verb").unwrap() && has_column(&conn, "items", "verb_checked").unwrap());
+        assert!(has_column(&conn, "directory_people", "photo").unwrap() && has_column(&conn, "directory_people", "photo_at").unwrap());
         let plan: String = conn
             .query_row("EXPLAIN QUERY PLAN SELECT COUNT(*) FROM items WHERE account_id = 1 AND lower(from_email) = 'a@x.ru'", [], |r| r.get::<_, String>(3))
             .unwrap();

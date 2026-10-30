@@ -1,6 +1,7 @@
 <script lang="ts">
-  import { initials } from "../contact";
   import type { SuggestPerson } from "../api";
+  import { primePhotos } from "../photos.svelte";
+  import Avatar from "./Avatar.svelte";
 
   /**
    * Выпадающие подсказки под строкой поиска, как в OWA (п. 9 обкатки): раздел «От» с людьми
@@ -22,6 +23,10 @@
 
   const text = $derived(query.trim());
   const showRecent = $derived(!text && recent.length > 0);
+  // Фото людей из кэша бэкенда (без сети), когда список меняется.
+  $effect(() => {
+    void primePhotos(people.map((p) => p.email));
+  });
 </script>
 
 <div class="panel" role="listbox" aria-label="Подсказки поиска" tabindex="-1" onpointerdown={(e) => e.preventDefault()}>
@@ -30,7 +35,7 @@
     {#each people as p (p.email.toLowerCase())}
       <div class="row" role="option" aria-selected="false">
         <button type="button" class="pick" onclick={() => onfrom(p)} title="Письма от {p.email}">
-          <span class="avatar" aria-hidden="true">{initials(p.name, p.email)}</span>
+          <Avatar name={p.name} email={p.email} size={28} />
           <span class="who">
             <span class="name">{p.name || p.email}</span>
             {#if p.name}<span class="email caption">{p.email}</span>{/if}
@@ -108,19 +113,6 @@
   .row.pick {
     height: 32px;
     padding: 0 var(--space-3);
-  }
-  .avatar {
-    flex: none;
-    width: 28px;
-    height: 28px;
-    border-radius: 50%;
-    background: var(--accent-soft);
-    color: var(--accent);
-    font: var(--text-caption);
-    font-weight: 600;
-    display: flex;
-    align-items: center;
-    justify-content: center;
   }
   .who {
     min-width: 0;

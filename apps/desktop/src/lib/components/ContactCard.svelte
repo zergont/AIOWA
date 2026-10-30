@@ -2,7 +2,9 @@
   import { onDestroy, onMount, tick, untrack } from "svelte";
   import { api, errorMessage, isDirectoryList, listDate, plural, type ComposeRecipient, type ContactCard, type DirectoryPerson } from "../api";
   import { ICON } from "../actions";
-  import { CONTACT_ICON, KIND_LABEL, copyText, directoryLine, emailKey, expandSupported, initials, noteExpandError, rememberKinds, telHref, type ContactRef } from "../contact";
+  import { CONTACT_ICON, KIND_LABEL, copyText, directoryLine, emailKey, expandSupported, noteExpandError, rememberKinds, telHref, type ContactRef } from "../contact";
+  import { notePhoto } from "../photos.svelte";
+  import Avatar from "./Avatar.svelte";
   import { anchorRect, dismissOn, placePopup } from "../popover";
   import { hint, layer } from "../hotkeys";
 
@@ -79,6 +81,8 @@
       if (n !== request) return;
       card = c;
       if (c.person) rememberKinds([c.person]);
+      // Фото (или его отсутствие) запоминается для заголовков писем и подсказок.
+      if (!c.from_cache || c.photo_url) notePhoto(current.email, c.photo_url ?? null);
     } catch (e) {
       if (n === request) failure = errorMessage(e);
     } finally {
@@ -230,13 +234,13 @@
         <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path d={CONTACT_ICON.back} fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round" /></svg>
       </button>
     {/if}
-    <div class="avatar" class:list={isList} aria-hidden="true">
-      {#if isList}
+    {#if isList}
+      <div class="avatar list" aria-hidden="true">
         <svg width="20" height="20" viewBox="0 0 16 16"><path d={CONTACT_ICON.people} fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round" /></svg>
-      {:else}
-        {initials(name, email)}
-      {/if}
-    </div>
+      </div>
+    {:else}
+      <Avatar {name} {email} size={48} src={card?.photo_url} />
+    {/if}
     <div class="who">
       <h2 class="name" id="{uid}-name">{name}</h2>
       {#if subtitle}<div class="sub" id="{uid}-sub">{subtitle}</div>{/if}

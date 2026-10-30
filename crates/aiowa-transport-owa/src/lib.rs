@@ -16,7 +16,7 @@ use aiowa_core::{
 use aiowa_transport::{
     async_trait, AttachmentContent, Credentials, DeleteMode, FolderCounts, ItemFetchShape, ItemResult, MailTransport, NotificationEvent, NotificationKind, Result, ServerInfo, StreamEnd, SubscriptionRequest,
     SubscriptionResult, TransportError, WriteResult,
-};
+ ResolvedPerson,};
 use base64::prelude::*;
 use jiff::Timestamp;
 use notify::SubscribeForm;
@@ -284,6 +284,18 @@ fn truncate(s: &str, n: usize) -> String {
 }
 
 /// Классификация редиректа после запроса к сессии.
+/// Ответ пробного GET `service.svc/s/<op>` (`OwaTransport::service_get_probe`).
+#[derive(Debug, Clone)]
+pub struct ServiceGetReply {
+    pub status: u16,
+    pub content_type: Option<String>,
+    pub etag: bool,
+    pub cache_control: Option<String>,
+    /// `Location` редиректа; может содержать адрес из запроса — не печатать.
+    pub location: Option<String>,
+    pub bytes: Vec<u8>,
+}
+
 fn classify_redirect(location: &str) -> TransportError {
     let lower = location.to_ascii_lowercase();
     if lower.contains("logon.aspx") {
@@ -681,6 +693,38 @@ impl OwaTransport {
         }
         debug!(op = "GetFileAttachment", %status, ms = started.elapsed().as_millis(), bytes = bytes.len(), "service.svc/s");
         Ok(AttachmentContent { bytes, content_type: content_type.map(|c| c.split(';').next().unwrap_or(&c).trim().to_string()), file_name })
+    }
+
+    /// Проба GET `service.svc/s/<op>?<params>&X-OWA-CANARY=…` (канарейка и заголовком): ответ как
+    /// есть, без повторного входа и разбора — для снятия формы (фото и т. п.). Тело не больше
+    /// `max_bytes`, лишнее отбрасывается.
+    pub async fn service_get_probe(&self, op: &str, params: &[(&str, &str)], max_bytes: usize) -> Result<ServiceGetReply> {
+        let inner = &self.inner;
+        let _permit = inner.permits.acquire().await.map_err(|_| TransportError::Cancelled)?;
+        let canary = inner.canary.read().expect("canary lock").clone().ok_or(TransportError::SessionExpired)?;
+        let mut url = inner.base.join(&format!("owa/service.svc/s/{op}")).map_err(|e| TransportError::Protocol { op: op.into(), status: 0, raw: e.to_string() })?;
+        {
+            let mut q = url.query_pairs_mut();
+            for (k, v) in params {
+                q.append_pair(k, v);
+            }
+            q.append_pair("X-OWA-CANARY", &canary);
+        }
+        let mut headers = HeaderMap::new();
+        headers.insert("X-OWA-CANARY", HeaderValue::from_str(&canary).map_err(|_| TransportError::CsrfRejected)?);
+        let mut r = send_retrying(inner.client.get(url).headers(headers), op, true).await?;
+        let header = |r: &reqwest::Response, name| r.headers().get(name).and_then(|v| v.to_str().ok()).map(str::to_string);
+        let status = r.status().as_u16();
+        let content_type = header(&r, CONTENT_TYPE);
+        let etag = r.headers().contains_key(reqwest::header::ETAG);
+        let cache_control = header(&r, reqwest::header::CACHE_CONTROL);
+        let location = header(&r, LOCATION);
+        let mut bytes: Vec<u8> = Vec::new();
+        while let Some(chunk) = r.chunk().await.map_err(net)? {
+            let room = max_bytes.saturating_sub(bytes.len());
+            bytes.extend_from_slice(&chunk[..chunk.len().min(room)]);
+        }
+        Ok(ServiceGetReply { status, content_type, etag, cache_control, location, bytes })
     }
 
     /// Операция `GetAttachment`: `Body.ResponseMessages.Items[0].Attachments[0].Content` в base64.
@@ -1433,6 +1477,22 @@ impl OwaTransport {
         Ok(people)
     }
 
+    /// Как `resolve_names_result`, но с фото (`Contact.Photo`).
+    pub fn resolve_names_full_result(v: &Value) -> Result<Vec<ResolvedPerson>> {
+        let msgs = protocol::response_messages(v);
+        let Some(msg) = msgs.first() else {
+            if let Some((code, message)) = protocol::body_error(v) {
+                return Err(server_error(code, message, v.get("Body").unwrap_or(v)));
+            }
+            return Err(TransportError::Protocol { op: "ResolveNames".into(), status: 200, raw: format!("нет ResponseMessages: {}", protocol::json_shape(v, 3)) });
+        };
+        let found = protocol::parse_resolve_names_full(msg).map_err(|(code, message)| server_error(code, message, msg))?;
+        let with_photo = found.iter().filter(|(_, p)| p.is_some()).count();
+        let photo_bytes: usize = found.iter().filter_map(|(_, p)| p.as_ref().map(Vec::len)).sum();
+        debug!(code = protocol::str_of(msg, "ResponseCode").unwrap_or("?"), parsed = found.len(), with_photo, photo_bytes, "ResolveNames: записи справочника с фото");
+        Ok(found.into_iter().map(|(person, photo)| ResolvedPerson { person, photo }).collect())
+    }
+
     /// Участники из ответа `ExpandDL`; отказ сервера (не список, нет доступа) — `Server`.
     pub fn expand_dl_result(v: &Value) -> Result<Vec<DirectoryPerson>> {
         let msg = Self::first_message("ExpandDL", v)?;
@@ -1907,6 +1967,18 @@ impl MailTransport for OwaTransport {
         let people = Self::find_people_result(&v, max)?;
         debug!(query_len = query.chars().count(), found = people.len(), ms = started.elapsed().as_millis(), "FindPeople");
         Ok(people)
+    }
+
+    async fn resolve_names_full(&self, query: &str) -> Result<Vec<ResolvedPerson>> {
+        let query = query.trim();
+        if query.is_empty() {
+            return Ok(Vec::new());
+        }
+        let started = Instant::now();
+        let v = self.resolve_names_value(query, true).await?;
+        let out = Self::resolve_names_full_result(&v)?;
+        debug!(chars = query.chars().count(), found = out.len(), ms = started.elapsed().as_millis() as u64, "ResolveNames с фото");
+        Ok(out)
     }
 
     async fn resolve_names(&self, query: &str, full_contact: bool) -> Result<Vec<DirectoryPerson>> {

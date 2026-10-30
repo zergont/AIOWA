@@ -304,6 +304,11 @@ enum Cmd {
         /// вместе) и форму `ContactDataShape: Default` у ResolveNames
         #[arg(long)]
         probe_shapes: bool,
+        /// Проба фото и оргструктуры по первой найденной записи ящика: `Photo`, `HasPicture`,
+        /// `Manager*`, `DirectReports` у ResolveNames и GET фото (`GetPersonaPhoto`,
+        /// `GetUserPhoto`); печатаются только коды, формы, длины и вид картинки
+        #[arg(long)]
+        probe_photo: bool,
         /// Сколько кандидатов в списки рассылки из локальной базы проверять ResolveNames
         #[arg(long, default_value_t = 5)]
         dl_candidates: usize,
@@ -2131,6 +2136,127 @@ async fn directory_probe_shapes(t: &OwaTransport, query: &str) {
     }
 }
 
+/// Проба фото и оргструктуры (`--probe-photo`): `ResolveNames AllProperties` по адресу `first` и
+/// частым отправителям того же домена из локальной базы (сколько с фото, размер и вид, формы
+/// руководителя и подчинённых), затем GET фото по первому адресу с фото и по несуществующему.
+/// Адреса и значения в вывод не идут.
+async fn directory_probe_photo(t: &OwaTransport, store: &Store, account: AccountId, first: &str) -> Result<()> {
+    use aiowa_transport_owa::protocol;
+    let domain = first.split_once('@').map(|(_, d)| d.to_string()).unwrap_or_default();
+    let sql = format!(
+        "SELECT lower(from_email) AS e, COUNT(*) AS n FROM items WHERE account_id = {} AND lower(from_email) LIKE '%@{}'
+          GROUP BY e ORDER BY n DESC LIMIT 25",
+        account.0,
+        domain.replace('\'', "")
+    );
+    let mut emails = vec![first.to_string()];
+    for e in store.debug_query(&sql)?.into_iter().skip(1).filter_map(|line| line.split('\t').next().map(String::from)) {
+        if !emails.contains(&e) {
+            emails.push(e);
+        }
+    }
+    println!("Проба фото: адресов {} (первая запись поиска и частые отправители домена)", emails.len());
+    let (mut with_photo, mut has_picture_true, mut with_manager, mut with_reports) = (0, 0, 0, 0);
+    let mut sizes: Vec<usize> = Vec::new();
+    let mut kinds: std::collections::BTreeMap<&str, usize> = Default::default();
+    let mut shapes: std::collections::BTreeSet<String> = Default::default();
+    let mut photo_email: Option<String> = None;
+    for e in &emails {
+        let v = match t.resolve_names_value(e, true).await {
+            Ok(v) => v,
+            Err(err) => {
+                println!("  ResolveNames: отказ {}", transport_error_code(&err));
+                continue;
+            }
+        };
+        let msgs = protocol::response_messages(&v);
+        let msg = msgs.first().map(|m| (*m).clone()).unwrap_or_default();
+        let res = protocol::resolutions_array(&msg).cloned().unwrap_or_default();
+        let Some(r) = res.first() else { continue };
+        let c = r.get("Contact").cloned().unwrap_or_default();
+        if c.get("HasPicture").and_then(serde_json::Value::as_bool) == Some(true) {
+            has_picture_true += 1;
+        }
+        if let Some(b) = protocol::resolution_photo(r) {
+            with_photo += 1;
+            sizes.push(b.len());
+            *kinds.entry(protocol::image_kind(&b).unwrap_or("неизвестен")).or_default() += 1;
+            photo_email.get_or_insert_with(|| e.clone());
+        }
+        if c.get("Manager").and_then(serde_json::Value::as_str).is_some_and(|s| !s.trim().is_empty()) {
+            with_manager += 1;
+        }
+        if c.get("DirectReports").and_then(serde_json::Value::as_array).is_some_and(|a| !a.is_empty()) {
+            with_reports += 1;
+        }
+        for key in ["HasPicture", "Photo", "ManagerMailbox", "DirectReports"] {
+            if let Some(x) = c.get(key) {
+                let shape = protocol::json_shape(x, 3);
+                // Длины строк и массивов у каждой записи свои: форма — без чисел.
+                let shape: String = shape.chars().filter(|ch| !ch.is_ascii_digit()).collect();
+                shapes.insert(format!("{key}: {shape}"));
+            }
+        }
+    }
+    sizes.sort_unstable();
+    println!(
+        "  HasPicture true {has_picture_true}, Photo непустых {with_photo} (размеры {}, виды {kinds:?}), Manager {with_manager}, DirectReports {with_reports}",
+        if sizes.is_empty() { "—".to_string() } else { format!("{}–{} байт", sizes[0], sizes[sizes.len() - 1]) }
+    );
+    for s in &shapes {
+        println!("  форма {s}");
+    }
+    let target = photo_email.clone().unwrap_or_else(|| first.to_string());
+    println!("GET фото: адрес {}", if photo_email.is_some() { "с фото в ResolveNames" } else { "без фото (с фото не нашлось)" });
+    let nobody = format!("aiowa-no-such-person-probe@{domain}");
+    let probes: Vec<(&str, &str, Vec<(&str, &str)>)> = vec![
+        ("GetUserPhoto, HR48x48", "GetUserPhoto", vec![("email", target.as_str()), ("size", "HR48x48")]),
+        ("GetUserPhoto, HR96x96", "GetUserPhoto", vec![("email", target.as_str()), ("size", "HR96x96")]),
+        ("GetUserPhoto, HR240x240", "GetUserPhoto", vec![("email", target.as_str()), ("size", "HR240x240")]),
+        ("GetUserPhoto, UA=0, HR96x96", "GetUserPhoto", vec![("email", target.as_str()), ("UA", "0"), ("size", "HR96x96")]),
+        ("GetUserPhoto, без size", "GetUserPhoto", vec![("email", target.as_str())]),
+        ("GetPersonaPhoto, HR96x96", "GetPersonaPhoto", vec![("email", target.as_str()), ("UA", "0"), ("size", "HR96x96")]),
+        ("GetUserPhoto, нет такого адреса", "GetUserPhoto", vec![("email", nobody.as_str()), ("size", "HR96x96")]),
+    ];
+    for (label, op, params) in probes {
+        let started = std::time::Instant::now();
+        match t.service_get_probe(op, &params, 2 * 1024 * 1024).await {
+            Ok(r) => {
+                let redirect = r.location.as_deref().map(|l| {
+                    let l = l.to_ascii_lowercase();
+                    if l.contains("logon.aspx") {
+                        "на вход"
+                    } else if l.contains("errorfe") {
+                        "на страницу ошибки"
+                    } else {
+                        "другой"
+                    }
+                });
+                // Короткий текст отказа без адресов — в вывод (форма ошибки), иначе только длина.
+                let text = String::from_utf8_lossy(&r.bytes);
+                let excerpt = if protocol::image_kind(&r.bytes).is_none() && !r.bytes.is_empty() && r.bytes.len() <= 200 && !text.contains('@') {
+                    format!(", текст «{}»", text.trim())
+                } else {
+                    String::new()
+                };
+                println!(
+                    "GET {label}: {} мс, статус {}, тип {}, ETag {}, Cache-Control {}{}, тело {} байт, вид {}{excerpt}",
+                    started.elapsed().as_millis(),
+                    r.status,
+                    r.content_type.as_deref().unwrap_or("нет"),
+                    if r.etag { "есть" } else { "нет" },
+                    r.cache_control.as_deref().unwrap_or("нет"),
+                    redirect.map(|w| format!(", редирект {w}")).unwrap_or_default(),
+                    r.bytes.len(),
+                    protocol::image_kind(&r.bytes).unwrap_or(if r.bytes.is_empty() { "пусто" } else { "не картинка" })
+                );
+            }
+            Err(e) => println!("GET {label}: отказ {} за {} мс", transport_error_code(&e), started.elapsed().as_millis()),
+        }
+    }
+    Ok(())
+}
+
 /// Один `FindPeople` с `AdditionalProperties` `fields`: принят ли, какие ключи добавились к
 /// базовым `base_keys` и их форма (без значений).
 async fn probe_persona_fields(t: &OwaTransport, query: &str, base_keys: &std::collections::BTreeSet<String>, fields: &[&str], label: &str) -> bool {
@@ -2171,6 +2297,7 @@ struct DirectoryOpts<'a> {
     prefix3: bool,
     max: usize,
     probe_shapes: bool,
+    probe_photo: bool,
     dl_candidates: usize,
     dl_queries: &'a [String],
 }
@@ -2215,6 +2342,12 @@ async fn directory_flow(t: &OwaTransport, store: &Store, account: AccountId, opt
                 Ok(s) => println!("Переписка с этим адресом по локальной базе: писем от него {}, ему {}, последнее {}", s.messages_from, s.messages_to, if s.last_ms.is_some() { "есть" } else { "нет" }),
                 Err(e) => println!("Переписка по локальной базе: ошибка {e}"),
             }
+        }
+    }
+    if opts.probe_photo {
+        match found.iter().find(|p| p.kind == PersonKind::Mailbox).and_then(|p| p.email_key()) {
+            Some(email) => directory_probe_photo(t, store, account, &email).await?,
+            None => println!("Проба фото: в результатах нет записи ящика с SMTP-адресом, пропущено"),
         }
     }
     if let Some(target) = expand {
@@ -2862,7 +2995,7 @@ async fn real_main() -> Result<()> {
                 println!("{:>6}  {}  {}", r.weight, pad(r.name.as_deref().unwrap_or(""), 30), r.email);
             }
         }
-        Cmd::Directory { query, resolve, expand, prefix3, max, probe_shapes, dl_candidates, dl_query } => {
+        Cmd::Directory { query, resolve, expand, prefix3, max, probe_shapes, probe_photo, dl_candidates, dl_query } => {
             let store = Store::open(&db_path)?;
             let account = store.account(&cli.host, &cli.user)?;
             let query = match query.as_deref().map(str::trim).filter(|q| !q.is_empty()) {
@@ -2877,7 +3010,7 @@ async fn real_main() -> Result<()> {
                 }
             };
             let t = connect(&cli).await?;
-            let opts = DirectoryOpts { query: &query, resolve: *resolve, expand: expand.as_deref(), prefix3: *prefix3, max: *max, probe_shapes: *probe_shapes, dl_candidates: *dl_candidates, dl_queries: dl_query };
+            let opts = DirectoryOpts { query: &query, resolve: *resolve, expand: expand.as_deref(), prefix3: *prefix3, max: *max, probe_shapes: *probe_shapes, probe_photo: *probe_photo, dl_candidates: *dl_candidates, dl_queries: dl_query };
             let result = directory_flow(&t, &store, account, &opts).await;
             t.logoff().await.ok();
             result?;

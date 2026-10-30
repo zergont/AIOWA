@@ -1490,6 +1490,52 @@ pub fn parse_resolution(v: &Value) -> Option<DirectoryPerson> {
     })
 }
 
+/// Фото записи `ResolveNames` с `AllProperties`: `Contact.Photo` в base64 (пустая строка или
+/// мусор — `None`).
+pub fn resolution_photo(v: &Value) -> Option<Vec<u8>> {
+    let s = v.pointer("/Contact/Photo").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty())?;
+    BASE64_STANDARD.decode(s).ok().filter(|b| !b.is_empty())
+}
+
+/// Вид картинки по первым байтам: `jpeg`, `png`, `gif`, `bmp`, иначе `None`.
+pub fn image_kind(bytes: &[u8]) -> Option<&'static str> {
+    match bytes {
+        [0xFF, 0xD8, 0xFF, ..] => Some("jpeg"),
+        [0x89, b'P', b'N', b'G', ..] => Some("png"),
+        [b'G', b'I', b'F', b'8', ..] => Some("gif"),
+        [b'B', b'M', ..] => Some("bmp"),
+        _ => None,
+    }
+}
+
+/// Фото из разрешения `ResolveNames` с полными данными: `Contact.Photo` — base64 картинки
+/// (терпимо к пробелам и `data:`-префиксу); нет ключа, пусто или не декодируется — `None`.
+pub fn parse_resolution_photo(v: &Value) -> Option<Vec<u8>> {
+    let raw = v.get("Contact")?.get("Photo")?.as_str()?.trim();
+    let raw = raw.rsplit_once(',').map(|(_, b)| b).unwrap_or(raw);
+    let compact: String = raw.chars().filter(|c| !c.is_whitespace()).collect();
+    if compact.is_empty() {
+        return None;
+    }
+    BASE64_STANDARD.decode(compact.as_bytes()).ok().filter(|b| !b.is_empty())
+}
+
+/// Запись справочника и её фото из одного разрешения `ResolveNames`.
+pub type ResolvedWithPhoto = (DirectoryPerson, Option<Vec<u8>>);
+
+/// Как `parse_resolve_names`, но каждая запись — вместе с фото (`parse_resolution_photo`).
+pub fn parse_resolve_names_full(msg: &Value) -> std::result::Result<Vec<ResolvedWithPhoto>, (String, String)> {
+    if let Some((code, message)) = message_error(msg) {
+        match code.as_str() {
+            "ErrorNameResolutionNoResults" => return Ok(Vec::new()),
+            "ErrorNameResolutionMultipleResults" => {}
+            _ if resolutions_array(msg).is_some_and(|a| !a.is_empty()) && str_of(msg, "ResponseClass") == Some("Warning") => {}
+            _ => return Err((code, message)),
+        }
+    }
+    Ok(resolutions_array(msg).map(|a| a.iter().filter_map(|r| parse_resolution(r).map(|p| (p, parse_resolution_photo(r)))).collect()).unwrap_or_default())
+}
+
 /// Массив разрешений из сообщения `ResolveNames`: `ResolutionSet.Resolutions` (терпимо к
 /// `Resolution`, `Items` и к `ResolutionSet` массивом).
 pub fn resolutions_array(msg: &Value) -> Option<&Vec<Value>> {
@@ -2077,6 +2123,22 @@ mod tests {
         let sync = serde_json::to_string(&sync_folder_items_body(&FolderRef::Distinguished(DistinguishedFolder::Inbox), None, 10, true)).unwrap();
         assert!(sync.contains(r#"{"__type":"PropertyUri:#Exchange","FieldURI":"item:IconIndex"}"#), "{sync}");
         assert!(sync.contains(r#"{"__type":"ExtendedPropertyUri:#Exchange","PropertyTag":"0x1081","PropertyType":"Integer"},{"__type":"ExtendedPropertyUri:#Exchange","PropertyTag":"0x1082","PropertyType":"SystemTime"}]},"SyncFolderId""#), "{sync}");
+    }
+
+    #[test]
+    fn resolution_photo_is_decoded_from_base64() {
+        let jpeg = [0xFFu8, 0xD8, 0xFF, 0xE0, 0x00, 0x10, b'J', b'F'];
+        let b64 = BASE64_STANDARD.encode(jpeg);
+        let v: Value = serde_json::from_str(&format!(r#"{{"Mailbox":{{"Name":"Имя","EmailAddress":"a@x.ru","MailboxType":"Mailbox"}},"Contact":{{"DisplayName":"Имя","HasPicture":true,"Photo":" {b64} "}}}}"#)).unwrap();
+        assert_eq!(parse_resolution_photo(&v).as_deref(), Some(&jpeg[..]));
+        let v: Value = serde_json::from_str(r#"{"Mailbox":{"Name":"Имя","EmailAddress":"a@x.ru"},"Contact":{"DisplayName":"Имя","HasPicture":false}}"#).unwrap();
+        assert_eq!(parse_resolution_photo(&v), None);
+        let v: Value = serde_json::from_str(r#"{"Mailbox":{"Name":"Имя","EmailAddress":"a@x.ru"},"Contact":{"Photo":"не base64 !!!"}}"#).unwrap();
+        assert_eq!(parse_resolution_photo(&v), None);
+        let msg: Value = serde_json::from_str(&format!(r#"{{"ResponseClass":"Success","ResponseCode":"NoError","ResolutionSet":{{"Resolutions":[{{"Mailbox":{{"Name":"Имя","EmailAddress":"a@x.ru","MailboxType":"Mailbox"}},"Contact":{{"Photo":"{b64}"}}}},{{"Mailbox":{{"Name":"Без фото","EmailAddress":"b@x.ru","MailboxType":"Mailbox"}}}}]}}}}"#)).unwrap();
+        let full = parse_resolve_names_full(&msg).unwrap();
+        assert_eq!(full.len(), 2);
+        assert!(full[0].1.is_some() && full[1].1.is_none());
     }
 
     #[test]
