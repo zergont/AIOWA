@@ -19,9 +19,11 @@
     onsync: () => void;
     /** В композере несохранённое письмо: перезапуск после «Забыть учётную запись» его потеряет. */
     unsavedDraft?: boolean;
+    /** «Забыть учётную запись» подтверждено: окно стирает своё о ящике (недавние запросы поиска). */
+    onforget?: () => void;
     onclose: () => void;
   }
-  let { syncing, onsync, unsavedDraft = false, onclose }: Props = $props();
+  let { syncing, onsync, unsavedDraft = false, onforget, onclose }: Props = $props();
 
   type SectionId = "account" | "sync" | "reading" | "notify" | "signature" | "view" | "data" | "about";
   const SECTIONS: { id: SectionId; label: string }[] = [
@@ -233,6 +235,8 @@
     if (forgetBusy) return;
     forgetBusy = true;
     forgetError = null;
+    // До вызова: после успеха бэкенд сразу перезапускает приложение, ответа окно может не дождаться.
+    onforget?.();
     try {
       await api.settingsForgetAccount();
       // Дальше бэкенд перезапускает приложение в мастер подключения; окно остаётся занятым.

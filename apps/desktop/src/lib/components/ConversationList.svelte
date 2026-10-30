@@ -1,3 +1,16 @@
+<script module lang="ts">
+  import type { Conversation as Row } from "../api";
+
+  /**
+   * К беседе применимы почтовые действия (ответ, пересылка, «прочитано», флаг, перенос и архив):
+   * письмо или черновик; у заглушки беседы из поиска вида нет — это письмо. Контакт, встреча, задача
+   * и заметка в «Удалённых» только удаляются (п. 14 обкатки).
+   */
+  export function mailActionsApply(c: Row): boolean {
+    return c.kind == null || c.kind === "mail" || c.kind === "draft";
+  }
+</script>
+
 <script lang="ts">
   import { tick, untrack } from "svelte";
   import { SvelteSet } from "svelte/reactivity";
@@ -134,6 +147,11 @@
     return participantsLabel(c) || "(без отправителя)";
   }
 
+  /** Дата строки; 0 — у элементов беседы нет дат (контакты в «Удалённых»): пусто, не «1 января 1970». */
+  function rowDate(c: Conversation): string {
+    return c.last_received_ms != null && c.last_received_ms > 0 ? listDate(c.last_received_ms) : "";
+  }
+
   /** Значок вида для не почтовых элементов (контакт, встреча, задача, заметка). */
   function kindIcon(kind: ItemKind | null | undefined): string | null {
     switch (kind) {
@@ -247,19 +265,26 @@
    */
   const busy = new SvelteSet<number>();
 
-  const labels = $derived(conversationActionLabels(targets, inDeleted));
+  /** Выбранные беседы, к которым применимы почтовые действия: контакты, встречи и задачи только удаляются. */
+  const mailTargets = $derived(targets.filter(mailActionsApply));
+  const labels = $derived(conversationActionLabels(mailTargets, inDeleted));
 
   const menuItems = $derived.by((): MenuItem[] => {
     if (!menu) return [];
-    const l = conversationActionLabels(menu.targets, inDeleted);
-    const single = menu.targets.length === 1;
+    const mail = menu.targets.filter(mailActionsApply);
+    const l = conversationActionLabels(mail, inDeleted);
+    const single = menu.targets.length === 1 && mail.length === 1;
     return [
       ...(single ? COMPOSE_ACTIONS.map((a) => ({ id: a.kind, label: a.label, icon: a.icon })) : []),
-      { id: "read", label: l.read, icon: l.anyUnread ? ICON.read : ICON.unread, separator: single },
-      { id: "flag", label: l.flag, icon: ICON.flag },
-      { id: "move", label: l.move, icon: ICON.move },
-      { id: "archive", label: l.archive, icon: ICON.archive, disabled: inArchive },
-      { id: "delete", label: l.delete, icon: ICON.delete, danger: true, separator: true },
+      ...(mail.length
+        ? [
+            { id: "read", label: l.read, icon: l.anyUnread ? ICON.read : ICON.unread, separator: single },
+            { id: "flag", label: l.flag, icon: ICON.flag },
+            { id: "move", label: l.move, icon: ICON.move },
+            { id: "archive", label: l.archive, icon: ICON.archive, disabled: inArchive },
+          ]
+        : []),
+      { id: "delete", label: l.delete, icon: ICON.delete, danger: true, separator: mail.length > 0 },
     ];
   });
 
@@ -312,28 +337,30 @@
     menu = null;
     if (!m) return;
     const ts = m.targets;
-    const l = conversationActionLabels(ts, inDeleted);
+    // Почтовые действия — только над письмами и черновиками выбора; удаление — над всеми.
+    const mail = ts.filter(mailActionsApply);
+    const l = conversationActionLabels(mail, inDeleted);
     switch (id) {
       case "reply":
       case "reply_all":
       case "forward":
         focusBack(scroller);
-        if (ts.length === 1) oncompose(ts[0], id);
+        if (ts.length === 1 && mail.length === 1) oncompose(ts[0], id);
         break;
       case "read":
         focusBack(scroller);
-        void run(ts, { kind: "read", read: l.anyUnread }, m.anchor);
+        if (mail.length) void run(mail, { kind: "read", read: l.anyUnread }, m.anchor);
         break;
       case "flag":
         focusBack(scroller);
-        void run(ts, { kind: "flag", flagged: !l.anyFlagged }, m.anchor);
+        if (mail.length) void run(mail, { kind: "flag", flagged: !l.anyFlagged }, m.anchor);
         break;
       case "move":
-        picker = { targets: ts, anchor: m.anchor };
+        if (mail.length) picker = { targets: mail, anchor: m.anchor };
         break;
       case "archive":
         focusBack(scroller);
-        void run(ts, { kind: "archive" }, m.anchor);
+        if (mail.length) void run(mail, { kind: "archive" }, m.anchor);
         break;
       case "delete":
         requestDelete(ts, false, m.anchor);
@@ -385,7 +412,7 @@
     const btn = e.currentTarget as HTMLElement;
     focusBack(scroller);
     if (action.kind === "delete") requestDelete(targets, false, btn);
-    else void run(targets, action, btn);
+    else if (mailTargets.length) void run(mailTargets, action, btn);
   }
 
   /** «Снять выбор» с панели: фокус списку до коллапса — после него панель исчезает вместе с кнопкой. */
@@ -395,7 +422,7 @@
   }
 
   function bulkMove(e: MouseEvent) {
-    picker = picker ? null : { targets, anchor: e.currentTarget as HTMLElement };
+    picker = picker || !mailTargets.length ? null : { targets: mailTargets, anchor: e.currentTarget as HTMLElement };
   }
 
   // --- значки строки: флажок выбора слева, быстрые действия справа ------------------------------
@@ -439,6 +466,7 @@
     menu = null;
     picker = null;
     focusBack(scroller);
+    if (kind !== "delete" && !mailActionsApply(c)) return;
     switch (kind) {
       case "read":
         void run([c], { kind: "read", read: l.anyUnread }, btn);
@@ -494,9 +522,9 @@
     } else if (e.key === "Delete" && targets.length) {
       e.preventDefault();
       requestDelete(targets, e.shiftKey, selectedAnchor());
-    } else if (plain && !e.shiftKey && e.code === "KeyE" && targets.length && !inArchive) {
+    } else if (plain && !e.shiftKey && e.code === "KeyE" && mailTargets.length && !inArchive) {
       e.preventDefault();
-      void run(targets, { kind: "archive" }, selectedAnchor());
+      void run(mailTargets, { kind: "archive" }, selectedAnchor());
     } else if ((e.key === "ContextMenu" || (e.key === "F10" && e.shiftKey)) && selected && idx >= 0) {
       e.preventDefault();
       openMenu(selected, selectedAnchor());
@@ -521,9 +549,15 @@
 
   function onDragStart(e: DragEvent, c: Conversation) {
     if (!e.dataTransfer || folderPk == null) return;
-    // Тащат беседу вне выбора — выбор переходит к ней; выбранную — тащится весь выбор.
-    const pks = sel.has(c.conversation_pk) ? [...sel] : [c.conversation_pk];
+    // Тащат беседу вне выбора — выбор переходит к ней; выбранную — тащится весь выбор. Перенос — в
+    // почтовые папки: контакты, встречи и задачи из выбора не тащатся, только они — не тащится ничего.
+    const notMail = new Set(conversations.filter((x) => !mailActionsApply(x)).map((x) => x.conversation_pk));
+    const pks = (sel.has(c.conversation_pk) ? [...sel] : [c.conversation_pk]).filter((pk) => !notMail.has(pk));
     if (!sel.has(c.conversation_pk)) selectOne(c);
+    if (!pks.length) {
+      e.preventDefault();
+      return;
+    }
     const payload: DragPayload = { conversation_pks: pks, folder_pk: folderPk };
     e.dataTransfer.setData(DND_CONVERSATIONS, JSON.stringify(payload));
     e.dataTransfer.effectAllowed = "move";
@@ -541,16 +575,16 @@
   <div class="head bulk" role="toolbar" aria-label="Действия с выбранными беседами">
     <span class="bulk-title" aria-live="polite">Выбрано {sel.size.toLocaleString("ru-RU")}</span>
     <span class="bulk-actions">
-      <button class="act" onclick={(e) => bulk(e, { kind: "read", read: labels.anyUnread })} aria-label={labels.read} title={labels.read}>
+      <button class="act" onclick={(e) => bulk(e, { kind: "read", read: labels.anyUnread })} disabled={!mailTargets.length} aria-label={labels.read} title={labels.read}>
         <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path d={labels.anyUnread ? ICON.read : ICON.unread} fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round" /></svg>
       </button>
-      <button class="act" class:on={labels.anyFlagged} onclick={(e) => bulk(e, { kind: "flag", flagged: !labels.anyFlagged })} aria-label={labels.flag} title={labels.flag}>
+      <button class="act" class:on={labels.anyFlagged} onclick={(e) => bulk(e, { kind: "flag", flagged: !labels.anyFlagged })} disabled={!mailTargets.length} aria-label={labels.flag} title={labels.flag}>
         <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path d={ICON.flag} fill={labels.anyFlagged ? "currentColor" : "none"} stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round" /></svg>
       </button>
-      <button class="act" onclick={bulkMove} aria-label={labels.move} title={labels.move} aria-haspopup="dialog" aria-expanded={picker !== null}>
+      <button class="act" onclick={bulkMove} disabled={!mailTargets.length} aria-label={labels.move} title={labels.move} aria-haspopup="dialog" aria-expanded={picker !== null}>
         <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path d={ICON.move} fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round" /></svg>
       </button>
-      <button class="act" onclick={(e) => bulk(e, { kind: "archive" })} disabled={inArchive} aria-label={labels.archive} title={inArchive ? "Беседы уже в архиве" : hint(labels.archive, "archive")}>
+      <button class="act" onclick={(e) => bulk(e, { kind: "archive" })} disabled={inArchive || !mailTargets.length} aria-label={labels.archive} title={inArchive ? "Беседы уже в архиве" : hint(labels.archive, "archive")}>
         <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path d={ICON.archive} fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round" /></svg>
       </button>
       <button class="act danger" onclick={(e) => bulk(e, { kind: "delete", permanent: false })} aria-label={labels.delete} title={hint(labels.delete, "list-delete")}>
@@ -636,7 +670,7 @@
             {#if c.last_verb}
               <svg class="verb" width="13" height="13" viewBox="0 0 16 16" role="img" aria-label={lastVerbText(c.last_verb) ?? ""}><title>{lastVerbText(c.last_verb)}</title><path d={c.last_verb === LAST_VERB.forwarded ? ICON.forward : c.last_verb === LAST_VERB.repliedAll ? ICON.replyAll : ICON.reply} fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" /></svg>
             {/if}
-            <span class="date">{listDate(c.last_received_ms)}</span>
+            <span class="date">{rowDate(c)}</span>
           </div>
           <div class="line2">
             <span class="topic">{c.topic || "(без темы)"}</span>
@@ -651,15 +685,17 @@
             <span class="preview">{c.preview ?? ""}</span>
           </div>
           <span class="quick">
-            <button class="act" onclick={(e) => quick(e, c, "read")} ondblclick={(e) => e.stopPropagation()} disabled={rowBusy} aria-label={l.read} title={l.read} tabindex="-1">
-              <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path d={l.anyUnread ? ICON.read : ICON.unread} fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round" /></svg>
-            </button>
-            <button class="act" class:on={l.anyFlagged} onclick={(e) => quick(e, c, "flag")} ondblclick={(e) => e.stopPropagation()} disabled={rowBusy} aria-label={l.flag} title={l.flag} tabindex="-1">
-              <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path d={ICON.flag} fill={l.anyFlagged ? "currentColor" : "none"} stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round" /></svg>
-            </button>
-            <button class="act" onclick={(e) => quick(e, c, "archive")} ondblclick={(e) => e.stopPropagation()} disabled={rowBusy || inArchive} aria-label={l.archive} title={inArchive ? "Беседа уже в архиве" : hint(l.archive, "archive")} tabindex="-1">
-              <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path d={ICON.archive} fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round" /></svg>
-            </button>
+            {#if mailActionsApply(c)}
+              <button class="act" onclick={(e) => quick(e, c, "read")} ondblclick={(e) => e.stopPropagation()} disabled={rowBusy} aria-label={l.read} title={l.read} tabindex="-1">
+                <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path d={l.anyUnread ? ICON.read : ICON.unread} fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round" /></svg>
+              </button>
+              <button class="act" class:on={l.anyFlagged} onclick={(e) => quick(e, c, "flag")} ondblclick={(e) => e.stopPropagation()} disabled={rowBusy} aria-label={l.flag} title={l.flag} tabindex="-1">
+                <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path d={ICON.flag} fill={l.anyFlagged ? "currentColor" : "none"} stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round" /></svg>
+              </button>
+              <button class="act" onclick={(e) => quick(e, c, "archive")} ondblclick={(e) => e.stopPropagation()} disabled={rowBusy || inArchive} aria-label={l.archive} title={inArchive ? "Беседа уже в архиве" : hint(l.archive, "archive")} tabindex="-1">
+                <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path d={ICON.archive} fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round" /></svg>
+              </button>
+            {/if}
             <button class="act danger" onclick={(e) => quick(e, c, "delete")} ondblclick={(e) => e.stopPropagation()} disabled={rowBusy} aria-label={l.delete} title={deleteTitle} tabindex="-1">
               <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path d={ICON.delete} fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round" /></svg>
             </button>

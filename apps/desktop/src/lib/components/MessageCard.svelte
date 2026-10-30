@@ -71,6 +71,11 @@
     const kind = itemKindOf(message.item_class, false);
     return kind === "mail" ? null : (itemKindLabel(kind)?.toLowerCase() ?? null);
   });
+  /**
+   * Письмо (или черновик): к нему применимы ответ, пересылка, «прочитано», флаг, перенос и архив,
+   * автопометка и загрузка тела. Не почтовый элемент только печатается и удаляется.
+   */
+  const isMail = $derived(itemKindOf(message.item_class, false) === "mail");
 
   /** Черновик: по признаку письма или по папке — у него вместо панели действий «Открыть черновик». */
   const isDraft = $derived(message.is_draft || (draftsFolderPk != null && message.folder_pk === draftsFolderPk));
@@ -146,7 +151,7 @@
   }
 
   $effect(() => {
-    if (!expanded || !needsFetch) return;
+    if (!expanded || !needsFetch || !isMail) return;
     untrack(() => {
       if (autoFetched) return;
       autoFetched = true;
@@ -246,7 +251,7 @@
     lastRead = read;
     // Задержку читаем до выходов: смена настройки перезапускает отсчёт у открытых карточек.
     const delay = prefs.autoReadMs;
-    if (!delay || !expanded || !onScreen || read || autoMarked) return;
+    if (!delay || !expanded || !onScreen || read || autoMarked || !isMail) return;
     const t = setTimeout(() => {
       if (document.visibilityState !== "visible" || autoMarked || busy) return;
       void autoRead();
@@ -560,7 +565,7 @@
           <div class="line caption recipients">
             <span class="rcpt-body" class:wrap={recipientsOpen} title={!recipientsOpen && to.length ? peopleText(to) : undefined}>
               Кому:
-              {#if to.length}{@render people(recipientsOpen ? to : to.slice(0, SHOWN_NAMES))}{#if !recipientsOpen && to.length > SHOWN_NAMES}<button type="button" class="more" onclick={(e) => { e.stopPropagation(); toggleRecipients(); }}>и ещё {to.length - SHOWN_NAMES}</button>{/if}{:else if needsFetch}<span class="muted">загружаю получателей…</span>{:else}{message.display_to || "—"}{/if}
+              {#if to.length}{@render people(recipientsOpen ? to : to.slice(0, SHOWN_NAMES))}{#if !recipientsOpen && to.length > SHOWN_NAMES}<button type="button" class="more" onclick={(e) => { e.stopPropagation(); toggleRecipients(); }}>и ещё {to.length - SHOWN_NAMES}</button>{/if}{:else if needsFetch && isMail}<span class="muted">загружаю получателей…</span>{:else}{message.display_to || "—"}{/if}
             </span>
             {#if recipientsExpandable}
               <button type="button" class="chev" onclick={(e) => { e.stopPropagation(); toggleRecipients(); }} aria-expanded={recipientsOpen} aria-label={recipientsOpen ? "Свернуть получателей" : "Показать всех получателей"} title={recipientsOpen ? "Свернуть" : "Все получатели"}>
@@ -613,11 +618,13 @@
       </div>
     {:else if expanded}
       <div class="actions" role="toolbar" aria-label="Действия с письмом" aria-busy={busy}>
-        {#each COMPOSE_ACTIONS as a (a.kind)}
-          <button class="act" onclick={() => oncompose(a.kind)} aria-label={a.label} title="{a.label} ({a.keys})">
-            <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path d={a.icon} fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round" /></svg>
-          </button>
-        {/each}
+        {#if isMail}
+          {#each COMPOSE_ACTIONS as a (a.kind)}
+            <button class="act" onclick={() => oncompose(a.kind)} aria-label={a.label} title="{a.label} ({a.keys})">
+              <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path d={a.icon} fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round" /></svg>
+            </button>
+          {/each}
+        {/if}
         <button class="act" onclick={print} disabled={printing} aria-label="Печать" title={hint("Печать", "print")} aria-busy={printing}>
           {#if printing}
             <span class="spinner" aria-hidden="true"></span>
@@ -627,18 +634,20 @@
         </button>
         {@render darkToggle()}
         <span class="act-sep" aria-hidden="true"></span>
-        <button class="act" onclick={() => run({ kind: "read", read: !message.is_read })} disabled={busy} aria-label={message.is_read ? "Пометить непрочитанным" : "Пометить прочитанным"} title={message.is_read ? "Пометить непрочитанным" : "Пометить прочитанным"}>
-          <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path d={message.is_read ? ICON.unread : ICON.read} fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round" /></svg>
-        </button>
-        <button class="act" class:on={message.is_flagged} onclick={() => run({ kind: "flag", flagged: !message.is_flagged })} disabled={busy} aria-label={message.is_flagged ? "Снять флаг" : "Поставить флаг"} title={message.is_flagged ? "Снять флаг" : "Поставить флаг"} aria-pressed={message.is_flagged}>
-          <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path d={ICON.flag} fill={message.is_flagged ? "currentColor" : "none"} stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round" /></svg>
-        </button>
-        <button class="act" bind:this={moveBtn} onclick={() => (picker = !picker)} disabled={busy} aria-label="Переместить…" title="Переместить…" aria-haspopup="dialog" aria-expanded={picker}>
-          <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path d={ICON.move} fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round" /></svg>
-        </button>
-        <button class="act" bind:this={archiveBtn} onclick={() => run({ kind: "archive" }, archiveBtn)} disabled={busy || inArchive} aria-label="В архив" title={inArchive ? "Письмо уже в архиве" : "В архив"}>
-          <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path d={ICON.archive} fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round" /></svg>
-        </button>
+        {#if isMail}
+          <button class="act" onclick={() => run({ kind: "read", read: !message.is_read })} disabled={busy} aria-label={message.is_read ? "Пометить непрочитанным" : "Пометить прочитанным"} title={message.is_read ? "Пометить непрочитанным" : "Пометить прочитанным"}>
+            <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path d={message.is_read ? ICON.unread : ICON.read} fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round" /></svg>
+          </button>
+          <button class="act" class:on={message.is_flagged} onclick={() => run({ kind: "flag", flagged: !message.is_flagged })} disabled={busy} aria-label={message.is_flagged ? "Снять флаг" : "Поставить флаг"} title={message.is_flagged ? "Снять флаг" : "Поставить флаг"} aria-pressed={message.is_flagged}>
+            <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path d={ICON.flag} fill={message.is_flagged ? "currentColor" : "none"} stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round" /></svg>
+          </button>
+          <button class="act" bind:this={moveBtn} onclick={() => (picker = !picker)} disabled={busy} aria-label="Переместить…" title="Переместить…" aria-haspopup="dialog" aria-expanded={picker}>
+            <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path d={ICON.move} fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round" /></svg>
+          </button>
+          <button class="act" bind:this={archiveBtn} onclick={() => run({ kind: "archive" }, archiveBtn)} disabled={busy || inArchive} aria-label="В архив" title={inArchive ? "Письмо уже в архиве" : "В архив"}>
+            <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path d={ICON.archive} fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round" /></svg>
+          </button>
+        {/if}
         <button class="act danger" bind:this={deleteBtn} onclick={() => (confirmDelete ? cancelDelete() : requestDelete())} disabled={busy} aria-label={inDeleted ? "Удалить навсегда…" : "Удалить"} title={inDeleted ? "Удалить навсегда…" : "Удалить (в «Удалённые»)"} aria-haspopup={inDeleted ? "dialog" : undefined}>
           <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path d={ICON.delete} fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round" /></svg>
         </button>
@@ -784,7 +793,7 @@
         </div>
       {:else if message.body_state === 1}
         <div class="caption note">Письмо без текста.</div>
-      {:else if !fetching && !fetchError}
+      {:else if !fetching && !fetchError && isMail}
         <div class="note status">
           <span class="status-text caption">Текст письма ещё не загружен.</span>
           <button class="btn" onclick={fetchNow}>Загрузить</button>

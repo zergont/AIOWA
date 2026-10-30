@@ -302,7 +302,12 @@ pub struct ConversationRow {
     pub unread_count: i64,
     /// Писем во всей беседе (во всех папках).
     pub total_count: i64,
+    /// Время самого свежего элемента беседы в папке для показа; `None` — у элементов беседы нет ни
+    /// одной даты (контакты, заметки): не «1 января 1970».
     pub last_received_at: Option<Timestamp>,
+    /// То же время в мс, как в базе (0 — без даты): ключ порядка списка и курсор страниц
+    /// (`ConversationRow::cursor`). Беседы без даты стоят в конце папки и листаются, как остальные.
+    pub order_ms: i64,
     pub has_attachments: bool,
     /// Есть ли в беседе (во всех папках) письмо с флагом «к исполнению».
     pub has_flagged: bool,
@@ -1559,6 +1564,7 @@ impl Store {
             ))?;
             let mut rows: Vec<ConversationRow> = st
                 .query_map(params![folder_pk, account.0, limit as i64], |r| {
+                    let order_ms = r.get::<_, Option<i64>>(5)?.unwrap_or(0);
                     Ok(ConversationRow {
                         conversation_pk: r.get(0)?,
                         topic: r.get(1)?,
@@ -1567,7 +1573,8 @@ impl Store {
                         unread_count: r.get(3)?,
                         total_count: r.get(4)?,
                         // 0 — у элементов беседы нет ни одной даты (контакты, заметки): не «1 января 1970».
-                        last_received_at: ms_ts(r.get::<_, Option<i64>>(5)?).filter(|t| t.as_millisecond() > 0),
+                        last_received_at: ms_ts(Some(order_ms)).filter(|t| t.as_millisecond() > 0),
+                        order_ms,
                         has_attachments: r.get::<_, i64>(6)? != 0,
                         has_flagged: r.get::<_, i64>(7)? != 0,
                         preview: None,

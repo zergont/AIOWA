@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount, tick, untrack } from "svelte";
-  import { api, conversationKeyOf, conversationsText, errorMessage, messageNeedsFetch, messagesKey, newMailSender, onCalendarChanged, onCloseRequested, onFoldersChanged, onItemsChanged, onNewMail, onNotifyStatus, onReminder, onSyncProgress, onWriteFailed, type AccountInfo, type ComposeContext, type ComposeKind, type ComposeRecipient, type Conversation, type Folder, type ItemsChanged, type Message, type NewMail, type NotifyStatus, type ReminderDto, type SearchHit, type StageAction, type StagedDto, type SyncStatus, type WriteReport } from "./lib/api";
+  import { api, conversationKeyOf, conversationsText, errorMessage, itemKindOf, messageNeedsFetch, messagesKey, newMailSender, onCalendarChanged, onCloseRequested, onFoldersChanged, onItemsChanged, onNewMail, onNotifyStatus, onReminder, onSyncProgress, onWriteFailed, type AccountInfo, type ComposeContext, type ComposeKind, type ComposeRecipient, type Conversation, type Folder, type ItemsChanged, type Message, type NewMail, type NotifyStatus, type ReminderDto, type SearchHit, type StageAction, type StagedDto, type SyncStatus, type WriteReport } from "./lib/api";
   import { onSyncLive, type SyncLive } from "./lib/api";
   import { ICON, failureText, findArchiveFolder, type DragPayload, type ItemAction } from "./lib/actions";
   import { focusBack, type Anchor } from "./lib/popover";
@@ -12,7 +12,7 @@
   import ContactCard from "./lib/components/ContactCard.svelte";
   import ChoicePopover from "./lib/components/ChoicePopover.svelte";
   import FolderTree from "./lib/components/FolderTree.svelte";
-  import ConversationList from "./lib/components/ConversationList.svelte";
+  import ConversationList, { mailActionsApply } from "./lib/components/ConversationList.svelte";
   import ReadingPane from "./lib/components/ReadingPane.svelte";
   import SearchResults from "./lib/components/SearchResults.svelte";
   import SearchSuggest from "./lib/components/SearchSuggest.svelte";
@@ -374,6 +374,15 @@
     openCompose(kind, itemPk, selected?.conversation_pk ?? null);
   }
 
+  /**
+   * Верхнее развёрнутое письмо для Ctrl+R и Ctrl+Shift+F; null — его нет или это не письмо: на контакт,
+   * встречу, задачу и заметку не отвечают и их не пересылают (п. 14 обкатки).
+   */
+  function replyablePk(): number | null {
+    const m = topExpandedPk == null ? undefined : messages.find((x) => x.item_pk === topExpandedPk);
+    return m && itemKindOf(m.item_class, false) === "mail" ? m.item_pk : null;
+  }
+
   /** Ответ из меню списка: самое свежее письмо беседы в текущей папке. */
   async function composeFromConversation(c: Conversation, kind: ComposeKind) {
     if (!selectedFolder) return;
@@ -519,6 +528,7 @@
   async function loadMore() {
     if (!selectedFolder || loadingList || !hasMore) return;
     const last = conversations[conversations.length - 1];
+    // У строк списка курсор всегда число (у беседы без даты — 0); null бывает только у заглушки из поиска.
     if (!last || last.last_received_ms == null) {
       hasMore = false;
       return;
@@ -1088,8 +1098,7 @@
     query = "";
     searchHits = null;
     suggestOpen = false;
-    localPeople = [];
-    dirPeople = [];
+    resetSuggestions();
   }
 
   /** Поиск сразу, без паузы ввода: Enter, выбор подсказки, «Искать во всей почте». */
@@ -1119,33 +1128,62 @@
   // Под строкой поиска: раздел «От» — частые корреспонденты из базы (сразу, без сети), затем кэш
   // справочника и FindPeople с паузой; недавние запросы (localStorage); «Искать … во всей почте».
   // Выбор человека ставит «от:адрес» — точное условие по адресу, не поиск по словам.
+  // Недавние запросы — личные данные ящика (адреса, имена), а профиль WebView2 у всех учётных записей
+  // один: ключ свой у каждого ящика (сервер и имя), ключи других ящиков и общий ключ прежних версий
+  // при старте убираются, «Забыть учётную запись» стирает и свой.
 
+  /** Ключ недавних запросов без суффикса ящика — так их хранили прежние версии (общий на все ящики). */
   const RECENT_KEY = "aiowa.search.recent";
   const RECENT_MAX = 8;
   let suggestOpen = $state(false);
   let localPeople = $state<SuggestPerson[]>([]);
   let dirPeople = $state<SuggestPerson[]>([]);
   let suggestLoading = $state(false);
-  let recentQueries = $state<string[]>(loadRecentQueries());
+  let recentQueries = $state<string[]>([]);
+  /** Ключ недавних запросов открытого ящика; null — ящик ещё не известен или забыт: запросы только в памяти. */
+  let recentKey: string | null = null;
   let suggestSeq = 0;
   let suggestTimer: ReturnType<typeof setTimeout> | undefined;
   const suggestPeople = $derived(mergePeople(localPeople, dirPeople));
   const suggestVisible = $derived(suggestOpen && section === "mail" && (suggestPeople.length > 0 || suggestLoading || query.trim() !== "" || recentQueries.length > 0));
 
-  function loadRecentQueries(): string[] {
+  /** Недавние запросы ящика `a` (после account_info); чужие и общий ключ прежних версий убираются. */
+  function loadRecentQueries(a: AccountInfo) {
+    recentKey = `${RECENT_KEY}:${a.host.trim().toLowerCase()}|${a.user.trim().toLowerCase()}`;
+    dropRecentQueries(recentKey);
     try {
-      const v = JSON.parse(localStorage.getItem(RECENT_KEY) ?? "[]");
-      return Array.isArray(v) ? v.filter((x): x is string => typeof x === "string").slice(0, RECENT_MAX) : [];
+      const v = JSON.parse(localStorage.getItem(recentKey) ?? "[]");
+      recentQueries = Array.isArray(v) ? v.filter((x): x is string => typeof x === "string").slice(0, RECENT_MAX) : [];
     } catch {
-      return [];
+      recentQueries = [];
     }
+  }
+  /** Убрать из хранилища окна недавние запросы всех ящиков, кроме ключа `keep`. */
+  function dropRecentQueries(keep: string | null) {
+    try {
+      const keys: string[] = [];
+      for (let i = 0; i < localStorage.length; i++) {
+        const k = localStorage.key(i);
+        if (k !== null && k !== keep && (k === RECENT_KEY || k.startsWith(`${RECENT_KEY}:`))) keys.push(k);
+      }
+      for (const k of keys) localStorage.removeItem(k);
+    } catch {
+      // Хранилище окна недоступно: в нём и нечего убирать.
+    }
+  }
+  /** «Забыть учётную запись»: недавние запросы ящика стираются вместе с ней. */
+  function forgetRecentQueries() {
+    recentQueries = [];
+    recentKey = null;
+    dropRecentQueries(null);
   }
   function rememberQuery(q: string) {
     const t = q.trim();
     if (!t) return;
     recentQueries = [t, ...recentQueries.filter((x) => x !== t)].slice(0, RECENT_MAX);
+    if (!recentKey) return;
     try {
-      localStorage.setItem(RECENT_KEY, JSON.stringify(recentQueries));
+      localStorage.setItem(recentKey, JSON.stringify(recentQueries));
     } catch {
       // Хранилище окна недоступно: подсказки живут до перезапуска.
     }
@@ -1217,19 +1255,35 @@
   function searchAll() {
     finishPick();
   }
-  function finishPick() {
-    rememberQuery(query);
-    suggestOpen = false;
+  /**
+   * Убрать подсказки людей и погасить запросы, что ещё идут (FindPeople с паузой): их ответы после
+   * этого не применяются — иначе после Esc в пустом поле всплыли бы люди по стёртому тексту.
+   */
+  function resetSuggestions() {
     clearTimeout(suggestTimer);
     suggestSeq++;
     localPeople = [];
     dirPeople = [];
     suggestLoading = false;
+  }
+  function finishPick() {
+    rememberQuery(query);
+    suggestOpen = false;
+    resetSuggestions();
     runSearchNow();
   }
+  /**
+   * Карточка из подсказок: панель закрывается вместе с кнопкой, поэтому якорь — поле поиска (живой
+   * элемент): карточка встаёт под ним, а после закрытия фокус возвращается в поле.
+   */
   function suggestCard(p: SuggestPerson, anchor: HTMLElement) {
     suggestOpen = false;
-    openContactCard({ name: p.name, email: p.email }, anchor);
+    openContactCard({ name: p.name, email: p.email }, document.getElementById("search-input") ?? anchor);
+  }
+  /** Фокус в поле поиска: подсказки; карточка, открытая из них (её якорь — само поле), закрывается. */
+  function onSearchFocus(e: FocusEvent) {
+    suggestOpen = true;
+    if (contact && contact.anchor === e.currentTarget) closeContact(false);
   }
   function onSearchKey(e: KeyboardEvent) {
     if (e.key === "Enter") {
@@ -1716,16 +1770,21 @@
         if (topExpandedPk != null) void printMessageByPk(topExpandedPk);
         return;
       case "reply":
-      case "reply-all":
-        if (topExpandedPk != null) composeFromMessage(topExpandedPk, id === "reply" ? "reply" : "reply_all");
+      case "reply-all": {
+        const pk = replyablePk();
+        if (pk != null) composeFromMessage(pk, id === "reply" ? "reply" : "reply_all");
         return;
-      case "forward":
-        if (topExpandedPk != null) composeFromMessage(topExpandedPk, "forward");
+      }
+      case "forward": {
+        const pk = replyablePk();
+        if (pk != null) composeFromMessage(pk, "forward");
         return;
+      }
       case "archive": {
         // «В архив» для выбранных бесед; в списке клавишу обрабатывает он сам (и гасит событие).
+        // Контакты, встречи и задачи в почтовые папки не переносятся (п. 14 обкатки).
         if (e.defaultPrevented || searchHits !== null) return;
-        const targets = multiCount ? conversations.filter((c) => selectedPks.has(c.conversation_pk)) : selected ? [selected] : [];
+        const targets = (multiCount ? conversations.filter((c) => selectedPks.has(c.conversation_pk)) : selected ? [selected] : []).filter(mailActionsApply);
         if (targets.length && archiveFolder?.folder_pk !== selectedFolder?.folder_pk) {
           e.preventDefault();
           void onListAction(targets, { kind: "archive" }).catch((err) => (error = errorMessage(err)));
@@ -1806,6 +1865,7 @@
         unlistenWriteFailed = await onWriteFailed((ev) => (error = ev.message));
         unlistenClose = await onCloseRequested(onCloseRequest);
         account = await api.accountInfo();
+        loadRecentQueries(account);
         void loadDirectoryCaps();
         await loadFolders();
         void refreshLocalDrafts();
@@ -1889,7 +1949,7 @@
     </button>
     <div class="search" class:active={query.length > 0} class:off={section !== "mail"}>
       <svg class="search-icon" width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><circle cx="7" cy="7" r="4.5" fill="none" stroke="currentColor" stroke-width="1.4" /><path d="M10.5 10.5 14 14" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" /></svg>
-      <input id="search-input" type="search" placeholder="Поиск в почте: тема, текст, от:имя, вложение:" bind:value={query} oninput={onQueryInput} onkeydown={onSearchKey} onfocus={() => (suggestOpen = true)} onblur={() => (suggestOpen = false)} autocomplete="off" spellcheck="false" />
+      <input id="search-input" type="search" placeholder="Поиск в почте: тема, текст, от:имя, вложение:" bind:value={query} oninput={onQueryInput} onkeydown={onSearchKey} onfocus={onSearchFocus} onblur={() => (suggestOpen = false)} autocomplete="off" spellcheck="false" />
       <kbd class="search-kbd">{keysOf("search").replace("+", " ")}</kbd>
       {#if suggestVisible}
         <SearchSuggest {query} people={suggestPeople} recent={recentQueries} loading={suggestLoading} onfrom={pickFrom} onto={pickTo} oncard={suggestCard} onrecent={pickRecent} onall={searchAll} />
@@ -1945,7 +2005,7 @@
   </footer>
 
   {#if settingsOpen}
-    <Settings syncing={syncStatus?.running ?? false} onsync={() => void startSync()} unsavedDraft={closeGuard} onclose={closeSettings} />
+    <Settings syncing={syncStatus?.running ?? false} onsync={() => void startSync()} unsavedDraft={closeGuard} onforget={forgetRecentQueries} onclose={closeSettings} />
   {/if}
 
   {#if archivePrompt}

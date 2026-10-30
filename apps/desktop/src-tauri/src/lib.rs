@@ -177,7 +177,9 @@ struct ConversationDto {
     item_count: i64,
     unread_count: i64,
     total_count: i64,
-    last_received_ms: Option<i64>,
+    /// Время самого свежего элемента беседы в папке, мс, и курсор следующей страницы; 0 — у элементов
+    /// беседы нет дат (контакты, заметки): окно такую дату не показывает, но листает дальше по числу.
+    last_received_ms: i64,
     has_attachments: bool,
     /// В беседе (в любой папке) есть письмо с флагом «к исполнению».
     has_flagged: bool,
@@ -527,7 +529,7 @@ fn conversations(state: State<'_, AppState>, folder_pk: i64, after_ms: Option<i6
             item_count: r.item_count,
             unread_count: r.unread_count,
             total_count: r.total_count,
-            last_received_ms: ms(r.last_received_at),
+            last_received_ms: r.order_ms,
             has_attachments: r.has_attachments,
             has_flagged: r.has_flagged,
             preview: r.preview,

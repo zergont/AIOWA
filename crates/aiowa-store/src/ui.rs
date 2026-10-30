@@ -66,6 +66,13 @@ pub struct ConversationCursor {
     pub conversation_pk: i64,
 }
 
+impl ConversationRow {
+    /// Курсор страницы, следующей за этой строкой: по числу из базы, у беседы без даты — 0.
+    pub fn cursor(&self) -> ConversationCursor {
+        ConversationCursor { last_received_at: self.order_ms, conversation_pk: self.conversation_pk }
+    }
+}
+
 /// Ключ состояния письма в беседе: по нему окно решает, перечитывать ли беседу целиком
 /// после синхронизации. Дёшево: один запрос без тел, вложений и файлов.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -155,6 +162,7 @@ impl Store {
             ))?;
             let mut rows: Vec<ConversationRow> = st
                 .query_map(params![folder_pk, account.0, after.map(|a| a.last_received_at), after.map(|a| a.conversation_pk).unwrap_or(i64::MAX), limit as i64], |r| {
+                    let order_ms = r.get::<_, Option<i64>>(5)?.unwrap_or(0);
                     Ok(ConversationRow {
                         conversation_pk: r.get(0)?,
                         topic: r.get(1)?,
@@ -162,7 +170,10 @@ impl Store {
                         item_count: r.get(2)?,
                         unread_count: r.get(3)?,
                         total_count: r.get(4)?,
-                        last_received_at: ms_ts(r.get::<_, Option<i64>>(5)?).filter(|t| t.as_millisecond() > 0),
+                        // Нулевое время (у элементов беседы нет дат) прячется при показе, а курсор
+                        // страниц остаётся числом (`order_ms`): иначе листание встало бы на такой строке.
+                        last_received_at: ms_ts(Some(order_ms)).filter(|t| t.as_millisecond() > 0),
+                        order_ms,
                         has_attachments: r.get::<_, i64>(6)? != 0,
                         has_flagged: r.get::<_, i64>(7)? != 0,
                         preview: None,
@@ -357,6 +368,48 @@ mod tests {
         let b: i64 = s.debug_query("SELECT item_pk FROM items WHERE server_id = 'B'").unwrap()[1].parse().unwrap();
         s.mark_deleted_local(&[b]).unwrap();
         assert_eq!(s.conversations_page(acc, inbox, None, 10).unwrap()[0].preview.as_deref(), Some("Первое письмо"));
+    }
+
+    #[test]
+    fn undated_conversations_page_to_the_end_of_folder() {
+        let s = tmp_store("undated-paging");
+        let acc = s.account("h", "u").unwrap();
+        s.upsert_folders(acc, &[folder("Удалённые", Some("deleteditems"))]).unwrap();
+        let (deleted, _) = s.folder_by_distinguished(acc, "deleteditems").unwrap().unwrap();
+        // Удалённые контакты: ни времени получения, ни отправки — у беседы в папке время 0.
+        let undated = |id: &str| MessageMeta { item_class: Some("IPM.Contact".into()), received_at: None, ..meta(id, "2026-10-01T10:00:00Z", &format!("c-{id}"), None) };
+        s.apply_item_changes(
+            acc,
+            deleted,
+            &[
+                ItemChange::Create(meta("A", "2026-10-02T10:00:00Z", "c-A", None)),
+                ItemChange::Create(meta("B", "2026-10-01T10:00:00Z", "c-B", None)),
+                ItemChange::Create(undated("K1")),
+                ItemChange::Create(undated("K2")),
+                ItemChange::Create(undated("K3")),
+            ],
+        )
+        .unwrap();
+
+        // Страницы по две строки: вторая кончается на беседе без даты, а листание идёт дальше.
+        let mut seen: Vec<(i64, bool, i64)> = Vec::new();
+        let mut after = None;
+        loop {
+            let page = s.conversations_page(acc, deleted, after, 2).unwrap();
+            seen.extend(page.iter().map(|c| (c.conversation_pk, c.last_received_at.is_some(), c.order_ms)));
+            match page.last() {
+                Some(last) if page.len() == 2 => after = Some(last.cursor()),
+                _ => break,
+            }
+        }
+        assert_eq!(seen.len(), 5, "все беседы папки: {seen:?}");
+        let mut pks: Vec<i64> = seen.iter().map(|r| r.0).collect();
+        pks.sort_unstable();
+        pks.dedup();
+        assert_eq!(pks.len(), 5, "без повторов: {seen:?}");
+        assert!(seen[..2].iter().all(|&(_, dated, ms)| dated && ms > 0), "{seen:?}");
+        assert!(seen[2..].iter().all(|&(_, dated, ms)| !dated && ms == 0), "без даты — в конце, дата для показа пуста: {seen:?}");
+        assert!(s.list_conversations(acc, deleted, 10).unwrap()[4].last_received_at.is_none(), "и в выдаче без курсора");
     }
 
     #[test]
