@@ -77,6 +77,7 @@ mod mail_dark;
 mod navigation;
 mod notify;
 mod ondemand;
+mod people;
 mod preview;
 mod reminders;
 mod settings;
@@ -832,6 +833,9 @@ pub fn run() {
             directory::contact_card,
             directory::contact_photos,
             directory::contact_photo,
+            people::contacts_list,
+            people::contact_personal,
+            people::contacts_status,
             directory::directory_expand,
             directory::directory_capabilities,
             calendar::calendar_events,

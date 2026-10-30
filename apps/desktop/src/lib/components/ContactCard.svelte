@@ -1,8 +1,8 @@
 <script lang="ts">
   import { onDestroy, onMount, tick, untrack } from "svelte";
-  import { api, errorMessage, isDirectoryList, listDate, plural, type ComposeRecipient, type ContactCard, type DirectoryPerson } from "../api";
+  import { api, errorMessage, isDirectoryList, listDate, plural, type ComposeRecipient, type ContactCard, type DirectoryPerson, type PersonalContact } from "../api";
   import { ICON } from "../actions";
-  import { CONTACT_ICON, KIND_LABEL, copyText, directoryLine, emailKey, expandSupported, noteExpandError, rememberKinds, telHref, type ContactRef } from "../contact";
+  import { CONTACT_ICON, KIND_LABEL, copyText, directoryLine, emailKey, expandSupported, noteExpandError, phoneLabel, rememberKinds, telHref, type ContactRef } from "../contact";
   import { notePhoto } from "../photos.svelte";
   import Avatar from "./Avatar.svelte";
   import { anchorRect, dismissOn, placePopup } from "../popover";
@@ -40,6 +40,8 @@
   let trail = $state<ContactRef[]>([]);
 
   let card = $state<ContactCard | null>(null);
+  /** Этот адрес есть в личных контактах ящика (docs/obkatka.md п. 8): телефоны и заметки оттуда. */
+  let personal = $state<PersonalContact | null>(null);
   let loading = $state(false);
   /** Отказ самой команды (сведения не получены совсем); отказ сервера при кэше — в card.error. */
   let failure = $state<string | null>(null);
@@ -61,25 +63,38 @@
   const local = $derived(card?.local ?? null);
   const facts = $derived(
     [
-      { label: "Компания", value: person?.company?.trim() },
-      { label: "Офис", value: person?.office?.trim() },
+      { label: "Компания", value: person?.company?.trim() || personal?.item.company?.trim() },
+      { label: "Должность", value: person ? undefined : personal?.item.job_title?.trim() },
+      { label: "Офис", value: person?.office?.trim() || personal?.item.office?.trim() },
     ].filter((f): f is { label: string; value: string } => !!f.value),
   );
-  const phones = $derived(
-    [
-      { label: "Рабочий", value: person?.business_phone?.trim() },
-      { label: "Мобильный", value: person?.mobile_phone?.trim() },
-    ].filter((f): f is { label: string; value: string } => !!f.value),
-  );
+  // Телефоны справочника, затем личного контакта; одинаковые номера (по цифрам) — один раз.
+  const phones = $derived.by(() => {
+    const out: { label: string; value: string }[] = [];
+    const seen = new Set<string>();
+    const add = (label: string, value: string | null | undefined) => {
+      const v = (value ?? "").trim();
+      if (!v) return;
+      const k = v.replace(/\D/g, "") || v;
+      if (seen.has(k)) return;
+      seen.add(k);
+      out.push({ label, value: v });
+    };
+    add("Рабочий", person?.business_phone);
+    add("Мобильный", person?.mobile_phone);
+    for (const p of personal?.item.phones ?? []) add(phoneLabel(p.key), p.number);
+    return out;
+  });
 
   async function load(refresh: boolean) {
     const n = ++request;
     loading = true;
     failure = null;
     try {
-      const c = await api.contactCard(current.email, refresh);
+      const [c, mine] = await Promise.all([api.contactCard(current.email, refresh), api.contactPersonal(current.email).catch(() => null)]);
       if (n !== request) return;
       card = c;
+      personal = mine;
       if (c.person) rememberKinds([c.person]);
       // Фото (или его отсутствие) запоминается для заголовков писем и подсказок.
       if (!c.from_cache || c.photo_url) notePhoto(current.email, c.photo_url ?? null);
@@ -130,6 +145,7 @@
   function show(ref: ContactRef) {
     current = ref;
     card = null;
+    personal = null;
     members = null;
     membersError = null;
     status = null;
@@ -244,6 +260,7 @@
     <div class="who">
       <h2 class="name" id="{uid}-name">{name}</h2>
       {#if subtitle}<div class="sub" id="{uid}-sub">{subtitle}</div>{/if}
+      {#if personal}<span class="badge">В моих контактах</span>{/if}
       {#if kindLabel}<span class="badge">{kindLabel}</span>{/if}
     </div>
     <div class="head-actions">
@@ -270,7 +287,7 @@
         </button>
       </dd>
     </div>
-    {#each phones as p (p.label)}
+    {#each phones as p, i (`${p.label}:${i}`)}
       <div class="fact">
         <dt>{p.label}</dt>
         <dd><a class="link" href={telHref(p.value)} onclick={(e) => void call(e, p.value)} title="Позвонить">{p.value}</a></dd>
@@ -294,6 +311,10 @@
     {:else if !card.person}
       <div class="msg caption">В справочнике организации не найден</div>
     {/if}
+  {/if}
+
+  {#if personal?.item.notes}
+    <div class="section notes">{personal.item.notes}</div>
   {/if}
 
   {#if local}
@@ -391,6 +412,12 @@
     margin-top: 2px;
     color: var(--fg-2);
     overflow-wrap: anywhere;
+  }
+  .section.notes {
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    max-height: 120px;
+    overflow-y: auto;
   }
   .badge {
     display: inline-block;

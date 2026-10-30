@@ -461,6 +461,74 @@ export interface DirectorySearch {
   error?: string | null;
 }
 
+/** Адрес личного контакта: ключ словаря сервера (EmailAddress1…3), адрес и имя записи. */
+export interface ContactEmail {
+  key?: string | null;
+  email: string;
+  name?: string | null;
+}
+export interface ContactPhone {
+  key?: string | null;
+  number: string;
+}
+export interface ContactAddress {
+  key?: string | null;
+  street?: string | null;
+  city?: string | null;
+  state?: string | null;
+  country?: string | null;
+  postal_code?: string | null;
+}
+/** Личный контакт или группа, как их отдал сервер (aiowa_core::ContactItem); даты — RFC 3339. */
+export interface ContactItem {
+  item_id: { id: string; change_key?: string | null };
+  item_class?: string | null;
+  display_name?: string | null;
+  file_as?: string | null;
+  given_name?: string | null;
+  middle_name?: string | null;
+  surname?: string | null;
+  nickname?: string | null;
+  company?: string | null;
+  job_title?: string | null;
+  department?: string | null;
+  office?: string | null;
+  emails: ContactEmail[];
+  phones: ContactPhone[];
+  addresses: ContactAddress[];
+  im_addresses: string[];
+  birthday?: string | null;
+  notes?: string | null;
+  notes_is_html: boolean;
+  has_photo: boolean;
+  members: { name?: string | null; email?: string | null; routing_type?: string | null }[];
+  modified_at?: string | null;
+}
+/** Личный контакт из локальной базы (docs/obkatka.md п. 8): имя для списка, первый адрес и все поля. */
+export interface PersonalContact {
+  contact_pk: number;
+  folder_pk: number;
+  name: string;
+  email: string | null;
+  is_group: boolean;
+  birthday_ms?: number | null;
+  modified_ms?: number | null;
+  item: ContactItem;
+}
+export interface ContactFolder {
+  folder_pk: number;
+  name: string;
+  distinguished?: string | null;
+  contacts: number;
+  total_count: number;
+  last_synced_ms?: number | null;
+  sync_complete: boolean;
+}
+export interface ContactsStatus {
+  total: number;
+  folders: ContactFolder[];
+}
+
 /** Переписка с адресом по локальной базе: писем от него, писем ему и время последнего. */
 export interface ContactLocal {
   messages_from: number;
@@ -856,6 +924,12 @@ export const api = {
   contactPhoto: (email: string) => invoke<string | null>("contact_photo", { email }),
   /** Участники списка рассылки (ExpandDL на сервере). */
   directoryExpand: (email: string) => invoke<DirectoryPerson[]>("directory_expand", { email }),
+  /** Личные контакты из базы по словам запроса (пустой — все), группы после контактов. */
+  contactsList: (query = "", limit?: number) => invoke<PersonalContact[]>("contacts_list", { query, limit: limit ?? null }),
+  /** Личный контакт с таким адресом (для карточки); null — в своих контактах его нет. */
+  contactPersonal: (email: string) => invoke<PersonalContact | null>("contact_personal", { email }),
+  /** Сколько контактов в базе и какие папки контактов есть. */
+  contactsStatus: () => invoke<ContactsStatus>("contacts_status"),
   /** Что умеет справочник на этом сервере: раскрытие списков рассылки бывает не реализовано (§ 5l). */
   directoryCapabilities: () => invoke<{ can_expand: boolean }>("directory_capabilities"),
   ownAddresses: () => invoke<string[]>("own_addresses"),
@@ -981,6 +1055,11 @@ export function onNewMail(cb: (mail: NewMail) => void): Promise<UnlistenFn> {
 /** Подписка на изменения в календаре на сервере (без подробностей: окно перечитывает текущий период). */
 export function onCalendarChanged(cb: () => void): Promise<UnlistenFn> {
   return listen<void>("calendar-changed", () => cb());
+}
+
+/** Личные контакты изменились после синхронизации (сколько добавлено, изменено, ушло). */
+export function onContactsChanged(cb: (ev: { created: number; updated: number; deleted: number }) => void): Promise<UnlistenFn> {
+  return listen<{ created: number; updated: number; deleted: number }>("contacts-changed", (e) => cb(e.payload));
 }
 
 /** Подписка на изменение настроек (свежий снимок после settings_set). Возвращает функцию отписки. */

@@ -2209,7 +2209,9 @@ async fn directory_probe_photo(t: &OwaTransport, store: &Store, account: Account
     let target = photo_email.clone().unwrap_or_else(|| first.to_string());
     println!("GET фото: адрес {}", if photo_email.is_some() { "с фото в ResolveNames" } else { "без фото (с фото не нашлось)" });
     let nobody = format!("aiowa-no-such-person-probe@{domain}");
-    let probes: Vec<(&str, &str, Vec<(&str, &str)>)> = vec![
+    /// Проба: имя, запрос и пары «ключ ответа → что искать».
+    type Probe<'a> = (&'a str, &'a str, Vec<(&'a str, &'a str)>);
+    let probes: Vec<Probe> = vec![
         ("GetUserPhoto, HR48x48", "GetUserPhoto", vec![("email", target.as_str()), ("size", "HR48x48")]),
         ("GetUserPhoto, HR96x96", "GetUserPhoto", vec![("email", target.as_str()), ("size", "HR96x96")]),
         ("GetUserPhoto, HR240x240", "GetUserPhoto", vec![("email", target.as_str()), ("size", "HR240x240")]),

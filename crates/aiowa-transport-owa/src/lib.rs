@@ -10,7 +10,7 @@ pub mod notify;
 pub mod protocol;
 
 use aiowa_core::{
-    CalendarEvent, CalendarEventDetails, CalendarItemChanges, ComposeKind, DirectoryPerson, DraftContent, FolderChanges, FolderId, FolderRef, ItemChanges, ItemId, MeetingRequestInfo, MeetingResponse, MessageMeta,
+    CalendarEvent, CalendarEventDetails, CalendarItemChanges, ComposeKind, ContactChange, ContactChanges, ContactItem, DirectoryPerson, DraftContent, FolderChanges, FolderId, FolderRef, ItemChanges, ItemId, MeetingRequestInfo, MeetingResponse, MessageMeta,
     NewCalendarItem, OutgoingAttachment, OutgoingMessage, Signature, SyncState,
 };
 use aiowa_transport::{
@@ -1503,6 +1503,42 @@ impl OwaTransport {
     }
 }
 
+impl OwaTransport {
+    /// Контакты и группы по идентификаторам: `GetItem` формой `AllProperties` (§ 5q) пачками по 25.
+    /// Элемент, по которому сервер отказал (`ErrorItemNotFound` — удалён между вызовами) или не
+    /// вернул ответ, — `None` на своей позиции. В журнал — только имена ключей первой записи.
+    async fn get_contact_items(&self, ids: &[ItemId]) -> Result<Vec<Option<ContactItem>>> {
+        const BATCH: usize = 25;
+        let mut out = Vec::with_capacity(ids.len());
+        let mut logged = false;
+        for chunk in ids.chunks(BATCH) {
+            let started = Instant::now();
+            let v = self.call("GetItem", protocol::V_2017, protocol::get_contact_items_body(chunk)).await?;
+            let msgs = protocol::response_messages(&v);
+            let mut failed = 0usize;
+            for pos in 0..chunk.len() {
+                let msg = msgs.get(pos).copied();
+                if let Some(m) = msg
+                    && let Some((code, _)) = protocol::message_error(m)
+                {
+                    failed += 1;
+                    debug!(code, "GetItem контакта: отказ по элементу");
+                    out.push(None);
+                    continue;
+                }
+                let item = msg.and_then(|m| m.get("Items").and_then(Value::as_array)).and_then(|a| a.first());
+                if !logged && let Some(i) = item {
+                    debug!(form = %protocol::contact_items_keys([i]), "GetItem контакта: форма AllProperties");
+                    logged = true;
+                }
+                out.push(item.and_then(protocol::parse_contact_item));
+            }
+            debug!(requested = chunk.len(), got = msgs.len(), failed, ms = started.elapsed().as_millis() as u64, "GetItem контактов");
+        }
+        Ok(out)
+    }
+}
+
 #[async_trait]
 impl MailTransport for OwaTransport {
     async fn sync_folder_hierarchy(&self, state: Option<&SyncState>) -> Result<FolderChanges> {
@@ -1530,6 +1566,38 @@ impl MailTransport for OwaTransport {
         let msg = Self::first_message("SyncFolderItems", &v)?;
         let (state, changes, includes_last) = protocol::parse_item_changes(&msg, max);
         Ok(ItemChanges { state, changes, includes_last })
+    }
+
+    async fn sync_contact_items(&self, folder: &FolderRef, state: Option<&SyncState>, max_changes: u32) -> Result<ContactChanges> {
+        let max = max_changes.clamp(1, 512);
+        let started = Instant::now();
+        let v = self.call("SyncFolderItems", protocol::V_2013, protocol::sync_contact_items_body(folder, state, max)).await?;
+        let msg = Self::first_message("SyncFolderItems", &v)?;
+        let (state, mut changes, includes_last) = protocol::parse_contact_changes(&msg, max);
+        if !changes.is_empty() {
+            // Форма ответа — только имена ключей (§ 5q снята с живого сервера по этой записи).
+            debug!(form = %protocol::contact_form_keys(&msg), changes = changes.len(), includes_last, ms = started.elapsed().as_millis() as u64, "SyncFolderItems контактов: форма AllProperties (базовые поля)");
+        }
+        // Полные поля — `GetItem` по созданным и изменённым: отказ всего вызова — отказ страницы
+        // (состояние не продвигается, повтор в следующий прогон); отказ по одному элементу
+        // оставляет базовые поля из `SyncFolderItems`.
+        let ids: Vec<ItemId> = changes
+            .iter()
+            .filter_map(|c| match c {
+                ContactChange::Create(c) | ContactChange::Update(c) => Some(c.item_id.clone()),
+                ContactChange::Delete(_) => None,
+            })
+            .collect();
+        if !ids.is_empty() {
+            let mut full = self.get_contact_items(&ids).await?.into_iter();
+            for ch in &mut changes {
+                let (ContactChange::Create(c) | ContactChange::Update(c)) = ch else { continue };
+                if let Some(Some(f)) = full.next() {
+                    *c = f;
+                }
+            }
+        }
+        Ok(ContactChanges { state, changes, includes_last })
     }
 
     async fn find_recent_items(&self, folder: &FolderRef, max: u32) -> Result<Vec<MessageMeta>> {

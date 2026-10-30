@@ -7,7 +7,7 @@
   import { hint, keysOf, matchHotkey, preventBrowserKeys } from "./lib/hotkeys";
   import { printMessage } from "./lib/print";
   import { mergeRecipients, sameEmail } from "./lib/addresses";
-  import { contactCardOpener, directoryLine, loadDirectoryCaps, provideContactCard, type ContactRef } from "./lib/contact";
+  import { directoryLine, loadDirectoryCaps, provideContactCard, type ContactRef } from "./lib/contact";
   import type { DirectoryPerson, SuggestPerson } from "./lib/api";
   import ContactCard from "./lib/components/ContactCard.svelte";
   import ChoicePopover from "./lib/components/ChoicePopover.svelte";
@@ -23,6 +23,7 @@
   import ConfirmPopover from "./lib/components/ConfirmPopover.svelte";
   import CalendarView from "./lib/components/CalendarView.svelte";
   import MiniMonth from "./lib/components/MiniMonth.svelte";
+  import PeopleView from "./lib/components/PeopleView.svelte";
   import ReminderBanner from "./lib/components/ReminderBanner.svelte";
   import Settings from "./lib/components/Settings.svelte";
   import { addDays, sameDay, startOfDay, viewRange, type CalendarViewKind } from "./lib/calendar";
@@ -68,12 +69,15 @@
   // как были. Календарь создаётся при первом показе (на старте приложения запроса календаря нет);
   // якорный день и вид живут здесь, потому что их меняет и мини-календарь в колонке навигации.
 
-  type Section = "mail" | "calendar";
+  type Section = "mail" | "calendar" | "people";
   let section = $state<Section>("mail");
   /** Календарь уже показывали: дальше он только прячется. */
   let calendarMounted = $state(false);
+  /** Раздел «Люди» уже показывали (docs/obkatka.md п. 8): создаётся при первом показе, дальше прячется. */
+  let peopleMounted = $state(false);
   $effect(() => {
     if (section === "calendar") calendarMounted = true;
+    if (section === "people") peopleMounted = true;
   });
   /** Якорный день сетки календаря: меняют мини-календарь, стрелки и «Сегодня». */
   let calendarAnchor = $state(startOfDay(new Date()));
@@ -1222,7 +1226,7 @@
   }
   function suggestCard(p: SuggestPerson, anchor: HTMLElement) {
     suggestOpen = false;
-    contactCardOpener()?.({ name: p.name, email: p.email }, anchor);
+    openContactCard({ name: p.name, email: p.email }, anchor);
   }
   function onSearchKey(e: KeyboardEvent) {
     if (e.key === "Enter") {
@@ -1237,7 +1241,8 @@
 
   let contact = $state<{ who: ContactRef; anchor: HTMLElement; blocked: string | null } | null>(null);
 
-  provideContactCard((who, anchor) => {
+  provideContactCard(openContactCard);
+  function openContactCard(who: ContactRef, anchor: HTMLElement) {
     if (contact && contact.anchor === anchor && sameEmail(contact.who.email, who.email)) {
       closeContact();
       return;
@@ -1246,7 +1251,7 @@
     // а окно осталось бы открытым за кадром со своими клавишами (Ctrl+Enter — сохранить и разослать).
     const blocked = anchor.closest('[aria-modal="true"]') ? "Сначала закройте окно, из которого открыта карточка" : null;
     contact = { who, anchor, blocked };
-  });
+  }
 
   function closeContact(returnFocus = true) {
     const anchor = contact?.anchor;
@@ -1262,6 +1267,18 @@
   }
 
   /** «Найти письма» из карточки: поиск в почте по отправителю. */
+  /** Из раздела «Люди»: новое письмо адресатам (всей группе) — карточка контакта при этом не открыта. */
+  function composeToPerson(to: ComposeRecipient[]) {
+    openCompose("new", null, null, false, to);
+  }
+
+  /** Из раздела «Люди»: письма от адреса — поиск в почте. */
+  function searchPerson(email: string) {
+    section = "mail";
+    query = `от:${email}`;
+    finishPick();
+  }
+
   function searchContact(email: string) {
     if (contact?.blocked) return;
     closeContact();
@@ -1673,6 +1690,9 @@
       case "section-calendar":
         showCalendar();
         return;
+      case "section-people":
+        section = "people";
+        return;
       case "search":
         // Поле поиска спрятано в календаре: сначала показать почту, фокус — после обновления DOM.
         section = "mail";
@@ -1858,6 +1878,7 @@
     <div class="segmented sections" role="tablist" aria-label="Разделы">
       <button role="tab" aria-selected={section === "mail"} class:on={section === "mail"} onclick={() => (section = "mail")} title={hint("Почта", "section-mail")}>Почта</button>
       <button role="tab" aria-selected={section === "calendar"} class:on={section === "calendar"} onclick={showCalendar} title={hint("Календарь", "section-calendar")}>Календарь</button>
+      <button role="tab" aria-selected={section === "people"} class:on={section === "people"} onclick={() => (section = "people")} title={hint("Люди", "section-people")}>Люди</button>
     </div>
     <button class="new-mail" onclick={() => openCompose("new", null, null)} title={hint("Новое письмо", "new-mail")}>
       <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path d={ICON.compose} fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" /></svg>
@@ -1881,7 +1902,7 @@
     </div>
   </header>
 
-  <nav class="nav" aria-label={section === "mail" ? "Папки" : "Мини-календарь"}>
+  <nav class="nav" aria-label={section === "mail" ? "Папки" : section === "calendar" ? "Мини-календарь" : "Люди"}>
     <div class="folders" class:off={section !== "mail"}>
       <FolderTree {folders} selected={selectedFolder} onselect={openFolder} onsync={startFolderSync} syncing={syncStatus?.running ?? false} oncreate={createFolder} onrename={renameFolder} ondelete={deleteFolder} ondrop={dropConversations} />
     </div>
@@ -1907,6 +1928,12 @@
   {#if calendarMounted}
     <section class="calendar" class:off={section !== "calendar"} aria-label="Календарь">
       <CalendarView bind:this={calendarView} bind:anchor={calendarAnchor} bind:kind={calendarKind} visible={section === "calendar"} bind:selectedPk={calendarSelectedPk} bind:eventDays={calendarEventDays} />
+    </section>
+  {/if}
+
+  {#if peopleMounted}
+    <section class="calendar people-section" class:off={section !== "people"} aria-label="Люди">
+      <PeopleView visible={section === "people"} oncompose={composeToPerson} onsearch={searchPerson} />
     </section>
   {/if}
 

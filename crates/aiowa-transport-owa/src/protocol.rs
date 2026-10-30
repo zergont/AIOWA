@@ -5,7 +5,8 @@
 use aiowa_core::{
     response_from_item_class, AttachmentMeta, Attendee, BodyType, CalendarEvent, CalendarEventDetails, CalendarItemChanges, CalendarItemType, ComposeKind, ConversationId, DistinguishedFolder,
     DirectoryPerson, DraftContent, FlagStatus, Folder, FolderChange, FolderId, FolderRef, FreeBusy, Importance, ItemChange, ItemId, MeetingMessageKind, MeetingRequestInfo, MeetingResponse, MessageBody, MessageFull,
-    MessageMeta, NewCalendarItem, OutgoingAttachment, OutgoingMessage, Participant, PersonKind, ResponseType, Signature, SyncState, LastVerb};
+    MessageMeta, NewCalendarItem, OutgoingAttachment, OutgoingMessage, Participant, PersonKind, ResponseType, Signature, SyncState, LastVerb,
+    ContactAddress, ContactChange, ContactEmail, ContactItem, ContactPhone};
 use aiowa_transport::WriteResult;
 use base64::prelude::*;
 use jiff::Timestamp;
@@ -147,6 +148,25 @@ pub fn sync_folder_items_body(folder: &FolderRef, state: Option<&SyncState>, max
     body
 }
 
+/// `SyncFolderItems` по папке контактов (§ 5q): форма `AllProperties` — у контактов нет именованной
+/// формы списка. Снято с сервера 30.10.2026: в этой операции полная форма отдаёт только базовые
+/// поля элемента (`ItemId`, `ItemClass`, `LastModifiedTime`, `Subject`…) и из контактных —
+/// `DisplayName`, `FileAs`, `ContactSource`; адреса, телефоны, компания, заметки и участники группы
+/// приходят отдельным `GetItem` с той же формой (`get_contact_items_body`).
+pub fn sync_contact_items_body(folder: &FolderRef, state: Option<&SyncState>, max_changes: u32) -> Value {
+    let mut body = json!({
+        "__type": "SyncFolderItemsRequest:#Exchange",
+        "ItemShape": { "__type": "ItemResponseShape:#Exchange", "BaseShape": "AllProperties", "BodyType": "Text" },
+        "SyncFolderId": target_folder_json(folder),
+        "MaxChangesReturned": max_changes,
+        "SyncScope": "NormalItems",
+    });
+    if let Some(s) = state {
+        body["SyncState"] = json!(s.0);
+    }
+    body
+}
+
 /// Свойство, по которому сортируется выборка последних писем папки.
 pub const RECENT_SORT_FIELD: &str = "item:DateTimeReceived";
 
@@ -207,6 +227,18 @@ pub fn get_item_ids_body(ids: &[ItemId]) -> Value {
     json!({
         "__type": "GetItemRequest:#Exchange",
         "ItemShape": { "__type": "ItemResponseShape:#Exchange", "BaseShape": "IdOnly" },
+        "ItemIds": ids.iter().map(|id| json!({ "__type": "ItemId:#Exchange", "Id": id.id })).collect::<Vec<_>>(),
+        "ShapeName": null,
+    })
+}
+
+/// `GetItem` контактов по идентификаторам (§ 5q): форма `AllProperties` с телом текстом — так
+/// приходят адреса, телефоны, компания, заметки и участники группы, которых `SyncFolderItems` с
+/// той же формой не отдаёт. Ключ изменений не нужен: читается текущая версия.
+pub fn get_contact_items_body(ids: &[ItemId]) -> Value {
+    json!({
+        "__type": "GetItemRequest:#Exchange",
+        "ItemShape": { "__type": "ItemResponseShape:#Exchange", "BaseShape": "AllProperties", "BodyType": "Text" },
         "ItemIds": ids.iter().map(|id| json!({ "__type": "ItemId:#Exchange", "Id": id.id })).collect::<Vec<_>>(),
         "ShapeName": null,
     })
@@ -1806,6 +1838,150 @@ pub fn parse_item_changes(msg: &Value, requested: u32) -> (SyncState, Vec<ItemCh
     (state, out, includes_last)
 }
 
+/// Записи словаря EWS (`EmailAddresses`, `PhoneNumbers`, `PhysicalAddresses`, `ImAddresses`):
+/// массив записей с `Key` (форма OWA JSON) или объект «ключ → запись». Каждая запись — объект
+/// (строка оборачивается в `{"Value": …}`), ключ — `Key` записи или имя поля объекта.
+fn dict_entries(v: Option<&Value>) -> Vec<(Option<String>, Value)> {
+    fn wrap(e: &Value) -> Value {
+        match e {
+            Value::String(s) => json!({ "Value": s }),
+            other => other.clone(),
+        }
+    }
+    match v {
+        Some(Value::Array(a)) => a.iter().map(|e| (str_of(e, "Key").map(String::from), wrap(e))).collect(),
+        Some(single @ Value::Object(o)) if o.contains_key("Key") => vec![(str_of(single, "Key").map(String::from), single.clone())],
+        Some(Value::Object(o)) => o.iter().map(|(k, e)| (Some(k.clone()), wrap(e))).collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Контакт или группа из элемента с формой `AllProperties` (§ 5q): `SyncFolderItems` или `GetItem`
+/// по папке класса `IPF.Contact`. Терпим к форме: словари адресов, телефонов и почтовых адресов —
+/// массивы записей `{Key, …}` или объекты по ключам, участники группы — `Members[].Member.Mailbox`
+/// или `Members[].Mailbox`, тело — объект `{BodyType, Value}` или строка. Нет `ItemId` — `None`.
+pub fn parse_contact_item(v: &Value) -> Option<ContactItem> {
+    let item_id = v.get("ItemId").and_then(parse_item_id)?;
+    let mut c = ContactItem::new(item_id);
+    c.item_class = str_of(v, "ItemClass").map(String::from);
+    c.display_name = first_text(v, &["DisplayName"]);
+    c.file_as = first_text(v, &["FileAs"]);
+    c.given_name = first_text(v, &["GivenName"]);
+    c.middle_name = first_text(v, &["MiddleName"]);
+    c.surname = first_text(v, &["Surname"]);
+    c.nickname = first_text(v, &["Nickname"]);
+    c.company = first_text(v, &["CompanyName"]);
+    c.job_title = first_text(v, &["JobTitle"]);
+    c.department = first_text(v, &["Department"]);
+    c.office = first_text(v, &["OfficeLocation"]);
+    c.emails = dict_entries(v.get("EmailAddresses"))
+        .into_iter()
+        .filter_map(|(key, e)| {
+            let raw = e.get("EmailAddress").or_else(|| e.get("Value")).and_then(loose_text)?;
+            let email = smtp_like(&raw).unwrap_or(raw);
+            Some(ContactEmail { key, email, name: e.get("Name").and_then(loose_text) })
+        })
+        .collect();
+    c.phones = dict_entries(v.get("PhoneNumbers"))
+        .into_iter()
+        .filter_map(|(key, e)| {
+            let number = e.get("PhoneNumber").or_else(|| e.get("Number")).or_else(|| e.get("Value")).and_then(loose_text)?;
+            Some(ContactPhone { key, number })
+        })
+        .collect();
+    c.addresses = dict_entries(v.get("PhysicalAddresses"))
+        .into_iter()
+        .map(|(key, e)| ContactAddress {
+            key,
+            street: first_text(&e, &["Street"]),
+            city: first_text(&e, &["City"]),
+            state: first_text(&e, &["State"]),
+            country: first_text(&e, &["CountryOrRegion", "Country"]),
+            postal_code: first_text(&e, &["PostalCode"]),
+        })
+        .filter(|a| a.street.is_some() || a.city.is_some() || a.state.is_some() || a.country.is_some() || a.postal_code.is_some())
+        .collect();
+    c.im_addresses = dict_entries(v.get("ImAddresses")).into_iter().filter_map(|(_, e)| e.get("ImAddress").or_else(|| e.get("Value")).and_then(loose_text)).collect();
+    (c.notes, c.notes_is_html) = match v.get("Body") {
+        Some(b @ Value::Object(_)) => (b.get("Value").and_then(loose_text), str_of(b, "BodyType").is_some_and(|t| t.eq_ignore_ascii_case("HTML"))),
+        Some(b @ Value::String(_)) => (loose_text(b), false),
+        _ => (None, false),
+    };
+    c.birthday = parse_timestamp(str_of(v, "Birthday"));
+    c.has_photo = bool_of(v, "HasPicture");
+    c.members = v.get("Members").and_then(Value::as_array).map(|a| a.iter().filter_map(|e| parse_participant(e.get("Member").unwrap_or(e))).collect()).unwrap_or_default();
+    c.modified_at = parse_timestamp(str_of(v, "LastModifiedTime"));
+    Some(c)
+}
+
+/// Изменения папки контактов из ответа `SyncFolderItems` (§ 5q): как `parse_item_changes`, но
+/// элементы — контакты и группы (`parse_contact_item`); `ReadFlagChange` у контактов не бывает и
+/// пропускается.
+pub fn parse_contact_changes(msg: &Value, requested: u32) -> (SyncState, Vec<ContactChange>, bool) {
+    let state = SyncState(str_of(msg, "SyncState").unwrap_or("").to_string());
+    let raw = changes_array(msg);
+    let mut out = Vec::with_capacity(raw.len());
+    for ch in &raw {
+        let kind = str_of(ch, "ChangeType").unwrap_or("");
+        match kind {
+            "Create" | "Update" => {
+                if let Some(c) = ch.get("Item").and_then(parse_contact_item) {
+                    out.push(if kind == "Create" { ContactChange::Create(c) } else { ContactChange::Update(c) });
+                }
+            }
+            "Delete" => {
+                if let Some(id) = ch.get("ItemId").and_then(parse_item_id).or_else(|| ch.get("Item").and_then(|i| i.get("ItemId")).and_then(parse_item_id)) {
+                    out.push(ContactChange::Delete(id));
+                }
+            }
+            _ => {}
+        }
+    }
+    let includes_last = msg.get("IncludesLastItemInRange").and_then(Value::as_bool).unwrap_or(raw.len() < requested as usize);
+    (state, out, includes_last)
+}
+
+/// Имена ключей формы `AllProperties` контактов в ответе `SyncFolderItems` (`contact_items_keys` по
+/// элементам изменений `Create`/`Update`).
+pub fn contact_form_keys(msg: &Value) -> String {
+    let raw = changes_array(msg);
+    contact_items_keys(raw.iter().filter_map(|ch| ch.get("Item")))
+}
+
+/// Имена ключей элементов-контактов (`SyncFolderItems`, `GetItem`) — для журнала и документа
+/// (§ 5q): объединение ключей элементов и записей словарей адресов, телефонов, почтовых адресов,
+/// участников и тела. Только имена ключей, без значений.
+pub fn contact_items_keys<'a>(items: impl IntoIterator<Item = &'a Value>) -> String {
+    use std::collections::{BTreeMap, BTreeSet};
+    let mut item_keys = BTreeSet::new();
+    let mut nested: BTreeMap<&str, BTreeSet<String>> = BTreeMap::new();
+    for item in items {
+        let Some(item) = item.as_object() else { continue };
+        item_keys.extend(item.keys().cloned());
+        for dict in ["EmailAddresses", "PhoneNumbers", "PhysicalAddresses", "ImAddresses", "Members", "Body"] {
+            let entries: Vec<&Value> = match item.get(dict) {
+                Some(Value::Array(a)) => a.iter().collect(),
+                Some(o @ Value::Object(_)) => vec![o],
+                _ => continue,
+            };
+            let set = nested.entry(dict).or_default();
+            for e in entries {
+                if let Some(o) = e.as_object() {
+                    set.extend(o.keys().cloned());
+                    if let Some(inner) = o.get("Member").or_else(|| o.get("Mailbox")).and_then(Value::as_object) {
+                        set.extend(inner.keys().map(|k| format!("Mailbox.{k}")));
+                    }
+                }
+            }
+        }
+    }
+    let mut s = format!("Item{{{}}}", item_keys.into_iter().collect::<Vec<_>>().join(","));
+    for (k, set) in nested {
+        s.push_str(&format!(" {k}[{{{}}}]", set.into_iter().collect::<Vec<_>>().join(",")));
+    }
+    s
+}
+
 /// Выдача `FindItem` писем папки (§ 5m).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FoundItems {
@@ -2040,6 +2216,72 @@ mod tests {
         assert!(s.starts_with("{\"__type\":\"GetFolderJsonRequest:#Exchange\""), "{s}");
         let body = s.find("\"Body\":{").unwrap();
         assert!(s[body..].starts_with("\"Body\":{\"__type\":\"GetFolderRequest:#Exchange\""), "{s}");
+    }
+
+    #[test]
+    fn contacts_sync_body_and_changes() {
+        let folder = FolderRef::Id(FolderId { id: "F-C".into(), change_key: None });
+        let body = sync_contact_items_body(&folder, Some(&SyncState("st".into())), 100);
+        assert_eq!(body["__type"], "SyncFolderItemsRequest:#Exchange");
+        assert_eq!(body["ItemShape"], json!({ "__type": "ItemResponseShape:#Exchange", "BaseShape": "AllProperties", "BodyType": "Text" }), "полная форма без AdditionalProperties");
+        assert_eq!(body["SyncFolderId"], target_folder_json(&folder));
+        assert_eq!((body["MaxChangesReturned"].as_u64(), body["SyncScope"].as_str(), body["SyncState"].as_str()), (Some(100), Some("NormalItems"), Some("st")));
+        assert!(sync_contact_items_body(&folder, None, 10).get("SyncState").is_none());
+
+        let msg: Value = serde_json::from_str(r#"{"SyncState":"s2","IncludesLastItemInRange":true,"Changes":{"Changes":[
+          {"__type":"SyncFolderItemsCreateType:#Exchange","ChangeType":"Create","Item":{"__type":"Contact:#Exchange","ItemId":{"Id":"C1","ChangeKey":"ck1"},"ItemClass":"IPM.Contact","DisplayName":"Иван Петров","FileAs":"Петров, Иван","GivenName":"Иван","Surname":"Петров","CompanyName":"ООО Ромашка","JobTitle":"Инженер","EmailAddresses":[{"Key":"EmailAddress1","Name":"Иван Петров","RoutingType":"SMTP","MailboxType":"Contact","EmailAddress":"ivan@example.com"}],"PhoneNumbers":[{"Key":"MobilePhone","PhoneNumber":"+7 916 1234567"},{"Key":"BusinessPhone","PhoneNumber":""}],"PhysicalAddresses":[{"Key":"Business","Street":"Ленина, 1","City":"Москва","CountryOrRegion":"Россия","PostalCode":"101000"}],"ImAddresses":[{"Key":"ImAddress1","ImAddress":"sip:ivan@example.com"}],"Body":{"BodyType":"HTML","Value":"<p>Заметка</p>"},"Birthday":"1980-05-04T00:00:00Z","HasPicture":true,"LastModifiedTime":"2026-10-30T10:00:00Z"}},
+          {"__type":"SyncFolderItemsCreateOrUpdateType:#Exchange","ChangeType":"Update","Item":{"__type":"DistributionList:#Exchange","ItemId":{"Id":"G1","ChangeKey":"gk"},"ItemClass":"IPM.DistList","DisplayName":"Семья","Members":[{"__type":"Member:#Exchange","Key":"m1","Mailbox":{"Name":"Анна","EmailAddress":"anna@example.com","RoutingType":"SMTP"},"Status":"Normal"}]}},
+          {"__type":"SyncFolderItemsDeleteType:#Exchange","ChangeType":"Delete","ItemId":{"Id":"C0"}},
+          {"__type":"SyncFolderItemsReadFlagType:#Exchange","ChangeType":"ReadFlagChange","ItemId":{"Id":"C1"},"IsRead":true}
+        ]}}"#).unwrap();
+        let (state, changes, last) = parse_contact_changes(&msg, 100);
+        assert_eq!(state, SyncState("s2".into()));
+        assert!(last);
+        assert_eq!(changes.len(), 3, "ReadFlagChange у контактов пропускается");
+        let ContactChange::Create(c) = &changes[0] else { panic!("{:?}", changes[0]) };
+        assert_eq!(c.item_id.change_key.as_deref(), Some("ck1"));
+        assert_eq!(c.item_class.as_deref(), Some("IPM.Contact"));
+        assert_eq!(c.file_as.as_deref(), Some("Петров, Иван"));
+        assert_eq!(c.list_name().as_deref(), Some("Петров, Иван"));
+        assert_eq!(c.primary_email().as_deref(), Some("ivan@example.com"));
+        assert_eq!((c.emails[0].key.as_deref(), c.emails[0].name.as_deref()), (Some("EmailAddress1"), Some("Иван Петров")));
+        assert_eq!(c.phones.len(), 1, "пустой номер отброшен");
+        assert_eq!((c.phones[0].key.as_deref(), c.phones[0].number.as_str()), (Some("MobilePhone"), "+7 916 1234567"));
+        assert_eq!(c.addresses.len(), 1);
+        assert_eq!((c.addresses[0].key.as_deref(), c.addresses[0].city.as_deref(), c.addresses[0].country.as_deref()), (Some("Business"), Some("Москва"), Some("Россия")));
+        assert_eq!(c.im_addresses, vec!["sip:ivan@example.com".to_string()]);
+        assert_eq!((c.notes.as_deref(), c.notes_is_html), (Some("<p>Заметка</p>"), true));
+        assert!(c.has_photo && c.birthday.is_some() && c.modified_at.is_some());
+        assert!(!c.is_group());
+        let ContactChange::Update(g) = &changes[1] else { panic!("{:?}", changes[1]) };
+        assert!(g.is_group());
+        assert_eq!(g.members.len(), 1);
+        assert_eq!((g.members[0].name.as_deref(), g.members[0].email.as_deref()), (Some("Анна"), Some("anna@example.com")));
+        assert_eq!(changes[2], ContactChange::Delete(ItemId { id: "C0".into(), change_key: None }));
+
+        let keys = contact_form_keys(&msg);
+        assert!(keys.starts_with("Item{Birthday,Body,CompanyName,"), "{keys}");
+        assert!(keys.contains(" EmailAddresses[{EmailAddress,Key,MailboxType,Name,RoutingType}]"), "{keys}");
+        assert!(keys.contains(" Members[{Key,Mailbox,Mailbox.EmailAddress,Mailbox.Name,Mailbox.RoutingType,Status,__type}]"), "{keys}");
+        assert!(!keys.contains("ivan@") && !keys.contains("Петров"), "в форме только имена ключей");
+        let item = msg.pointer("/Changes/Changes/0/Item").unwrap();
+        let one = contact_items_keys([item]);
+        assert!(one.starts_with("Item{Birthday,Body,CompanyName,") && !one.contains("Members"), "ключи одного элемента, без участников группы: {one}");
+
+        let body = get_contact_items_body(&[ItemId { id: "C1".into(), change_key: Some("ck".into()) }, ItemId { id: "G1".into(), change_key: None }]);
+        assert_eq!(
+            serde_json::to_string(&body).unwrap(),
+            r#"{"__type":"GetItemRequest:#Exchange","ItemShape":{"__type":"ItemResponseShape:#Exchange","BaseShape":"AllProperties","BodyType":"Text"},"ItemIds":[{"__type":"ItemId:#Exchange","Id":"C1"},{"__type":"ItemId:#Exchange","Id":"G1"}],"ShapeName":null}"#
+        );
+
+        // Словари объектами «ключ → значение» и тело строкой — тоже разбираются.
+        let alt = json!({ "ItemId": { "Id": "C2" }, "GivenName": "Зоя", "EmailAddresses": { "EmailAddress1": "smtp:zoya@example.com" }, "PhoneNumbers": { "HomePhone": "123" }, "Body": "просто текст" });
+        let c = parse_contact_item(&alt).unwrap();
+        assert_eq!(c.list_name().as_deref(), Some("Зоя"));
+        assert_eq!((c.emails[0].key.as_deref(), c.emails[0].email.as_str()), (Some("EmailAddress1"), "zoya@example.com"));
+        assert_eq!((c.phones[0].key.as_deref(), c.phones[0].number.as_str()), (Some("HomePhone"), "123"));
+        assert_eq!((c.notes.as_deref(), c.notes_is_html), (Some("просто текст"), false));
+        assert!(parse_contact_item(&json!({ "DisplayName": "без идентификатора" })).is_none());
     }
 
     #[test]

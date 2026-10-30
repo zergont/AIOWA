@@ -910,6 +910,63 @@ base64 картинки (JPEG, у проверенного коллеги 1 621 
 значок — запасной путь без времени). Фейковый сервер тестов принимает `ExtendedPropertyUri`, но
 не отдаёт значений.
 
+## 5q. Личные контакты: `SyncFolderItems` и `GetItem` формой `AllProperties` (клиент, 30.10.2026)
+
+Личные контакты (docs/obkatka.md п. 8) читаются из папок класса ровно `IPF.Contact` (стандартная
+`contacts` и созданные пользователем; служебные `IPF.Contact.RecipientCache`, `IPF.Contact.MOC.*` —
+нет) теми же операциями, что почта, но формой `AllProperties`: именованной формы списка у
+контактов нет.
+
+Запрос `SyncFolderItems` (протокол `V2013`, `SyncState` — как у писем, § 5b'):
+
+```json
+{ "__type": "SyncFolderItemsRequest:#Exchange",
+  "ItemShape": { "__type": "ItemResponseShape:#Exchange", "BaseShape": "AllProperties", "BodyType": "Text" },
+  "SyncFolderId": { "__type": "FolderId:#Exchange", "Id": "…" },
+  "MaxChangesReturned": 100, "SyncScope": "NormalItems", "SyncState": "…" }
+```
+
+Снято 30.10.2026 с папки «Контакты» (одна запись — группа `IPM.DistList`): сервер принял форму, но
+в этой операции `AllProperties` отдаёт только базовые поля элемента и три контактных. Ключи
+элемента: `__type, ContactSource, ConversationId, Culture, DateTimeCreated, DateTimeReceived,
+DateTimeSent, DisplayCc, DisplayName, DisplayTo, EffectiveRights, FileAs, Flag, HasAttachments,
+Importance, InstanceKey, IsAssociated, IsDocumentCentricMessage, IsDocumentCentricNotification,
+IsDraft, IsFromMe, IsLocked, IsResend, IsSubmitted, IsUnmodified, ItemClass, ItemId,
+LastModifiedName, LastModifiedTime, ParentFolderId, ReminderIsSet, ReminderMinutesBeforeStart,
+Sensitivity, Size, Subject, SupportsSideConversation, WebClientReadFormQueryString`. Ни адресов,
+ни телефонов, ни участников группы. `ChangeType` (`Create`, `Update`, `Delete`) и
+`IncludesLastItemInRange` — как у писем; `ReadFlagChange` у контактов не бывает.
+
+Поэтому по созданным и изменённым клиент тут же читает `GetItem` (протокол `V2017`) той же
+формой, без ключа изменений, пачками по 25 (отказ всего вызова — страница не применяется и
+состояние не продвигается; отказ по одному элементу оставляет базовые поля):
+
+```json
+{ "__type": "GetItemRequest:#Exchange",
+  "ItemShape": { "__type": "ItemResponseShape:#Exchange", "BaseShape": "AllProperties", "BodyType": "Text" },
+  "ItemIds": [ { "__type": "ItemId:#Exchange", "Id": "…" } ], "ShapeName": null }
+```
+
+Снято по группе (126 мс): к ключам выше добавляются `Body: { "BodyType", "IsTruncated", "Value" }`,
+`DisplayBcc`, `EntityExtractionResult`, `Likes`, `LikesPreview` и `Members: [ { "Key", "Mailbox":
+{ "Name", "EmailAddress", "RoutingType", "MailboxType", "SipUri" }, "Status" } ]`; `__type`
+элемента — `DistributionList:#Exchange`. У контакта (`IPM.Contact`, `Contact:#Exchange`) по схеме
+EWS ожидаются `GivenName`, `Surname`, `MiddleName`, `Nickname`, `CompanyName`, `JobTitle`,
+`Department`, `OfficeLocation`, `Birthday`, `HasPicture` и словари `EmailAddresses: [ { "Key":
+"EmailAddress1", "Name", "RoutingType", "MailboxType", "EmailAddress" } ]`, `PhoneNumbers: [ {
+"Key": "MobilePhone", "PhoneNumber" } ]`, `PhysicalAddresses: [ { "Key": "Business", "Street",
+"City", "State", "CountryOrRegion", "PostalCode" } ]`, `ImAddresses: [ { "Key", "ImAddress" } ]` —
+в ящике автора контактов-людей на 30.10.2026 нет, эта форма не снята. Разбор
+(`protocol::parse_contact_item`) терпим: словари принимаются и массивами записей с `Key`, и
+объектами «ключ → значение», тело — объектом или строкой, участники — `Members[].Mailbox` или
+`Members[].Member.Mailbox`. Имена ключей ответа клиент пишет в журнал на уровне `debug`
+(`contact_items_keys`), значения — никогда. Фейковый сервер тестов контакты не моделирует
+(`SyncFolderItems` только с `IdOnly`); разбор покрыт тестами протокола и хранилища.
+
+Не снято: `CreateItem`/`UpdateItem`/`DeleteItem` контакта и группы (запись — после HAR автора,
+docs/patch2-people.md шаг 0), `FindPeople` по папке `contacts`, фото личного контакта
+(`GetUserPhoto` или вложение `ContactPicture.jpg`).
+
 ## 6. Что это значит для клиента
 
 1. Вход: POST формы, затем `sessiondata.ashx` даёт профиль, дерево папок и первую страницу входящих.

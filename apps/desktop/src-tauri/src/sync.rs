@@ -8,8 +8,8 @@
 //! После входа транспорт процесса сверяет ящик с базой (`mailbox::verify_login`): в базе записан
 //! GUID другого ящика — транспорт не выдаётся (`ConnectError::WrongMailbox`) до перезапуска.
 
-use aiowa_core::{AccountId, ItemId};
-use aiowa_store::Store;
+use aiowa_core::{AccountId, FolderId, FolderRef, ItemId};
+use aiowa_store::{ContactApplyStats, Store};
 use aiowa_sync::{Engine, FolderSelection, SyncEvent, SyncOptions, SyncReport, SyncStage};
 use aiowa_transport::{Credentials, MailTransport, TransportError, WriteResult};
 use aiowa_transport_owa::{OwaConfig, OwaTransport};
@@ -19,7 +19,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tauri::{AppHandle, Emitter, Manager};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
+
+/// Событие окну `contacts-changed`: сколько личных контактов добавилось, изменилось и ушло.
+#[derive(Debug, Clone, Serialize)]
+struct ContactsChanged {
+    created: usize,
+    updated: usize,
+    deleted: usize,
+}
 
 pub(crate) const KEYRING_SERVICE: &str = "AIOWA";
 /// Ключ в `sync_state` с временем последней успешной синхронизации из окна (мс UTC).
@@ -520,7 +528,7 @@ impl SyncState {
             let st = self.clone();
             Arc::new(move |e: &SyncEvent| st.on_event(&app, e))
         };
-        let engine = Engine::new(Arc::new(transport.clone()), self.store.clone(), self.account, cancel).on_progress(progress);
+        let engine = Engine::new(Arc::new(transport.clone()), self.store.clone(), self.account, cancel.clone()).on_progress(progress);
         let folders = match scope {
             Scope::AllMail => FolderSelection::AllMail,
             Scope::Folders(pks) => FolderSelection::Ids(pks),
@@ -549,7 +557,99 @@ impl SyncState {
         let report = engine.run(&opts).await.map_err(Self::failed)?;
         self.repair_change_keys(&transport).await;
         self.backfill_verbs(&transport, body_days).await;
+        self.sync_contacts(app, &transport, &cancel).await;
         Ok(report)
+    }
+
+    /// Личные контакты (docs/obkatka.md п. 8): после почты — `SyncFolderItems` формой
+    /// `AllProperties` по папкам класса ровно `IPF.Contact` (служебные `IPF.Contact.*` не
+    /// трогаются), состояние — в `folders.sync_state`, как у почты. Отказ сервера по папке не
+    /// прерывает прогон: папка ждёт следующего. Об изменениях окну сообщает событие
+    /// `contacts-changed`.
+    async fn sync_contacts(&self, app: &AppHandle, transport: &OwaTransport, cancel: &AtomicBool) {
+        const PAGE: u32 = 100;
+        const MAX_PAGES: u32 = 100;
+        let folders = match self.store.contact_folders(self.account) {
+            Ok(f) => f,
+            Err(e) => {
+                warn!(error = %e, "папки контактов не выбраны");
+                return;
+            }
+        };
+        if folders.is_empty() {
+            return;
+        }
+        let started = std::time::Instant::now();
+        let mut stats = ContactApplyStats::default();
+        let mut failed = 0usize;
+        for f in &folders {
+            if cancel.load(Ordering::Relaxed) {
+                return;
+            }
+            let folder = FolderRef::Id(FolderId { id: f.server_id.clone(), change_key: None });
+            let mut state = match self.store.folder_sync_state(f.folder_pk) {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!(folder_pk = f.folder_pk, error = %e, "состояние папки контактов не прочитано");
+                    failed += 1;
+                    continue;
+                }
+            };
+            let mut reset_once = false;
+            let mut pages = 0u32;
+            while pages < MAX_PAGES && !cancel.load(Ordering::Relaxed) {
+                let changes = match tokio::time::timeout(Duration::from_secs(60), transport.sync_contact_items(&folder, state.as_ref(), PAGE)).await {
+                    Ok(Ok(c)) => c,
+                    Ok(Err(e)) if e.invalidates_sync_state() && !reset_once => {
+                        warn!(folder_pk = f.folder_pk, "состояние папки контактов недействительно, синхронизация заново");
+                        reset_once = true;
+                        state = None;
+                        if let Err(e) = self.store.set_folder_sync_state(f.folder_pk, None, false) {
+                            warn!(folder_pk = f.folder_pk, error = %e, "состояние папки контактов не сброшено");
+                        }
+                        continue;
+                    }
+                    Ok(Err(e)) => {
+                        warn!(folder_pk = f.folder_pk, error = %e, pages, "контакты папки не синхронизированы");
+                        failed += 1;
+                        break;
+                    }
+                    Err(_) => {
+                        warn!(folder_pk = f.folder_pk, pages, "контакты папки не синхронизированы: сервер не ответил за 60 с");
+                        failed += 1;
+                        break;
+                    }
+                };
+                pages += 1;
+                let applied = match self.store.apply_contact_batch(self.account, f.folder_pk, &changes.changes, &changes.state, changes.includes_last) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        warn!(folder_pk = f.folder_pk, error = %e, "пачка контактов не записана");
+                        failed += 1;
+                        break;
+                    }
+                };
+                stats.created += applied.created;
+                stats.updated += applied.updated;
+                stats.deleted += applied.deleted;
+                let empty = changes.changes.is_empty();
+                state = Some(changes.state);
+                if changes.includes_last || empty {
+                    break;
+                }
+            }
+        }
+        let changed = stats.created + stats.updated + stats.deleted;
+        if changed > 0 || failed > 0 {
+            info!(folders = folders.len(), created = stats.created, updated = stats.updated, deleted = stats.deleted, failed, elapsed_ms = started.elapsed().as_millis() as u64, "личные контакты синхронизированы");
+        } else {
+            debug!(folders = folders.len(), elapsed_ms = started.elapsed().as_millis() as u64, "личные контакты: изменений нет");
+        }
+        if changed > 0
+            && let Err(e) = app.emit("contacts-changed", ContactsChanged { created: stats.created, updated: stats.updated, deleted: stats.deleted })
+        {
+            warn!(error = %e, "событие contacts-changed не отправлено");
+        }
     }
 
     /// Письма окна тел, скачанные до того, как клиент стал запрашивать последнее действие

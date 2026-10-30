@@ -16,10 +16,10 @@
  */
 
 /** Где действует клавиша: везде или в одном разделе окна. */
-export type HotkeyWhere = "everywhere" | "mail" | "calendar";
+export type HotkeyWhere = "everywhere" | "mail" | "calendar" | "people";
 
 /** Раздел окна на экране. */
-export type Section = "mail" | "calendar";
+export type Section = "mail" | "calendar" | "people";
 
 /** Как распознать нажатие. */
 interface KeyMatch {
@@ -97,6 +97,16 @@ const GLOBAL = [
     match: { code: "Digit2", ctrl: true, shift: true },
     prevent: "match",
     description: "Раздел «Календарь»",
+  },
+  {
+    id: "section-people",
+    keys: "Ctrl+Shift+3",
+    where: "everywhere",
+    inInput: true,
+    inEditor: true,
+    match: { code: "Digit3", ctrl: true, shift: true },
+    prevent: "match",
+    description: "Раздел «Люди»: личные контакты и справочник",
   },
   {
     id: "search",

@@ -84,10 +84,47 @@ export const CONTACT_ICON = {
 export const KIND_LABEL: Record<DirectoryKind, string | null> = {
   mailbox: null,
   list: "Список рассылки",
-  contact: "Личный контакт",
+  contact: "Внешний адрес",
   room: "Переговорная",
   other: null,
 };
+
+const PHONE_LABEL: Record<string, string> = {
+  businessphone: "Рабочий",
+  businessphone2: "Рабочий 2",
+  mobilephone: "Мобильный",
+  homephone: "Домашний",
+  homephone2: "Домашний 2",
+  businessfax: "Факс",
+  homefax: "Домашний факс",
+  otherfax: "Факс",
+  othertelephone: "Другой",
+  pager: "Пейджер",
+  assistantphone: "Помощник",
+  companymainphone: "Компания",
+  carphone: "Автомобильный",
+  callback: "Обратный",
+  isdn: "ISDN",
+  primaryphone: "Основной",
+  radiophone: "Радио",
+  telex: "Телекс",
+  ttytddphone: "TTY/TDD",
+};
+const EMAIL_LABEL: Record<string, string> = { emailaddress1: "Почта", emailaddress2: "Почта 2", emailaddress3: "Почта 3" };
+const ADDRESS_LABEL: Record<string, string> = { business: "Рабочий адрес", home: "Домашний адрес", other: "Другой адрес" };
+
+/** Подпись телефона личного контакта по ключу словаря сервера (`MobilePhone` → «Мобильный»). */
+export function phoneLabel(key: string | null | undefined): string {
+  return PHONE_LABEL[(key ?? "").toLowerCase()] ?? key ?? "Телефон";
+}
+/** Подпись адреса почты личного контакта (`EmailAddress2` → «Почта 2»). */
+export function emailLabel(key: string | null | undefined): string {
+  return EMAIL_LABEL[(key ?? "").toLowerCase()] ?? "Почта";
+}
+/** Подпись почтового адреса личного контакта (`Business` → «Рабочий адрес»). */
+export function addressLabel(key: string | null | undefined): string {
+  return ADDRESS_LABEL[(key ?? "").toLowerCase()] ?? key ?? "Адрес";
+}
 
 /** Инициалы для кружка: первые буквы двух слов имени, иначе две буквы адреса. */
 export function initials(name: string | null | undefined, email: string | null | undefined): string {

@@ -9,6 +9,7 @@
 //! Календарь кэшируется окнами (`calendar`): окно перечитывается с сервера целиком.
 
 pub mod calendar;
+pub mod contacts;
 pub mod directory;
 pub mod drafts;
 pub mod identity;
@@ -31,6 +32,7 @@ use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
 pub use calendar::{reminder_state_key, CachedTimeZone, CalendarRow, ReminderMark, ReminderRow, ReminderState, OWA_TIME_ZONE_KEY, OWA_TIME_ZONE_TTL_MS};
+pub use contacts::{ContactApplyStats, ContactFolderInfo, ContactRecipient, ContactRow};
 pub use directory::ContactLocalStats;
 pub use drafts::LocalDraft;
 pub use identity::{login_key, read_summary, DbAccount, DbSummary, MailboxIdentity};
@@ -88,6 +90,10 @@ struct CachedRecipient {
     /// Имя после `norm_lower` (нижний регистр, ё→е).
     name_norm: String,
 }
+
+/// Вес личного контакта в подсказках адресатов: выше любой частоты переписки (docs/obkatka.md
+/// п. 8 — личные контакты первыми).
+pub(crate) const CONTACT_WEIGHT: i64 = 1_000_000;
 
 /// Кэш подсказок перестраивается после записи не раньше, чем через столько времени после
 /// прошлой сборки (во время синхронизации записи идут каждые несколько секунд).
@@ -1692,7 +1698,7 @@ impl Store {
                 .collect::<std::result::Result<Vec<_>, _>>()?;
             Ok(rows)
         })?;
-        let rows: Vec<CachedRecipient> = rows
+        let history: Vec<CachedRecipient> = rows
             .into_iter()
             .map(|(email, named, weight)| {
                 let name = named.and_then(|n| n.split_once('|').map(|(_, name)| name.to_string())).filter(|n| !n.is_empty());
@@ -1700,7 +1706,20 @@ impl Store {
                 CachedRecipient { email_norm: email.clone(), name_norm, suggestion: RecipientSuggestion { name, email, weight } }
             })
             .collect();
-        debug!(addresses = rows.len(), ms = started.elapsed().as_millis(), "кэш подсказок получателей построен");
+        // Личные контакты (docs/obkatka.md п. 8) — первыми, по имени списка; адрес, который есть и
+        // в контактах, и в переписке, остаётся контактом (имя из контакта).
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut rows: Vec<CachedRecipient> = Vec::new();
+        for c in self.contact_recipients(account)? {
+            if !seen.insert(c.email.clone()) {
+                continue;
+            }
+            let name_norm = c.name.as_deref().map(text::norm_lower).unwrap_or_default();
+            rows.push(CachedRecipient { email_norm: c.email.clone(), name_norm, suggestion: RecipientSuggestion { name: c.name, email: c.email, weight: CONTACT_WEIGHT } });
+        }
+        let personal = rows.len();
+        rows.extend(history.into_iter().filter(|r| !seen.contains(&r.email_norm)));
+        debug!(addresses = rows.len(), personal, ms = started.elapsed().as_millis(), "кэш подсказок получателей построен");
         Ok(RecipientCache { account, built_at: Instant::now(), generation, rows })
     }
 

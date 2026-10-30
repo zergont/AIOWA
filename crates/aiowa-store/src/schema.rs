@@ -12,7 +12,7 @@ use rusqlite::types::ValueRef;
 use rusqlite::Connection;
 use tracing::info;
 
-pub const CURRENT_VERSION: i64 = 9;
+pub const CURRENT_VERSION: i64 = 10;
 
 /// Состояния текста вложения (`attachments.text_state`).
 pub const TEXT_PENDING: i64 = 0;
@@ -539,8 +539,51 @@ pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
         }
         info!("схема базы обновлена до версии 9: фото в кэше справочника");
     }
+    if version < 10 {
+        conn.execute_batch("BEGIN IMMEDIATE;")?;
+        let result = (|| -> rusqlite::Result<()> {
+            conn.execute_batch(V10_TABLES)?;
+            conn.pragma_update(None, "user_version", 10)?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => conn.execute_batch("COMMIT;")?,
+            Err(e) => {
+                let _ = conn.execute_batch("ROLLBACK;");
+                return Err(e);
+            }
+        }
+        info!("схема базы обновлена до версии 10: личные контакты");
+    }
     Ok(())
 }
+
+/// Версия 10: личные контакты ящика (docs/obkatka.md п. 8) — разобранный контакт как JSON и
+/// колонки для списка, поиска и подсказок адресатов. Состояние синхронизации папки контактов —
+/// в `folders.sync_state`.
+const V10_TABLES: &str = r#"
+CREATE TABLE IF NOT EXISTS contacts (
+  contact_pk   INTEGER PRIMARY KEY,
+  account_id   INTEGER NOT NULL REFERENCES accounts(account_id),
+  folder_pk    INTEGER NOT NULL REFERENCES folders(folder_pk),
+  server_id    TEXT NOT NULL,
+  change_key   TEXT,
+  item_class   TEXT,
+  is_group     INTEGER NOT NULL DEFAULT 0,
+  display_name TEXT,
+  email        TEXT,
+  company      TEXT,
+  job_title    TEXT,
+  sort_key     TEXT NOT NULL DEFAULT '',
+  search_text  TEXT NOT NULL DEFAULT '',
+  json         TEXT NOT NULL DEFAULT '{}',
+  modified_at  INTEGER,
+  updated_at   INTEGER NOT NULL,
+  UNIQUE(account_id, server_id)
+);
+CREATE INDEX IF NOT EXISTS contacts_folder ON contacts(folder_pk);
+CREATE INDEX IF NOT EXISTS contacts_email ON contacts(account_id, email);
+"#;
 
 /// Версия 8: снять «непрочитано» с контактов, встреч, задач и заметок, пересчитать беседы.
 const V8_NON_MAIL_READ: &str = r#"

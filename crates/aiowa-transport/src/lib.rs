@@ -4,7 +4,7 @@
 //! Уровень абстракции: операции схемы EWS, а не HTTP. Транспорт сам отвечает за
 //! сессию, повторный вход и ограничение параллелизма.
 
-use aiowa_core::{FolderChanges, FolderId, FolderRef, ItemChanges, ItemId, MessageFull, MessageMeta, Participant, SyncState};
+use aiowa_core::{ContactChanges, FolderChanges, FolderId, FolderRef, ItemChanges, ItemId, MessageFull, MessageMeta, Participant, SyncState};
 pub use aiowa_core::{
     Attendee, CalendarEvent, CalendarEventDetails, CalendarItemChanges, CalendarItemType, ComposeKind, DirectoryPerson, DraftContent, FreeBusy, MeetingMessageKind, MeetingRequestInfo, MeetingResponse,
     NewCalendarItem, OutgoingAttachment, OutgoingMessage, PersonKind, ResponseType, Signature,
@@ -343,6 +343,16 @@ pub trait MailTransport: Send + Sync {
     async fn find_recent_items(&self, folder: &FolderRef, max: u32) -> Result<Vec<MessageMeta>> {
         let _ = (folder, max);
         Err(TransportError::Protocol { op: "FindItem".into(), status: 0, raw: "транспорт не умеет выбирать последние письма папки".into() })
+    }
+
+    /// Изменения личных контактов папки класса `IPF.Contact` (`SyncFolderItems` с формой
+    /// `AllProperties`, docs/protocol-owa-json.md § 5q): контакты и группы со всеми полями, которые
+    /// отдал сервер; `state` = `None` — полная выгрузка. Почтовую синхронизацию
+    /// (`sync_folder_items`) не трогает. По умолчанию — отказ `Protocol` (транспорт без такой
+    /// операции): личных контактов тогда просто нет.
+    async fn sync_contact_items(&self, folder: &FolderRef, state: Option<&SyncState>, max_changes: u32) -> Result<ContactChanges> {
+        let _ = (folder, state, max_changes);
+        Err(TransportError::Protocol { op: "SyncFolderItems".into(), status: 0, raw: "транспорт не умеет синхронизировать контакты".into() })
     }
 
     /// Элементы по идентификаторам. Реализация сама режет на допустимые пачки.

@@ -1071,6 +1071,138 @@ pub struct ItemChanges {
     pub includes_last: bool,
 }
 
+/// Адрес личного контакта: ключ словаря сервера (`EmailAddress1`…`EmailAddress3`), сам адрес и
+/// имя, под которым он записан.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct ContactEmail {
+    pub key: Option<String>,
+    pub email: String,
+    pub name: Option<String>,
+}
+
+/// Телефон личного контакта: ключ словаря (`BusinessPhone`, `MobilePhone`, `HomePhone`…) и номер.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct ContactPhone {
+    pub key: Option<String>,
+    pub number: String,
+}
+
+/// Почтовый адрес личного контакта (`Business`, `Home`, `Other`): поля как у сервера.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct ContactAddress {
+    pub key: Option<String>,
+    pub street: Option<String>,
+    pub city: Option<String>,
+    pub state: Option<String>,
+    pub country: Option<String>,
+    pub postal_code: Option<String>,
+}
+
+/// Личный контакт ящика — элемент папки класса `IPF.Contact`: контакт (`IPM.Contact`) или группа
+/// (`IPM.DistList`), как его отдал `SyncFolderItems` с формой `AllProperties` (docs/obkatka.md
+/// п. 8). Пустые строки сведены к `None`, неизвестные поля отброшены. Персональные данные:
+/// в журналы не пишутся.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContactItem {
+    pub item_id: ItemId,
+    pub item_class: Option<String>,
+    pub display_name: Option<String>,
+    /// Имя для списка, как его хранит Outlook («Фамилия, Имя»).
+    pub file_as: Option<String>,
+    pub given_name: Option<String>,
+    pub middle_name: Option<String>,
+    pub surname: Option<String>,
+    pub nickname: Option<String>,
+    pub company: Option<String>,
+    pub job_title: Option<String>,
+    pub department: Option<String>,
+    pub office: Option<String>,
+    pub emails: Vec<ContactEmail>,
+    pub phones: Vec<ContactPhone>,
+    pub addresses: Vec<ContactAddress>,
+    pub im_addresses: Vec<String>,
+    pub birthday: Option<Timestamp>,
+    /// Заметки (тело элемента); при `notes_is_html` — разметка, которую хранилище сводит к тексту.
+    pub notes: Option<String>,
+    pub notes_is_html: bool,
+    /// У контакта есть фото (`HasPicture`); само фото не запрашивается.
+    pub has_photo: bool,
+    /// Участники группы (`IPM.DistList`); у контакта пусто.
+    pub members: Vec<Participant>,
+    pub modified_at: Option<Timestamp>,
+}
+
+impl ContactItem {
+    /// Пустой контакт с идентификатором: остальное заполняет разбор.
+    pub fn new(item_id: ItemId) -> Self {
+        Self {
+            item_id,
+            item_class: None,
+            display_name: None,
+            file_as: None,
+            given_name: None,
+            middle_name: None,
+            surname: None,
+            nickname: None,
+            company: None,
+            job_title: None,
+            department: None,
+            office: None,
+            emails: Vec::new(),
+            phones: Vec::new(),
+            addresses: Vec::new(),
+            im_addresses: Vec::new(),
+            birthday: None,
+            notes: None,
+            notes_is_html: false,
+            has_photo: false,
+            members: Vec::new(),
+            modified_at: None,
+        }
+    }
+
+    /// Группа (личный список рассылки, `IPM.DistList`), а не контакт.
+    pub fn is_group(&self) -> bool {
+        self.item_class.as_deref().is_some_and(|c| c.to_ascii_lowercase().starts_with("ipm.distlist")) || (!self.members.is_empty() && self.emails.is_empty())
+    }
+
+    /// Первый SMTP-адрес в нижнем регистре — ключ для подсказок адресатов и карточки.
+    pub fn primary_email(&self) -> Option<String> {
+        self.emails.iter().map(|e| e.email.trim()).find(|e| e.split_once('@').is_some_and(|(l, d)| !l.is_empty() && !d.is_empty())).map(str::to_lowercase)
+    }
+
+    /// Имя для списка: `FileAs`, иначе `DisplayName`, иначе имя и фамилия, иначе компания, иначе
+    /// первый адрес; у контакта без всего этого — `None`.
+    pub fn list_name(&self) -> Option<String> {
+        let clean = |s: &Option<String>| s.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(String::from);
+        clean(&self.file_as)
+            .or_else(|| clean(&self.display_name))
+            .or_else(|| {
+                let parts: Vec<&str> = [&self.given_name, &self.middle_name, &self.surname].into_iter().filter_map(|s| s.as_deref().map(str::trim)).filter(|s| !s.is_empty()).collect();
+                (!parts.is_empty()).then(|| parts.join(" "))
+            })
+            .or_else(|| clean(&self.company))
+            .or_else(|| self.emails.iter().map(|e| e.email.trim()).find(|e| !e.is_empty()).map(String::from))
+    }
+}
+
+/// Изменение личного контакта из `SyncFolderItems` по папке контактов.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ContactChange {
+    Create(ContactItem),
+    Update(ContactItem),
+    /// Удалён или перемещён из папки.
+    Delete(ItemId),
+}
+
+/// Результат одного вызова `SyncFolderItems` по папке контактов.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContactChanges {
+    pub state: SyncState,
+    pub changes: Vec<ContactChange>,
+    pub includes_last: bool,
+}
+
 /// Изменение папки из `SyncFolderHierarchy`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FolderChange {
