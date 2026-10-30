@@ -550,6 +550,11 @@ fn photo_key(email_key: &str) -> String {
     format!("\u{1}photo {email_key}")
 }
 
+/// Общий отказ при загрузке фото (нет связи, таймаут): останавливает на `FAILURE_TTL` только фото.
+/// Фото грузятся в фоне при раскрытии письма — их сбой не должен выключать поиск по справочнику и
+/// карточку контакта, как общий отказ `QueryCache::outage`.
+const PHOTO_OUTAGE_KEY: &str = "\u{1}photo *";
+
 // --- состояние -------------------------------------------------------------------------------
 
 /// Вход на сервер, начатый этим модулем: одна задача на всех, результат — в `SyncState`.
@@ -933,9 +938,13 @@ pub(crate) async fn contact_photo(email: String, state: State<'_, AppState>, syn
     }
     // Сервер недавно не ответил (общий отказ или по этому адресу) — без нового похода.
     let pkey = photo_key(&key);
-    let plan = lock(&dir.queries).plan(&pkey, Instant::now(), false);
-    if let Plan::Failed(why) = plan {
-        return Err(why);
+    {
+        let queries = lock(&dir.queries);
+        for k in [pkey.as_str(), PHOTO_OUTAGE_KEY] {
+            if let Plan::Failed(why) = queries.plan(k, Instant::now(), false) {
+                return Err(why);
+            }
+        }
     }
     let deadline = Instant::now() + SERVER_TIMEOUT;
     let fetched = match dir.transport(sync.inner(), deadline, SERVER_TIMEOUT).await {
@@ -957,7 +966,9 @@ pub(crate) async fn contact_photo(email: String, state: State<'_, AppState>, syn
         Err(f) => {
             let why = dir.fail(&sync, "photo", &f, describe_transport).await;
             warn!(why, "справочник: фото не получено");
-            lock(&dir.queries).record_failure(&pkey, Instant::now(), why.clone(), f.is_outage());
+            // Общий отказ — только для фото (`PHOTO_OUTAGE_KEY`), отказ по адресу — по этому адресу.
+            let k = if f.is_outage() { PHOTO_OUTAGE_KEY } else { pkey.as_str() };
+            lock(&dir.queries).record_failure(k, Instant::now(), why.clone(), false);
             Err(why)
         }
     }
@@ -1274,11 +1285,16 @@ mod tests {
         assert_eq!(c.plan(&a, s(5), false), Plan::Failed("Сервер отказал: X".into()));
         assert_eq!(c.plan(&b, s(5), false), Plan::Server);
         assert_eq!(c.plan(&a, t0 + FAILURE_TTL, false), Plan::Server, "потом — снова сервер");
-        // Нет связи: 30 с ни фото, ни карточка не идут на сервер и не ждут таймаут.
-        c.record_failure(&a, s(100), "Нет связи с сервером".into(), true);
-        assert_eq!(c.plan(&b, s(101), false), Plan::Failed("Нет связи с сервером".into()));
-        assert_eq!(c.plan(&card_key("b@x.ru"), s(101), false), Plan::Failed("Нет связи с сервером".into()));
-        assert_eq!(c.plan(&b, s(100) + FAILURE_TTL, false), Plan::Server);
+        // Нет связи при загрузке фото (так пишет `contact_photo`): 30 с фото не идут на сервер,
+        // а поиск и карточка — идут, фоновая загрузка их не выключает.
+        c.record_failure(PHOTO_OUTAGE_KEY, s(100), "Нет связи с сервером".into(), false);
+        assert_eq!(c.plan(PHOTO_OUTAGE_KEY, s(101), false), Plan::Failed("Нет связи с сервером".into()));
+        assert_eq!(c.plan(&card_key("b@x.ru"), s(101), false), Plan::Server);
+        assert_eq!(c.plan("иванов", s(101), true), Plan::Server);
+        assert_eq!(c.plan(PHOTO_OUTAGE_KEY, s(100) + FAILURE_TTL, false), Plan::Server);
+        // Общий отказ поиска или карточки останавливает и фото.
+        c.record_failure(&card_key("b@x.ru"), s(200), "Нет связи с сервером".into(), true);
+        assert_eq!(c.plan(&b, s(201), false), Plan::Failed("Нет связи с сервером".into()));
     }
 
     #[test]

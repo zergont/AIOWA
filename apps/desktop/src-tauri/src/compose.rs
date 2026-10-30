@@ -74,8 +74,9 @@ const SIGNATURE_AUTO_KEY: &str = "desktop.signature_auto";
 
 /// Текст для окна, когда черновик создан, а дальше не вышло.
 const DRAFT_KEPT: &str = "Письмо не отправлено, черновик сохранён на сервере в «Черновиках»";
-/// Цитату ответа или пересылки не собрать: оригинала нет ни в базе, ни на сервере.
-const ORIGINAL_GONE: &str = "Исходное письмо удалено или перенесено: цитату не собрать, черновик на сервере не обновлён — в «Черновиках» он остался с цитатой, но без последних правок";
+/// Цитату ответа или пересылки не собрать: оригинала нет ни в базе, ни на сервере. Окно предлагает
+/// продолжить без цитаты (`ComposeRequest::without_quote`).
+const ORIGINAL_GONE: &str = "Исходное письмо удалено или перенесено: цитату не собрать, черновик на сервере не обновлён. Текст остался в этом окне — письмо можно сохранить или отправить без цитаты";
 /// `UpdateItem` черновика, которого на сервере нет.
 const DRAFT_GONE: &str = "Черновика на сервере нет: он удалён или письмо уже ушло раньше. Проверьте «Отправленные», прежде чем отправлять заново";
 
@@ -89,26 +90,33 @@ pub(crate) struct ComposeFail {
     pub retry: bool,
     /// Причина — связь, а не отказ сервера или проверка в окне.
     pub network: bool,
+    /// Оригинала ответа или пересылки больше нет: окно предлагает продолжить без цитаты.
+    pub original_gone: bool,
 }
 
 impl ComposeFail {
     /// Отказ, который повтором не лечится: проверка запроса, база, удалённый оригинал.
     fn fixed(message: impl Into<String>) -> Self {
-        Self { message: message.into(), retry: false, network: false }
+        Self { message: message.into(), retry: false, network: false, original_gone: false }
     }
 
     fn retryable(message: impl Into<String>) -> Self {
-        Self { message: message.into(), retry: true, network: false }
+        Self { message: message.into(), retry: true, network: false, original_gone: false }
     }
 
     fn from_transport(e: &TransportError) -> Self {
         let network = e.is_network();
         let retry = network || e.is_retryable() || e.needs_reauth() || is_stale_object(e) || matches!(e, TransportError::Protocol { .. });
-        Self { message: describe_transport(e), retry, network }
+        Self { message: describe_transport(e), retry, network, original_gone: false }
+    }
+
+    /// Оригинала ответа или пересылки нет: цитату не собрать, повтор не поможет — только «без цитаты».
+    fn original_gone() -> Self {
+        Self { original_gone: true, ..Self::fixed(ORIGINAL_GONE) }
     }
 
     fn timed_out(limit: Duration) -> Self {
-        Self { message: timed_out(limit), retry: true, network: true }
+        Self { message: timed_out(limit), retry: true, network: true, original_gone: false }
     }
 
     /// Вход на сервер не удался: без пароля или с отклонённым паролем повтор не поможет.
@@ -313,6 +321,10 @@ pub(crate) struct ComposeRequest {
     /// Локальный черновик этого композера (`compose_local_save`): после отправки он не нужен.
     #[serde(default)]
     local_draft_id: Option<String>,
+    /// Автор решил продолжить без цитаты: оригинала больше нет (`ORIGINAL_GONE`), тело черновика
+    /// заменяется одним текстом из окна.
+    #[serde(default)]
+    without_quote: bool,
 }
 
 /// Локальный черновик композера для окна (`local_drafts` в базе): всё, что нужно, чтобы открыть
@@ -949,7 +961,7 @@ async fn server_files(sync: &SyncState, transport: &impl MailTransport, item: &I
 /// черновик не обновляется, иначе тело с цитатой сервера молча заменилось бы одним новым текстом.
 /// Текст при этом остаётся в окне и в локальном черновике.
 async fn append_quote(state: &AppState, sync: &SyncState, transport: &impl MailTransport, cs: &ComposeState, req: &ComposeRequest, msg: &mut OutgoingMessage) -> Result<(), ComposeFail> {
-    let (true, Some(pk)) = (req.kind.needs_reference(), req.reference_item_pk) else { return Ok(()) };
+    let (true, Some(pk), false) = (req.kind.needs_reference(), req.reference_item_pk, req.without_quote) else { return Ok(()) };
     let quote = original_quote(state, sync, transport, cs, pk).await?;
     msg.body_html.push_str(&quote);
     Ok(())
@@ -974,7 +986,7 @@ fn quote_reference(store: &Store, pk: i64) -> Result<ItemId, ComposeFail> {
         Some(r) => Ok(r.id),
         None => {
             warn!(reference_pk = pk, "исходное письмо удалено: цитату не собрать, черновик не обновляется");
-            Err(ComposeFail::fixed(ORIGINAL_GONE))
+            Err(ComposeFail::original_gone())
         }
     }
 }
@@ -986,7 +998,7 @@ fn quote_of(pk: i64, got: Option<ItemResult>) -> Result<String, ComposeFail> {
         Some(ItemResult::Ok(m)) => Ok(quote_from_full(&m)?),
         Some(ItemResult::Failed { code, .. }) if code == ITEM_NOT_FOUND => {
             warn!(reference_pk = pk, "исходного письма нет на сервере: цитату не собрать, черновик не обновляется");
-            Err(ComposeFail::fixed(ORIGINAL_GONE))
+            Err(ComposeFail::original_gone())
         }
         Some(ItemResult::Failed { code, .. }) => Err(ComposeFail::retryable(format!("Исходное письмо не прочитано с сервера ({code}) — цитату не собрать, черновик не обновлён"))),
         None => Err(ComposeFail::retryable("Сервер не вернул исходное письмо — цитату не собрать, черновик не обновлён")),
@@ -1763,6 +1775,7 @@ mod tests {
             draft_server_id: None,
             removed_attachment_ids: vec![],
             local_draft_id: None,
+            without_quote: false,
         };
         let msg = outgoing(&req, true).unwrap();
         assert_eq!(msg.subject, "Тема");
@@ -1956,9 +1969,19 @@ mod tests {
     }
 
     #[test]
+    fn original_gone_offers_to_continue_without_quote() {
+        let fail = ComposeFail::original_gone();
+        assert!(fail.original_gone && !fail.retry && !fail.network);
+        assert_eq!(serde_json::to_value(&fail).unwrap()["original_gone"], true, "окно видит признак и предлагает «без цитаты»");
+        assert!(!ComposeFail::fixed("x").original_gone && !ComposeFail::retryable("x").prefixed("y").original_gone);
+        assert!(request(r#"{"kind":"reply","reference_item_pk":5,"without_quote":true}"#).without_quote);
+        assert!(!request(r#"{"kind":"reply","reference_item_pk":5}"#).without_quote, "по умолчанию цитата обязательна");
+    }
+
+    #[test]
     fn quote_is_not_dropped_silently_when_the_original_is_gone() {
         let gone = quote_of(1, Some(ItemResult::Failed { id: ItemId { id: "O".into(), change_key: None }, code: ITEM_NOT_FOUND.into(), message: String::new() })).unwrap_err();
-        assert_eq!(gone, ComposeFail::fixed(ORIGINAL_GONE), "оригинала нет на сервере: черновик не обновляется, повтор не поможет");
+        assert_eq!(gone, ComposeFail::original_gone(), "оригинала нет на сервере: черновик не обновляется, повтор не поможет");
         assert!(gone.message.contains("цитату не собрать") && gone.message.contains("не обновлён"), "{gone:?}");
         let busy = quote_of(1, Some(ItemResult::Failed { id: ItemId { id: "O".into(), change_key: None }, code: "ErrorServerBusy".into(), message: String::new() })).unwrap_err();
         assert!(busy.retry && busy.message.contains("ErrorServerBusy"));
@@ -2204,8 +2227,8 @@ mod tests {
             assert_eq!(quote_reference(&store, pks[0]).unwrap().id, "M1");
             // Оригинал удалён в базе: черновик ответа не обновляется одним новым текстом без цитаты.
             store.mark_deleted_local(&[pks[0]]).unwrap();
-            assert_eq!(quote_reference(&store, pks[0]).unwrap_err(), ComposeFail::fixed(ORIGINAL_GONE));
-            assert_eq!(quote_reference(&store, 999_999).unwrap_err(), ComposeFail::fixed(ORIGINAL_GONE));
+            assert_eq!(quote_reference(&store, pks[0]).unwrap_err(), ComposeFail::original_gone());
+            assert_eq!(quote_reference(&store, 999_999).unwrap_err(), ComposeFail::original_gone());
             let _ = std::fs::remove_dir_all(&dir);
         }
 

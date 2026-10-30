@@ -558,9 +558,11 @@ impl SyncState {
         self.repair_change_keys(&transport, &cancel).await;
         self.backfill_verbs(&transport, body_days, &cancel).await;
         self.sync_contacts(app, &transport, &cancel).await;
-        // Остановка на дозапросах или контактах — тоже остановка, а не удачный прогон.
+        // Остановка на дозапросах или контактах прерывает только их: почта к этому моменту уже
+        // синхронизирована, и отчёт прогона — удачный (счётчик непрочитанных, запуск канала
+        // уведомлений); недоделанное продолжит следующий прогон.
         if cancel.load(Ordering::Relaxed) {
-            return Err(Outcome::Cancelled);
+            info!("синхронизация: остановлена на дозапросах или контактах, почта готова");
         }
         Ok(report)
     }

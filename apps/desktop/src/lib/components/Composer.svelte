@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onDestroy, onMount, untrack } from "svelte";
-  import { api, errorMessage, failNetwork, failRetryable, formatSize, fullDate, isInlinePicture, messageNeedsFetch, onSyncProgress, personLabel, type ComposeContext, type ComposeRecipient, type ComposeRequest, type DraftAttachment, type DraftRef, type Message, type PickedFile, type SignatureDto } from "../api";
+  import { api, errorMessage, failNetwork, failOriginalGone, failRetryable, formatSize, fullDate, isInlinePicture, messageNeedsFetch, onSyncProgress, personLabel, type ComposeContext, type ComposeRecipient, type ComposeRequest, type DraftAttachment, type DraftRef, type Message, type PickedFile, type SignatureDto } from "../api";
   import { COMPOSE_TITLE, ICON } from "../actions";
   import { isValidEmail, mergeRecipients } from "../addresses";
   import { cleanDraftHtml, htmlToText, restoreDraftHtml } from "../html";
@@ -150,6 +150,13 @@
 
   let error = $state<string | null>(null);
   let lastAction = $state<"send" | "draft" | null>(null);
+  /**
+   * Оригинала ответа или пересылки больше нет, цитату не собрать (`original_gone`): какое действие
+   * отказало — его кнопка «…без цитаты» повторит, когда автор согласится.
+   */
+  let quoteGone = $state<"send" | "draft" | "autosave" | null>(null);
+  /** Автор согласился продолжать без цитаты: черновик и отправка дальше — одним текстом окна. */
+  let withoutQuote = $state(false);
   let cancelAsk = $state(false);
   let sigOpen = $state(false);
   let showOriginal = $state(true);
@@ -296,6 +303,7 @@
       draft_server_id: draftRef?.server_id ?? null,
       removed_attachment_ids: removedServerIds,
       local_draft_id: localId,
+      without_quote: withoutQuote,
     };
   }
 
@@ -453,6 +461,7 @@
         if (!alive) return;
         autosaveError = errorMessage(e);
         autosaveNetwork = failNetwork(e);
+        if (failOriginalGone(e)) quoteGone = "autosave";
         if (autosaveNetwork) {
           // Связь: тот же снимок повторится сам (пауза растёт), правка не нужна.
           netFailures += 1;
@@ -506,6 +515,7 @@
       if (!alive) return;
       error = errorMessage(e);
       if (!failRetryable(e)) lastAction = null;
+      if (failOriginalGone(e)) quoteGone = "send";
     } finally {
       if (alive) busy = null;
     }
@@ -531,6 +541,7 @@
       if (!alive) return;
       error = errorMessage(e);
       if (!failRetryable(e)) lastAction = null;
+      if (failOriginalGone(e)) quoteGone = "draft";
     } finally {
       if (alive) busy = null;
     }
@@ -539,6 +550,25 @@
   function retry() {
     if (lastAction === "send") void send();
     else if (lastAction === "draft") void saveDraft();
+  }
+
+  /** Подпись кнопки «…без цитаты» по отказавшему действию. */
+  const quoteGoneLabel = $derived(quoteGone === "send" ? "Отправить без цитаты" : quoteGone === "draft" ? "Сохранить без цитаты" : "Сохранять без цитаты");
+
+  /**
+   * Оригинала больше нет: по решению автора черновик и отправка дальше идут без цитаты (тело
+   * черновика на сервере заменится текстом окна), и отказавшее действие повторяется.
+   */
+  function continueWithoutQuote() {
+    const what = quoteGone;
+    withoutQuote = true;
+    quoteGone = null;
+    error = null;
+    autosaveError = null;
+    failedKey = null;
+    if (what === "send") void send();
+    else if (what === "draft") void saveDraft();
+    else autosave();
   }
 
   function requestCancel() {
@@ -621,6 +651,7 @@
       }
       error = errorMessage(e);
       if (!failRetryable(e)) lastAction = null;
+      if (failOriginalGone(e)) quoteGone = "draft";
       settleClose(null);
     } finally {
       if (alive) busy = null;
@@ -719,6 +750,7 @@
     <div class="error" role="alert">
       <span class="error-text">{error}</span>
       {#if lastAction}<button class="btn small" onclick={retry} disabled={busy != null}>Повторить</button>{/if}
+      {#if quoteGone && quoteGone !== "autosave"}<button class="btn small" onclick={continueWithoutQuote} disabled={busy != null}>{quoteGoneLabel}</button>{/if}
       <button class="btn small" onclick={() => (error = null)} aria-label="Скрыть сообщение об ошибке">Скрыть</button>
     </div>
   {/if}
@@ -790,6 +822,7 @@
       <span class="foot-failed">Нет связи: черновик пока только в этом окне, повторю сам</span>
     {:else if autosaveError}
       <span class="foot-failed">Черновик не сохранён: {autosaveError}</span>
+      {#if quoteGone === "autosave"}<button class="btn small" onclick={continueWithoutQuote} disabled={busy != null}>{quoteGoneLabel}</button>{/if}
     {:else if savedAt != null}
       <span>Черновик сохранён в {timeOnly.format(new Date(savedAt))}{pendingFiles ? " · изменения вложений ещё не сохранены" : ""}</span>
     {:else if draftRef}

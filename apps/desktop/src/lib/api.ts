@@ -39,6 +39,15 @@ export interface Conversation {
 /** Вид элемента папки (см. `aiowa_core::ItemKind`): в «Удалённых» рядом с письмами лежат контакты и встречи. */
 export type ItemKind = "mail" | "draft" | "contact" | "appointment" | "task" | "note" | "other";
 
+/**
+ * Не почтовый элемент — контакт, встреча, задача, заметка: только печать и удаление, тело не
+ * загружается (п. 14 обкатки). Прочее (`IPM.Document`, `IPM.Activity`) читается, помечается и
+ * переносится как письмо, но без ответа и пересылки.
+ */
+export function isNonMail(kind: ItemKind | null | undefined): boolean {
+  return kind === "contact" || kind === "appointment" || kind === "task" || kind === "note";
+}
+
 /** Подпись вида для не почтовых элементов и черновиков; у письма — null. */
 export function itemKindLabel(kind: ItemKind | null | undefined): string | null {
   switch (kind) {
@@ -347,6 +356,8 @@ export interface ComposeRequest {
   removed_attachment_ids?: string[];
   /** Локальный черновик этого композера: после отправки бэкенд убирает его сам. */
   local_draft_id?: string | null;
+  /** Продолжить без цитаты: оригинала больше нет (ошибка с `original_gone`). */
+  without_quote?: boolean;
 }
 
 /**
@@ -375,6 +386,8 @@ export interface ComposeFail {
   retry: boolean;
   /** Причина — связь, а не отказ сервера: автосохранение повторится само. */
   network: boolean;
+  /** Оригинала ответа или пересылки нет: цитату не собрать, можно продолжить без неё. */
+  original_gone?: boolean;
 }
 
 function isComposeFail(e: unknown): e is ComposeFail {
@@ -384,6 +397,11 @@ function isComposeFail(e: unknown): e is ComposeFail {
 /** Стоит ли предлагать «Повторить» по ошибке команды композера; строки без признаков — да, как раньше. */
 export function failRetryable(e: unknown): boolean {
   return isComposeFail(e) ? e.retry : true;
+}
+
+/** Ошибка команды композера: оригинала ответа или пересылки больше нет, цитату не собрать. */
+export function failOriginalGone(e: unknown): boolean {
+  return isComposeFail(e) ? e.original_gone === true : false;
 }
 
 /** Ошибка команды композера из-за связи (сервер недоступен, обрыв, таймаут). */

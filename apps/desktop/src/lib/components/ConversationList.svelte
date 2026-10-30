@@ -1,12 +1,17 @@
 <script module lang="ts">
-  import type { Conversation as Row } from "../api";
+  import { isNonMail, type Conversation as Row } from "../api";
 
   /**
-   * К беседе применимы почтовые действия (ответ, пересылка, «прочитано», флаг, перенос и архив):
-   * письмо или черновик; у заглушки беседы из поиска вида нет — это письмо. Контакт, встреча, задача
-   * и заметка в «Удалённых» только удаляются (п. 14 обкатки).
+   * К беседе применимы почтовые действия («прочитано», флаг, перенос и архив): всё, кроме
+   * контакта, встречи, задачи и заметки — они в «Удалённых» только удаляются (п. 14 обкатки); у
+   * заглушки беседы из поиска вида нет — это письмо.
    */
   export function mailActionsApply(c: Row): boolean {
+    return !isNonMail(c.kind);
+  }
+
+  /** К беседе применимы ответ и пересылка: письмо или черновик (у заглушки из поиска вида нет). */
+  export function composeApplies(c: Row): boolean {
     return c.kind == null || c.kind === "mail" || c.kind === "draft";
   }
 </script>
@@ -273,12 +278,12 @@
     if (!menu) return [];
     const mail = menu.targets.filter(mailActionsApply);
     const l = conversationActionLabels(mail, inDeleted);
-    const single = menu.targets.length === 1 && mail.length === 1;
+    const compose = menu.targets.length === 1 && mail.length === 1 && composeApplies(menu.targets[0]);
     return [
-      ...(single ? COMPOSE_ACTIONS.map((a) => ({ id: a.kind, label: a.label, icon: a.icon })) : []),
+      ...(compose ? COMPOSE_ACTIONS.map((a) => ({ id: a.kind, label: a.label, icon: a.icon })) : []),
       ...(mail.length
         ? [
-            { id: "read", label: l.read, icon: l.anyUnread ? ICON.read : ICON.unread, separator: single },
+            { id: "read", label: l.read, icon: l.anyUnread ? ICON.read : ICON.unread, separator: compose },
             { id: "flag", label: l.flag, icon: ICON.flag },
             { id: "move", label: l.move, icon: ICON.move },
             { id: "archive", label: l.archive, icon: ICON.archive, disabled: inArchive },
@@ -345,7 +350,7 @@
       case "reply_all":
       case "forward":
         focusBack(scroller);
-        if (ts.length === 1 && mail.length === 1) oncompose(ts[0], id);
+        if (ts.length === 1 && composeApplies(ts[0])) oncompose(ts[0], id);
         break;
       case "read":
         focusBack(scroller);

@@ -1280,9 +1280,12 @@
     suggestOpen = false;
     openContactCard({ name: p.name, email: p.email }, document.getElementById("search-input") ?? anchor);
   }
+  /** Фокус вернулся в поле поиска после закрытия карточки из подсказок: панель не открывать заново. */
+  let quietSearchFocus = false;
   /** Фокус в поле поиска: подсказки; карточка, открытая из них (её якорь — само поле), закрывается. */
   function onSearchFocus(e: FocusEvent) {
-    suggestOpen = true;
+    if (quietSearchFocus) quietSearchFocus = false;
+    else suggestOpen = true;
     if (contact && contact.anchor === e.currentTarget) closeContact(false);
   }
   function onSearchKey(e: KeyboardEvent) {
@@ -1313,7 +1316,10 @@
   function closeContact(returnFocus = true) {
     const anchor = contact?.anchor;
     contact = null;
-    if (returnFocus) focusBack(anchor);
+    if (!returnFocus) return;
+    // Карточка из подсказок стоит под полем поиска: фокус вернётся в поле без новой панели.
+    if (anchor?.id === "search-input" && document.activeElement !== anchor && !(document.activeElement instanceof HTMLIFrameElement)) quietSearchFocus = true;
+    focusBack(anchor);
   }
 
   /** «Написать письмо» из карточки: новое письмо этому адресату (фокус заберёт композер). */

@@ -5,7 +5,7 @@
 
 <script lang="ts">
   import { onDestroy, untrack } from "svelte";
-  import { api, errorMessage, formatSize, fullDate, isInlinePicture, isPreviewable, listDate, meetingKindOf, messageNeedsFetch, personLabel, senderResponseOf, type Attachment, type ComposeKind, type Folder, type MeetingInfo, type MeetingResponse, type Message, type ResponseType, LAST_VERB, lastVerbText, itemKindLabel, itemKindOf} from "../api";
+  import { api, errorMessage, formatSize, fullDate, isInlinePicture, isPreviewable, listDate, meetingKindOf, messageNeedsFetch, personLabel, senderResponseOf, type Attachment, type ComposeKind, type Folder, type MeetingInfo, type MeetingResponse, type Message, type ResponseType, LAST_VERB, lastVerbText, itemKindLabel, itemKindOf, isNonMail} from "../api";
   import { COMPOSE_ACTIONS, ICON, type ItemAction } from "../actions";
   import { requestPhoto } from "../photos.svelte";
   import Avatar from "./Avatar.svelte";
@@ -71,11 +71,14 @@
     const kind = itemKindOf(message.item_class, false);
     return kind === "mail" ? null : (itemKindLabel(kind)?.toLowerCase() ?? null);
   });
-  /**
-   * Письмо (или черновик): к нему применимы ответ, пересылка, «прочитано», флаг, перенос и архив,
-   * автопометка и загрузка тела. Не почтовый элемент только печатается и удаляется.
-   */
+  /** Письмо (или черновик): к нему применимы ответ и пересылка. */
   const isMail = $derived(itemKindOf(message.item_class, false) === "mail");
+  /**
+   * Почтовый по поведению элемент: «прочитано», флаг, перенос, архив, автопометка и загрузка тела.
+   * Контакт, встреча, задача и заметка только печатаются и удаляются (п. 14 обкатки); прочее
+   * (`IPM.Document`, `IPM.Activity`) — как письмо, но без ответа.
+   */
+  const mailLike = $derived(!isNonMail(itemKindOf(message.item_class, false)));
 
   /** Черновик: по признаку письма или по папке — у него вместо панели действий «Открыть черновик». */
   const isDraft = $derived(message.is_draft || (draftsFolderPk != null && message.folder_pk === draftsFolderPk));
@@ -151,7 +154,7 @@
   }
 
   $effect(() => {
-    if (!expanded || !needsFetch || !isMail) return;
+    if (!expanded || !needsFetch || !mailLike) return;
     untrack(() => {
       if (autoFetched) return;
       autoFetched = true;
@@ -251,7 +254,7 @@
     lastRead = read;
     // Задержку читаем до выходов: смена настройки перезапускает отсчёт у открытых карточек.
     const delay = prefs.autoReadMs;
-    if (!delay || !expanded || !onScreen || read || autoMarked || !isMail) return;
+    if (!delay || !expanded || !onScreen || read || autoMarked || !mailLike) return;
     const t = setTimeout(() => {
       if (document.visibilityState !== "visible" || autoMarked || busy) return;
       void autoRead();
@@ -565,7 +568,7 @@
           <div class="line caption recipients">
             <span class="rcpt-body" class:wrap={recipientsOpen} title={!recipientsOpen && to.length ? peopleText(to) : undefined}>
               Кому:
-              {#if to.length}{@render people(recipientsOpen ? to : to.slice(0, SHOWN_NAMES))}{#if !recipientsOpen && to.length > SHOWN_NAMES}<button type="button" class="more" onclick={(e) => { e.stopPropagation(); toggleRecipients(); }}>и ещё {to.length - SHOWN_NAMES}</button>{/if}{:else if needsFetch && isMail}<span class="muted">загружаю получателей…</span>{:else}{message.display_to || "—"}{/if}
+              {#if to.length}{@render people(recipientsOpen ? to : to.slice(0, SHOWN_NAMES))}{#if !recipientsOpen && to.length > SHOWN_NAMES}<button type="button" class="more" onclick={(e) => { e.stopPropagation(); toggleRecipients(); }}>и ещё {to.length - SHOWN_NAMES}</button>{/if}{:else if needsFetch && mailLike}<span class="muted">загружаю получателей…</span>{:else}{message.display_to || "—"}{/if}
             </span>
             {#if recipientsExpandable}
               <button type="button" class="chev" onclick={(e) => { e.stopPropagation(); toggleRecipients(); }} aria-expanded={recipientsOpen} aria-label={recipientsOpen ? "Свернуть получателей" : "Показать всех получателей"} title={recipientsOpen ? "Свернуть" : "Все получатели"}>
@@ -634,7 +637,7 @@
         </button>
         {@render darkToggle()}
         <span class="act-sep" aria-hidden="true"></span>
-        {#if isMail}
+        {#if mailLike}
           <button class="act" onclick={() => run({ kind: "read", read: !message.is_read })} disabled={busy} aria-label={message.is_read ? "Пометить непрочитанным" : "Пометить прочитанным"} title={message.is_read ? "Пометить непрочитанным" : "Пометить прочитанным"}>
             <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path d={message.is_read ? ICON.unread : ICON.read} fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round" /></svg>
           </button>
@@ -793,7 +796,7 @@
         </div>
       {:else if message.body_state === 1}
         <div class="caption note">Письмо без текста.</div>
-      {:else if !fetching && !fetchError && isMail}
+      {:else if !fetching && !fetchError && mailLike}
         <div class="note status">
           <span class="status-text caption">Текст письма ещё не загружен.</span>
           <button class="btn" onclick={fetchNow}>Загрузить</button>
