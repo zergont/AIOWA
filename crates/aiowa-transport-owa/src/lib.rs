@@ -205,8 +205,9 @@ const TCP_KEEPALIVE: Duration = Duration::from_secs(30);
 const CONNECT_RETRIES: u32 = 2;
 
 /// Можно ли повторить операцию после обрыва, когда неизвестно, дошла ли она до сервера.
-/// Чтения — да; `UpdateItem` идёт с `AlwaysOverwrite` — да; создание, отправка, перенос,
-/// удаление и подписки — нет (повтор дал бы дубль или второе действие).
+/// Чтения — да; `UpdateItem` идёт с `AlwaysOverwrite` — да (кроме записи календаря с рассылкой
+/// участникам, `update_calendar_item`); создание, отправка, перенос, удаление и подписки — нет
+/// (повтор дал бы дубль или второе действие).
 pub(crate) fn is_idempotent(op: &str) -> bool {
     !matches!(
         op,
@@ -230,10 +231,13 @@ pub(crate) fn is_idempotent(op: &str) -> bool {
 /// Отправка запроса с повторами. Соединение не установилось (запрос не ушёл): до
 /// `CONNECT_RETRIES` повторов для любой операции с паузой 1 и 2 с. Обрыв после отправки
 /// (сброс, ошибка чтения ответа): один повтор только для идемпотентных операций; таймаут ответа
-/// не повторяется — ждать ещё раз столько же нет смысла. В журнал — вид сбоя, длительность и
-/// цепочка причин; адрес запроса без query (`net`).
+/// не повторяется — ждать ещё раз столько же нет смысла. Если после обрыва после отправки
+/// следующая попытка не соединилась, ошибка — `Network`, не `Connect`: первая попытка могла дойти
+/// до сервера. В журнал — вид сбоя, длительность и цепочка причин; адрес запроса без query (`net`).
 pub(crate) async fn send_retrying(req: reqwest::RequestBuilder, op: &str, idempotent: bool) -> Result<reqwest::Response> {
     let mut attempt = 0u32;
+    // Была попытка, оборванная после отправки: исход запроса неизвестен.
+    let mut sent = false;
     loop {
         let Some(this) = req.try_clone() else {
             // Тело-поток клонировать нельзя: без повторов.
@@ -251,7 +255,11 @@ pub(crate) async fn send_retrying(req: reqwest::RequestBuilder, op: &str, idempo
                 let connect = e.is_connect();
                 let timeout = e.is_timeout();
                 let retry = if connect { attempt < CONNECT_RETRIES } else { idempotent && !timeout && attempt < 1 };
-                let err = net(e);
+                let err = match net(e) {
+                    TransportError::Connect(e) if sent => TransportError::Network(e),
+                    err => err,
+                };
+                sent |= !connect;
                 warn!(op, attempt, connect, timeout, idempotent, retry, ms = started.elapsed().as_millis() as u64, error = %err.chain(), "сетевой сбой запроса");
                 if !retry {
                     return Err(err);
@@ -519,17 +527,17 @@ impl OwaTransport {
 
     /// То же с собственным таймаутом запроса вместо общего из настроек (загрузка вложений).
     pub async fn call_with_timeout(&self, op: &str, version: &str, body: Value, timeout: Option<Duration>) -> Result<Value> {
-        self.call_in_zone(op, version, None, body, timeout).await
+        self.call_in_zone(op, version, None, body, timeout, is_idempotent(op)).await
     }
 
     /// Вызов с другим `TimeZoneContext` в заголовке только этого запроса: `time_zone` — пояс
     /// Windows пользователя (запись в календарь, § 5i); `None` — пояс из настроек (UTC).
-    /// Записи календаря (`CreateItem`, `UpdateItem` с рассылкой участникам) после обрыва не
-    /// повторяются: повтор разослал бы приглашения второй раз.
-    pub async fn call_in_zone(&self, op: &str, version: &str, time_zone: Option<&str>, body: Value, timeout: Option<Duration>) -> Result<Value> {
+    /// `idempotent` — можно ли повторить запрос после обрыва после отправки; решает вид записи, а
+    /// не пояс: записи календаря (`CreateItem`, `UpdateItem` с рассылкой участникам) не
+    /// повторяются и без пояса — повтор разослал бы приглашения или обновления второй раз.
+    pub async fn call_in_zone(&self, op: &str, version: &str, time_zone: Option<&str>, body: Value, timeout: Option<Duration>, idempotent: bool) -> Result<Value> {
         let env = protocol::envelope(op, version, time_zone.unwrap_or(&self.inner.config.time_zone), body);
         let payload = serde_json::to_vec(&env).map_err(|e| TransportError::Protocol { op: op.into(), status: 0, raw: e.to_string() })?;
-        let idempotent = is_idempotent(op) && (time_zone.is_none() || op != "UpdateItem");
         self.call_payload(op, payload, timeout, idempotent).await
     }
 
@@ -1986,7 +1994,7 @@ impl MailTransport for OwaTransport {
     /// весь день границы — местные полуночи дат без зоны; без пояса — контекст UTC и моменты с `Z`.
     async fn create_calendar_item(&self, item: &NewCalendarItem, time_zone: Option<&str>) -> Result<ItemId> {
         let body = protocol::create_calendar_item_body(item, time_zone.is_some() && item.is_all_day);
-        let v = self.call_in_zone("CreateItem", protocol::V_2017, time_zone, body, None).await?;
+        let v = self.call_in_zone("CreateItem", protocol::V_2017, time_zone, body, None, false).await?;
         let m = Self::first_message("CreateItem", &v)?;
         Self::log_shape("CreateItem", &m);
         let id = protocol::parse_created_item_id(&m).ok_or_else(|| TransportError::Protocol { op: "CreateItem".into(), status: 200, raw: format!("нет Items[0].ItemId: {}", protocol::json_shape(&m, 2)) })?;
@@ -2000,7 +2008,9 @@ impl MailTransport for OwaTransport {
             return Ok(id.clone());
         }
         let body = protocol::update_calendar_item_body(id, changes, send_updates, time_zone.is_some() && changes.is_all_day == Some(true));
-        let v = self.call_in_zone("UpdateItem", protocol::V_2017, time_zone, body, None).await?;
+        // С рассылкой (`SendToAllAndSaveCopy`) повтор после обрыва разослал бы обновление участникам
+        // второй раз; без неё (`SendToNone`, `AlwaysOverwrite`) — повторяется, как запись писем.
+        let v = self.call_in_zone("UpdateItem", protocol::V_2017, time_zone, body, None, !send_updates).await?;
         let m = Self::first_message("UpdateItem", &v)?;
         Self::log_shape("UpdateItem", &m);
         Ok(protocol::written_item_id(&m).unwrap_or_else(|| id.clone()))
@@ -2299,5 +2309,29 @@ mod tests {
         let text = net(e).to_string();
         assert!(!text.contains("SECRET-CANARY") && !text.contains("X-OWA-CANARY"), "{text}");
         assert!(text.contains("127.0.0.1") && text.contains("GetFileAttachment"), "хост и путь для диагностики остаются: {text}");
+    }
+
+    /// Обрыв после отправки, затем повторы не соединяются: первая попытка могла дойти до сервера —
+    /// ошибка `Network` (исход неизвестен), а не `Connect` («запрос не ушёл»).
+    #[tokio::test]
+    async fn connect_failure_after_sent_attempt_is_network() {
+        use std::io::Read;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        // Один запрос прочитан, соединение закрыто без ответа; слушатель закрывается вместе с ним.
+        let server = std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            let (mut buf, mut chunk) = (Vec::new(), [0u8; 1024]);
+            while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                match s.read(&mut chunk) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                }
+            }
+        });
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let r = send_retrying(client.get(format!("http://127.0.0.1:{port}/owa/service.svc")), "UpdateItem", true).await;
+        server.join().unwrap();
+        assert!(matches!(r, Err(TransportError::Network(_))), "{r:?}");
     }
 }

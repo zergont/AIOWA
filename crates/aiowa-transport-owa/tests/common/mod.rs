@@ -86,6 +86,9 @@ pub struct Faults {
     /// Первый запрос этой операции ждёт сигнала теста ([`Hold`]), остальные запросы идут своим
     /// ходом: долгий запрос синхронизации не должен задерживать команды окна.
     pub hold_op: Option<(String, Arc<Hold>)>,
+    /// Обрыв после отправки: сервер обрабатывает запрос операции (он пишется в [`Mailbox::calls`]
+    /// и меняет ящик) и закрывает соединение, не ответив. Имя операции → сколько раз ещё.
+    pub drop_response: HashMap<String, u32>,
 }
 
 /// Запрос, задержанный сервером до сигнала теста.
@@ -628,6 +631,20 @@ impl Mailbox {
             "UserOptions": {},
             "PolicySettings": {}
         })
+    }
+
+    /// Оставить запрос без ответа по режиму [`Faults::drop_response`] (остаток уменьшается).
+    fn take_drop(&mut self, req: &Request) -> bool {
+        if req.method != "POST" || req.path != "/owa/service.svc" {
+            return false;
+        }
+        match req.query("action").and_then(|op| self.faults.drop_response.get_mut(op)) {
+            Some(left) if *left > 0 => {
+                *left -= 1;
+                true
+            }
+            _ => false,
+        }
     }
 
     /// Сбой по режиму `fail_op` для операции `op` (остаток уменьшается).
@@ -1772,8 +1789,14 @@ impl FakeOwa {
                             }
                             None => {}
                         }
-                        let resp = shared.lock().expect("состояние фейка").handle(&req);
-                        let _ = write_response(&mut stream, resp).await;
+                        let (resp, dropped) = {
+                            let mut st = shared.lock().expect("состояние фейка");
+                            let resp = st.handle(&req);
+                            (resp, st.take_drop(&req))
+                        };
+                        if !dropped {
+                            let _ = write_response(&mut stream, resp).await;
+                        }
                     }
                 });
             }

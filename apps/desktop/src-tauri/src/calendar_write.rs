@@ -518,6 +518,46 @@ async fn fresh_item_id(sync: &SyncState, transport: &impl MailTransport, store: 
     }
 }
 
+/// Текущий идентификатор события календаря с сервера (`GetItem` только с идентификатором): ключ
+/// строки кэша устаревает, когда событие меняется на сервере (ответ по письму, правка
+/// организатора), а в кэш свежий ключ ляжет с событием, перечитанным после записи. События нет
+/// — `Fail::NotFound`.
+async fn fresh_event_id(sync: &SyncState, transport: &impl MailTransport, calendar_pk: i64, stored: &ItemId) -> Result<ItemId, Fail> {
+    let mut got = call(sync, "GetItem", transport.refresh_item_ids(std::slice::from_ref(stored))).await?;
+    match got.pop() {
+        Some(WriteResult::Ok { id }) => {
+            info!(calendar_pk, stored_ck_len = stored.change_key_len(), fresh_ck_len = id.change_key_len(), "ключ события перечитан");
+            Ok(id)
+        }
+        Some(WriteResult::Failed { code, .. }) if code == ITEM_NOT_FOUND => Err(Fail::NotFound),
+        Some(WriteResult::Failed { code, message, .. }) => {
+            warn!(calendar_pk, code, message = %message, "сервер не отдал идентификатор события");
+            Err(Fail::Other(format!("Сервер отказал: {code}")))
+        }
+        None => Err(Fail::Other("Сервер не вернул идентификатор события".into())),
+    }
+}
+
+/// Ответ на приглашение со ссылкой (`ReferenceItemId`) на письмо или событие с его ключом
+/// изменений: ключ в базе бывает усечённым или устаревшим (п. 19 обкатки), поэтому `fresh`
+/// перечитывает его с сервера перед ответом; при `ErrorStaleObject` — ещё одна попытка с заново
+/// перечитанным ключом.
+async fn respond_with_fresh_key<K, R>(mut fresh: impl FnMut() -> K, mut respond: impl FnMut(ItemId) -> R) -> Result<(), Fail>
+where
+    K: Future<Output = Result<ItemId, Fail>>,
+    R: Future<Output = Result<(), Fail>>,
+{
+    let id = fresh().await?;
+    match respond(id).await {
+        Err(Fail::Stale) => {
+            warn!("ответ на приглашение: ErrorStaleObject после перечитывания ключа, ещё одна попытка");
+            let id = fresh().await?;
+            respond(id).await
+        }
+        other => other,
+    }
+}
+
 fn db_err<E: std::fmt::Display>(e: E) -> String {
     format!("Ошибка локальной базы: {e}")
 }
@@ -723,7 +763,17 @@ pub(crate) async fn calendar_respond(calendar_pk: i64, response: String, send_re
         return Err("Вы организатор этой встречи: на своё приглашение не отвечают".into());
     }
     let transport = sync.transport().await.map_err(|e| e.to_string())?;
-    call(&sync, "CreateItem", transport.respond_to_meeting(&row.id, response, send_response, None)).await.map_err(|f| f.text("Событие удалено на сервере"))?;
+    // Ключ события в кэше устаревает, когда событие меняется на сервере, а кэш окна ещё не
+    // обновлён: он перечитывается, как у ответа по письму.
+    respond_with_fresh_key(
+        || fresh_event_id(&sync, &transport, calendar_pk, &row.id),
+        |id| {
+            let (sync, transport) = (&sync, &transport);
+            async move { call(sync, "CreateItem", transport.respond_to_meeting(&id, response, send_response, None)).await }
+        },
+    )
+    .await
+    .map_err(|f| f.text("Событие удалено на сервере"))?;
     info!(calendar_pk, response = response.key(), send_response, "ответ на приглашение отправлен по событию");
     match call(&sync, "GetItem", transport.get_calendar_item(&row.id)).await {
         Ok(details) => {
@@ -809,20 +859,16 @@ pub(crate) async fn meeting_respond(item_pk: i64, response: String, send_respons
     let account = state.account;
     let item = store.item_ref(item_pk).map_err(err)?.ok_or_else(|| "Письмо удалено".to_string())?;
     let transport = sync.transport().await.map_err(|e| e.to_string())?;
-    // Ответ ссылается на письмо-приглашение (`ReferenceItemId`) с его ключом изменений: ключ в базе
-    // бывает усечённым или устаревшим (п. 19 обкатки), поэтому он перечитывается с сервера; при
-    // `ErrorStaleObject` — ещё одна попытка с заново перечитанным ключом.
-    let gone = "Письмо удалено на сервере";
-    let fresh = fresh_item_id(&sync, &transport, &store, item_pk, &item.id).await.map_err(|f| f.text(gone))?;
-    match call(&sync, "CreateItem", transport.respond_to_meeting(&fresh, response, send_response, None)).await {
-        Ok(()) => {}
-        Err(Fail::Stale) => {
-            warn!(item_pk, "ответ на приглашение: ErrorStaleObject после перечитывания ключа, ещё одна попытка");
-            let fresh = fresh_item_id(&sync, &transport, &store, item_pk, &item.id).await.map_err(|f| f.text(gone))?;
-            call(&sync, "CreateItem", transport.respond_to_meeting(&fresh, response, send_response, None)).await.map_err(|f| f.text(gone))?;
-        }
-        Err(f) => return Err(f.text(gone)),
-    }
+    // Ответ ссылается на письмо-приглашение (`ReferenceItemId`) с его ключом изменений.
+    respond_with_fresh_key(
+        || fresh_item_id(&sync, &transport, &store, item_pk, &item.id),
+        |id| {
+            let (sync, transport) = (&sync, &transport);
+            async move { call(sync, "CreateItem", transport.respond_to_meeting(&id, response, send_response, None)).await }
+        },
+    )
+    .await
+    .map_err(|f| f.text("Письмо удалено на сервере"))?;
     info!(item_pk, response = response.key(), send_response, "ответ на приглашение отправлен по письму");
     // Сведения о письме устарели (свой ответ и ChangeKey письма сменились); связанное событие —
     // по ним, пока они ещё есть.
@@ -1199,5 +1245,37 @@ mod tests {
         assert!(parse_response("maybe").is_err());
         assert_eq!(Fail::NotFound.text("Письмо удалено на сервере"), "Письмо удалено на сервере");
         assert_eq!(Fail::Other("Нет связи с сервером".into()).text("x"), "Нет связи с сервером");
+    }
+
+    /// Ответ на приглашение: ключ перечитывается до ответа и ответ идёт с ним; при
+    /// `ErrorStaleObject` — ключ перечитывается ещё раз и ответ повторяется, но только однажды;
+    /// другие отказы не повторяются, отказ перечитывания до ответа не доходит.
+    #[test]
+    fn meeting_response_uses_fresh_key_and_retries_stale_once() {
+        let key = |n: usize| ItemId { id: "AAMk".into(), change_key: Some(format!("CQAAABYAAAA{n}")) };
+        let run = |answers: Vec<Result<(), Fail>>, fresh_ok: bool| {
+            let (mut refreshed, mut sent, mut answers) = (0usize, Vec::<ItemId>::new(), answers.into_iter());
+            let r = tauri::async_runtime::block_on(respond_with_fresh_key(
+                || {
+                    refreshed += 1;
+                    std::future::ready(if fresh_ok { Ok(key(refreshed)) } else { Err(Fail::NotFound) })
+                },
+                |id| {
+                    sent.push(id);
+                    std::future::ready(answers.next().expect("лишний ответ"))
+                },
+            ));
+            (r, refreshed, sent)
+        };
+        let (r, refreshed, sent) = run(vec![Ok(())], true);
+        assert!(r.is_ok() && refreshed == 1 && sent == vec![key(1)], "ответ со свежим ключом, без повтора");
+        let (r, refreshed, sent) = run(vec![Err(Fail::Stale), Ok(())], true);
+        assert!(r.is_ok() && refreshed == 2 && sent == vec![key(1), key(2)], "после ErrorStaleObject — заново перечитанный ключ");
+        let (r, refreshed, sent) = run(vec![Err(Fail::Stale), Err(Fail::Stale)], true);
+        assert!(matches!(r, Err(Fail::Stale)) && refreshed == 2 && sent.len() == 2, "повтор один");
+        let (r, refreshed, sent) = run(vec![Err(Fail::Other("Нет связи с сервером".into()))], true);
+        assert!(matches!(r, Err(Fail::Other(_))) && refreshed == 1 && sent.len() == 1, "сетевой отказ не повторяется");
+        let (r, refreshed, sent) = run(vec![], false);
+        assert!(matches!(r, Err(Fail::NotFound)) && refreshed == 1 && sent.is_empty(), "без ключа ответа нет");
     }
 }

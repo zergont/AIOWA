@@ -4,7 +4,7 @@
 
 mod common;
 
-use aiowa_core::{ComposeKind, DistinguishedFolder, FlagStatus, FolderChange, FolderId, FolderRef, Importance, ItemChange, ItemId, MessageMeta, OutgoingAttachment, OutgoingMessage, Participant, RecipientKind, SyncState};
+use aiowa_core::{CalendarItemChanges, ComposeKind, DistinguishedFolder, FlagStatus, FolderChange, FolderId, FolderRef, Importance, ItemChange, ItemId, MessageMeta, OutgoingAttachment, OutgoingMessage, Participant, RecipientKind, SyncState};
 use aiowa_store::Store;
 use aiowa_sync::{Engine, FolderSelection, SyncOptions};
 use aiowa_transport::{Credentials, DeleteMode, ItemFetchShape, ItemResult, MailTransport, TransportError, WriteResult};
@@ -916,5 +916,46 @@ async fn window_requests_pass_while_sync_request_is_pending() {
     hold.release.notify_one();
     let changes = tokio::time::timeout(Duration::from_secs(10), pending).await.expect("SyncFolderItems не завершился").unwrap().unwrap();
     assert_eq!(changes.changes.len(), 3);
+    t.logoff().await.unwrap();
+}
+
+/// Обрыв после отправки (сервер выполнил запрос и не ответил): правка события с рассылкой
+/// участникам не повторяется и без пояса пользователя — второй запрос разослал бы обновление ещё
+/// раз; ошибка `Network` (исход неизвестен). С поясом — так же.
+#[tokio::test]
+async fn calendar_update_with_notifications_is_not_resent_after_drop() {
+    let server = FakeOwa::start().await;
+    let t = connect(&server).await;
+    let id = ItemId { id: "AAMkCalendarItem".into(), change_key: Some("DwAAABYAAAA".into()) };
+    let changes = CalendarItemChanges { subject: Some("[AIOWA test] Перенос планёрки".into()), ..Default::default() };
+    for zone in [None, Some("Russian Standard Time")] {
+        server.state().faults.drop_response.insert("UpdateItem".into(), 1);
+        let before = server.state().calls_of("UpdateItem").len();
+        let r = t.update_calendar_item(&id, &changes, true, zone).await;
+        assert!(matches!(r, Err(TransportError::Network(_))), "пояс {zone:?}: {r:?}");
+        let st = server.state();
+        let calls = st.calls_of("UpdateItem");
+        assert_eq!(calls.len() - before, 1, "пояс {zone:?}: запрос с рассылкой ушёл один раз");
+        assert_eq!(calls.last().unwrap().body["SendCalendarInvitationsOrCancellations"], "SendToAllAndSaveCopy");
+    }
+    t.logoff().await.unwrap();
+}
+
+/// Пометка «прочитано» (`UpdateItem` с `AlwaysOverwrite`) после обрыва после отправки
+/// повторяется: второй запрос безвреден, ответ на него — результат вызова.
+#[tokio::test]
+async fn mail_update_is_retried_after_drop() {
+    let server = FakeOwa::start().await;
+    let t = connect(&server).await;
+    let (metas, _) = sync_folder(&t, INBOX).await;
+    let shipment = by_subject(&metas, SHIPMENT).item_id.clone();
+    server.state().faults.drop_response.insert("UpdateItem".into(), 1);
+    let r = t.set_read(std::slice::from_ref(&shipment), true).await.expect("повтор после обрыва");
+    assert!(matches!(&r[..], [WriteResult::Ok { id }] if id.id == shipment.id), "{r:?}");
+    {
+        let st = server.state();
+        assert_eq!(st.calls_of("UpdateItem").len(), 2, "первый запрос без ответа, второй — повтор");
+        assert!(st.item(&shipment.id).unwrap().is_read);
+    }
     t.logoff().await.unwrap();
 }
