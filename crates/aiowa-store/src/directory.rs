@@ -31,10 +31,20 @@ fn extra_json(p: &DirectoryPerson) -> String {
         ("business_phone", &p.business_phone),
         ("mobile_phone", &p.mobile_phone),
         ("alias", &p.alias),
+        ("address", &p.address),
+        ("notes", &p.notes),
     ] {
         if let Some(v) = value {
             m.insert(key.to_string(), Value::String(v.clone()));
         }
+    }
+    // Оргструктура: руководитель и подчинённые (ключ `direct_reports` есть только у записи с
+    // полными данными — по нему карточка отличает старый кэш от «подчинённых нет»).
+    if let Some(mgr) = &p.manager {
+        m.insert("manager".into(), serde_json::to_value(mgr).unwrap_or(Value::Null));
+    }
+    if let Some(reports) = &p.direct_reports {
+        m.insert("direct_reports".into(), serde_json::to_value(reports).unwrap_or(Value::Array(Vec::new())));
     }
     Value::Object(m).to_string()
 }
@@ -54,6 +64,10 @@ fn person_from_row(email: String, display_name: Option<String>, kind: &str, json
         business_phone: get("business_phone"),
         mobile_phone: get("mobile_phone"),
         alias: get("alias"),
+        manager: v.get("manager").and_then(|m| serde_json::from_value(m.clone()).ok()),
+        direct_reports: v.get("direct_reports").and_then(|d| serde_json::from_value(d.clone()).ok()),
+        address: get("address"),
+        notes: get("notes"),
     }
 }
 
@@ -268,7 +282,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let s = Store::open(&path).unwrap();
         let acc = s.account("h", "u").unwrap();
-        let person = DirectoryPerson { display_name: Some("Имя".into()), email: Some("A@x.ru".into()), kind: PersonKind::Mailbox, title: None, department: None, company: None, office: None, business_phone: None, mobile_phone: None, alias: None };
+        let person = DirectoryPerson { display_name: Some("Имя".into()), email: Some("A@x.ru".into()), kind: PersonKind::Mailbox, title: None, department: None, company: None, office: None, business_phone: None, mobile_phone: None, alias: None, ..Default::default() };
         assert!(!s.set_directory_photo(acc, "a@x.ru", Some(&[1, 2, 3])).unwrap(), "записи ещё нет");
         assert!(s.replace_directory_person(acc, &person).unwrap());
         assert_eq!(s.directory_photo(acc, "a@x.ru").unwrap(), None, "фото не запрашивалось");

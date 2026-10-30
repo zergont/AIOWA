@@ -2177,7 +2177,7 @@ async fn directory_probe_photo(t: &OwaTransport, store: &Store, account: Account
         if c.get("HasPicture").and_then(serde_json::Value::as_bool) == Some(true) {
             has_picture_true += 1;
         }
-        if let Some(b) = protocol::resolution_photo(r) {
+        if let Some(b) = protocol::parse_resolution_photo(r) {
             with_photo += 1;
             sizes.push(b.len());
             *kinds.entry(protocol::image_kind(&b).unwrap_or("неизвестен")).or_default() += 1;

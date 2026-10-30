@@ -1467,6 +1467,10 @@ pub fn parse_persona(v: &Value) -> Option<DirectoryPerson> {
             .or_else(|| phone_of(v.get("PhoneNumber"), MOBILE_PHONE_KINDS))
             .or_else(|| phone_of(v.get("PhoneNumbers"), MOBILE_PHONE_KINDS)),
         alias: first_text(v, &["Alias"]),
+        manager: None,
+        direct_reports: None,
+        address: None,
+        notes: None,
     })
 }
 
@@ -1519,14 +1523,25 @@ pub fn parse_resolution(v: &Value) -> Option<DirectoryPerson> {
         business_phone: phone_of(contact.get("PhoneNumbers"), BUSINESS_PHONE_KINDS).or_else(|| first_text(contact, &["BusinessPhone"])),
         mobile_phone: phone_of(contact.get("PhoneNumbers"), MOBILE_PHONE_KINDS).or_else(|| first_text(contact, &["MobilePhone"])),
         alias: first_text(contact, &["Alias"]).or_else(|| first_text(mbx, &["Alias"])),
+        // Оргструктура (§ 5l'): только в полной форме; у записи без `Contact` — неизвестна.
+        manager: contact.get("ManagerMailbox").and_then(parse_participant).or_else(|| first_text(contact, &["Manager"]).map(|name| Participant { name: Some(name), email: None, routing_type: None })),
+        direct_reports: contact.get("DirectReports").map(|d| d.as_array().map(|a| a.iter().filter_map(parse_participant).collect()).unwrap_or_default()),
+        address: business_address(contact.get("PhysicalAddresses")),
+        notes: first_text(contact, &["Notes"]),
     })
 }
 
-/// Фото записи `ResolveNames` с `AllProperties`: `Contact.Photo` в base64 (пустая строка или
-/// мусор — `None`).
-pub fn resolution_photo(v: &Value) -> Option<Vec<u8>> {
-    let s = v.pointer("/Contact/Photo").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty())?;
-    BASE64_STANDARD.decode(s).ok().filter(|b| !b.is_empty())
+/// Рабочий почтовый адрес из словаря `PhysicalAddresses` (запись с ключом `Business`, иначе первая
+/// непустая) одной строкой: улица, индекс и город, область, страна.
+fn business_address(v: Option<&Value>) -> Option<String> {
+    let entries = dict_entries(v);
+    let line = |e: &Value| -> Option<String> {
+        let part = |keys: &[&str]| first_text(e, keys);
+        let city = [part(&["PostalCode"]), part(&["City"])].into_iter().flatten().collect::<Vec<_>>().join(" ");
+        let parts: Vec<String> = [part(&["Street"]), (!city.is_empty()).then_some(city), part(&["State"]), part(&["CountryOrRegion", "Country"])].into_iter().flatten().collect();
+        (!parts.is_empty()).then(|| parts.join(", "))
+    };
+    entries.iter().find(|(k, _)| k.as_deref().is_some_and(|k| k.eq_ignore_ascii_case("Business"))).and_then(|(_, e)| line(e)).or_else(|| entries.iter().find_map(|(_, e)| line(e)))
 }
 
 /// Вид картинки по первым байтам: `jpeg`, `png`, `gif`, `bmp`, иначе `None`.
@@ -3219,6 +3234,9 @@ mod tests {
           "ResolutionSet":{"TotalItemsInView":2,"IncludesLastItemInRange":true,"Resolutions":[
             {"Mailbox":{"Name":"Петров Иван","EmailAddress":"ivan@x.ru","RoutingType":"SMTP","MailboxType":"Mailbox"},
              "Contact":{"DisplayName":"Петров Иван Сергеевич","JobTitle":"Инженер","Department":"ИТ","CompanyName":"ООО Х","OfficeLocation":"к. 101",
+                        "Manager":"Сидоров Пётр","ManagerMailbox":{"Mailbox":{"Name":"Сидоров Пётр","EmailAddress":"petr@x.ru","RoutingType":"SMTP","MailboxType":"Mailbox"}},
+                        "DirectReports":[{"Name":"Зайцев","EmailAddress":"z@x.ru","RoutingType":"SMTP","MailboxType":"Mailbox"}],
+                        "PhysicalAddresses":[{"Key":"Home","City":"Дома"},{"Key":"Business","Street":"Ленина, 1","City":"Москва","PostalCode":"101000","CountryOrRegion":"Россия"}],"Notes":"",
                         "PhoneNumbers":[{"Key":"AssistantPhone","PhoneNumber":""},{"Key":"BusinessPhone","PhoneNumber":"+7 495 000"},{"Key":"HomePhone","PhoneNumber":"дом"},{"Key":"MobilePhone","PhoneNumber":"+7 900 000"}],
                         "EmailAddresses":[{"Key":"EmailAddress1","EmailAddress":"SMTP:ivan@x.ru"}],"ContactSource":"ActiveDirectory"}},
             {"Mailbox":{"Name":"Список","EmailAddress":"/o=Org/cn=list","RoutingType":"EX","MailboxType":"PublicDL"},
@@ -3232,6 +3250,13 @@ mod tests {
         assert_eq!((p[0].title.as_deref(), p[0].department.as_deref(), p[0].company.as_deref(), p[0].office.as_deref()), (Some("Инженер"), Some("ИТ"), Some("ООО Х"), Some("к. 101")));
         assert_eq!(p[0].business_phone.as_deref(), Some("+7 495 000"));
         assert_eq!(p[0].mobile_phone.as_deref(), Some("+7 900 000"));
+        let mgr = p[0].manager.as_ref().expect("руководитель");
+        assert_eq!((mgr.name.as_deref(), mgr.email.as_deref()), (Some("Сидоров Пётр"), Some("petr@x.ru")), "ManagerMailbox главнее строки Manager");
+        assert_eq!(p[0].direct_reports.as_ref().map(|d| d.len()), Some(1));
+        assert_eq!(p[0].direct_reports.as_ref().unwrap()[0].email.as_deref(), Some("z@x.ru"));
+        assert_eq!(p[0].address.as_deref(), Some("Ленина, 1, 101000 Москва, Россия"), "рабочий адрес, не домашний");
+        assert_eq!(p[0].notes, None, "пустые заметки — None");
+        assert_eq!(p[1].direct_reports, None, "без Contact.DirectReports — неизвестно");
         assert_eq!(p[1].email.as_deref(), Some("list@x.ru"), "EX заменён SMTP из словаря без префикса smtp:");
         assert_eq!(p[1].kind, PersonKind::DistributionList);
         assert_eq!(p[1].display_name.as_deref(), Some("Список"));

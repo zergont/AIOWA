@@ -66,8 +66,16 @@
       { label: "Компания", value: person?.company?.trim() || personal?.item.company?.trim() },
       { label: "Должность", value: person ? undefined : personal?.item.job_title?.trim() },
       { label: "Офис", value: person?.office?.trim() || personal?.item.office?.trim() },
+      { label: "Адрес", value: person?.address?.trim() },
     ].filter((f): f is { label: string; value: string } => !!f.value),
   );
+  const manager = $derived(person?.manager && ((person.manager.name ?? "").trim() || (person.manager.email ?? "").trim()) ? person.manager : null);
+  const reports = $derived(person?.direct_reports ?? []);
+
+  /** Переход к карточке человека по ссылке (руководитель, подчинённый): как к участнику списка. */
+  function openRef(r: { name?: string | null; email?: string | null }) {
+    openMember({ name: r.name ?? null, email: r.email ?? null, kind: "mailbox" });
+  }
   // Телефоны справочника, затем личного контакта; одинаковые номера (по цифрам) — один раз.
   const phones = $derived.by(() => {
     const out: { label: string; value: string }[] = [];
@@ -299,6 +307,18 @@
         <dd>{f.value}</dd>
       </div>
     {/each}
+    {#if manager}
+      <div class="fact">
+        <dt>Руководитель</dt>
+        <dd>
+          {#if (manager.email ?? "").trim()}
+            <button class="link-btn" onclick={() => openRef(manager)} title={manager.email ?? ""}>{manager.name?.trim() || manager.email}</button>
+          {:else}
+            {manager.name}
+          {/if}
+        </dd>
+      </div>
+    {/if}
   </dl>
 
   {#if loading && !card}
@@ -324,6 +344,25 @@
       {:else}
         В почте на этом компьютере писем с этим адресом нет
       {/if}
+    </div>
+  {/if}
+
+  {#if person?.notes}
+    <div class="section notes">{person.notes}</div>
+  {/if}
+
+  {#if reports.length}
+    <div class="section members">
+      <div class="members-head caption">Подчинённые: {reports.length.toLocaleString("ru-RU")}</div>
+      <ul class="member-list">
+        {#each reports as r, i (`${emailKey(r.email)}:${i}`)}
+          <li>
+            <button class="member" onclick={() => openRef(r)} disabled={!(r.email ?? "").trim()} title={r.email ?? ""}>
+              <span class="member-name">{r.name?.trim() || r.email}</span>
+            </button>
+          </li>
+        {/each}
+      </ul>
     </div>
   {/if}
 
@@ -412,6 +451,14 @@
     margin-top: 2px;
     color: var(--fg-2);
     overflow-wrap: anywhere;
+  }
+  .link-btn {
+    color: var(--accent);
+    text-align: left;
+    overflow-wrap: anywhere;
+  }
+  .link-btn:hover {
+    text-decoration: underline;
   }
   .section.notes {
     white-space: pre-wrap;

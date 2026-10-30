@@ -452,6 +452,17 @@ export interface DirectoryPerson {
   office?: string | null;
   business_phone?: string | null;
   mobile_phone?: string | null;
+  /** Руководитель и подчинённые из ResolveNames с полными данными; у записи поиска нет. */
+  manager?: PersonRef | null;
+  direct_reports?: PersonRef[];
+  address?: string | null;
+  notes?: string | null;
+}
+
+/** Человек по ссылке из записи справочника: переход к его карточке. */
+export interface PersonRef {
+  name?: string | null;
+  email?: string | null;
 }
 
 /** Поиск по справочнику: найденное, взято ли оно из кэша, и текст отказа сервера (кэш при отказе всё равно отдаётся). */

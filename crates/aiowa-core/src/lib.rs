@@ -619,6 +619,18 @@ pub struct DirectoryPerson {
     pub business_phone: Option<String>,
     pub mobile_phone: Option<String>,
     pub alias: Option<String>,
+    /// Руководитель (`ManagerMailbox`, иначе имя из `Manager`); только у записи с полными данными.
+    #[serde(default)]
+    pub manager: Option<Participant>,
+    /// Подчинённые (`DirectReports`): `None` — запись без полных данных (поиск, старый кэш),
+    /// `Some(пусто)` — сервер ответил, подчинённых нет.
+    #[serde(default)]
+    pub direct_reports: Option<Vec<Participant>>,
+    /// Рабочий почтовый адрес одной строкой (`PhysicalAddresses`, ключ `Business` первым).
+    #[serde(default)]
+    pub address: Option<String>,
+    #[serde(default)]
+    pub notes: Option<String>,
 }
 
 impl DirectoryPerson {
@@ -651,6 +663,14 @@ impl DirectoryPerson {
         fill(&mut self.business_phone, &older.business_phone);
         fill(&mut self.mobile_phone, &older.mobile_phone);
         fill(&mut self.alias, &older.alias);
+        fill(&mut self.address, &older.address);
+        fill(&mut self.notes, &older.notes);
+        if self.manager.is_none() {
+            self.manager.clone_from(&older.manager);
+        }
+        if self.direct_reports.is_none() {
+            self.direct_reports.clone_from(&older.direct_reports);
+        }
         if self.kind == PersonKind::Other {
             self.kind = older.kind;
         }

@@ -843,13 +843,34 @@ CLI: `aiowa directory [--query Q] [--resolve] [--prefix3] [--expand first|АДР
 
 Как этим пользуется движок (`aiowa-sync`, `Engine::run`): после дерева папок у каждой непустой папки без состояния `SyncFolderItems` (в порядке плана, «Входящие» первыми) берётся страница из `SyncOptions::recent_first` писем (по умолчанию 100) и записывается в базу как обычные заголовки без состояния папки; затем идут полные выгрузки. Идентификаторы страницы хранятся в `sync_state` (`recent_pending.<folder_pk>`) и снимаются по мере того, как их присылает `SyncFolderItems`. Что осталось к концу выгрузки и всё ещё лежит в этой папке, сверяется с сервером одним `GetItem` (`MailListItem`): помечается удалённым только то, на что сервер ответил `ErrorItemNotFound` (письмо удалено или перенесено за время выгрузки — у перенесённого новый идентификатор). Не ответил — сверка повторяется при следующей синхронизации. Отказ `FindItem` синхронизацию не останавливает: папка выгружается обычным порядком.
 
-## 5l'. Фото из `ResolveNames` с полными данными (клиент, 30.10.2026)
+## 5l'. Фото и оргструктура из `ResolveNames` с полными данными, GET фото (клиент, 30.10.2026)
 
-В разрешении `ResolveNames` с `ReturnFullContactData` у записи справочника есть `Contact.Photo` —
-base64 картинки (JPEG, у проверенного коллеги 1 621 байт) и `HasPicture`. Клиент
-(`protocol::parse_resolution_photo`, `MailTransport::resolve_names_full`) декодирует её, кладёт в кэш
-справочника и показывает как `data:`-адрес; отдельного запроса фото нет. У записей без фото ключа
-`Photo` нет или он пуст. Другие источники фото (`GetPersonaPhoto`, `GetUserPhoto`) не пробовались.
+В разрешении `ResolveNames` с `ReturnFullContactData` (`AllProperties`) у записи справочника есть
+`Contact.HasPicture` и `Contact.Photo` — base64 JPEG. Проба `aiowa directory --probe-photo` по
+25 адресам ящика (первая запись поиска и частые отправители домена, только чтение): фото у 9,
+1 435–4 864 байт; у записей без фото ключей `Photo` и `HasPicture` нет вовсе. Клиент
+(`protocol::parse_resolution_photo`, `MailTransport::resolve_names_full`) декодирует его, кладёт в
+кэш справочника (`directory_people.photo`, `photo_at` — и как отметку «фото нет») и показывает как
+`data:`-адрес; отдельного запроса фото нет.
+
+Там же оргструктура: `Manager` — строка с именем (у 7 из 25), `ManagerMailbox: { "Mailbox": {
+"Name", "EmailAddress", "RoutingType", "MailboxType" } }`, `DirectReports: [ { "Name",
+"EmailAddress", "RoutingType", "MailboxType" } ]` (пустой массив, если подчинённых нет; у одного —
+11 записей), `PhysicalAddresses: [ { "Key", "Street", "City", "State", "CountryOrRegion",
+"PostalCode" } ]`, `Notes` — пустые строки. Разбор — `protocol::parse_resolution` (`manager`,
+`direct_reports`, `address`, `notes` в `DirectoryPerson`; `direct_reports = None` у записи без
+полных данных отличает её от «подчинённых нет»); карточка контакта показывает руководителя и
+подчинённых с переходом к их карточкам, адрес и заметки.
+
+GET фото (снято той же пробой): `GET /owa/service.svc/s/GetUserPhoto?email=<адрес>&size=HR96x96`
+с cookies сессии и `X-OWA-CANARY` (в строке запроса и заголовком) → `200 image/jpeg`
+(HR48x48 — 1 155 байт, столько же без `size`; HR96x96 — 2 145; HR240x240 — 6 636; 85–110 мс),
+`Cache-Control: private`, без `ETag`; `UA=0` ни на что не влияет. Нет фото или нет такого адреса
+— `404` с пустым телом и тем же `Cache-Control` (удобная отметка «фото нет»).
+`GetPersonaPhoto?email=…&size=…` → `400 text/html` «Неправильный запрос» (ждёт, видимо,
+PersonaId) — не использовать. Клиент этот GET пока не вызывает: фото приходит с записью
+`ResolveNames`; GET пригодится для крупного фото (240×240) и адресов без записи — основа в
+транспорте: `OwaTransport::service_get_probe` (сырой GET `service.svc/s/<op>` под семафором).
 
 ## 5n. Текущий ключ изменений: `GetItem` только с идентификаторами (клиент, 30.10.2026)
 

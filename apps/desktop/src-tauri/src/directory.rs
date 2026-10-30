@@ -107,6 +107,25 @@ pub(crate) struct DirectoryPersonDto {
     office: Option<String>,
     business_phone: Option<String>,
     mobile_phone: Option<String>,
+    /// Руководитель и подчинённые (§ 5l'): только у записи с полными данными; у записи поиска —
+    /// `None` и пустой список.
+    manager: Option<PersonRefDto>,
+    direct_reports: Vec<PersonRefDto>,
+    address: Option<String>,
+    notes: Option<String>,
+}
+
+/// Человек по ссылке из записи справочника: имя и адрес для перехода к его карточке.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct PersonRefDto {
+    name: Option<String>,
+    email: Option<String>,
+}
+
+impl From<aiowa_core::Participant> for PersonRefDto {
+    fn from(p: aiowa_core::Participant) -> Self {
+        Self { name: p.name, email: p.email.map(|e| e.trim().to_string()) }
+    }
 }
 
 impl From<DirectoryPerson> for DirectoryPersonDto {
@@ -121,6 +140,10 @@ impl From<DirectoryPerson> for DirectoryPersonDto {
             office: p.office,
             business_phone: p.business_phone,
             mobile_phone: p.mobile_phone,
+            manager: p.manager.map(PersonRefDto::from),
+            direct_reports: p.direct_reports.unwrap_or_default().into_iter().map(PersonRefDto::from).collect(),
+            address: p.address,
+            notes: p.notes,
         }
     }
 }
@@ -172,12 +195,11 @@ const PHOTO_TTL_MS: i64 = 7 * 24 * 3600 * 1000;
 /// `data:`-адрес картинки для окна; тип — по сигнатуре (JPEG, PNG, GIF, иначе JPEG).
 pub(crate) fn photo_data_url(bytes: &[u8]) -> String {
     use base64::prelude::*;
-    let mime = if bytes.starts_with(&[0x89, b'P', b'N', b'G']) {
-        "image/png"
-    } else if bytes.starts_with(b"GIF8") {
-        "image/gif"
-    } else {
-        "image/jpeg"
+    let mime = match aiowa_transport_owa::protocol::image_kind(bytes) {
+        Some("png") => "image/png",
+        Some("gif") => "image/gif",
+        Some("bmp") => "image/bmp",
+        _ => "image/jpeg",
     };
     format!("data:{mime};base64,{}", BASE64_STANDARD.encode(bytes))
 }
@@ -487,7 +509,8 @@ pub(crate) fn card_kind(fresh: PersonKind, cached: Option<PersonKind>) -> Person
 /// Запись кэша, похоже, получена только поиском (`FindPeople` не отдаёт отдела): у ящика человека
 /// без отдела карточка один раз в `QUERY_TTL` переспрашивает сервер полными данными.
 fn looks_incomplete(p: &DirectoryPerson) -> bool {
-    matches!(p.kind, PersonKind::Mailbox | PersonKind::Other) && p.department.is_none()
+    // Без отдела — запись из поиска; без `direct_reports` — кэш до появления оргструктуры (§ 5l').
+    matches!(p.kind, PersonKind::Mailbox | PersonKind::Other) && (p.department.is_none() || p.direct_reports.is_none())
 }
 
 /// Записи с адресом SMTP без повторов адреса.
@@ -1161,7 +1184,8 @@ mod tests {
         assert_eq!(v["title"], "Инженер");
         assert!(v.get("alias").is_none(), "псевдоним окну не нужен");
         let keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
-        assert_eq!(keys, ["name", "email", "kind", "title", "department", "company", "office", "business_phone", "mobile_phone"]);
+        assert_eq!(keys, ["name", "email", "kind", "title", "department", "company", "office", "business_phone", "mobile_phone", "manager", "direct_reports", "address", "notes"]);
+        assert!(v["manager"].is_null() && v["direct_reports"].as_array().is_some_and(Vec::is_empty), "без полных данных — руководителя нет, подчинённых пусто");
     }
 
     #[test]
@@ -1191,7 +1215,8 @@ mod tests {
         assert_eq!(card_kind(PersonKind::Mailbox, None), PersonKind::Mailbox);
 
         assert!(looks_incomplete(&person("Иван", "i@x.ru")), "ящик без отдела — только из поиска");
-        assert!(!looks_incomplete(&DirectoryPerson { department: Some("ОГЭ".into()), ..person("Иван", "i@x.ru") }));
+        assert!(looks_incomplete(&DirectoryPerson { department: Some("ОГЭ".into()), ..person("Иван", "i@x.ru") }), "кэш без оргструктуры — перечитать");
+        assert!(!looks_incomplete(&DirectoryPerson { department: Some("ОГЭ".into()), direct_reports: Some(Vec::new()), ..person("Иван", "i@x.ru") }));
         assert!(!looks_incomplete(&DirectoryPerson { kind: PersonKind::DistributionList, ..person("Все", "all@x.ru") }), "у списка отдела не бывает");
     }
 
