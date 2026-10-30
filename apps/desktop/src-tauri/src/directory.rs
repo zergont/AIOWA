@@ -214,6 +214,21 @@ fn photo_for(found: &[ResolvedPerson], key: &str) -> Option<Vec<u8>> {
     found.iter().find(|r| r.person.email_key().as_deref() == Some(key)).and_then(|r| r.photo.clone()).or_else(|| found.iter().find_map(|r| r.photo.clone()))
 }
 
+/// Ответ сервера на фото — в кэш: запись (вид — как у карточки, `card_kind`: переговорная из кэша
+/// остаётся переговорной) и под адресом `key` фото или отметка «фото нет». Строки с адресом `key`
+/// нет — `false`, фото не записано.
+fn store_photo_answer(store: &Store, account: AccountId, key: &str, person: Option<DirectoryPerson>, photo: Option<&[u8]>) -> aiowa_store::Result<bool> {
+    if let Some(mut p) = person {
+        let old = match p.email_key() {
+            Some(k) => store.directory_person(account, &k)?,
+            None => None,
+        };
+        p.kind = card_kind(p.kind, old.map(|o| o.kind));
+        store.replace_directory_person(account, &p)?;
+    }
+    store.set_directory_photo(account, key, photo)
+}
+
 // --- чистые функции (без базы и сети) --------------------------------------------------------
 
 /// Запрос к справочнику: текст для сервера и ключ кэша запросов и замка.
@@ -528,6 +543,11 @@ fn card_key(email_key: &str) -> String {
 /// Ключ развёртывания списка в замках и в кэше запросов.
 fn expand_key(email_key: &str) -> String {
     format!("\u{1}expand {email_key}")
+}
+
+/// Ключ фото в кэше запросов (только отказы: ответ сервера помнит сам кэш справочника).
+fn photo_key(email_key: &str) -> String {
+    format!("\u{1}photo {email_key}")
 }
 
 // --- состояние -------------------------------------------------------------------------------
@@ -875,11 +895,12 @@ pub(crate) async fn contact_card(email: String, refresh: bool, state: State<'_, 
 }
 
 /// Фото из кэша справочника по списку адресов, без сети: адрес (в нижнем регистре) → `data:`-адрес.
-/// Для заголовков писем и подсказок: сервер по ним не спрашивается.
+/// Для заголовков писем и подсказок: сервер по ним не спрашивается. В ответе только адреса с фото:
+/// отсутствие адреса не значит «фото нет» (его могли не спрашивать). Длинный список окно шлёт
+/// частями (`primePhotos`).
 #[tauri::command]
 pub(crate) async fn contact_photos(emails: Vec<String>, state: State<'_, AppState>) -> CmdResult<HashMap<String, String>> {
     let (store, account) = (state.store.clone(), state.account);
-    let emails: Vec<String> = emails.into_iter().take(200).collect();
     tauri::async_runtime::spawn_blocking(move || {
         let found = store.directory_photos(account, &emails).map_err(|e| format!("Ошибка локальной базы: {e}"))?;
         Ok(found.into_iter().map(|(k, b)| (k, photo_data_url(&b))).collect())
@@ -890,7 +911,8 @@ pub(crate) async fn contact_photos(emails: Vec<String>, state: State<'_, AppStat
 
 /// Фото одного человека: из кэша, если оно запрашивалось не старше недели (в том числе отметка
 /// «фото нет»), иначе `ResolveNames` с полными данными (одна запись за вызов, под замком адреса),
-/// запись в кэш и `data:`-адрес; адрес не SMTP или сервер недоступен — `None` без ошибки.
+/// запись в кэш и `data:`-адрес; адрес не SMTP — `None`. Сервер не ответил (или недавно не
+/// отвечал, `FAILURE_TTL`) — `Err` с текстом: это не «фото нет», в кэш ничего не пишется.
 #[tauri::command]
 pub(crate) async fn contact_photo(email: String, state: State<'_, AppState>, sync: State<'_, Arc<SyncState>>, dir: State<'_, DirectoryState>) -> CmdResult<Option<String>> {
     let key = email.trim().to_lowercase();
@@ -909,6 +931,12 @@ pub(crate) async fn contact_photo(email: String, state: State<'_, AppState>, syn
     {
         return Ok(photo.map(|b| photo_data_url(&b)));
     }
+    // Сервер недавно не ответил (общий отказ или по этому адресу) — без нового похода.
+    let pkey = photo_key(&key);
+    let plan = lock(&dir.queries).plan(&pkey, Instant::now(), false);
+    if let Plan::Failed(why) = plan {
+        return Err(why);
+    }
     let deadline = Instant::now() + SERVER_TIMEOUT;
     let fetched = match dir.transport(sync.inner(), deadline, SERVER_TIMEOUT).await {
         Ok(t) => until(deadline, SERVER_TIMEOUT, t.resolve_names_full(&key)).await,
@@ -919,14 +947,7 @@ pub(crate) async fn contact_photo(email: String, state: State<'_, AppState>, syn
             let photo = photo_for(&found, &key);
             let person = pick_card(found.into_iter().map(|r| r.person).collect(), &key);
             let (st, k, bytes) = (store.clone(), key.clone(), photo.clone());
-            let stored = tauri::async_runtime::spawn_blocking(move || -> aiowa_store::Result<bool> {
-                if let Some(p) = person {
-                    st.replace_directory_person(account, &p)?;
-                }
-                st.set_directory_photo(account, &k, bytes.as_deref())
-            })
-            .await
-            .map_err(err)?;
+            let stored = tauri::async_runtime::spawn_blocking(move || store_photo_answer(&st, account, &k, person, bytes.as_deref())).await.map_err(err)?;
             if let Err(e) = stored {
                 warn!(error = %e, "справочник: фото не записано в кэш");
             }
@@ -936,7 +957,8 @@ pub(crate) async fn contact_photo(email: String, state: State<'_, AppState>, syn
         Err(f) => {
             let why = dir.fail(&sync, "photo", &f, describe_transport).await;
             warn!(why, "справочник: фото не получено");
-            Ok(None)
+            lock(&dir.queries).record_failure(&pkey, Instant::now(), why.clone(), f.is_outage());
+            Err(why)
         }
     }
 }
@@ -1218,6 +1240,45 @@ mod tests {
         assert!(looks_incomplete(&DirectoryPerson { department: Some("ОГЭ".into()), ..person("Иван", "i@x.ru") }), "кэш без оргструктуры — перечитать");
         assert!(!looks_incomplete(&DirectoryPerson { department: Some("ОГЭ".into()), direct_reports: Some(Vec::new()), ..person("Иван", "i@x.ru") }));
         assert!(!looks_incomplete(&DirectoryPerson { kind: PersonKind::DistributionList, ..person("Все", "all@x.ru") }), "у списка отдела не бывает");
+    }
+
+    #[test]
+    fn photo_answer_keeps_known_kind() {
+        let store = temp_store("photo-kind");
+        let acc = store.account("h", "u").unwrap();
+        store.upsert_directory_people(acc, &[DirectoryPerson { kind: PersonKind::Room, ..person("Переговорная 1", "room1@x.ru") }, DirectoryPerson { kind: PersonKind::Contact, ..person("Контакт", "c@x.ru") }]).unwrap();
+        // ResolveNames знает только MailboxType: переговорная приходит обычным ящиком.
+        assert!(store_photo_answer(&store, acc, "room1@x.ru", Some(person("Переговорная 1", "Room1@x.ru")), Some(&[1, 2, 3])).unwrap());
+        assert_eq!(store.directory_person(acc, "room1@x.ru").unwrap().unwrap().kind, PersonKind::Room, "фото не понижает вид записи");
+        assert_eq!(store.directory_photo(acc, "room1@x.ru").unwrap().unwrap().0.as_deref(), Some(&[1u8, 2, 3][..]));
+        assert!(store_photo_answer(&store, acc, "c@x.ru", Some(DirectoryPerson { kind: PersonKind::Other, ..person("Контакт", "c@x.ru") }), None).unwrap());
+        assert_eq!(store.directory_person(acc, "c@x.ru").unwrap().unwrap().kind, PersonKind::Contact, "неизвестный вид уступает известному");
+        assert_eq!(store.directory_photo(acc, "c@x.ru").unwrap().map(|(p, _)| p.is_none()), Some(true), "отметка «фото нет»");
+        assert!(store_photo_answer(&store, acc, "new@x.ru", Some(person("Новый", "new@x.ru")), None).unwrap());
+        assert_eq!(store.directory_person(acc, "new@x.ru").unwrap().unwrap().kind, PersonKind::Mailbox, "новой записи — вид ответа");
+        assert!(!store_photo_answer(&store, acc, "none@x.ru", None, None).unwrap(), "ни записи, ни строки — ничего не записано");
+    }
+
+    #[test]
+    fn photo_failure_waits_but_is_not_an_answer() {
+        let t0 = Instant::now();
+        let s = |n: u64| t0 + Duration::from_secs(n);
+        let mut c = QueryCache::default();
+        let (a, b) = (photo_key("a@x.ru"), photo_key("b@x.ru"));
+        assert_ne!(a, card_key("a@x.ru"), "фото и карточка — разные ключи");
+        // Ответ карточки не отвечает за фото: фото помнит кэш справочника.
+        c.record_done(&card_key("a@x.ru"), t0, Answer::new(vec!["a@x.ru".into()], true), false);
+        assert_eq!(c.plan(&a, s(1), false), Plan::Server);
+        // Отказ по адресу: этот адрес 30 с не спрашивается, другие — да.
+        c.record_failure(&a, t0, "Сервер отказал: X".into(), false);
+        assert_eq!(c.plan(&a, s(5), false), Plan::Failed("Сервер отказал: X".into()));
+        assert_eq!(c.plan(&b, s(5), false), Plan::Server);
+        assert_eq!(c.plan(&a, t0 + FAILURE_TTL, false), Plan::Server, "потом — снова сервер");
+        // Нет связи: 30 с ни фото, ни карточка не идут на сервер и не ждут таймаут.
+        c.record_failure(&a, s(100), "Нет связи с сервером".into(), true);
+        assert_eq!(c.plan(&b, s(101), false), Plan::Failed("Нет связи с сервером".into()));
+        assert_eq!(c.plan(&card_key("b@x.ru"), s(101), false), Plan::Failed("Нет связи с сервером".into()));
+        assert_eq!(c.plan(&b, s(100) + FAILURE_TTL, false), Plan::Server);
     }
 
     #[test]

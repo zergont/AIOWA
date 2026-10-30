@@ -1,12 +1,22 @@
 /**
  * Фото людей для аватаров (п. 9 обкатки, этап 6): кэш окна «адрес → data:-адрес или null (фото
  * нет)». Заполняется из карточки контакта (бэкенд отдаёт фото вместе с записью) и по запросу
- * `requestPhoto` для отправителя открытого письма: один запрос к серверу за раз, повторов по уже
- * известным адресам нет. Подсказки и списки берут только то, что уже в кэше.
+ * `requestPhoto` для отправителя открытого письма: один запрос к серверу за раз, повтор по адресу —
+ * не раньше `RECHECK_MS` (срок годности фото в кэше бэкенда — неделя — соблюдает бэкенд), после
+ * сбоя — не раньше `RETRY_MS`. Подсказки и списки берут только фото, уже лежащие в кэше бэкенда.
  */
 import { api } from "./api";
 
+/** Через сколько снова спросить бэкенд по адресу, на который он уже ответил. */
+const RECHECK_MS = 60 * 60 * 1000;
+/** Через сколько повторить запрос, если сервер не ответил (нет связи, таймаут). */
+const RETRY_MS = 60 * 1000;
+/** Адресов в одном запросе к кэшу бэкенда: длинный список (все личные контакты) — частями. */
+const PRIME_CHUNK = 200;
+
 const cache = $state<Record<string, string | null>>({});
+/** Адрес → момент, раньше которого `requestPhoto` его не спрашивает (не реактивно). */
+const nextAsk = new Map<string, number>();
 const pending = new Set<string>();
 const queue: string[] = [];
 let running = false;
@@ -28,22 +38,27 @@ export function notePhoto(email: string | null | undefined, url: string | null |
   cache[k] = url ?? null;
 }
 
-/** Подгрузить фото из кэша бэкенда для списка адресов, без сети (заголовки, подсказки). */
+/**
+ * Подгрузить фото из кэша бэкенда для списка адресов, без сети (заголовки, подсказки). Ложатся
+ * только найденные фото: адрес без фото в кэше бэкенда мог ещё не спрашиваться — его спросит
+ * `requestPhoto`, а не «фото нет» отсюда.
+ */
 export async function primePhotos(emails: (string | null | undefined)[]) {
   const keys = [...new Set(emails.map(keyOf).filter((k) => k && !(k in cache)))];
-  if (!keys.length) return;
-  try {
-    const found = await api.contactPhotos(keys);
-    for (const k of keys) cache[k] = found[k] ?? cache[k] ?? null;
-  } catch {
-    // Без кэша — инициалы.
+  for (let i = 0; i < keys.length; i += PRIME_CHUNK) {
+    try {
+      const found = await api.contactPhotos(keys.slice(i, i + PRIME_CHUNK));
+      for (const [k, url] of Object.entries(found)) if (!(k in cache)) cache[k] = url;
+    } catch {
+      return; // Без кэша — инициалы.
+    }
   }
 }
 
 /** Запросить фото у бэкенда (кэш или сервер) для одного адреса; результат ложится в кэш окна. */
 export function requestPhoto(email: string | null | undefined) {
   const k = keyOf(email);
-  if (!k || !k.includes("@") || k in cache || pending.has(k)) return;
+  if (!k || !k.includes("@") || pending.has(k) || (nextAsk.get(k) ?? 0) > Date.now()) return;
   pending.add(k);
   queue.push(k);
   void drain();
@@ -57,8 +72,10 @@ async function drain() {
       const k = queue.shift()!;
       try {
         cache[k] = (await api.contactPhoto(k)) ?? null;
+        nextAsk.set(k, Date.now() + RECHECK_MS);
       } catch {
-        cache[k] = null;
+        // Сервер не ответил — это не «фото нет»: в кэше остаётся что было, повтор позже.
+        nextAsk.set(k, Date.now() + RETRY_MS);
       } finally {
         pending.delete(k);
       }

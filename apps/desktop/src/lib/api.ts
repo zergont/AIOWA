@@ -932,7 +932,7 @@ export const api = {
   contactCard: (email: string, refresh = false) => invoke<ContactCard>("contact_card", { email, refresh }),
   /** Фото из кэша справочника по адресам, без сети: адрес в нижнем регистре → data:-адрес. */
   contactPhotos: (emails: string[]) => invoke<Record<string, string>>("contact_photos", { emails }),
-  /** Фото одного человека: кэш не старше недели или ResolveNames; null — фото нет или сервер недоступен. */
+  /** Фото одного человека: кэш не старше недели или ResolveNames; null — фото нет; сервер не ответил — ошибка. */
   contactPhoto: (email: string) => invoke<string | null>("contact_photo", { email }),
   /** Участники списка рассылки (ExpandDL на сервере). */
   directoryExpand: (email: string) => invoke<DirectoryPerson[]>("directory_expand", { email }),
