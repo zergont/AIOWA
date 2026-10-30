@@ -918,8 +918,23 @@
     return stageWrite([itemPk], a, action, "письмо", restore);
   }
 
-  /** Больше бесед за раз не обрабатываем: по каждой — запрос писем, затем одна команда записи. */
-  const BULK_LIMIT = 200;
+  /**
+   * Бесед в одной порции запросов их писем (по команде на беседу, порция — параллельно). Выбор
+   * любого размера (п. 13 обкатки): порции идут друг за другом, ход — в строке уведомления; запись
+   * затем одна на весь выбор (одно окно отмены), на сервер она уходит пачками по папкам.
+   */
+  const PKS_CHUNK = 50;
+
+  /** Письма выбранных бесед в папке `folderPk` (null — во всех папках), без повторов. */
+  async function itemPksOf(targets: Conversation[], folderPk: number | null): Promise<number[]> {
+    const out = new Set<number>();
+    for (let i = 0; i < targets.length; i += PKS_CHUNK) {
+      const lists = await Promise.all(targets.slice(i, i + PKS_CHUNK).map((c) => api.conversationItemPks(c.conversation_pk, folderPk)));
+      for (const list of lists) for (const pk of list) out.add(pk);
+      if (targets.length > PKS_CHUNK) showNotice(`Собираю письма бесед: ${Math.min(i + PKS_CHUNK, targets.length).toLocaleString("ru-RU")} из ${targets.length.toLocaleString("ru-RU")}`);
+    }
+    return [...out];
+  }
 
   /**
    * Действие над всеми письмами выбранных бесед в текущей папке (меню списка, панель «Выбрано N»,
@@ -928,14 +943,12 @@
    */
   async function onListAction(targets: Conversation[], a: ItemAction, anchor?: Anchor): Promise<void> {
     if (!selectedFolder || !targets.length) return;
-    if (targets.length > BULK_LIMIT) throw `Выбрано слишком много бесед (${targets.length}): за раз можно обработать не больше ${BULK_LIMIT}`;
     if (a.kind === "archive" && !archiveFolder) {
       askArchive(anchor ?? composerAnchor(), () => onListAction(targets, a, anchor));
       return;
     }
     const folderPk = a.kind === "flag" && !a.flagged ? null : selectedFolder.folder_pk;
-    const lists = await Promise.all(targets.map((c) => api.conversationItemPks(c.conversation_pk, folderPk)));
-    const itemPks = [...new Set(lists.flat())];
+    const itemPks = await itemPksOf(targets, folderPk);
     if (!itemPks.length) return;
     const restore: Restore = { folderPk: selectedFolder.folder_pk, pks: targets.map((c) => c.conversation_pk), focusPk: selected?.conversation_pk ?? null };
     applyToRows(targets, a);
