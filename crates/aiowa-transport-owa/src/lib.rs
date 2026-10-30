@@ -189,7 +189,78 @@ fn net(mut e: reqwest::Error) -> TransportError {
     if let Some(u) = e.url_mut() {
         u.set_query(None);
     }
-    TransportError::Network(Box::new(e))
+    // Соединение не установилось — запрос не ушёл; всё остальное — после отправки.
+    if e.is_connect() { TransportError::Connect(Box::new(e)) } else { TransportError::Network(Box::new(e)) }
+}
+
+/// Таймаут установления соединения. Windows повторяет SYN на 1, 3, 7 и 15 с; прежние 10 с
+/// отсекали последний повтор и почти не оставляли времени на TLS (docs/obkatka.md п. 22).
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+/// Сколько держать простаивающее соединение в пуле. Чуть больше прежних 90 с по умолчанию:
+/// таймеры календаря и синхронизации реже, и почти каждый их запрос открывал соединение заново.
+const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(105);
+/// TCP keepalive простаивающих соединений: сетевое оборудование по пути не закрывает их молча.
+const TCP_KEEPALIVE: Duration = Duration::from_secs(30);
+/// Повторов, когда соединение не установилось (запрос не ушёл).
+const CONNECT_RETRIES: u32 = 2;
+
+/// Можно ли повторить операцию после обрыва, когда неизвестно, дошла ли она до сервера.
+/// Чтения — да; `UpdateItem` идёт с `AlwaysOverwrite` — да; создание, отправка, перенос,
+/// удаление и подписки — нет (повтор дал бы дубль или второе действие).
+pub(crate) fn is_idempotent(op: &str) -> bool {
+    !matches!(
+        op,
+        "CreateItem"
+            | "SendItem"
+            | "CreateAttachment"
+            | "DeleteAttachment"
+            | "MoveItem"
+            | "DeleteItem"
+            | "CopyItem"
+            | "CreateFolder"
+            | "DeleteFolder"
+            | "MoveFolder"
+            | "UpdateFolder"
+            | "EmptyFolder"
+            | "SubscribeToNotification"
+            | "UnsubscribeFromNotification"
+    )
+}
+
+/// Отправка запроса с повторами. Соединение не установилось (запрос не ушёл): до
+/// `CONNECT_RETRIES` повторов для любой операции с паузой 1 и 2 с. Обрыв после отправки
+/// (сброс, ошибка чтения ответа): один повтор только для идемпотентных операций; таймаут ответа
+/// не повторяется — ждать ещё раз столько же нет смысла. В журнал — вид сбоя, длительность и
+/// цепочка причин; адрес запроса без query (`net`).
+pub(crate) async fn send_retrying(req: reqwest::RequestBuilder, op: &str, idempotent: bool) -> Result<reqwest::Response> {
+    let mut attempt = 0u32;
+    loop {
+        let Some(this) = req.try_clone() else {
+            // Тело-поток клонировать нельзя: без повторов.
+            return req.send().await.map_err(net);
+        };
+        let started = Instant::now();
+        match this.send().await {
+            Ok(r) => {
+                if attempt > 0 {
+                    info!(op, attempt, "запрос прошёл после повтора");
+                }
+                return Ok(r);
+            }
+            Err(e) => {
+                let connect = e.is_connect();
+                let timeout = e.is_timeout();
+                let retry = if connect { attempt < CONNECT_RETRIES } else { idempotent && !timeout && attempt < 1 };
+                let err = net(e);
+                warn!(op, attempt, connect, timeout, idempotent, retry, ms = started.elapsed().as_millis() as u64, error = %err.chain(), "сетевой сбой запроса");
+                if !retry {
+                    return Err(err);
+                }
+                attempt += 1;
+                tokio::time::sleep(Duration::from_secs(u64::from(attempt))).await;
+            }
+        }
+    }
 }
 
 /// Начало ответа, который не разобрался как JSON, — для текста ошибки. Похожее на JSON (обрезанный
@@ -245,7 +316,9 @@ impl OwaTransport {
             .redirect(Policy::none())
             .user_agent(&config.user_agent)
             .http1_only()
-            .connect_timeout(Duration::from_secs(10))
+            .connect_timeout(CONNECT_TIMEOUT)
+            .pool_idle_timeout(POOL_IDLE_TIMEOUT)
+            .tcp_keepalive(TCP_KEEPALIVE)
             .timeout(config.timeout);
         // Тестовый сервер на петлевом адресе: прямое соединение, без системного прокси.
         if config.base_url.is_some() {
@@ -316,7 +389,7 @@ impl OwaTransport {
         let inner = &self.inner;
         let owa = inner.base.join("owa").expect("url");
         let logon = inner.base.join("owa/auth/logon.aspx").expect("url");
-        let _ = inner.client.get(logon).query(&[("url", owa.as_str()), ("reason", "0")]).send().await.map_err(net)?;
+        let _ = send_retrying(inner.client.get(logon).query(&[("url", owa.as_str()), ("reason", "0")]), "logon.aspx", true).await?;
 
         let form = [
             ("destination", owa.as_str()),
@@ -327,7 +400,8 @@ impl OwaTransport {
             ("passwordText", ""),
             ("isUtf8", "1"),
         ];
-        let r = inner.client.post(inner.base.join("owa/auth.owa").expect("url")).form(&form).send().await.map_err(net)?;
+        // Повтор только если соединение не установилось: ушедший вход мог создать сессию.
+        let r = send_retrying(inner.client.post(inner.base.join("owa/auth.owa").expect("url")).form(&form), "auth.owa", false).await?;
         let status = r.status();
         let location = r.headers().get(LOCATION).and_then(|v| v.to_str().ok()).map(String::from);
         if let Some(loc) = &location {
@@ -352,7 +426,7 @@ impl OwaTransport {
         for _ in 0..5 {
             let Some(loc) = next.take() else { break };
             let url = inner.base.join(&loc).map_err(|e| TransportError::Protocol { op: "redirect".into(), status: 0, raw: e.to_string() })?;
-            let r = inner.client.get(url).send().await.map_err(net)?;
+            let r = send_retrying(inner.client.get(url), "auth-redirect", true).await?;
             self.remember_build(r.headers());
             if r.status().is_redirection() {
                 let l = r.headers().get(LOCATION).and_then(|v| v.to_str().ok()).map(String::from);
@@ -438,25 +512,28 @@ impl OwaTransport {
 
     /// Вызов с другим `TimeZoneContext` в заголовке только этого запроса: `time_zone` — пояс
     /// Windows пользователя (запись в календарь, § 5i); `None` — пояс из настроек (UTC).
+    /// Записи календаря (`CreateItem`, `UpdateItem` с рассылкой участникам) после обрыва не
+    /// повторяются: повтор разослал бы приглашения второй раз.
     pub async fn call_in_zone(&self, op: &str, version: &str, time_zone: Option<&str>, body: Value, timeout: Option<Duration>) -> Result<Value> {
         let env = protocol::envelope(op, version, time_zone.unwrap_or(&self.inner.config.time_zone), body);
         let payload = serde_json::to_vec(&env).map_err(|e| TransportError::Protocol { op: op.into(), status: 0, raw: e.to_string() })?;
-        self.call_payload(op, payload, timeout).await
+        let idempotent = is_idempotent(op) && (time_zone.is_none() || op != "UpdateItem");
+        self.call_payload(op, payload, timeout, idempotent).await
     }
 
     /// Операция с OWA-специфичным конвертом (параметры на верхнем уровне рядом с `request`,
     /// без `Body`): `payload` уходит как есть, ответ — произвольный JSON (у подписок массив).
     pub async fn call_raw(&self, op: &str, payload: Value) -> Result<Value> {
         let payload = serde_json::to_vec(&payload).map_err(|e| TransportError::Protocol { op: op.into(), status: 0, raw: e.to_string() })?;
-        self.call_payload(op, payload, None).await
+        self.call_payload(op, payload, None, is_idempotent(op)).await
     }
 
     /// Готовое тело запроса под разрешением семафора с одной попыткой повторного входа.
-    async fn call_payload(&self, op: &str, payload: Vec<u8>, timeout: Option<Duration>) -> Result<Value> {
+    async fn call_payload(&self, op: &str, payload: Vec<u8>, timeout: Option<Duration>, idempotent: bool) -> Result<Value> {
         let _permit = self.inner.permits.acquire().await.map_err(|_| TransportError::Cancelled)?;
         for attempt in 0..2 {
             let generation = self.inner.generation.load(Ordering::SeqCst);
-            match self.call_once(op, payload.clone(), timeout).await {
+            match self.call_once(op, payload.clone(), timeout, idempotent).await {
                 Err(e) if e.needs_reauth() && attempt == 0 => {
                     self.relogin_once(generation).await?;
                 }
@@ -466,7 +543,7 @@ impl OwaTransport {
         Err(TransportError::SessionExpired)
     }
 
-    async fn call_once(&self, op: &str, payload: Vec<u8>, timeout: Option<Duration>) -> Result<Value> {
+    async fn call_once(&self, op: &str, payload: Vec<u8>, timeout: Option<Duration>, idempotent: bool) -> Result<Value> {
         let inner = &self.inner;
         let id = inner.action_id.fetch_sub(1, Ordering::SeqCst);
         let mut url = inner.base.join("owa/service.svc").expect("url");
@@ -487,7 +564,7 @@ impl OwaTransport {
         if let Some(t) = timeout {
             req = req.timeout(t);
         }
-        let r = req.send().await.map_err(net)?;
+        let r = send_retrying(req, op, idempotent).await?;
         let status = r.status();
         self.remember_build(r.headers());
         if status == StatusCode::from_u16(440).unwrap_or(StatusCode::UNAUTHORIZED) || status == StatusCode::UNAUTHORIZED {
@@ -564,7 +641,7 @@ impl OwaTransport {
         let mut headers = HeaderMap::new();
         headers.insert("X-OWA-CANARY", HeaderValue::from_str(&canary).map_err(|_| TransportError::CsrfRejected)?);
         let started = std::time::Instant::now();
-        let mut r = inner.client.get(url).headers(headers).send().await.map_err(net)?;
+        let mut r = send_retrying(inner.client.get(url).headers(headers), "GetFileAttachment", true).await?;
         let status = r.status();
         self.remember_build(r.headers());
         if status == StatusCode::from_u16(440).unwrap_or(StatusCode::UNAUTHORIZED) || status == StatusCode::UNAUTHORIZED {
@@ -631,7 +708,7 @@ impl OwaTransport {
     async fn call_unpermitted(&self, op: &str, version: &str, body: Value) -> Result<Value> {
         let env = protocol::envelope(op, version, &self.inner.config.time_zone, body);
         let payload = serde_json::to_vec(&env).map_err(|e| TransportError::Protocol { op: op.into(), status: 0, raw: e.to_string() })?;
-        self.call_once(op, payload, None).await
+        self.call_once(op, payload, None, is_idempotent(op)).await
     }
 
     /// Форма сообщения ответа в журнал отладки без содержимого: тип, код, ключи сообщения и
@@ -1241,6 +1318,7 @@ fn error_kind(e: &TransportError) -> &'static str {
         TransportError::Server { .. } => "Server",
         TransportError::Cancelled => "Cancelled",
         TransportError::TooLarge { .. } => "TooLarge",
+        TransportError::Connect(_) => "Connect",
     }
 }
 
@@ -1970,6 +2048,8 @@ mod tests {
     #[test]
     fn redirect_classification() {
         assert!(matches!(classify_redirect("/owa/auth/logon.aspx?reason=0"), TransportError::SessionExpired));
+        assert!(is_idempotent("GetItem") && is_idempotent("UpdateItem") && is_idempotent("SyncFolderItems") && is_idempotent("FindPeople"));
+        assert!(!is_idempotent("CreateItem") && !is_idempotent("SendItem") && !is_idempotent("MoveItem") && !is_idempotent("SubscribeToNotification"));
         assert!(matches!(classify_redirect("/owa/auth/errorFE.aspx?httpCode=500"), TransportError::CsrfRejected));
         assert!(matches!(classify_redirect("/owa/auth/errorfe.aspx?httpCode=500&inex=Microsoft.Mapi.MapiExceptionSessionLimit"), TransportError::SessionLimit));
     }

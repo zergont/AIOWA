@@ -1356,6 +1356,7 @@ mod tests {
     fn send_item_outcome_unknown_only_for_network_and_protocol() {
         use aiowa_transport::TransportError;
         assert!(outcome_unknown(&TransportError::Network("обрыв".into())));
+        assert!(!outcome_unknown(&TransportError::Connect("нет соединения".into())), "запрос не ушёл — письмо точно не отправлено");
         assert!(outcome_unknown(&TransportError::Protocol { op: "SendItem".into(), status: 502, raw: String::new() }));
         assert!(outcome_unknown(&TransportError::Protocol { op: "SendItem".into(), status: 200, raw: "не JSON".into() }));
         assert!(!outcome_unknown(&TransportError::Server { code: "ErrorInvalidRecipients".into(), message: String::new() }));

@@ -1826,6 +1826,7 @@ fn transport_error_code(e: &TransportError) -> String {
         }
         TransportError::Throttled { retry_after } => format!("Throttled {retry_after:?}"),
         TransportError::Network(_) => "Network".into(),
+        TransportError::Connect(_) => "Connect".into(),
         TransportError::AuthFailed(_) => "AuthFailed".into(),
         other => other.to_string(),
     }

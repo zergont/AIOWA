@@ -365,6 +365,7 @@ pub(crate) fn error_kind(e: &TransportError) -> String {
         TransportError::AuthFailed(_) => "AuthFailed".into(),
         TransportError::Throttled { .. } => "Throttled".into(),
         TransportError::Network(_) => "Network".into(),
+        TransportError::Connect(_) => "Connect".into(),
         TransportError::Cancelled => "Cancelled".into(),
         TransportError::TooLarge { .. } => "TooLarge".into(),
     }

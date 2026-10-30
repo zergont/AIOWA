@@ -87,6 +87,7 @@ pub(crate) fn describe_transport(e: &TransportError) -> String {
         TransportError::AuthFailed(_) => "Вход отклонён сервером: проверьте пароль (настройки → «Сменить пароль…»)".into(),
         TransportError::Throttled { .. } => "Сервер занят, повторите позже".into(),
         TransportError::Network(_) => "Нет связи с сервером".into(),
+        TransportError::Connect(_) => "Нет связи с сервером: соединение не установилось".into(),
         TransportError::Protocol { status: 0, .. } => "Сервер ответил неожиданно".into(),
         TransportError::Protocol { status, .. } => format!("Сервер ответил неожиданно (HTTP {status})"),
         TransportError::Server { code, .. } if code == STALE_OBJECT => "Письмо на сервере изменилось, повторите попытку".into(),
@@ -343,6 +344,7 @@ mod tests {
         assert_eq!(describe_transport(&TransportError::TooLarge { limit: 200 * 1024 * 1024 }), "Файл больше лимита 200 МБ");
         assert_eq!(describe_transport(&TransportError::SessionExpired), "Сессия истекла, повторите попытку");
         assert_eq!(describe_transport(&TransportError::Network(Box::new(std::io::Error::other("x")))), "Нет связи с сервером");
+        assert_eq!(describe_transport(&TransportError::Connect(Box::new(std::io::Error::other("x")))), "Нет связи с сервером: соединение не установилось");
     }
 
     #[test]

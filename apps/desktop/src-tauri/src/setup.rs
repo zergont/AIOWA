@@ -253,7 +253,7 @@ pub(crate) fn describe_login_error(e: &TransportError, host: &str) -> String {
     match e {
         TransportError::AuthFailed(_) => "Неверный логин или пароль: сервер отклонил вход".into(),
         TransportError::SessionLimit => "Исчерпан лимит сессий на ящик: закройте лишние окна OWA или подождите несколько минут".into(),
-        TransportError::Network(inner) => classify_network(&error_chain_text(inner.as_ref()), host).into(),
+        TransportError::Network(inner) | TransportError::Connect(inner) => classify_network(&error_chain_text(inner.as_ref()), host).into(),
         TransportError::Protocol { status: 404, .. } => "По этому адресу нет OWA (HTTP 404): проверьте адрес сервера".into(),
         TransportError::Protocol { op, status: 0, .. } if op == "config" => "Не похоже на адрес сервера".into(),
         TransportError::SessionExpired | TransportError::CsrfRejected => "Сервер отклонил сессию сразу после входа: повторите попытку".into(),

@@ -33,9 +33,14 @@ pub enum TransportError {
     /// Сервер просит подождать (ErrorServerBusy, BackOffMilliseconds).
     #[error("сервер просит подождать {retry_after:?}")]
     Throttled { retry_after: Option<Duration> },
-    /// Сетевая ошибка: соединение, TLS, таймаут.
+    /// Сетевая ошибка после отправки запроса: обрыв, таймаут ответа, ошибка чтения тела.
+    /// Дошёл ли запрос до сервера — неизвестно.
     #[error("сеть: {0}")]
     Network(#[source] Box<dyn std::error::Error + Send + Sync + 'static>),
+    /// Соединение не установлено: DNS, отказ порта, таймаут соединения, TLS. Запрос не ушёл,
+    /// повтор безопасен для любой операции, включая `CreateItem` и `SendItem`.
+    #[error("нет соединения: {0}")]
+    Connect(#[source] Box<dyn std::error::Error + Send + Sync + 'static>),
     /// Ответ не разобран или HTTP-статус неожиданный. `raw` усечён.
     #[error("протокол {op}: HTTP {status}: {raw}")]
     Protocol { op: String, status: u16, raw: String },
@@ -54,7 +59,7 @@ impl TransportError {
     /// Стоит ли повторить ту же операцию позже без вмешательства человека.
     /// Ответы шлюза 502/503/504 — временная недоступность, а не отказ по элементу.
     pub fn is_retryable(&self) -> bool {
-        matches!(self, Self::Throttled { .. } | Self::Network(_) | Self::SessionLimit)
+        matches!(self, Self::Throttled { .. } | Self::Network(_) | Self::Connect(_) | Self::SessionLimit)
             || matches!(self, Self::Protocol { status: 502..=504, .. })
             || matches!(self, Self::Server { code, .. } if code == "ErrorServerBusy" || code == "ErrorTimeoutExpired" || code == "ErrorMailboxStoreUnavailable")
     }
@@ -72,6 +77,18 @@ impl TransportError {
         matches!(self, Self::SessionExpired | Self::CsrfRejected)
     }
 
+    /// Сетевая ошибка любого вида (до или после отправки запроса).
+    pub fn is_network(&self) -> bool {
+        matches!(self, Self::Network(_) | Self::Connect(_))
+    }
+
+    /// Текст ошибки с цепочкой причин (`source()`): для журнала, где «сеть: error sending request»
+    /// без причины бесполезен. Адреса из текста не вычищаются — вызывающий отвечает за то, что
+    /// в ошибку не попало содержимое писем (транспорт убирает query с канарейкой).
+    pub fn chain(&self) -> String {
+        error_chain(self)
+    }
+
     /// Состояние синхронизации недействительно: папку надо синхронизировать заново.
     pub fn invalidates_sync_state(&self) -> bool {
         matches!(self, Self::Server { code, .. } if code == "ErrorInvalidSyncStateData" || code == "ErrorSyncFolderNotFound")
@@ -79,6 +96,18 @@ impl TransportError {
 }
 
 pub type Result<T> = std::result::Result<T, TransportError>;
+
+/// Текст ошибки вместе с цепочкой причин через « ← » (reqwest → hyper → ОС).
+pub fn error_chain(e: &(dyn std::error::Error + 'static)) -> String {
+    let mut out = e.to_string();
+    let mut cur = e.source();
+    while let Some(s) = cur {
+        out.push_str(" ← ");
+        out.push_str(&s.to_string());
+        cur = s.source();
+    }
+    out
+}
 
 /// Учётные данные для входа. Пароль не печатается и не клонируется без нужды.
 #[derive(Clone)]
@@ -508,6 +537,9 @@ mod tests {
         assert!(TransportError::CsrfRejected.needs_reauth());
         assert!(!TransportError::SessionExpired.is_retryable());
         assert!(TransportError::Throttled { retry_after: None }.is_retryable());
+        let connect = TransportError::Connect(Box::new(std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "refused")));
+        assert!(connect.is_retryable() && connect.is_network() && !connect.needs_reauth() && !connect.is_item_failure());
+        assert_eq!(connect.chain(), "нет соединения: refused ← refused");
         assert!(TransportError::Server { code: "ErrorInvalidSyncStateData".into(), message: String::new() }.invalidates_sync_state());
         assert!(!TransportError::Cancelled.is_retryable());
         assert!(!TransportError::TooLarge { limit: 1 }.is_retryable());

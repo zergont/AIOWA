@@ -149,17 +149,15 @@ impl OwaTransport {
         let url = inner.base.join("owa/sessiondata.ashx?appcacheclient=0").expect("url");
         let corr = aiowa_transport::new_guid();
         let started = std::time::Instant::now();
-        let r = inner
+        let req = inner
             .client
             .post(url)
             .header("X-OWA-CorrelationId", &corr)
             .header("client-request-id", &corr)
             .header("X-Requested-With", "XMLHttpRequest")
             .header(reqwest::header::CONTENT_LENGTH, "0")
-            .body(Vec::<u8>::new())
-            .send()
-            .await
-            .map_err(net)?;
+            .body(Vec::<u8>::new());
+        let r = crate::send_retrying(req, "sessiondata", true).await?;
         let status = r.status();
         self.remember_build(r.headers());
         if status == StatusCode::from_u16(440).unwrap_or(StatusCode::UNAUTHORIZED) || status == StatusCode::UNAUTHORIZED {
