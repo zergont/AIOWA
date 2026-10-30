@@ -26,6 +26,24 @@ pub struct ItemId {
     pub change_key: Option<String>,
 }
 
+impl ItemId {
+    /// Короче этого — усечённый ключ изменений. Полные ключи у Exchange — 40 символов base64
+    /// (тип элемента и номер версии); ответ `UpdateItem` в OWA JSON отдаёт только тип,
+    /// 8 символов (`CQAAAA==`). Усечённый ключ для `ReferenceItemId` непригоден: сервер
+    /// отвечает `ErrorStaleObject`.
+    pub const MIN_FULL_CHANGE_KEY: usize = 20;
+
+    /// Есть ли у идентификатора полный ключ изменений.
+    pub fn has_full_change_key(&self) -> bool {
+        self.change_key.as_deref().is_some_and(|ck| ck.len() >= Self::MIN_FULL_CHANGE_KEY)
+    }
+
+    /// Длина ключа изменений для журнала (сам ключ в журнал не пишется).
+    pub fn change_key_len(&self) -> Option<usize> {
+        self.change_key.as_deref().map(str::len)
+    }
+}
+
 /// Идентификатор беседы.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ConversationId(pub String);

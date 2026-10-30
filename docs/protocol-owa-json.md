@@ -297,7 +297,7 @@ X-OWA-CANARY: <канарейка>          — дублируется заго�
     "ConflictResults": { "...": "счётчик конфликтов, клиенту не нужен" } }
   ```
 
-  `Id` письма не меняется (152 символа, как в базе). `ChangeKey` в ответе **короткий, 8 символов**, тогда как `SyncFolderItems`/`GetItem` отдают ключи по 40 символов: OWA JSON кладёт в ответ `UpdateItem` усечённую форму ключа. Второй вызов, отправленный с этим 8-символьным ключом, прошёл и вернул тот же 8-символьный ключ; ключ недельной давности из синхронизации с `AlwaysOverwrite` сервер тоже принял. Клиент записывает ключ из ответа в базу (`update_item_id`). **Поправка 30.10.2026:** это ошибка. Усечённый ключ — один тип элемента без номера версии (`CQAAAA==`, у полных ключей начало `CQAAABYA`). После пометки прочитанным `SyncFolderItems` присылает только `ReadFlagChange`, полного ключа не возвращает. `ReferenceItemId` ответа и пересылки с усечённым ключом сервер отвергает: `ErrorStaleObject` «The current ChangeKey is required for this operation» (docs/obkatka.md п. 19). Ключ из ответа `UpdateItem` для `ReferenceItemId` непригоден. Для `MoveItem` и `DeleteItem` ключ не нужен. Отказ по элементу приходит тем же сообщением с `ResponseClass: Error` и `ResponseCode` (например, `ErrorItemNotFound`) — в этой проверке не наблюдался.
+  `Id` письма не меняется (152 символа, как в базе). `ChangeKey` в ответе **короткий, 8 символов**, тогда как `SyncFolderItems`/`GetItem` отдают ключи по 40 символов: OWA JSON кладёт в ответ `UpdateItem` усечённую форму ключа. Второй вызов, отправленный с этим 8-символьным ключом, прошёл и вернул тот же 8-символьный ключ; ключ недельной давности из синхронизации с `AlwaysOverwrite` сервер тоже принял. Клиент записывает ключ из ответа в базу (`update_item_id`). **Поправка 30.10.2026:** это ошибка. Усечённый ключ — один тип элемента без номера версии (`CQAAAA==`, у полных ключей начало `CQAAABYA`). После пометки прочитанным `SyncFolderItems` присылает только `ReadFlagChange`, полного ключа не возвращает. `ReferenceItemId` ответа и пересылки с усечённым ключом сервер отвергает: `ErrorStaleObject` «The current ChangeKey is required for this operation» (docs/obkatka.md п. 19). Ключ из ответа `UpdateItem` для `ReferenceItemId` непригоден. Для `MoveItem` и `DeleteItem` ключ не нужен. **Клиент с 30.10.2026** ключ из ответа `UpdateItem` не записывает (хранилище не заменяет полный ключ усечённым), а перед `ReferenceItemId` перечитывает ключ оригинала запросом § 5n. Отказ по элементу приходит тем же сообщением с `ResponseClass: Error` и `ResponseCode` (например, `ErrorItemNotFound`) — в этой проверке не наблюдался.
 
 **`MoveItem`**:
 
@@ -842,6 +842,26 @@ CLI: `aiowa directory [--query Q] [--resolve] [--prefix3] [--expand first|АДР
 - `ShapeName: "MailListItem"` даёт 27 ключей (лишние `InstanceKey`, `ExtendedProperty`, `ReceivedOrRenewTime`, `IconIndex`, `Sensitivity`, `IsSubmitted`, `IsReadReceiptRequested`, `IsDeliveryReceiptRequested`, `DateTimeCreated`), но **без `InternetMessageId`**, который нужен базе для «усыновления» перенесённых писем. Клиент запрашивает свойства явно.
 
 Как этим пользуется движок (`aiowa-sync`, `Engine::run`): после дерева папок у каждой непустой папки без состояния `SyncFolderItems` (в порядке плана, «Входящие» первыми) берётся страница из `SyncOptions::recent_first` писем (по умолчанию 100) и записывается в базу как обычные заголовки без состояния папки; затем идут полные выгрузки. Идентификаторы страницы хранятся в `sync_state` (`recent_pending.<folder_pk>`) и снимаются по мере того, как их присылает `SyncFolderItems`. Что осталось к концу выгрузки и всё ещё лежит в этой папке, сверяется с сервером одним `GetItem` (`MailListItem`): помечается удалённым только то, на что сервер ответил `ErrorItemNotFound` (письмо удалено или перенесено за время выгрузки — у перенесённого новый идентификатор). Не ответил — сверка повторяется при следующей синхронизации. Отказ `FindItem` синхронизацию не останавливает: папка выгружается обычным порядком.
+
+## 5n. Текущий ключ изменений: `GetItem` только с идентификаторами (клиент, 30.10.2026)
+
+Нужен перед `ReferenceItemId` ответа, пересылки и ответа на приглашение (§ 5e: ключ из ответа
+`UpdateItem` усечённый) и для починки таких ключей в базе. Форма — `GetItem` без именованной
+формы и без тела, `RequestServerVersion: V2017_08_18`:
+
+```json
+{ "__type": "GetItemRequest:#Exchange",
+  "ItemShape": { "__type": "ItemResponseShape:#Exchange", "BaseShape": "IdOnly" },
+  "ItemIds": [ { "__type": "ItemId:#Exchange", "Id": "<Id>" } ],
+  "ShapeName": null }
+```
+
+`ChangeKey` в запрос не кладётся (сервер его не сверяет, а усечённый — лишний повод для отказа).
+Ответ — по одному `GetItemResponseMessage` на идентификатор в порядке запроса, `Items[0].ItemId`
+с **полным** ключом (40 символов); отсутствующее письмо — `ResponseClass: Error`,
+`ErrorItemNotFound`. Разбирается тем же разбором, что операции записи (`parse_write_results`).
+Снято 30.10.2026: пачки по 25 идентификаторов, 207 ключей за ~2 с (9 запросов), один ключ перед
+ответом — ~170 мс. Транспорт: `MailTransport::refresh_item_ids`, форма `protocol::get_item_ids_body`.
 
 ## 6. Что это значит для клиента
 

@@ -313,6 +313,22 @@ pub trait MailTransport: Send + Sync {
     /// приходит как `ItemResult::Failed`, `Err` означает отказ всего вызова.
     async fn get_items(&self, ids: &[ItemId], shape: ItemFetchShape) -> Result<Vec<ItemResult>>;
 
+    /// Текущие идентификаторы элементов с сервера: полный `ChangeKey` для `ReferenceItemId`
+    /// ответа, пересылки и ответа на приглашение (усечённый ключ из ответа `UpdateItem` сервер
+    /// отвергает `ErrorStaleObject`). Один короткий запрос без тел. Результат по позициям `ids`:
+    /// `Ok` с идентификатором с сервера, `Failed` с кодом (`ErrorItemNotFound` — элемента нет).
+    /// По умолчанию — через `get_items` с формой списка.
+    async fn refresh_item_ids(&self, ids: &[ItemId]) -> Result<Vec<WriteResult>> {
+        let got = self.get_items(ids, ItemFetchShape::Meta).await?;
+        Ok(got
+            .into_iter()
+            .map(|r| match r {
+                ItemResult::Ok(m) => WriteResult::Ok { id: m.meta.item_id },
+                ItemResult::Failed { id, code, message } => WriteResult::Failed { id, code, message },
+            })
+            .collect())
+    }
+
     /// Счётчики папок.
     async fn get_folder_counts(&self, folders: &[FolderRef]) -> Result<Vec<FolderCounts>>;
 

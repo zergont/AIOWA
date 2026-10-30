@@ -8,10 +8,10 @@
 //! После входа транспорт процесса сверяет ящик с базой (`mailbox::verify_login`): в базе записан
 //! GUID другого ящика — транспорт не выдаётся (`ConnectError::WrongMailbox`) до перезапуска.
 
-use aiowa_core::AccountId;
+use aiowa_core::{AccountId, ItemId};
 use aiowa_store::Store;
 use aiowa_sync::{Engine, FolderSelection, SyncEvent, SyncOptions, SyncReport, SyncStage};
-use aiowa_transport::{Credentials, MailTransport, TransportError};
+use aiowa_transport::{Credentials, MailTransport, TransportError, WriteResult};
 use aiowa_transport_owa::{OwaConfig, OwaTransport};
 use secrecy::SecretString;
 use serde::Serialize;
@@ -545,7 +545,60 @@ impl SyncState {
             attachment_cache_bytes: prefs.attachment_cache_bytes(),
             ..SyncOptions::default()
         };
-        engine.run(&opts).await.map_err(Self::failed)
+        let report = engine.run(&opts).await.map_err(Self::failed)?;
+        self.repair_change_keys(&transport).await;
+        Ok(report)
+    }
+
+    /// Письма с усечённым ключом изменений (8 символов из ответа `UpdateItem`, записанные до
+    /// второго патча; docs/obkatka.md п. 19) перечитываются пачками `GetItem` только с
+    /// идентификаторами, полный ключ ложится в базу. Пачка, которую сервер не отдал, ждёт
+    /// следующего прогона; письма, которых нет на сервере, уберёт синхронизация.
+    async fn repair_change_keys(&self, transport: &OwaTransport) {
+        const BATCH: usize = 25;
+        const PER_RUN: usize = 1000;
+        let rows = match self.store.items_with_short_change_keys(self.account, ItemId::MIN_FULL_CHANGE_KEY, PER_RUN) {
+            Ok(rows) => rows,
+            Err(e) => {
+                warn!(error = %e, "письма с усечёнными ключами не выбраны");
+                return;
+            }
+        };
+        if rows.is_empty() {
+            return;
+        }
+        let (mut fixed, mut failed) = (0usize, 0usize);
+        for chunk in rows.chunks(BATCH) {
+            let ids: Vec<ItemId> = chunk.iter().map(|(_, id)| id.clone()).collect();
+            let results = match tokio::time::timeout(Duration::from_secs(60), transport.refresh_item_ids(&ids)).await {
+                Ok(Ok(r)) => r,
+                Ok(Err(e)) => {
+                    warn!(error = %e, fixed, "починка ключей прервана отказом сервера");
+                    return;
+                }
+                Err(_) => {
+                    warn!(fixed, "починка ключей прервана: сервер не ответил за 60 с");
+                    return;
+                }
+            };
+            for ((pk, _), r) in chunk.iter().zip(results) {
+                match r {
+                    WriteResult::Ok { id } if id.has_full_change_key() => match self.store.update_item_id(*pk, &id) {
+                        Ok(()) => fixed += 1,
+                        Err(e) => warn!(item_pk = pk, error = %e, "полный ключ не записан"),
+                    },
+                    WriteResult::Ok { id } => {
+                        failed += 1;
+                        warn!(item_pk = pk, ck_len = id.change_key_len(), "сервер снова отдал усечённый ключ");
+                    }
+                    WriteResult::Failed { code, .. } => {
+                        failed += 1;
+                        info!(item_pk = pk, code, "ключ письма не перечитан");
+                    }
+                }
+            }
+        }
+        info!(fixed, failed, total = rows.len(), "усечённые ключи изменений перечитаны");
     }
 
     /// Ошибка движка в исход запуска: транспортная сохраняет причину для `invalidate_on`.

@@ -180,6 +180,19 @@ pub fn get_item_body(ids: &[ItemId], shape_name: &str, max_body: u64, with_reply
     })
 }
 
+/// `GetItem` только с идентификаторами (`BaseShape: IdOnly`, без именованной формы): сервер
+/// отдаёт `ItemId` с полным `ChangeKey`. Нужен перед `ReferenceItemId` ответа и пересылки и для
+/// починки усечённых ключей в базе. Ключи в запрос не кладутся: сервер их не сверяет, а
+/// усечённые — лишний повод для отказа.
+pub fn get_item_ids_body(ids: &[ItemId]) -> Value {
+    json!({
+        "__type": "GetItemRequest:#Exchange",
+        "ItemShape": { "__type": "ItemResponseShape:#Exchange", "BaseShape": "IdOnly" },
+        "ItemIds": ids.iter().map(|id| json!({ "__type": "ItemId:#Exchange", "Id": id.id })).collect::<Vec<_>>(),
+        "ShapeName": null,
+    })
+}
+
 /// Операция `GetAttachment` (EWS-схема): содержимое файлового вложения приходит в `Content` как base64.
 pub fn get_attachment_body(attachment_id: &str) -> Value {
     json!({
@@ -2011,6 +2024,27 @@ mod tests {
             r#"{"__type":"GetItemRequest:#Exchange","ItemShape":{"__type":"ItemResponseShape:#Exchange","BaseShape":"IdOnly","FilterHtmlContent":true,"BlockExternalImagesIfSenderUntrusted":true,"MaximumBodySize":4096,"MaximumRecipientsToReturn":200},"ItemIds":[{"__type":"ItemId:#Exchange","Id":"A","ChangeKey":"ck1"},{"__type":"ItemId:#Exchange","Id":"B"}],"ShapeName":"MailListItem"}"#,
             "без Reply-To форма прежняя, снятая с сервера"
         );
+    }
+
+    #[test]
+    fn get_item_ids_body_exact_without_change_keys() {
+        let s = serde_json::to_string(&get_item_ids_body(&ids())).unwrap();
+        assert_eq!(
+            s,
+            r#"{"__type":"GetItemRequest:#Exchange","ItemShape":{"__type":"ItemResponseShape:#Exchange","BaseShape":"IdOnly"},"ItemIds":[{"__type":"ItemId:#Exchange","Id":"A"},{"__type":"ItemId:#Exchange","Id":"B"}],"ShapeName":null}"#
+        );
+        // Ответ разбирается общим разбором операций по элементам: полный ключ приходит в Items[0].ItemId.
+        let v: Value = serde_json::from_str(
+            r#"{"Body":{"ResponseMessages":{"Items":[
+              {"__type":"GetItemResponseMessage:#Exchange","ResponseClass":"Success","ResponseCode":"NoError","Items":[{"__type":"Message:#Exchange","ItemId":{"__type":"ItemId:#Exchange","Id":"A","ChangeKey":"CQAAABYAAAD7bL0OVIq7Rr0Dd0Rdq5a5AAAbuyX5"}}]},
+              {"__type":"GetItemResponseMessage:#Exchange","ResponseClass":"Error","ResponseCode":"ErrorItemNotFound","MessageText":"The specified object was not found in the store.","Items":[]}
+            ]}}}"#,
+        )
+        .unwrap();
+        let out = parse_write_results(&response_messages(&v), &ids());
+        assert_eq!(out[0], WriteResult::Ok { id: ItemId { id: "A".into(), change_key: Some("CQAAABYAAAD7bL0OVIq7Rr0Dd0Rdq5a5AAAbuyX5".into()) } });
+        assert!(matches!(&out[1], WriteResult::Failed { code, .. } if code == "ErrorItemNotFound"));
+        assert!(out[0].id().has_full_change_key() && !ids()[0].has_full_change_key());
     }
 
     fn folder_id() -> FolderId {

@@ -69,6 +69,15 @@ impl<K: Eq + Hash> KeyedLocks<K> {
     }
 }
 
+/// Код отказа сервера «ключ изменений устарел»: у `ReferenceItemId` ответа и пересылки, у
+/// `UpdateItem` без `AlwaysOverwrite`.
+pub(crate) const STALE_OBJECT: &str = "ErrorStaleObject";
+
+/// Отказ сервера из-за устаревшего ключа изменений.
+pub(crate) fn is_stale_object(e: &TransportError) -> bool {
+    matches!(e, TransportError::Server { code, .. } if code == STALE_OBJECT)
+}
+
 /// Текст ошибки транспорта для пользователя: фиксированные фразы. Ответ сервера (`Protocol::raw`
 /// бывает HTML страницы) и подробности входа в окно не попадают, они остаются в журнале.
 pub(crate) fn describe_transport(e: &TransportError) -> String {
@@ -80,6 +89,7 @@ pub(crate) fn describe_transport(e: &TransportError) -> String {
         TransportError::Network(_) => "Нет связи с сервером".into(),
         TransportError::Protocol { status: 0, .. } => "Сервер ответил неожиданно".into(),
         TransportError::Protocol { status, .. } => format!("Сервер ответил неожиданно (HTTP {status})"),
+        TransportError::Server { code, .. } if code == STALE_OBJECT => "Письмо на сервере изменилось, повторите попытку".into(),
         TransportError::Server { code, .. } => format!("Сервер отказал: {code}"),
         TransportError::Cancelled => "Отменено".into(),
         TransportError::TooLarge { limit } => format!("Файл больше лимита {} МБ", limit / (1024 * 1024)),

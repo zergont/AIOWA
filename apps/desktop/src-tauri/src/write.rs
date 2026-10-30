@@ -27,7 +27,7 @@ use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 use tauri::{AppHandle, Emitter, Manager, State};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 /// Таймаут одной пачки на сервере.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(60);
@@ -235,7 +235,14 @@ impl Action {
     /// Подтверждение сервером: записать идентификатор после операции.
     fn confirm(&self, store: &Store, r: &ItemRef, id: &ItemId) -> aiowa_store::Result<()> {
         match self {
-            Action::Read(_) | Action::Flag(_) => store.update_item_id(r.item_pk, id),
+            // Ключ из ответа `UpdateItem` усечённый (8 символов, без номера версии): с ним ответ и
+            // пересылка падают с `ErrorStaleObject` (docs/obkatka.md п. 19). Прочтение и флаг идут с
+            // `AlwaysOverwrite`, ключ им не нужен; полный придёт синхронизацией или перечитается
+            // перед ответом. Записывать нечего.
+            Action::Read(_) | Action::Flag(_) => {
+                debug!(item_pk = r.item_pk, ck_len = id.change_key_len(), "ключ из ответа UpdateItem не записывается");
+                Ok(())
+            }
             // Перенос уже сделан локально; новый идентификатор записывает тот же `move_local`:
             // он учитывает двойника, которого параллельная синхронизация могла создать в целевой папке.
             Action::Move { folder_pk, .. } | Action::ToDeleted { deleted_pk: folder_pk } => store.move_local(r.item_pk, *folder_pk, Some(id)),
@@ -688,10 +695,11 @@ mod tests {
         assert!(s.item_ref(was_read.item_pk).unwrap().unwrap().is_read, "откат уже прочитанного оставляет его прочитанным");
         assert_eq!(snapshot(&s), initial);
 
-        // Подтверждение: новый ChangeKey после UpdateItem, новый идентификатор после переноса.
+        // Подтверждение: усечённый ChangeKey из ответа UpdateItem не записывается (п. 19 обкатки),
+        // новый идентификатор после переноса — записывается.
         read_all.apply(&s, &before).unwrap();
-        read_all.confirm(&s, &before[0], &ItemId { id: before[0].id.id.clone(), change_key: Some("ck2".into()) }).unwrap();
-        assert_eq!(s.item_ref(before[0].item_pk).unwrap().unwrap().id.change_key.as_deref(), Some("ck2"));
+        read_all.confirm(&s, &before[0], &ItemId { id: before[0].id.id.clone(), change_key: Some("CQAAAA==".into()) }).unwrap();
+        assert_eq!(s.item_ref(before[0].item_pk).unwrap().unwrap().id.change_key, before[0].id.change_key, "ключ после «прочитано» прежний");
         let to_deleted = Action::ToDeleted { deleted_pk: deleted };
         to_deleted.apply(&s, std::slice::from_ref(&before[1])).unwrap();
         to_deleted.confirm(&s, &before[1], &ItemId { id: "B-new".into(), change_key: Some("k".into()) }).unwrap();

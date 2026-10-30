@@ -28,13 +28,13 @@
 //! счётчики и коды, без тем, мест и адресов.
 
 use crate::calendar::{CalendarEventDto, CalendarState, ParticipantDto, ITEM_NOT_FOUND};
-use crate::ondemand::{describe_transport, timed_out, KeyedLocks};
+use crate::ondemand::{describe_transport, is_stale_object, timed_out, KeyedLocks};
 use crate::reminders::RemindersState;
 use crate::sync::SyncState;
 use crate::{err, sanitize_html, AppState, CmdResult, ComposeRecipientDto, InlineMap};
 use aiowa_core::{all_day_bound_utc, all_day_date, AccountId, Attendee, CalendarEvent, CalendarEventDetails, CalendarItemChanges, CalendarItemType, FreeBusy, ItemId, MeetingRequestInfo, MeetingResponse, NewCalendarItem, Participant, ResponseType};
 use aiowa_store::{CalendarRow, Store};
-use aiowa_transport::{MailTransport, TransportError};
+use aiowa_transport::{MailTransport, TransportError, WriteResult};
 use aiowa_transport_owa::OwaTransport;
 use jiff::tz::TimeZone;
 use jiff::Timestamp;
@@ -454,6 +454,8 @@ pub(crate) fn linked_event(store: &Store, account: AccountId, info: &MeetingRequ
 #[derive(Debug)]
 enum Fail {
     NotFound,
+    /// Ключ изменений устарел (`ErrorStaleObject`): элемент изменился на сервере.
+    Stale,
     Other(String),
 }
 
@@ -462,6 +464,7 @@ impl Fail {
     fn text(self, gone: &str) -> String {
         match self {
             Fail::NotFound => gone.to_string(),
+            Fail::Stale => "Данные на сервере изменились, повторите попытку".to_string(),
             Fail::Other(s) => s,
         }
     }
@@ -476,6 +479,10 @@ async fn call<T>(sync: &SyncState, what: &'static str, fut: impl Future<Output =
             warn!(step = what, "элемента нет на сервере");
             Err(Fail::NotFound)
         }
+        Ok(Err(e)) if is_stale_object(&e) => {
+            warn!(step = what, "ключ изменений устарел (ErrorStaleObject)");
+            Err(Fail::Stale)
+        }
         Ok(Err(e)) => {
             warn!(step = what, error = %e, "запись в календарь отклонена");
             sync.invalidate_on(&e).await;
@@ -485,6 +492,29 @@ async fn call<T>(sync: &SyncState, what: &'static str, fut: impl Future<Output =
             warn!(step = what, "запись в календарь не уложилась в таймаут");
             Err(Fail::Other(timed_out(WRITE_TIMEOUT)))
         }
+    }
+}
+
+/// Текущий идентификатор письма с сервера (`GetItem` только с идентификатором); полный ключ
+/// записывается в базу. Письма нет — `Fail::NotFound`.
+async fn fresh_item_id(sync: &SyncState, transport: &impl MailTransport, store: &Store, item_pk: i64, stored: &ItemId) -> Result<ItemId, Fail> {
+    let mut got = call(sync, "GetItem", transport.refresh_item_ids(std::slice::from_ref(stored))).await?;
+    match got.pop() {
+        Some(WriteResult::Ok { id }) => {
+            info!(item_pk, stored_ck_len = stored.change_key_len(), fresh_ck_len = id.change_key_len(), "ключ письма перечитан");
+            if id.has_full_change_key()
+                && let Err(e) = store.update_item_id(item_pk, &id)
+            {
+                warn!(item_pk, error = %e, "перечитанный ключ не записан в базу");
+            }
+            Ok(id)
+        }
+        Some(WriteResult::Failed { code, .. }) if code == ITEM_NOT_FOUND => Err(Fail::NotFound),
+        Some(WriteResult::Failed { code, message, .. }) => {
+            warn!(item_pk, code, message = %message, "сервер не отдал идентификатор письма");
+            Err(Fail::Other(format!("Сервер отказал: {code}")))
+        }
+        None => Err(Fail::Other("Сервер не вернул идентификатор письма".into())),
     }
 }
 
@@ -663,7 +693,7 @@ pub(crate) async fn calendar_delete(calendar_pk: i64, send_cancellations: bool, 
     match call(&sync, "DeleteItem", transport.delete_calendar_item(&row.id, send_cancellations)).await {
         Ok(()) => info!(calendar_pk, send_cancellations, is_meeting = row.is_meeting, "событие календаря удалено"),
         Err(Fail::NotFound) => info!(calendar_pk, "события на сервере уже нет, убираю из кэша"),
-        Err(Fail::Other(e)) => return Err(e),
+        Err(f) => return Err(f.text("Событие удалено на сервере")),
     }
     store.remove_calendar_event(calendar_pk).map_err(db_err)?;
     if let Err(e) = store.set_reminder_state(state.account, &row.id.id, None) {
@@ -703,7 +733,8 @@ pub(crate) async fn calendar_respond(calendar_pk: i64, response: String, send_re
         Err(Fail::NotFound) => {
             store.remove_calendar_event(calendar_pk).map_err(db_err)?;
         }
-        Err(Fail::Other(e)) => {
+        Err(f) => {
+            let e = f.text("Событие удалено на сервере");
             warn!(calendar_pk, error = %e, "ответ принят, но перечитать событие не удалось: кэш правится по ответу");
             if response == MeetingResponse::Decline {
                 store.remove_calendar_event(calendar_pk).map_err(db_err)?;
@@ -759,7 +790,7 @@ pub(crate) async fn meeting_info(item_pk: i64, state: State<'_, AppState>, sync:
                 info!(item_pk, "связанное событие отменённой встречи положено в кэш");
             }
             Err(Fail::NotFound) => info!(item_pk, "связанного события отменённой встречи на сервере уже нет"),
-            Err(Fail::Other(e)) => warn!(item_pk, error = %e, "связанное событие отменённой встречи не загружено"),
+            Err(f) => warn!(item_pk, error = %f.text("нет на сервере"), "связанное событие отменённой встречи не загружено"),
         }
     }
     Ok(meeting_dto(&info, calendar_pk))
@@ -778,7 +809,20 @@ pub(crate) async fn meeting_respond(item_pk: i64, response: String, send_respons
     let account = state.account;
     let item = store.item_ref(item_pk).map_err(err)?.ok_or_else(|| "Письмо удалено".to_string())?;
     let transport = sync.transport().await.map_err(|e| e.to_string())?;
-    call(&sync, "CreateItem", transport.respond_to_meeting(&item.id, response, send_response, None)).await.map_err(|f| f.text("Письмо удалено на сервере"))?;
+    // Ответ ссылается на письмо-приглашение (`ReferenceItemId`) с его ключом изменений: ключ в базе
+    // бывает усечённым или устаревшим (п. 19 обкатки), поэтому он перечитывается с сервера; при
+    // `ErrorStaleObject` — ещё одна попытка с заново перечитанным ключом.
+    let gone = "Письмо удалено на сервере";
+    let fresh = fresh_item_id(&sync, &transport, &store, item_pk, &item.id).await.map_err(|f| f.text(gone))?;
+    match call(&sync, "CreateItem", transport.respond_to_meeting(&fresh, response, send_response, None)).await {
+        Ok(()) => {}
+        Err(Fail::Stale) => {
+            warn!(item_pk, "ответ на приглашение: ErrorStaleObject после перечитывания ключа, ещё одна попытка");
+            let fresh = fresh_item_id(&sync, &transport, &store, item_pk, &item.id).await.map_err(|f| f.text(gone))?;
+            call(&sync, "CreateItem", transport.respond_to_meeting(&fresh, response, send_response, None)).await.map_err(|f| f.text(gone))?;
+        }
+        Err(f) => return Err(f.text(gone)),
+    }
     info!(item_pk, response = response.key(), send_response, "ответ на приглашение отправлен по письму");
     // Сведения о письме устарели (свой ответ и ChangeKey письма сменились); связанное событие —
     // по ним, пока они ещё есть.

@@ -29,7 +29,7 @@
 //! адресата. Цитату оригинала (и вложения оригинала у пересылки) при создании добавляет сервер,
 //! клиент передаёт только новую часть.
 
-use crate::ondemand::{describe_transport, timed_out};
+use crate::ondemand::{describe_transport, is_stale_object, timed_out};
 use crate::sync::SyncState;
 use crate::{build_message, err, prepare_attachments, AppState, CmdResult, ComposeRecipientDto, InlineMap, MessageDto, ParticipantDto, RecipientDto};
 use aiowa_core::{AccountId, AttachmentMeta, BodyType, ComposeKind, Importance, ItemId, MessageFull, OutgoingAttachment, OutgoingMessage, Participant};
@@ -744,7 +744,7 @@ async fn write_draft(state: &AppState, sync: &SyncState, transport: &impl MailTr
     let (kind, mut msg, files) = prepared;
     let (mut current, files, removed) = match existing {
         None => {
-            let draft = step(sync, "CreateItem", CREATE_TIMEOUT, transport.create_draft(&kind, &msg)).await.map_err(DraftFailure::Before)?;
+            let draft = create_draft_fresh(state, sync, transport, kind, &msg, req.reference_item_pk).await.map_err(DraftFailure::Before)?;
             cs.remember(&draft);
             (draft, files, Vec::new())
         }
@@ -776,6 +776,73 @@ async fn write_draft(state: &AppState, sync: &SyncState, transport: &impl MailTr
         }
     }
     Ok((current, touched))
+}
+
+/// Тот же вид письма с другим идентификатором оригинала.
+fn with_reference(kind: ComposeKind, reference: ItemId) -> ComposeKind {
+    match kind {
+        ComposeKind::New => ComposeKind::New,
+        ComposeKind::Reply { .. } => ComposeKind::Reply { reference },
+        ComposeKind::ReplyAll { .. } => ComposeKind::ReplyAll { reference },
+        ComposeKind::Forward { .. } => ComposeKind::Forward { reference },
+    }
+}
+
+/// Текущий идентификатор оригинала с сервера (`GetItem` только с идентификатором). Ключ в базе
+/// бывает усечённым (после нашей же пометки «прочитано») или устаревшим (письмо изменили в OWA,
+/// на него уже ответили): с таким `ReferenceItemId` сервер отвечает `ErrorStaleObject`
+/// (docs/obkatka.md п. 19). Полный ключ записывается в базу.
+async fn fresh_reference(state: &AppState, sync: &SyncState, transport: &impl MailTransport, pk: i64) -> CmdResult<ItemId> {
+    let stored = state.store.item_ref(pk).map_err(err)?.ok_or_else(|| "Исходное письмо удалено".to_string())?.id;
+    let mut got = step(sync, "GetItem", REREAD_TIMEOUT, transport.refresh_item_ids(std::slice::from_ref(&stored))).await?;
+    match got.pop() {
+        Some(WriteResult::Ok { id }) => {
+            info!(reference_pk = pk, stored_ck_len = stored.change_key_len(), fresh_ck_len = id.change_key_len(), "ключ исходного письма перечитан");
+            if id.has_full_change_key()
+                && let Err(e) = state.store.update_item_id(pk, &id)
+            {
+                warn!(reference_pk = pk, error = %e, "перечитанный ключ не записан в базу");
+            }
+            Ok(id)
+        }
+        Some(WriteResult::Failed { code, .. }) if code == ITEM_NOT_FOUND => Err("Исходное письмо удалено на сервере".into()),
+        Some(WriteResult::Failed { code, message, .. }) => {
+            warn!(reference_pk = pk, code, message = %message, "сервер не отдал идентификатор исходного письма");
+            Err(format!("Исходное письмо не прочитано с сервера ({code})"))
+        }
+        None => Err("Сервер не вернул идентификатор исходного письма".into()),
+    }
+}
+
+/// Код отказа сервера «письма нет».
+const ITEM_NOT_FOUND: &str = "ErrorItemNotFound";
+
+/// `CreateItem` черновика. У ответа и пересылки ключ оригинала (`reference_pk`) сначала
+/// перечитывается с сервера; если сервер всё же ответил `ErrorStaleObject` (письмо изменилось
+/// между запросами), ещё одна попытка с заново перечитанным ключом, и только потом ошибка.
+async fn create_draft_fresh(state: &AppState, sync: &SyncState, transport: &impl MailTransport, kind: ComposeKind, msg: &OutgoingMessage, reference_pk: Option<i64>) -> CmdResult<ItemId> {
+    let kind = match reference_pk {
+        Some(pk) if kind.reference().is_some() => with_reference(kind, fresh_reference(state, sync, transport, pk).await?),
+        _ => kind,
+    };
+    match tokio::time::timeout(CREATE_TIMEOUT, transport.create_draft(&kind, msg)).await {
+        Ok(Ok(id)) => Ok(id),
+        Ok(Err(e)) if is_stale_object(&e) && reference_pk.is_some() => {
+            let pk = reference_pk.expect("проверено выше");
+            warn!(reference_pk = pk, ck_len = kind.reference().and_then(ItemId::change_key_len), "CreateItem: ErrorStaleObject после перечитывания ключа, ещё одна попытка");
+            let kind = with_reference(kind, fresh_reference(state, sync, transport, pk).await?);
+            step(sync, "CreateItem", CREATE_TIMEOUT, transport.create_draft(&kind, msg)).await
+        }
+        Ok(Err(e)) => {
+            warn!(step = "CreateItem", ?reference_pk, error = %e, "шаг композера отклонён");
+            sync.invalidate_on(&e).await;
+            Err(describe_transport(&e))
+        }
+        Err(_) => {
+            warn!(step = "CreateItem", ?reference_pk, "шаг композера не уложился в таймаут");
+            Err(timed_out(CREATE_TIMEOUT))
+        }
+    }
 }
 
 /// Ошибка транспорта на `SendItem`, при которой письмо могло уйти: обрыв связи (в том числе при
@@ -947,7 +1014,7 @@ pub(crate) async fn compose_autosave(req: ComposeRequest, draft_server_id: Optio
     let id = match existing.as_deref() {
         None => {
             let kind = compose_kind(&state.store, req.kind, req.reference_item_pk)?;
-            step(&sync, "CreateItem", CREATE_TIMEOUT, transport.create_draft(&kind, &msg)).await?
+            create_draft_fresh(&state, &sync, &transport, kind, &msg, req.reference_item_pk).await?
         }
         Some(sid) => {
             append_quote(&state, &sync, &transport, &cs, &req, &mut msg).await?;
@@ -1273,6 +1340,16 @@ mod tests {
         assert_eq!(content_type_for("a.docx"), "application/vnd.openxmlformats-officedocument.wordprocessingml.document");
         assert_eq!(content_type_for("archive.tar.gz"), "application/octet-stream");
         assert_eq!(content_type_for("noext"), "application/octet-stream");
+    }
+
+    #[test]
+    fn with_reference_keeps_kind_and_swaps_original() {
+        let old = ItemId { id: "A".into(), change_key: Some("CQAAAA==".into()) };
+        let fresh = ItemId { id: "A".into(), change_key: Some("CQAAABYAAAD7bL0OVIq7Rr0Dd0Rdq5a5AAAbuyX5".into()) };
+        assert_eq!(with_reference(ComposeKind::Reply { reference: old.clone() }, fresh.clone()), ComposeKind::Reply { reference: fresh.clone() });
+        assert_eq!(with_reference(ComposeKind::ReplyAll { reference: old.clone() }, fresh.clone()), ComposeKind::ReplyAll { reference: fresh.clone() });
+        assert_eq!(with_reference(ComposeKind::Forward { reference: old }, fresh.clone()), ComposeKind::Forward { reference: fresh.clone() });
+        assert_eq!(with_reference(ComposeKind::New, fresh), ComposeKind::New);
     }
 
     #[test]

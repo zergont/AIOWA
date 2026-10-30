@@ -1288,14 +1288,38 @@ impl Store {
     }
 
     /// Записывает идентификатор письма после операции на сервере (новый `ChangeKey` после
-    /// `UpdateItem`). Удалённые строки тоже обновляются: это нужно откату.
+    /// `GetItem`/`UpdateItem`). Удалённые строки тоже обновляются: это нужно откату.
+    ///
+    /// Полный ключ усечённым не заменяется: ответ `UpdateItem` отдаёт 8-символьный ключ без
+    /// номера версии, и с ним ответ на письмо падает с `ErrorStaleObject` (docs/obkatka.md п. 19).
+    /// При том же `server_id` ключ короче сохранённого (или отсутствующий) оставляет прежний.
     pub fn update_item_id(&self, item_pk: i64, id: &ItemId) -> Result<()> {
         self.with_conn(|c| {
-            let n = c.execute("UPDATE items SET server_id = ?2, change_key = ?3, updated_at = ?4 WHERE item_pk = ?1", params![item_pk, id.id, id.change_key, now_ms()])?;
+            let n = c.execute(
+                "UPDATE items SET
+                   change_key = CASE
+                     WHEN ?3 IS NULL THEN change_key
+                     WHEN server_id = ?2 AND change_key IS NOT NULL AND length(?3) < length(change_key) THEN change_key
+                     ELSE ?3 END,
+                   server_id = ?2,
+                   updated_at = ?4
+                 WHERE item_pk = ?1",
+                params![item_pk, id.id, id.change_key, now_ms()],
+            )?;
             if n == 0 {
                 return Err(StoreError::Other(format!("письмо #{item_pk} не найдено")));
             }
             Ok(())
+        })
+    }
+
+    /// Письма с усечённым ключом изменений (короче `min_len` символов): их ключи нужно
+    /// перечитать с сервера, иначе ответ и пересылка на них отказывают (`ErrorStaleObject`).
+    pub fn items_with_short_change_keys(&self, account: AccountId, min_len: usize, limit: usize) -> Result<Vec<(i64, ItemId)>> {
+        self.with_conn(|c| {
+            let mut st = c.prepare_cached("SELECT item_pk, server_id, change_key FROM items WHERE account_id = ?1 AND deleted = 0 AND change_key IS NOT NULL AND length(change_key) < ?2 ORDER BY item_pk LIMIT ?3")?;
+            let rows = st.query_map(params![account.0, min_len as i64, limit as i64], |r| Ok((r.get::<_, i64>(0)?, ItemId { id: r.get(1)?, change_key: r.get(2)? })))?;
+            rows.collect::<std::result::Result<Vec<_>, _>>().map_err(Into::into)
         })
     }
 
@@ -2694,10 +2718,24 @@ mod tests {
         assert!(s.list_conversations(acc, archive, 10).unwrap().is_empty());
         assert_eq!(folder_counts(archive), (10, 1));
 
-        // update_item_id: новый ChangeKey после UpdateItem.
+        // update_item_id: новый ChangeKey после GetItem/UpdateItem.
         s.update_item_id(a, &ItemId { id: "A2".into(), change_key: Some("k3".into()) }).unwrap();
         assert_eq!(s.item_ref(a).unwrap().unwrap().id.change_key.as_deref(), Some("k3"));
         assert!(s.update_item_id(9999, &ItemId { id: "n".into(), change_key: None }).is_err());
+        // Полный ключ усечённым не заменяется (ответ UpdateItem — 8 символов, п. 19 обкатки),
+        // без ключа — остаётся прежний; с новым server_id ключ берётся как есть.
+        let full = "CQAAABYAAAD7bL0OVIq7Rr0Dd0Rdq5a5AAAbuyX5".to_string();
+        s.update_item_id(a, &ItemId { id: "A2".into(), change_key: Some(full.clone()) }).unwrap();
+        s.update_item_id(a, &ItemId { id: "A2".into(), change_key: Some("CQAAAA==".into()) }).unwrap();
+        assert_eq!(s.item_ref(a).unwrap().unwrap().id.change_key.as_deref(), Some(full.as_str()), "усечённый ключ не затирает полный");
+        s.update_item_id(a, &ItemId { id: "A2".into(), change_key: None }).unwrap();
+        assert_eq!(s.item_ref(a).unwrap().unwrap().id.change_key.as_deref(), Some(full.as_str()), "без ключа прежний остаётся");
+        assert!(s.items_with_short_change_keys(acc, ItemId::MIN_FULL_CHANGE_KEY, 10).unwrap().iter().all(|(pk, _)| *pk != a));
+        s.update_item_id(a, &ItemId { id: "A3".into(), change_key: Some("CQAAAA==".into()) }).unwrap();
+        let r = s.item_ref(a).unwrap().unwrap();
+        assert_eq!((r.id.id.as_str(), r.id.change_key.as_deref()), ("A3", Some("CQAAAA==")), "новый идентификатор после переноса берётся целиком");
+        let short = s.items_with_short_change_keys(acc, ItemId::MIN_FULL_CHANGE_KEY, 10).unwrap();
+        assert!(short.iter().any(|(pk, id)| *pk == a && id.id == "A3"), "усечённый ключ попадает в выборку на починку: {short:?}");
 
         // mark_deleted_local и восстановление: агрегаты, индекс, счётчики папки.
         assert_eq!(s.search(acc, "тема:договор", 10).unwrap().len(), 3);

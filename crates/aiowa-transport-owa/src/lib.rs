@@ -1474,6 +1474,14 @@ impl MailTransport for OwaTransport {
         self.get_attachment_with_relogin(attachment_id, max_bytes).await
     }
 
+    async fn refresh_item_ids(&self, ids: &[ItemId]) -> Result<Vec<WriteResult>> {
+        // Та же обвязка, что у операций записи: пачки, повторный вход, результат по позициям.
+        let out = self.write_items("GetItem", ids, protocol::get_item_ids_body).await?;
+        let full = out.iter().filter(|r| r.is_ok() && r.id().has_full_change_key()).count();
+        debug!(requested = ids.len(), ok = out.iter().filter(|r| r.is_ok()).count(), full_keys = full, "идентификаторы перечитаны");
+        Ok(out)
+    }
+
     async fn set_read(&self, ids: &[ItemId], read: bool) -> Result<Vec<WriteResult>> {
         self.write_items("UpdateItem", ids, |chunk| protocol::set_read_body(chunk, read)).await
     }
