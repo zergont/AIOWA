@@ -81,7 +81,8 @@
   const mailLike = $derived(!isNonMail(itemKindOf(message.item_class, false)));
 
   /** Черновик: по признаку письма или по папке — у него вместо панели действий «Открыть черновик». */
-  const isDraft = $derived(message.is_draft || (draftsFolderPk != null && message.folder_pk === draftsFolderPk));
+  // Контакт, встреча и задача тоже приходят с `is_draft` (никогда не отправлялись): черновик — только письмо.
+  const isDraft = $derived(isMail && (message.is_draft || (draftsFolderPk != null && message.folder_pk === draftsFolderPk)));
 
   const to = $derived(message.recipients.filter((r) => r.kind === 1 && personLabel(r.name, r.email)));
   const cc = $derived(message.recipients.filter((r) => r.kind === 2 && personLabel(r.name, r.email)));
@@ -551,7 +552,7 @@
           {/if}
           {#if message.from_name && message.from_email}<span class="email caption">{message.from_email}</span>{/if}
           {#if message.importance === "High"}<span class="badge high">важное</span>{/if}
-          {#if message.is_draft}<span class="badge">черновик</span>{/if}
+          {#if isDraft && message.is_draft}<span class="badge">черновик</span>{/if}
           {#if kindBadge}<span class="badge">{kindBadge}</span>{/if}
         </div>
         {#if verbNote}

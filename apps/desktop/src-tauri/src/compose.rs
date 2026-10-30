@@ -823,6 +823,11 @@ fn local_draft(store: &Store, item_pk: i64) -> CmdResult<LocalDraft> {
     if !head.is_draft {
         return Err("Это письмо не черновик".into());
     }
+    // Контакт, встреча и задача тоже приходят с `IsDraft` (никогда не отправлялись): в композере их
+    // сохранение переписало бы элемент полями письма.
+    if !aiowa_core::ItemKind::of(head.item_class.as_deref(), true).is_mail() {
+        return Err("Это не письмо: в композере открываются только черновики писем".into());
+    }
     let rows = store.recipients(item_pk).map_err(err)?;
     // Правится полное тело: UniqueBody у ответа обрезан до нового текста, а в черновике нужна и цитата.
     let body = store.message_body(item_pk).map_err(err)?.filter(|b| !b.is_truncated);
@@ -2218,6 +2223,16 @@ mod tests {
             assert!(local_draft(&store, pks[1]).unwrap().body_html.is_none());
             assert_eq!(local_draft(&store, pks[2]).err().as_deref(), Some("Это письмо не черновик"));
             assert_eq!(local_draft(&store, 999_999).err().as_deref(), Some("Черновик удалён"));
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn contact_with_is_draft_does_not_open_in_composer() {
+            // Сервер отдаёт контакт с IsDraft (он никогда не отправлялся): в композер его не пускать.
+            let mut contact = full("C1", true, "<p>заметки</p>", Some("<p>заметки</p>"), vec![]);
+            contact.meta.item_class = Some("IPM.Contact".into());
+            let (store, dir, pks) = setup("contact", &[contact]);
+            assert_eq!(local_draft(&store, pks[0]).err().as_deref(), Some("Это не письмо: в композере открываются только черновики писем"));
             let _ = std::fs::remove_dir_all(&dir);
         }
 
