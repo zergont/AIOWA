@@ -479,6 +479,14 @@ enum Cmd {
         #[arg(long)]
         yes_i_know: bool,
     },
+    /// Проба переноса папки (MoveFolder, п. 17) на своих папках «[AIOWA] Перенос …»: в соседнюю
+    /// папку, в корень, в свою подпапку (ждём отказ), в «Удалённые» и обратно; без --yes-i-know
+    /// только печатает план
+    MoveFolderCheck {
+        /// Действительно записать на сервер (папки создаются и удаляются)
+        #[arg(long)]
+        yes_i_know: bool,
+    },
     /// Проба записи личного контакта (§ 5r): CreatePersona «[AIOWA] Тест …» в «Контактах», правка
     /// полей по одному, перечитывание, связка ItemId → PersonaId, DeletePersonas. Без --yes-i-know
     /// только печатает план. Печатает коды, длительности и флаги, без значений
@@ -770,6 +778,157 @@ async fn empty_folder_check(t: &OwaTransport, store: &Store, account: AccountId)
         Err(e) => println!("DeleteFolder HardDelete: {e} — папка «{EMPTY_CHECK_NAME}» осталась в ящике!"),
     }
     outcome
+}
+
+const MOVE_CHECK_NAME: &str = "[AIOWA] Перенос";
+const MOVE_CHECK_TARGET: &str = "[AIOWA] Перенос цель";
+const MOVE_CHECK_CONTROL: &str = "[AIOWA] Перенос контроль";
+const MOVE_CHECK_ONCE: &str = "[AIOWA] Перенос 2";
+
+/// Проба переноса папки (`aiowa move-folder-check --yes-i-know`, п. 17): свои папки «[AIOWA] Перенос»
+/// (с черновиком и подпапкой) и «[AIOWA] Перенос цель» в корне ящика; `MoveFolder` в соседнюю папку
+/// (и что показала синхронизация иерархии), обратно в корень, в собственную подпапку (ждём отказ),
+/// в «Удалённые» (`DeleteFolder MoveToDeletedItems`, как удаляет окно) и восстановление оттуда
+/// `MoveFolder` в корень; обе папки с черновиком удаляются навсегда. Печатает коды, числа и
+/// длительности.
+async fn move_folder_check(t: &OwaTransport, store: &Store, account: AccountId) -> Result<()> {
+    for name in [MOVE_CHECK_NAME, MOVE_CHECK_TARGET, MOVE_CHECK_CONTROL, MOVE_CHECK_ONCE] {
+        if store.resolve_folder(account, name)?.is_some() {
+            bail!("папка «{name}» уже есть в ящике: удалите её");
+        }
+    }
+    let root_id = store.msgfolderroot_server_id(account)?;
+    let deleted_id = store.folder_by_distinguished(account, "deleteditems")?.map(|(_, id)| id);
+    let root = FolderRef::Distinguished(aiowa_core::DistinguishedFolder::MsgFolderRoot);
+    let mut created: Vec<FolderId> = Vec::new();
+    for name in [MOVE_CHECK_TARGET, MOVE_CHECK_CONTROL, MOVE_CHECK_ONCE, MOVE_CHECK_NAME] {
+        match t.create_folder(&root, name).await {
+            Ok(id) => created.push(id),
+            Err(e) => {
+                for id in &created {
+                    t.delete_folder(id, true).await.ok();
+                }
+                bail!("CreateFolder «{name}»: {e}");
+            }
+        }
+    }
+    let (target, control, once, folder) = (created[0].clone(), created[1].clone(), created[2].clone(), created[3].clone());
+    println!("CreateFolder четырёх тестовых папок «[AIOWA] Перенос …» в корне: Ok");
+    let label = |p: Option<&str>| -> &'static str {
+        match p {
+            Some(p) if p == target.id => "в «цели»",
+            Some(p) if Some(p) == root_id.as_deref() => "в корне ящика",
+            Some(p) if Some(p) == deleted_id.as_deref() => "в «Удалённых»",
+            Some(_) => "у ДРУГОГО родителя",
+            None => "без родителя",
+        }
+    };
+    // Где папка и на месте ли её подпапка и черновик — по `FindFolder`.
+    let state = |id: FolderId, sub: Option<FolderId>| async move {
+        let sizes = t.folder_sizes().await.map_err(|e| anyhow!("FindFolder: {e}"))?;
+        let me = sizes.iter().find(|f| f.id == id.id);
+        let sub_ok = sub.map(|s| sizes.iter().any(|f| f.id == s.id && f.parent_id.as_deref() == Some(id.id.as_str())));
+        Ok::<String, anyhow::Error>(match me {
+            None => "папки НЕТ в FindFolder".into(),
+            Some(f) => format!(
+                "{}, элементов {}{}",
+                label(f.parent_id.as_deref()),
+                f.total_count.unwrap_or(0),
+                match sub_ok {
+                    Some(true) => ", подпапка на месте",
+                    Some(false) => ", подпапка ПОТЕРЯЛАСЬ",
+                    None => "",
+                }
+            ),
+        })
+    };
+    let same = |a: &FolderId, b: &FolderId| format!("Id {}, ChangeKey {}", if a.id == b.id { "тот же" } else { "ДРУГОЙ" }, if a.change_key == b.change_key { "тот же" } else { "новый" });
+    let outcome = async {
+        for f in [&control, &once] {
+            test_draft_in(t, f, 1).await?;
+            t.create_folder(&FolderRef::Id(f.clone()), "вложенная").await.map_err(|e| anyhow!("CreateFolder подпапки: {e}"))?;
+        }
+        test_draft_in(t, &folder, 1).await?;
+        let sub = t.create_folder(&FolderRef::Id(folder.clone()), "вложенная").await.map_err(|e| anyhow!("CreateFolder подпапки: {e}"))?;
+        let pre = refresh_hierarchy(t, store, account).await?;
+        println!("  SyncFolderHierarchy до переноса: изменений {}; {}", pre.len(), state(folder.clone(), Some(sub.clone())).await?);
+        let once_now = match t.move_folder(&once, &FolderRef::Id(target.clone())).await {
+            Ok(id) => id,
+            Err(e) => {
+                println!("MoveFolder «{MOVE_CHECK_ONCE}» в «цель»: отказ {}", transport_error_code(&e));
+                once.clone()
+            }
+        };
+        let mut current = folder.clone();
+
+        let started = std::time::Instant::now();
+        match t.move_folder(&current, &FolderRef::Id(target.clone())).await {
+            Ok(id) => {
+                println!("MoveFolder в соседнюю папку: Ok за {} мс; {}; {}", started.elapsed().as_millis(), same(&id, &current), state(id.clone(), Some(sub.clone())).await?);
+                current = id;
+                let changes = refresh_hierarchy(t, store, account).await?;
+                let seen = changes.iter().rev().find_map(|c| match c {
+                    FolderChange::Create(f) | FolderChange::Update(f) if f.id.id == current.id => Some((if matches!(c, FolderChange::Create(_)) { "Create" } else { "Update" }, label(f.parent_id.as_ref().map(|p| p.id.as_str())))),
+                    FolderChange::Delete(fid) if fid.id == current.id => Some(("Delete", "")),
+                    _ => None,
+                });
+                println!("  SyncFolderHierarchy после переноса: изменений {}, папка: {}", changes.len(), seen.map(|(k, l)| format!("{k} {l}")).unwrap_or_else(|| "НЕ упомянута".into()));
+            }
+            Err(e) => println!("MoveFolder в соседнюю папку: отказ {}", transport_error_code(&e)),
+        }
+
+        let started = std::time::Instant::now();
+        match t.move_folder(&current, &root).await {
+            Ok(id) => {
+                println!("MoveFolder в корень (msgfolderroot): Ok за {} мс; {}; {}", started.elapsed().as_millis(), same(&id, &current), state(id.clone(), Some(sub.clone())).await?);
+                current = id;
+            }
+            Err(e) => println!("MoveFolder в корень: отказ {}", transport_error_code(&e)),
+        }
+
+        let started = std::time::Instant::now();
+        match t.move_folder(&current, &FolderRef::Id(sub.clone())).await {
+            Ok(id) => {
+                println!("MoveFolder в собственную подпапку: ПРИНЯТ за {} мс (!); {}", started.elapsed().as_millis(), state(id.clone(), None).await?);
+                current = id;
+            }
+            Err(e) => println!("MoveFolder в собственную подпапку: отказ {} за {} мс (ожидаемо)", transport_error_code(&e), started.elapsed().as_millis()),
+        }
+
+        let started = std::time::Instant::now();
+        match t.delete_folder(&current, false).await {
+            Ok(()) => println!("DeleteFolder MoveToDeletedItems: Ok за {} мс; {}", started.elapsed().as_millis(), state(current.clone(), Some(sub.clone())).await?),
+            Err(e) => println!("DeleteFolder MoveToDeletedItems: отказ {}", transport_error_code(&e)),
+        }
+        let started = std::time::Instant::now();
+        match t.move_folder(&current, &root).await {
+            Ok(id) => {
+                println!("MoveFolder из «Удалённых» в корень: Ok за {} мс; {}; {}", started.elapsed().as_millis(), same(&id, &current), state(id.clone(), Some(sub.clone())).await?);
+                current = id;
+            }
+            Err(e) => println!("MoveFolder из «Удалённых» в корень: отказ {}", transport_error_code(&e)),
+        }
+        Ok::<(FolderId, FolderId), anyhow::Error>((current, once_now))
+    }
+    .await;
+    let (current, once_now) = match &outcome {
+        Ok(v) => v.clone(),
+        Err(_) => (FolderId { id: folder.id.clone(), change_key: None }, FolderId { id: once.id.clone(), change_key: None }),
+    };
+    // Удаление по одной с синхронизацией иерархии после каждой: сообщает ли сервер `Delete`.
+    for (what, id) in [("без переноса", &control), ("перенесённая в соседнюю", &once_now), ("побывавшая в «Удалённых»", &current), ("цель", &target)] {
+        match t.delete_folder(id, true).await {
+            Ok(()) => {
+                let reported = match refresh_hierarchy(t, store, account).await {
+                    Ok(c) => format!("изменений {}, Delete этой папки {}", c.len(), if c.iter().any(|x| matches!(x, FolderChange::Delete(f) if f.id == id.id)) { "есть" } else { "НЕТ" }),
+                    Err(e) => format!("{e}"),
+                };
+                println!("DeleteFolder HardDelete ({what}): Ok; SyncFolderHierarchy: {reported}");
+            }
+            Err(e) => println!("DeleteFolder HardDelete ({what}): {e} — папка осталась в ящике!"),
+        }
+    }
+    outcome.map(|_| ())
 }
 
 /// Поля персоны, которые проверяет `contact-check` правкой по одному: имя `FieldURI`, ключ массива в
@@ -3789,6 +3948,18 @@ async fn real_main() -> Result<()> {
             let account = store.account(&cli.host, &cli.user)?;
             let t = connect(&cli).await?;
             let result = empty_folder_check(&t, &store, account).await;
+            t.logoff().await.ok();
+            result?;
+        }
+        Cmd::MoveFolderCheck { yes_i_know } => {
+            if !*yes_i_know {
+                println!("План: CreateFolder «{MOVE_CHECK_NAME}» (черновик без адресатов, подпапка) и «{MOVE_CHECK_TARGET}» в корне ящика, MoveFolder в «цель» с синхронизацией иерархии, в корень, в собственную подпапку (ждём отказ), DeleteFolder MoveToDeletedItems, MoveFolder из «Удалённых» в корень, DeleteFolder HardDelete обеих. Запуск: --yes-i-know");
+                return Ok(());
+            }
+            let store = Store::open(&db_path)?;
+            let account = store.account(&cli.host, &cli.user)?;
+            let t = connect(&cli).await?;
+            let result = move_folder_check(&t, &store, account).await;
             t.logoff().await.ok();
             result?;
         }

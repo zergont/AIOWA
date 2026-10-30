@@ -758,6 +758,41 @@ impl Store {
         })
     }
 
+    /// Переносит папку локально (`MoveFolder`, docs/obkatka.md п. 17): новый родитель — по
+    /// идентификатору сервера (корень ящика — `msgfolderroot_server_id`, `None` — неизвестен),
+    /// `new_id` — из ответа сервера (новый `ChangeKey`). Подпапки и письма едут вместе с ней.
+    /// Служебную папку и перенос в собственное поддерево — отказ.
+    pub fn move_folder_local(&self, folder_pk: i64, parent_server_id: Option<&str>, new_id: Option<&FolderId>) -> Result<()> {
+        self.with_tx(|tx| {
+            let (account_id, server_id, distinguished): (i64, String, Option<String>) = tx
+                .query_row("SELECT account_id, server_id, distinguished FROM folders WHERE folder_pk = ?1 AND deleted = 0", params![folder_pk], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .optional()?
+                .ok_or_else(|| StoreError::Other(format!("папка #{folder_pk} не найдена")))?;
+            if let Some(d) = distinguished {
+                return Err(StoreError::Other(format!("служебную папку ({d}) перенести нельзя")));
+            }
+            if let Some(parent) = parent_server_id {
+                let parent_pk: Option<i64> = tx.query_row("SELECT folder_pk FROM folders WHERE account_id = ?1 AND server_id = ?2 AND deleted = 0", params![account_id, parent], |r| r.get(0)).optional()?;
+                if parent_pk.is_some_and(|p| folder_subtree(tx, account_id, folder_pk).map(|t| t.contains(&p)).unwrap_or(true)) {
+                    return Err(StoreError::Other("папку нельзя перенести в её же подпапку".into()));
+                }
+            }
+            let now = now_ms();
+            match new_id {
+                Some(id) => {
+                    tx.execute("UPDATE folders SET parent_server_id = ?2, server_id = ?3, change_key = COALESCE(?4, change_key), updated_at = ?5 WHERE folder_pk = ?1", params![folder_pk, parent_server_id, id.id, id.change_key, now])?;
+                    if id.id != server_id {
+                        tx.execute("UPDATE folders SET parent_server_id = ?3 WHERE account_id = ?1 AND parent_server_id = ?2", params![account_id, server_id, id.id])?;
+                    }
+                }
+                None => {
+                    tx.execute("UPDATE folders SET parent_server_id = ?2, updated_at = ?3 WHERE folder_pk = ?1", params![folder_pk, parent_server_id, now])?;
+                }
+            }
+            Ok(())
+        })
+    }
+
     /// Удаляет папку локально вместе с подпапками. `to_deleted = Some(pk «Удалённых»)` — сервер
     /// перенёс папку в «Удалённые» (`DeleteFolder MoveToDeletedItems`): папка с подпапками и
     /// письмами остаётся, меняется только её родитель. `None` — удалена навсегда (`HardDelete`):
@@ -789,20 +824,7 @@ impl Store {
                 }
                 None => {
                     let mut touched = Touched::default();
-                    let mut items = 0usize;
-                    for &pk in &subtree {
-                        let rows: Vec<(i64, Option<i64>)> = tx
-                            .prepare_cached("SELECT item_pk, conversation_pk FROM items WHERE folder_pk = ?1 AND deleted = 0")?
-                            .query_map(params![pk], |r| Ok((r.get(0)?, r.get(1)?)))?
-                            .collect::<std::result::Result<Vec<_>, _>>()?;
-                        for (item_pk, conv) in rows {
-                            fts_delete(tx, item_pk)?;
-                            touched.add(conv, pk);
-                            tx.prepare_cached("UPDATE items SET deleted = 1, updated_at = ?2 WHERE item_pk = ?1")?.execute(params![item_pk, now])?;
-                            items += 1;
-                        }
-                        tx.prepare_cached("UPDATE folders SET deleted = 1, total_count = 0, unread_count = 0, updated_at = ?2 WHERE folder_pk = ?1")?.execute(params![pk, now])?;
-                    }
+                    let items = delete_subtree_rows(tx, &subtree, now, &mut touched)?;
                     let conversation_pks = touched.recompute(tx)?;
                     Ok(FolderDeleteStats { folders: subtree.len(), items, conversation_pks })
                 }
@@ -915,10 +937,16 @@ impl Store {
     }
 
     /// Применяет пачку изменений иерархии и её состояние одной транзакцией. Возвращает число upsert-ов.
+    /// `Delete` снимает папку со всем поддеревом и письмами: об удалении подпапок вместе с родителем
+    /// сервер отдельно не сообщает (docs/protocol-owa-json.md § 5u).
     pub fn apply_hierarchy_batch(&self, account: AccountId, changes: &[FolderChange], state: &SyncState) -> Result<usize> {
+        if changes.iter().any(|c| matches!(c, FolderChange::Delete(_))) {
+            self.write_generation.fetch_add(1, Ordering::Relaxed);
+        }
         self.with_tx(|tx| {
             let now = now_ms();
             let mut upserts = 0usize;
+            let mut touched = Touched::default();
             for ch in changes {
                 match ch {
                     FolderChange::Create(f) | FolderChange::Update(f) => {
@@ -926,10 +954,15 @@ impl Store {
                         upserts += 1;
                     }
                     FolderChange::Delete(id) => {
-                        tx.execute("UPDATE folders SET deleted = 1, updated_at = ?3 WHERE account_id = ?1 AND server_id = ?2", params![account.0, id.id, now])?;
+                        let pk: Option<i64> = tx.query_row("SELECT folder_pk FROM folders WHERE account_id = ?1 AND server_id = ?2 AND deleted = 0", params![account.0, id.id], |r| r.get(0)).optional()?;
+                        if let Some(pk) = pk {
+                            let subtree = folder_subtree(tx, account.0, pk)?;
+                            delete_subtree_rows(tx, &subtree, now, &mut touched)?;
+                        }
                     }
                 }
             }
+            touched.recompute(tx)?;
             tx.execute(
                 "INSERT INTO sync_state(account_id, key, value, updated_at) VALUES (?1, 'hierarchy', ?2, ?3)
                  ON CONFLICT(account_id, key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
@@ -1917,6 +1950,26 @@ fn upsert_folder(tx: &Transaction, account: AccountId, f: &Folder, now: i64) -> 
 
 /// Поддерево папки (сама папка первой, затем не удалённые подпапки в ширину) по цепочке
 /// `parent_server_id`; защита от цикла — через множество увиденных и предел глубины.
+/// Помечает удалёнными папки `subtree` и их письма (письма снимаются с индекса, беседы — в
+/// `touched` для пересчёта). Возвращает число писем.
+fn delete_subtree_rows(tx: &Transaction, subtree: &[i64], now: i64, touched: &mut Touched) -> Result<usize> {
+    let mut items = 0usize;
+    for &pk in subtree {
+        let rows: Vec<(i64, Option<i64>)> = tx
+            .prepare_cached("SELECT item_pk, conversation_pk FROM items WHERE folder_pk = ?1 AND deleted = 0")?
+            .query_map(params![pk], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        for (item_pk, conv) in rows {
+            fts_delete(tx, item_pk)?;
+            touched.add(conv, pk);
+            tx.prepare_cached("UPDATE items SET deleted = 1, updated_at = ?2 WHERE item_pk = ?1")?.execute(params![item_pk, now])?;
+            items += 1;
+        }
+        tx.prepare_cached("UPDATE folders SET deleted = 1, total_count = 0, unread_count = 0, updated_at = ?2 WHERE folder_pk = ?1")?.execute(params![pk, now])?;
+    }
+    Ok(items)
+}
+
 fn folder_subtree(tx: &Transaction, account_id: i64, folder_pk: i64) -> Result<Vec<i64>> {
     let mut out = vec![folder_pk];
     let mut queue: Vec<(i64, usize)> = vec![(folder_pk, 0)];
@@ -2360,6 +2413,49 @@ mod tests {
 
     /// Очистка папки (пп. 15–16): письма самой папки — удалённые; подпапки остаются, переезжают в
     /// «Удалённые» с письмами или удаляются целиком; счётчики и агрегаты бесед пересчитаны.
+    #[test]
+    fn hierarchy_delete_and_local_move_take_subtree() {
+        let s = tmp_store("hierdelete");
+        let acc = s.account("h", "u").unwrap();
+        s.upsert_folders(
+            acc,
+            &[
+                folder_with("Входящие", Some("inbox"), Some("IPF.Note"), Some("ROOT"), 1),
+                folder_with("Проекты", None, Some("IPF.Note"), Some("ROOT"), 1),
+                folder_with("Старые", None, Some("IPF.Note"), Some("Проекты"), 1),
+                folder_with("Архив", None, Some("IPF.Note"), Some("ROOT"), 0),
+            ],
+        )
+        .unwrap();
+        let (inbox, _) = s.folder_by_distinguished(acc, "inbox").unwrap().unwrap();
+        let pk = |name: &str| s.resolve_folder(acc, name).unwrap().unwrap().folder_pk;
+        let (projects, old, archive) = (pk("Проекты"), pk("Старые"), pk("Архив"));
+        s.apply_item_changes(acc, old, &[ItemChange::Create(meta_at("O", "Проект", "2026-10-02T10:00:00Z", Some("c1")))]).unwrap();
+        s.apply_item_changes(acc, inbox, &[ItemChange::Create(meta_at("I", "RE: Проект", "2026-10-04T10:00:00Z", Some("c1")))]).unwrap();
+        let parent = |pk: i64| s.list_folders(acc).unwrap().into_iter().find(|(p, _)| *p == pk).and_then(|(_, f)| f.parent_id).map(|p| p.id);
+
+        // Перенос: служебную нельзя, в своё поддерево нельзя, в «Архив» — с новым ChangeKey.
+        assert!(s.move_folder_local(inbox, Some("F-Архив"), None).is_err());
+        assert!(s.move_folder_local(projects, Some("F-Старые"), None).is_err(), "в собственную подпапку");
+        assert!(s.move_folder_local(projects, Some("F-Проекты"), None).is_err(), "в саму себя");
+        s.move_folder_local(projects, Some("F-Архив"), Some(&FolderId { id: "F-Проекты".into(), change_key: Some("ck2".into()) })).unwrap();
+        assert_eq!(parent(projects).as_deref(), Some("F-Архив"));
+        assert_eq!(parent(old).as_deref(), Some("F-Проекты"), "подпапка едет с родителем");
+        // Новый Id сервера — подпапки переписываются на него.
+        s.move_folder_local(projects, Some("F-ROOT"), Some(&FolderId { id: "F-Проекты-2".into(), change_key: None })).unwrap();
+        assert_eq!(parent(old).as_deref(), Some("F-Проекты-2"));
+        let _ = archive;
+
+        // Удаление из иерархии: сервер сообщает только о родителе — подпапка и её письма тоже уходят.
+        s.apply_hierarchy_batch(acc, &[FolderChange::Delete(FolderId { id: "F-Проекты-2".into(), change_key: None })], &SyncState("s1".into())).unwrap();
+        assert!(s.folder_by_pk(acc, projects).unwrap().is_none());
+        assert!(s.folder_by_pk(acc, old).unwrap().is_none(), "подпапка удалена вместе с родителем");
+        let conv = s.list_conversations(acc, inbox, 10).unwrap().into_iter().find(|c| c.topic.as_deref() == Some("Проект")).unwrap();
+        assert_eq!(conv.item_count, 1, "письмо удалённой подпапки ушло из беседы");
+        // Повтор того же Delete и Delete неизвестной папки — без ошибок.
+        s.apply_hierarchy_batch(acc, &[FolderChange::Delete(FolderId { id: "F-Проекты-2".into(), change_key: None }), FolderChange::Delete(FolderId { id: "нет".into(), change_key: None })], &SyncState("s2".into())).unwrap();
+    }
+
     #[test]
     fn empty_folder_local_modes() {
         let s = tmp_store("emptyfolder");

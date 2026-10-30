@@ -819,6 +819,7 @@ pub fn run() {
             folders::folder_create,
             folders::folder_rename,
             folders::folder_delete,
+            folders::folder_move,
             folders::folder_empty,
             storage::storage_info,
             compose::compose_context,

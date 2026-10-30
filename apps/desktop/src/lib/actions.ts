@@ -97,6 +97,9 @@ export function failureText(report: WriteReport): string | null {
 /** Тип данных в dataTransfer: беседы из списка. Письма (item_pks) собираются при броске — у списка их нет. */
 export const DND_CONVERSATIONS = "application/x-aiowa-conversations";
 
+/** Перетаскивание своей папки в дереве (п. 17 обкатки): в данных — её ключ. */
+export const DND_FOLDER = "application/x-aiowa-folder";
+
 export interface DragPayload {
   conversation_pks: number[];
   /** Папка, из которой тащат: на неё бросить нельзя. */

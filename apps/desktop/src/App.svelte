@@ -987,6 +987,13 @@
     showNotice(r.permanent ? `Папка «${f.name}» очищена` : `Письма папки «${f.name}» перемещены в «Удалённые»`);
   }
 
+  /** Перенести свою папку (п. 17 обкатки): в другую папку или на верхний уровень (`target` null). */
+  async function moveFolder(f: Folder, target: Folder | null) {
+    await api.folderMove(f.folder_pk, target?.folder_pk ?? null);
+    await reloadFolders();
+    showNotice(target ? `Папка «${f.name}» перемещена в «${target.name}»` : `Папка «${f.name}» перемещена на верхний уровень`);
+  }
+
   async function deleteFolder(f: Folder, permanent: boolean) {
     await api.folderDelete(f.folder_pk, permanent);
     await reloadFolders();
@@ -2005,7 +2012,7 @@
 
   <nav class="nav" aria-label={section === "mail" ? "Папки" : section === "calendar" ? "Мини-календарь" : "Люди"}>
     <div class="folders" class:off={section !== "mail"}>
-      <FolderTree {folders} selected={selectedFolder} onselect={openFolder} onsync={startFolderSync} syncing={syncStatus?.running ?? false} oncreate={createFolder} onrename={renameFolder} ondelete={deleteFolder} ondrop={dropConversations} onempty={emptyFolder} />
+      <FolderTree {folders} selected={selectedFolder} onselect={openFolder} onsync={startFolderSync} syncing={syncStatus?.running ?? false} oncreate={createFolder} onrename={renameFolder} ondelete={deleteFolder} ondrop={dropConversations} onempty={emptyFolder} onmove={moveFolder} />
     </div>
     {#if section === "calendar"}
       <MiniMonth selected={calendarAnchor} range={calendarKind === "month" ? null : calendarRange} eventDays={calendarEventDays} onselect={pickCalendarDay} />

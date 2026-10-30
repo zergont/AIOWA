@@ -689,7 +689,7 @@ X-OWA-CANARY: <канарейка>          — дублируется заго�
 
 Сообщение ответа **без `__type`** и без `Folders`: `{ "ResponseCode": "NoError", "ResponseClass": "Success" }` (как у `SendItem` § 5f). `SyncFolderHierarchy` после удаления (168 мс, 2 276 байт) вернул одно изменение `Delete` с `FolderId` папки. `DeleteType: "MoveToDeletedItems"` — папка становится подпапкой «Удалённых» вместе с содержимым; **на сервере не проверялось** (бюджет записей — одна тестовая папка), форма по схеме EWS покрыта юнит-тестом. Клиент при `HardDelete` помечает папку, подпапки и их письма удалёнными (`Store::delete_folder_local(pk, None)`: письма снимаются с индекса, агрегаты бесед пересчитываются), при `MoveToDeletedItems` — только меняет родителя папки на «Удалённые» (`delete_folder_local(pk, Some(trash_pk))`), письма остаются в ней; следующая синхронизация иерархии сверяет. Служебные папки (`distinguished`) клиент не переименовывает и не удаляет; имя — 1–255 символов без управляющих и `\ / : * ? " < > |` (`aiowa_core::validate_folder_name`).
 
-**`MoveFolder`** (для перетаскивания папки) реализован по схеме EWS — `{ "__type": "MoveFolderRequest:#Exchange", "ToFolderId": { TargetFolderId{BaseFolderId} }, "FolderIds": [ FolderId ] }`, ответ ожидается `FolderInfoResponseMessage` с `Folders[0].FolderId` — **на сервере не выполнялся**, покрыт юнит-тестом формы.
+**`MoveFolder`** (для перетаскивания папки) реализован по схеме EWS — `{ "__type": "MoveFolderRequest:#Exchange", "ToFolderId": { TargetFolderId{BaseFolderId} }, "FolderIds": [ FolderId ] }`, ответ ожидается `FolderInfoResponseMessage` с `Folders[0].FolderId` — проверен на сервере 31.10.2026 (§ 5u).
 
 Разбор ответов (`protocol::parse_written_folder_id`): идентификатор из `Folders[0].FolderId`; его нет — у `UpdateFolder`/`MoveFolder` остаётся исходный. Версия схемы подбирается один раз на сессию (`OwaTransport::folder_call`): `V2017_08_18`, при HTTP 500 на форму — `Exchange2013`. CLI: `aiowa folder-create --name … [--parent …]`, `folder-rename --folder-pk … --name …`, `folder-delete --folder-pk … [--permanent]`, `folder-check [--probe-reply-to N]` (вся проверка одной сессией); все команды записи без `--yes-i-know` только печатают план, после записи выполняют инкрементальный `SyncFolderHierarchy` и печатают, упомянута ли папка в изменениях.
 
@@ -1142,6 +1142,33 @@ EffectiveRights, UnreadCount`; `ShapeName: "Folder"` отдаёт размер �
 черновиками (`CreateItem SaveOnly` прямо в папку): `MoveToDeletedItems` без подпапок — 479 мс, два
 черновика ушли в «Удалённые»; `SoftDelete` с подпапками — 147 мс, папка пуста, подпапка удалена;
 затем `DeleteFolder HardDelete` папки. Повтор после обрыва запрещён (`is_idempotent`).
+
+## 5u. Перенос папки `MoveFolder` и удаление поддерева в `SyncFolderHierarchy` (клиент `aiowa`, 31.10.2026)
+
+Форма — по схеме EWS (§ 5j, `protocol::move_folder_body`, через `folder_call`; `V2017_08_18` принят).
+Проба `aiowa move-folder-check --yes-i-know` на своих папках «[AIOWA] Перенос …» с черновиком без
+адресатов и подпапкой; где папка — по `FindFolder` (§ 5t):
+
+- в соседнюю папку (`TargetFolderId` c `FolderId`) — Ok за `60 мс; `Id` тот же, `ChangeKey` новый;
+  подпапка и черновик едут с ней; `SyncFolderHierarchy` сообщает `Update` с новым `ParentFolderId`;
+- в корень (`DistinguishedFolderId msgfolderroot`) — Ok, `Id` и `ChangeKey` те же;
+- в собственную подпапку — отказ `ErrorMoveCopyFailed`;
+- `DeleteFolder MoveToDeletedItems`, затем `MoveFolder` из «Удалённых» в корень — Ok: восстановление
+  папки из «Удалённых» — тот же перенос.
+
+**Удаление поддерева.** После `DeleteFolder HardDelete` папки с подпапкой `SyncFolderHierarchy`
+сообщает `Delete` только для самой папки, о подпапке — нет (три папки из трёх). Раньше
+`Store::apply_hierarchy_batch` помечал удалённой только эту строку: подпапки папки, удалённой в
+браузерной OWA, оставались в базе без родителя и с письмами. Теперь `Delete` снимает всё поддерево с
+письмами, как локальное удаление навсегда.
+
+**Пропущенный `Delete`.** В первом прогоне две папки удалялись подряд (перенесённая несколько раз,
+затем «цель») и иерархия синхронизировалась после обеих — пришло одно изменение, `Delete` «цели»;
+о перенесённой папке не пришло ничего, хотя `FindFolder` и `aiowa folders` её уже не видят, и
+повторная синхронизация тоже молчит. Во втором прогоне с синхронизацией после каждого удаления
+`Delete` пришёл для всех четырёх папок (без переноса, с одним переносом, побывавшей в «Удалённых»,
+«цели»). Причина не установлена; такую строку убирает только полная выгрузка иерархии (или сверка
+дерева с `FindFolder`). Удаление из окна этим не задето: оно правит базу само (`delete_folder_local`).
 
 ## 6. Что это значит для клиента
 

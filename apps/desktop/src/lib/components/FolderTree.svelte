@@ -1,12 +1,13 @@
 <script lang="ts">
   import { tick } from "svelte";
   import { api, errorMessage, type Folder } from "../api";
-  import { DND_CONVERSATIONS, ICON, folderNameError, isInsideDeleted, readDragPayload, type DragPayload } from "../actions";
+  import { DND_CONVERSATIONS, DND_FOLDER, ICON, folderNameError, isInsideDeleted, isTopLevel, readDragPayload, type DragPayload } from "../actions";
   import { focusBack, type Anchor } from "../popover";
   import { layerOpen } from "../hotkeys";
   import ContextMenu, { type MenuItem } from "./ContextMenu.svelte";
   import ConfirmPopover from "./ConfirmPopover.svelte";
   import ChoicePopover, { type ChoiceOption } from "./ChoicePopover.svelte";
+  import FolderPicker from "./FolderPicker.svelte";
 
   interface Props {
     folders: Folder[];
@@ -25,8 +26,114 @@
     ondrop?: (target: Folder, payload: DragPayload) => void;
     /** Очистить папку (пп. 15–16 обкатки): письма — в «Удалённые» или навсегда, при `subfolders` — с подпапками. */
     onempty?: (f: Folder, subfolders: boolean) => Promise<void>;
+    /** Перенести свою папку (п. 17 обкатки) в другую папку или на верхний уровень (`target` null). */
+    onmove?: (f: Folder, target: Folder | null) => Promise<void>;
   }
-  let { folders, selected, onselect, onsync, syncing = false, oncreate, onrename, ondelete, ondrop, onempty }: Props = $props();
+  let { folders, selected, onselect, onsync, syncing = false, oncreate, onrename, ondelete, ondrop, onempty, onmove }: Props = $props();
+
+  // --- перенос своей папки: пункт «Переместить в…» и перетаскивание ---------------------------------
+
+  /** Переносится только своя (не служебная) папка. */
+  function movable(f: Folder): boolean {
+    return !!onmove && f.distinguished == null;
+  }
+
+  /** Ключи папки и всех её подпапок: туда её не перенести. */
+  function subtreeOf(f: Folder): Set<number> {
+    const out = new Set([f.folder_pk]);
+    for (let grew = true; grew; ) {
+      grew = false;
+      for (const x of folders) {
+        if (x.parent_pk != null && out.has(x.parent_pk) && !out.has(x.folder_pk)) {
+          out.add(x.folder_pk);
+          grew = true;
+        }
+      }
+    }
+    return out;
+  }
+
+  let movePick = $state<{ f: Folder; anchor: Anchor } | null>(null);
+  const moveBlocked = $derived(movePick ? subtreeOf(movePick.f) : new Set<number>());
+
+  function requestMove(f: Folder, anchor: Anchor) {
+    if (!movable(f)) return;
+    rowError = null;
+    returnPk = f.folder_pk;
+    movePick = { f, anchor };
+  }
+
+  /**
+   * Перенести папку. В сами «Удалённые» — это удаление папки, с тем же вопросом, что у «Удалить
+   * папку…» (кроме папки, которая уже лежит внутри «Удалённых»: для неё это обычный перенос).
+   */
+  async function moveFolder(f: Folder, target: Folder | null, anchor: Anchor) {
+    movePick = null;
+    if (target?.distinguished === "deleteditems" && !isInsideDeleted(f, folders)) {
+      requestDelete(f, anchor);
+      return;
+    }
+    try {
+      await onmove?.(f, target);
+      if (target) expand(target.folder_pk);
+      void focusRow(f.folder_pk);
+    } catch (e) {
+      rowError = { pk: f.folder_pk, text: errorMessage(e) };
+      void focusRow(f.folder_pk);
+    }
+  }
+
+  /** Перетаскиваемая своя папка: во время dragover данные DataTransfer недоступны, только типы. */
+  let dragFolder = $state<Folder | null>(null);
+  let dragBlocked = new Set<number>();
+  /** Папку тащат над заголовком «Папки»: бросок — на верхний уровень. */
+  let dropRoot = $state(false);
+
+  function onRowDragStart(e: DragEvent, f: Folder) {
+    if (!movable(f) || !e.dataTransfer || edit) {
+      e.preventDefault();
+      return;
+    }
+    e.dataTransfer.setData(DND_FOLDER, String(f.folder_pk));
+    e.dataTransfer.effectAllowed = "move";
+    dragFolder = f;
+    dragBlocked = subtreeOf(f);
+    rowError = null;
+  }
+
+  function isFolderDrag(e: DragEvent): boolean {
+    return !!dragFolder && !!e.dataTransfer && Array.from(e.dataTransfer.types).includes(DND_FOLDER);
+  }
+
+  /** Бросить папку можно в почтовую папку, кроме неё самой, её подпапок и нынешнего родителя. */
+  function canDropFolder(target: Folder): boolean {
+    const d = dragFolder;
+    return !!d && target.is_mail && !dragBlocked.has(target.folder_pk) && target.folder_pk !== d.parent_pk;
+  }
+
+  /** Заголовок «Папки» принимает папку не верхнего уровня. */
+  const rootDropAllowed = $derived(!!dragFolder && !isTopLevel(dragFolder, folders));
+
+  function onRootDragOver(e: DragEvent) {
+    if (!isFolderDrag(e) || !rootDropAllowed) {
+      dropRoot = false;
+      return;
+    }
+    e.preventDefault();
+    e.dataTransfer!.dropEffect = "move";
+    dropRoot = true;
+  }
+
+  function onRootDrop(e: DragEvent) {
+    const d = dragFolder;
+    const ok = isFolderDrag(e) && rootDropAllowed;
+    dropRoot = false;
+    dragFolder = null;
+    if (!d || !ok) return;
+    e.preventDefault();
+    returnPk = d.folder_pk;
+    void moveFolder(d, null, e.currentTarget as HTMLElement);
+  }
 
   /** Папку можно очистить: своя (не служебная) или «Удалённые» и «Нежелательная». */
   function emptiable(f: Folder): boolean {
@@ -210,7 +317,7 @@
   // --- меню папки: создать, переименовать, удалить --------------------------------------------------
   // Служебные папки (distinguished) не переименовываются и не удаляются: сервер откажет, пункты недоступны.
 
-  const canManage = $derived(!!oncreate || !!onrename || !!ondelete);
+  const canManage = $derived(!!oncreate || !!onrename || !!ondelete || !!onmove);
   /** Меню на строке (f) или на пустом месте дерева (f null — только «Новая папка…» в корне). */
   let menu = $state<{ f: Folder | null; anchor: Anchor } | null>(null);
   /** Строка ввода имени: новая папка под parentPk (null — корень) или переименование pk. */
@@ -252,6 +359,7 @@
     const items: MenuItem[] = [
       { id: "create", label: "Новая папка…", icon: ICON.folderAdd, disabled: !oncreate || !f.is_mail },
       { id: "rename", label: "Переименовать…", icon: ICON.rename, disabled: !onrename || service },
+      { id: "move", label: "Переместить в…", icon: ICON.move, disabled: !onmove || service },
       { id: "delete", label: isInsideDeleted(f, folders) ? "Удалить папку навсегда…" : "Удалить папку…", icon: ICON.delete, danger: true, disabled: !ondelete || service },
     ];
     if (onempty && emptiable(f)) items.push({ id: "empty", label: "Очистить папку…", icon: ICON.delete, danger: true });
@@ -298,6 +406,9 @@
         break;
       case "delete":
         if (m.f) requestDelete(m.f, m.anchor);
+        break;
+      case "move":
+        if (m.f) requestMove(m.f, m.anchor);
         break;
       case "empty":
         if (m.f) requestEmpty(m.f, m.anchor);
@@ -463,7 +574,8 @@
   }
 
   function onDragOver(e: DragEvent, n: Node) {
-    if (!hasPayload(e)) return;
+    const folderDrag = isFolderDrag(e);
+    if (!folderDrag && !hasPayload(e)) return;
     const f = n.folder;
     if (hoverPk !== f.folder_pk) {
       hoverPk = f.folder_pk;
@@ -473,7 +585,7 @@
       if (n.children.length && collapsed.has(f.folder_pk)) expandTimer = setTimeout(() => expand(f.folder_pk), EXPAND_HOVER_MS);
     }
     // Без preventDefault бросок не разрешён: курсор «нельзя», событие drop не придёт.
-    if (!canDrop(f)) {
+    if (!(folderDrag ? canDropFolder(f) : canDrop(f))) {
       dropPk = null;
       return;
     }
@@ -494,6 +606,16 @@
     clearTimeout(expandTimer);
     dropPk = null;
     hoverPk = null;
+    if (isFolderDrag(e)) {
+      const d = dragFolder;
+      const ok = canDropFolder(f);
+      dragFolder = null;
+      if (!d || !ok) return;
+      e.preventDefault();
+      returnPk = d.folder_pk;
+      void moveFolder(d, f, e.currentTarget as HTMLElement);
+      return;
+    }
     const payload = readDragPayload(e.dataTransfer);
     if (!payload || !canDrop(f) || payload.folder_pk === f.folder_pk) return;
     e.preventDefault();
@@ -503,6 +625,8 @@
   function onDragEnd() {
     dropPk = null;
     hoverPk = null;
+    dragFolder = null;
+    dropRoot = false;
     clearTimeout(expandTimer);
   }
 </script>
@@ -556,6 +680,8 @@
         aria-selected={isSelected}
         aria-expanded={kids.length ? !collapsed.has(f.folder_pk) : undefined}
         tabindex="0"
+        draggable={movable(f) && !edit ? "true" : undefined}
+        ondragstart={(e) => onRowDragStart(e, f)}
         onclick={() => onselect(f)}
         onkeydown={(e) => onRowKey(e, f)}
         oncontextmenu={(e) => onRowContextMenu(e, f)}
@@ -605,8 +731,8 @@
     <p class="caption empty">Папок ещё нет: они появятся после первой синхронизации (кнопка «Обновить» внизу).</p>
   {:else if collapsedLoaded}
     {#if oncreate}
-      <div class="tree-head" role="none">
-        <span class="caption tree-title">Папки</span>
+      <div class="tree-head" class:drop={dropRoot} role="none" ondragover={onRootDragOver} ondragleave={() => (dropRoot = false)} ondrop={onRootDrop}>
+        <span class="caption tree-title">{rootDropAllowed ? "Папки — сюда, на верхний уровень" : "Папки"}</span>
         <button class="add" onclick={() => void startCreate(null)} aria-label="Новая папка в корне ящика" title="Новая папка">
           <svg width="14" height="14" viewBox="0 0 16 16" aria-hidden="true"><path d="M8 3v10M3 8h10" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" /></svg>
         </button>
@@ -624,6 +750,27 @@
 
 {#if menu}
   <ContextMenu items={menuItems} anchor={menu.anchor} label={menu.f ? `Действия с папкой «${menu.f.name}»` : "Папки"} onpick={pickMenu} onclose={closeMenu} />
+{/if}
+{#if movePick}
+  {@const mf = movePick.f}
+  {@const anchor = movePick.anchor}
+  {@const top = isTopLevel(mf, folders)}
+  <FolderPicker
+    {folders}
+    currentFolderPk={top ? null : mf.parent_pk}
+    {anchor}
+    align="start"
+    blocked={moveBlocked}
+    onroot={() => void moveFolder(mf, null, anchor)}
+    rootCurrent={top}
+    label={`Переместить папку «${mf.name}»`}
+    currentHint="Папка уже здесь"
+    onpick={(t) => void moveFolder(mf, t, anchor)}
+    onclose={() => {
+      movePick = null;
+      void focusRow(returnPk);
+    }}
+  />
 {/if}
 {#if confirmEmpty}
   {@const n = confirmEmpty.f.total}
@@ -672,6 +819,11 @@
   }
   .tree-title {
     letter-spacing: 0.02em;
+  }
+  .tree-head.drop {
+    border-radius: var(--radius-control);
+    background: var(--accent-soft);
+    box-shadow: inset 0 0 0 1px var(--accent);
   }
   .add {
     width: 24px;

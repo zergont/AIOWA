@@ -11,14 +11,25 @@
     align?: "start" | "end";
     onpick: (f: Folder) => void;
     onclose: () => void;
+    /** Показываются, но выбрать нельзя (перенос папки: она сама и её подпапки). */
+    blocked?: Set<number>;
+    /** Строка «Верхний уровень ящика» над деревом (перенос папки в корень); выбор — сюда. */
+    onroot?: () => void;
+    /** Папка уже на верхнем уровне: строка корня недоступна. */
+    rootCurrent?: boolean;
+    /** Подпись окна для чтения с экрана. */
+    label?: string;
+    /** Подсказка у текущей папки. */
+    currentHint?: string;
   }
-  let { folders, currentFolderPk, anchor, align = "end", onpick, onclose }: Props = $props();
+  let { folders, currentFolderPk, anchor, align = "end", onpick, onclose, blocked, onroot, rootCurrent = false, label = "Переместить в папку", currentHint = "Письма уже в этой папке" }: Props = $props();
 
   const uid = $props.id();
   const PINNED = ["inbox", "drafts", "sentitems", "deleteditems", "junkemail", "archive"];
 
+  /** Строка списка; `folder` null — «Верхний уровень ящика» (только при `onroot`). */
   interface Row {
-    folder: Folder;
+    folder: Folder | null;
     depth: number;
   }
   interface Node {
@@ -53,13 +64,14 @@
     }
     sortNodes(top);
     const visible = (n: Node): boolean => n.folder.is_mail || n.children.some(visible);
-    const out: Row[] = [];
+    const out: Row[] = onroot ? [{ folder: null, depth: 0 }] : [];
+    const base = onroot ? 1 : 0;
     const walk = (n: Node, depth: number) => {
       if (!visible(n)) return;
       out.push({ folder: n.folder, depth });
       for (const c of n.children) walk(c, depth + 1);
     };
-    for (const n of top) walk(n, 0);
+    for (const n of top) walk(n, base);
     return out;
   });
 
@@ -67,11 +79,12 @@
   const shown = $derived.by((): Row[] => {
     const q = filter.trim().toLocaleLowerCase("ru");
     if (!q) return rows;
-    return rows.filter((r) => r.folder.is_mail && r.folder.name.toLocaleLowerCase("ru").includes(q)).map((r) => ({ folder: r.folder, depth: 0 }));
+    return rows.filter((r) => r.folder != null && r.folder.is_mail && r.folder.name.toLocaleLowerCase("ru").includes(q)).map((r) => ({ folder: r.folder, depth: 0 }));
   });
 
   function selectable(r: Row): boolean {
-    return r.folder.is_mail && r.folder.folder_pk !== currentFolderPk;
+    if (!r.folder) return !rootCurrent;
+    return r.folder.is_mail && r.folder.folder_pk !== currentFolderPk && !blocked?.has(r.folder.folder_pk);
   }
 
   let active = $state(-1);
@@ -94,7 +107,9 @@
   }
 
   function pick(r: Row) {
-    if (selectable(r)) onpick(r.folder);
+    if (!selectable(r)) return;
+    if (r.folder) onpick(r.folder);
+    else onroot?.();
   }
 
   /**
@@ -134,7 +149,7 @@
   }
 
   function optId(r: Row): string {
-    return `${uid}-opt-${r.folder.folder_pk}`;
+    return `${uid}-opt-${r.folder?.folder_pk ?? "root"}`;
   }
 
   let el = $state<HTMLDivElement | null>(null);
@@ -162,7 +177,7 @@
 
 <svelte:window onkeydown={onKey} />
 
-<div class="popup picker" role="dialog" aria-modal="true" aria-label="Переместить в папку" bind:this={el} {@attach layer} style="left: {pos.left}px; top: {pos.top}px">
+<div class="popup picker" role="dialog" aria-modal="true" aria-label={label} bind:this={el} {@attach layer} style="left: {pos.left}px; top: {pos.top}px">
   <input
     class="filter"
     type="text"
@@ -179,9 +194,9 @@
     {#if shown.length === 0}
       <div class="empty caption">Папок с таким именем нет.</div>
     {/if}
-    {#each shown as r, i (r.folder.folder_pk)}
+    {#each shown as r, i (r.folder?.folder_pk ?? -1)}
       {@const ok = selectable(r)}
-      {@const current = r.folder.folder_pk === currentFolderPk}
+      {@const current = r.folder ? r.folder.folder_pk === currentFolderPk : rootCurrent}
       <div
         class="opt"
         class:active={i === active}
@@ -192,14 +207,14 @@
         aria-disabled={!ok}
         tabindex="-1"
         style="--depth: {r.depth}"
-        title={current ? "Письма уже в этой папке" : undefined}
+        title={current ? currentHint : r.folder && blocked?.has(r.folder.folder_pk) ? "Папку нельзя перенести в саму себя или в её подпапку" : undefined}
         onclick={() => pick(r)}
         onkeydown={(e) => onOptKey(e, r)}
         onpointermove={() => ok && (active = i)}
       >
         <span class="indent"></span>
-        <svg class="icon" width="14" height="14" viewBox="0 0 16 16" aria-hidden="true"><path d="M2 4h4.5l1.5 1.5H14V13H2V4Z" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round" /></svg>
-        <span class="name">{r.folder.name}</span>
+        <svg class="icon" width="14" height="14" viewBox="0 0 16 16" aria-hidden="true"><path d={r.folder ? "M2 4h4.5l1.5 1.5H14V13H2V4Z" : "M2 3.5h12v9H2v-9Zm0 0 6 4.5 6-4.5"} fill="none" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round" /></svg>
+        <span class="name">{r.folder ? r.folder.name : "Верхний уровень ящика"}</span>
         {#if current}<span class="caption here">текущая</span>{/if}
       </div>
     {/each}

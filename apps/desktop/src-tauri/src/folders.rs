@@ -1,5 +1,5 @@
-//! Команды окна для папок: создать, переименовать, удалить. Сначала сервер (`CreateFolder`,
-//! `UpdateFolder`, `DeleteFolder` через транспорт процесса, без новых входов, если сессия уже
+//! Команды окна для папок: создать, переименовать, перенести, удалить, очистить. Сначала сервер
+//! (`CreateFolder`, `UpdateFolder`, `MoveFolder`, `DeleteFolder`, `EmptyFolder` через транспорт процесса, без новых входов, если сессия уже
 //! есть), затем локальная правка таблицы `folders` зеркалом ответа, событие `folders-changed`
 //! окну и запрос синхронизации дерева (`SyncState::request_hierarchy`): она сверит имена,
 //! родителей и счётчики с сервером и по концу снова пошлёт `folders-changed`.
@@ -42,6 +42,41 @@ pub(crate) fn empty_mode(list: &[(i64, Folder)], folder_pk: i64, deleted_pk: Opt
         None if deleted_pk.is_some_and(|d| is_inside(list, folder_pk, d)) => Ok(EmptyMode::Permanent),
         None => Ok(EmptyMode::ToDeleted),
     }
+}
+
+/// Можно ли перенести папку `folder_pk` в `target_pk` (`None` — корень ящика, его идентификатор
+/// сервера `root_server_id`; п. 17 обкатки): только свою (не служебную) папку, в почтовую папку, не в
+/// саму себя и не в своё поддерево, без повтора имени у новых соседей. `Ok(false)` — папка уже там,
+/// запрос к серверу не нужен.
+pub(crate) fn check_move(list: &[(i64, Folder)], folder_pk: i64, target_pk: Option<i64>, root_server_id: Option<&str>) -> CmdResult<bool> {
+    let f = by_pk(list, folder_pk).ok_or("Папка не найдена")?;
+    if f.distinguished.is_some() {
+        return Err("Служебную папку нельзя перенести".into());
+    }
+    let target_server_id = match target_pk {
+        Some(t) => {
+            let tf = by_pk(list, t).ok_or("Папка назначения не найдена")?;
+            if t == folder_pk || is_inside(list, t, folder_pk) {
+                return Err("Папку нельзя перенести в саму себя или в её подпапку".into());
+            }
+            if !tf.is_mail() {
+                return Err("Почтовую папку можно перенести только в почтовую папку".into());
+            }
+            Some(tf.id.id.as_str())
+        }
+        None => root_server_id,
+    };
+    let already = match target_pk {
+        Some(_) => f.parent_id.as_ref().map(|p| p.id.as_str()) == target_server_id,
+        None => parent_pk(list, f).is_none_or(|p| by_pk(list, p).is_some_and(|pf| pf.distinguished.as_deref() == Some("msgfolderroot"))),
+    };
+    if already {
+        return Ok(false);
+    }
+    if name_taken(list, target_server_id, &f.display_name, Some(folder_pk)) {
+        return Err(format!("Там уже есть папка «{}»", f.display_name));
+    }
+    Ok(true)
 }
 
 /// Итог очистки для окна: сколько писем убрано локально и навсегда ли.
@@ -250,6 +285,29 @@ pub(crate) async fn folder_rename(folder_pk: i64, name: String, app: AppHandle, 
     folder_dto(&state, folder_pk)
 }
 
+/// Перенести свою папку (`MoveFolder`, п. 17 обкатки) в другую почтовую папку или в корень ящика
+/// (`target_pk = None`); подпапки и письма едут вместе с ней, `Id` папки сервер сохраняет (§ 5u).
+/// В «Удалённые» окно переносит удалением (`folder_delete`, с вопросом), обратно — этой командой.
+#[tauri::command]
+pub(crate) async fn folder_move(folder_pk: i64, target_pk: Option<i64>, app: AppHandle, state: State<'_, AppState>, sync: State<'_, Arc<SyncState>>) -> CmdResult<FolderDto> {
+    let list = state.store.list_folders(state.account).map_err(err)?;
+    let root = state.store.msgfolderroot_server_id(state.account).map_err(err)?;
+    if !check_move(&list, folder_pk, target_pk, root.as_deref())? {
+        return folder_dto(&state, folder_pk);
+    }
+    let f = by_pk(&list, folder_pk).ok_or("Папка не найдена")?;
+    let (target_ref, parent_server_id) = match target_pk.and_then(|pk| by_pk(&list, pk)) {
+        Some(t) => (FolderRef::Id(FolderId { id: t.id.id.clone(), change_key: None }), Some(t.id.id.clone())),
+        None => (FolderRef::Distinguished(DistinguishedFolder::MsgFolderRoot), root),
+    };
+    let transport = sync.transport().await.map_err(|e| e.to_string())?;
+    let new_id = server_step(&sync, "MoveFolder", transport.move_folder(&f.id, &target_ref)).await?;
+    state.store.move_folder_local(folder_pk, parent_server_id.as_deref(), Some(&new_id)).map_err(err)?;
+    info!(folder_pk, target_pk, same_id = new_id.id == f.id.id, "папка перенесена");
+    after_change(&app, &sync);
+    folder_dto(&state, folder_pk)
+}
+
 /// Удалить папку с подпапками и письмами: `permanent = false` — в «Удалённые» (папка становится
 /// подпапкой «Удалённых»; для папки, уже лежащей там, отказ), `permanent = true` — навсегда.
 #[tauri::command]
@@ -318,6 +376,28 @@ pub(crate) async fn folder_empty(folder_pk: i64, subfolders: bool, app: AppHandl
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn move_rules() {
+        let list = tree();
+        let root = Some("ROOT");
+        assert!(check_move(&list, 1, Some(3), root).is_err(), "служебную не перенести");
+        assert!(check_move(&list, 3, Some(3), root).is_err(), "в саму себя");
+        assert!(check_move(&list, 3, Some(7), root).is_err(), "в свою подпапку на любой глубине");
+        assert_eq!(check_move(&list, 4, Some(3), root), Ok(false), "уже там");
+        assert_eq!(check_move(&list, 3, None, root), Ok(false), "уже на верхнем уровне");
+        assert_eq!(check_move(&list, 4, Some(5), root), Ok(true));
+        assert_eq!(check_move(&list, 4, None, root), Ok(true), "в корень ящика");
+        assert_eq!(check_move(&list, 6, None, root), Ok(true), "из «Удалённых» обратно");
+        assert_eq!(check_move(&list, 7, Some(1), root), Ok(true), "во «Входящие»");
+        let mut dup = list.clone();
+        dup.push((8, folder("Альфа", "INBOX-A", Some("INBOX"), None)));
+        assert_eq!(check_move(&dup, 4, Some(1), root).unwrap_err(), "Там уже есть папка «Альфа»");
+        let mut cal = list.clone();
+        cal.push((9, Folder { folder_class: Some("IPF.Appointment".into()), ..folder("Календарь", "CAL", Some("ROOT"), Some("calendar")) }));
+        assert!(check_move(&cal, 4, Some(9), root).is_err(), "не в календарь");
+        assert!(check_move(&list, 99, None, root).is_err());
+    }
 
     #[test]
     fn empty_mode_by_folder_kind() {

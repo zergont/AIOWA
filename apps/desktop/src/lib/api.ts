@@ -1010,6 +1010,8 @@ export const api = {
   folderRename: (folderPk: number, name: string) => invoke<Folder>("folder_rename", { folderPk, name }),
   /** permanent=false — в «Удалённые» вместе с подпапками и письмами, permanent=true — навсегда. */
   folderDelete: (folderPk: number, permanent: boolean) => invoke<void>("folder_delete", { folderPk, permanent }),
+  /** Перенести свою папку в другую почтовую папку или в корень ящика (`targetPk` null). */
+  folderMove: (folderPk: number, targetPk: number | null) => invoke<Folder>("folder_move", { folderPk, targetPk }),
   /** Очистить папку: письма — в «Удалённые» или навсегда (из «Удалённых» и «Нежелательной»); `subfolders` — с подпапками. */
   folderEmpty: (folderPk: number, subfolders: boolean) => invoke<{ items: number; permanent: boolean }>("folder_empty", { folderPk, subfolders }),
   /** «Хранилище»: квота ящика, размеры всех папок на сервере и место на компьютере. */
