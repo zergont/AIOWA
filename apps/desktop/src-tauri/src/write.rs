@@ -2,8 +2,8 @@
 //!
 //! Порядок одной команды: ссылки на письма из базы → локальное изменение сразу (окно видит
 //! результат мгновенно) → сервер через транспорт процесса (`SyncState::transport`, без новых
-//! входов, если сессия уже есть) пачками не больше `BATCH` идентификаторов (одна пачка — один
-//! запрос к серверу) и с таймаутом на пачку → по ответу: успех записывает новый идентификатор,
+//! входов, если сессия уже есть) пачками писем одной исходной папки, не больше `BATCH`
+//! идентификаторов (одна пачка — один запрос к серверу), и с таймаутом на пачку → по ответу: успех записывает новый идентификатор,
 //! отказ по письму откатывает его локальное изменение обратным действием (`Undo`) и попадает
 //! в `failed` с русским текстом — кроме `ErrorItemNotFound`: письма на сервере уже нет, и оно
 //! помечается удалённым (следующая синхронизация вернёт его в настоящей папке, если оно там);
@@ -24,6 +24,7 @@ use aiowa_store::{ItemRef, Store};
 use aiowa_transport::{DeleteMode, MailTransport, TransportError, WriteResult};
 use serde::Serialize;
 use std::collections::{BTreeSet, HashSet};
+use std::ops::Range;
 use std::sync::Arc;
 use std::time::Duration;
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -316,9 +317,34 @@ fn describe_failure(code: &str, message: &str) -> String {
     }
 }
 
-/// Письма, которые сервер ещё не подтвердил, начиная с пачки `batch_index`.
-fn unsent(todo: &[ItemRef], batch_index: usize) -> &[ItemRef] {
-    &todo[(batch_index * BATCH).min(todo.len())..]
+/// Письма в порядке отправки: по исходной папке, внутри папки — как пришли.
+fn by_folder(todo: &[ItemRef]) -> Vec<ItemRef> {
+    let mut v = todo.to_vec();
+    v.sort_by_key(|r| r.folder_pk);
+    v
+}
+
+/// Пачки на сервер — диапазоны упорядоченного `by_folder` списка: письма одной исходной папки, не
+/// больше `BATCH`. Перенос в «Удалённые» писем из разных папок одним запросом сервер выполняет, но
+/// отвечает HTTP 500 (docs/protocol-owa-json.md § 5e) — окно откатило бы уже сделанное.
+fn batches(todo: &[ItemRef]) -> Vec<Range<usize>> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    while start < todo.len() {
+        let folder = todo[start].folder_pk;
+        let mut end = start + 1;
+        while end < todo.len() && end - start < BATCH && todo[end].folder_pk == folder {
+            end += 1;
+        }
+        out.push(start..end);
+        start = end;
+    }
+    out
+}
+
+/// Письма, которые сервер ещё не подтвердил, начиная с пачки `batch`.
+fn unsent<'a>(todo: &'a [ItemRef], batch: &Range<usize>) -> &'a [ItemRef] {
+    &todo[batch.start.min(todo.len())..]
 }
 
 /// Уникальные ключи в порядке первого появления.
@@ -414,8 +440,11 @@ pub(crate) async fn send_to_server(sync: &SyncState, store: &Store, action: &Act
         }
     };
 
+    let todo = by_folder(todo);
+    let todo = todo.as_slice();
     let mut answered = 0usize;
-    for (i, chunk) in todo.chunks(BATCH).enumerate() {
+    for batch in batches(todo) {
+        let chunk = &todo[batch.clone()];
         let ids: Vec<ItemId> = chunk.iter().map(|r| r.id.clone()).collect();
         let outcome = match tokio::time::timeout(WRITE_TIMEOUT, action.send(&transport, &ids)).await {
             Ok(Ok(results)) => Ok(results),
@@ -453,7 +482,7 @@ pub(crate) async fn send_to_server(sync: &SyncState, store: &Store, action: &Act
                 answered += chunk.len();
             }
             Err(message) => {
-                let rest = unsent(todo, i);
+                let rest = unsent(todo, &batch);
                 rollback(action, store, rest, changed);
                 if answered == 0 {
                     return Err(message);
@@ -528,19 +557,36 @@ mod tests {
         // пачки терял бы подтверждённые результаты первого, и откат задел бы уже изменённое на сервере.
         assert!(BATCH <= aiowa_transport_owa::OwaConfig::default().get_item_batch, "пачка команды не больше пачки транспорта");
         let todo: Vec<ItemRef> = (1..=123).map(|pk| item_ref(pk, 1, false, false)).collect();
-        let sizes: Vec<usize> = todo.chunks(BATCH).map(<[ItemRef]>::len).collect();
+        let bs = batches(&todo);
+        let sizes: Vec<usize> = bs.iter().map(Range::len).collect();
         assert_eq!(sizes, vec![25, 25, 25, 25, 23]);
         // Отказ целого вызова на второй пачке: откатываются вторая и дальше, первая уже подтверждена.
-        let rest = unsent(&todo, 1);
+        let rest = unsent(&todo, &bs[1]);
         assert_eq!(rest.len(), 98);
         assert_eq!(rest.first().map(|r| r.item_pk), Some(26));
-        assert_eq!(unsent(&todo, 0).len(), 123, "отказ на первой пачке откатывает всё");
-        assert_eq!(unsent(&todo, 2).len(), 73);
-        assert_eq!(unsent(&todo, 4).len(), 23);
-        assert!(unsent(&todo, 5).is_empty(), "за последней пачкой откатывать нечего");
+        assert_eq!(unsent(&todo, &bs[0]).len(), 123, "отказ на первой пачке откатывает всё");
+        assert_eq!(unsent(&todo, &bs[2]).len(), 73);
+        assert_eq!(unsent(&todo, &bs[4]).len(), 23);
         let one: Vec<ItemRef> = vec![item_ref(1, 1, false, false)];
-        assert_eq!(one.chunks(BATCH).count(), 1);
-        assert!(Vec::<ItemRef>::new().chunks(BATCH).next().is_none(), "пустой список — ни одного вызова сервера");
+        assert_eq!(batches(&one), vec![0..1]);
+        assert!(batches(&[]).is_empty(), "пустой список — ни одного вызова сервера");
+    }
+
+    #[test]
+    fn batches_hold_one_source_folder() {
+        // Копии письма себе во «Входящих» (7) и «Отправленных» (32) одним DeleteItem — HTTP 500 при
+        // выполненном переносе (§ 5e): каждая папка — своей пачкой, порядок внутри папки прежний.
+        let todo = vec![item_ref(1, 7, false, false), item_ref(2, 32, false, false), item_ref(3, 7, false, false), item_ref(4, 32, false, false)];
+        let sorted = by_folder(&todo);
+        assert_eq!(sorted.iter().map(|r| r.item_pk).collect::<Vec<_>>(), vec![1, 3, 2, 4]);
+        let bs = batches(&sorted);
+        assert_eq!(bs, vec![0..2, 2..4]);
+        assert!(bs.iter().all(|b| sorted[b.clone()].iter().all(|r| r.folder_pk == sorted[b.start].folder_pk)));
+        assert_eq!(unsent(&sorted, &bs[1]).iter().map(|r| r.item_pk).collect::<Vec<_>>(), vec![2, 4], "отказ второй пачки откатывает только её");
+        // Папка больше пачки — несколько пачек этой папки, следующая папка — с новой пачки.
+        let mut many: Vec<ItemRef> = (1..=30).map(|pk| item_ref(pk, 5, false, false)).collect();
+        many.push(item_ref(99, 6, false, false));
+        assert_eq!(batches(&by_folder(&many)), vec![0..25, 25..30, 30..31]);
     }
 
     #[test]
