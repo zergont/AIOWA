@@ -22,6 +22,35 @@ use std::time::Duration;
 use tauri::{AppHandle, Emitter, State};
 use tracing::{info, warn};
 
+/// Как очищается папка (docs/obkatka.md пп. 15–16).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EmptyMode {
+    /// Письма — в «Удалённые» (`MoveToDeletedItems`): обычная своя папка.
+    ToDeleted,
+    /// Навсегда (`SoftDelete`, в OWA их ещё можно восстановить): «Удалённые», «Нежелательная» и
+    /// папки внутри «Удалённых».
+    Permanent,
+}
+
+/// Можно ли очистить папку и как: служебные папки — нет, кроме «Удалённых» и «Нежелательной»
+/// (решение автора 25.10.2026: «корневые = служебные»).
+pub(crate) fn empty_mode(list: &[(i64, Folder)], folder_pk: i64, deleted_pk: Option<i64>) -> CmdResult<EmptyMode> {
+    let f = by_pk(list, folder_pk).ok_or("Папка не найдена")?;
+    match f.distinguished.as_deref() {
+        Some("deleteditems" | "junkemail") => Ok(EmptyMode::Permanent),
+        Some(_) => Err("Служебную папку не очистить: её письма удаляются выбором".into()),
+        None if deleted_pk.is_some_and(|d| is_inside(list, folder_pk, d)) => Ok(EmptyMode::Permanent),
+        None => Ok(EmptyMode::ToDeleted),
+    }
+}
+
+/// Итог очистки для окна: сколько писем убрано локально и навсегда ли.
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct FolderEmptyDto {
+    items: usize,
+    permanent: bool,
+}
+
 /// Таймаут одной операции с папкой на сервере.
 const FOLDER_TIMEOUT: Duration = Duration::from_secs(60);
 /// Предел длины имени папки в символах (как у Exchange).
@@ -254,9 +283,53 @@ pub(crate) async fn folder_delete(folder_pk: i64, permanent: bool, app: AppHandl
     Ok(())
 }
 
+/// Очистить папку (`EmptyFolder`): письма — в «Удалённые» или навсегда (`empty_mode`), при
+/// `subfolders` — вместе с подпапками (из обычной папки они переезжают в «Удалённые», из
+/// «Удалённых» и «Нежелательной» — удаляются). Затем локальная правка, события окну и
+/// синхронизация дерева и «Удалённых».
+#[tauri::command]
+pub(crate) async fn folder_empty(folder_pk: i64, subfolders: bool, app: AppHandle, state: State<'_, AppState>, sync: State<'_, Arc<SyncState>>) -> CmdResult<FolderEmptyDto> {
+    let list = state.store.list_folders(state.account).map_err(err)?;
+    let deleted_pk = deleted_items_pk(&state).ok();
+    let mode = empty_mode(&list, folder_pk, deleted_pk)?;
+    let f = by_pk(&list, folder_pk).ok_or("Папка не найдена")?;
+    let local = match (subfolders, mode) {
+        (false, _) => aiowa_store::EmptySubfolders::Keep,
+        (true, EmptyMode::Permanent) => aiowa_store::EmptySubfolders::Delete,
+        (true, EmptyMode::ToDeleted) => aiowa_store::EmptySubfolders::ToTrash(deleted_pk.ok_or("Папки «Удалённые» нет: дождитесь синхронизации")?),
+    };
+    let delete_type = if mode == EmptyMode::Permanent { "SoftDelete" } else { "MoveToDeletedItems" };
+    let affected = subtree_pks(&list, folder_pk);
+    let transport = sync.transport().await.map_err(|e| e.to_string())?;
+    server_step(&sync, "EmptyFolder", transport.empty_folder(&f.id, delete_type, subfolders)).await?;
+    let stats = state.store.empty_folder_local(folder_pk, local).map_err(err)?;
+    info!(folder_pk, permanent = mode == EmptyMode::Permanent, subfolders, folders = stats.folders, items = stats.items, "папка очищена");
+    after_change(&app, &sync);
+    if stats.items > 0 {
+        emit_items_changed(&app, stats.conversation_pks, affected);
+    }
+    // Перенесённые письма появятся в «Удалённых» синхронизацией этой папки.
+    if let (EmptyMode::ToDeleted, Some(d)) = (mode, deleted_pk) {
+        sync.request(app.clone(), Some(vec![d]));
+    }
+    Ok(FolderEmptyDto { items: stats.items, permanent: mode == EmptyMode::Permanent })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn empty_mode_by_folder_kind() {
+        let list = tree();
+        let deleted = list.iter().find(|(_, f)| f.distinguished.as_deref() == Some("deleteditems")).map(|(pk, _)| *pk);
+        let pk = |name: &str| list.iter().find(|(_, f)| f.display_name == name).map(|(pk, _)| *pk).unwrap();
+        assert!(empty_mode(&list, pk("Входящие"), deleted).is_err(), "служебную не очистить");
+        assert_eq!(empty_mode(&list, deleted.unwrap(), deleted).unwrap(), EmptyMode::Permanent);
+        assert_eq!(empty_mode(&list, pk("Проекты"), deleted).unwrap(), EmptyMode::ToDeleted);
+        assert_eq!(empty_mode(&list, pk("Старое"), deleted).unwrap(), EmptyMode::Permanent, "папка внутри «Удалённых» — навсегда");
+        assert!(empty_mode(&list, 9999, deleted).is_err());
+    }
 
     fn folder(name: &str, id: &str, parent: Option<&str>, dist: Option<&str>) -> Folder {
         Folder {

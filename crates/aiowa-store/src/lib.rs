@@ -324,7 +324,29 @@ pub struct ConversationRow {
 /// Подзапрос «в беседе есть письмо с флагом» для списков бесед (`c` — `conversations`).
 const HAS_FLAGGED_SQL: &str = "EXISTS(SELECT 1 FROM items fi WHERE fi.conversation_pk = c.conversation_pk AND fi.deleted = 0 AND fi.flag_status = 'Flagged')";
 
-/// Итог локального удаления папки (`Store::delete_folder_local`).
+/// Подпапки при очистке папки (`Store::empty_folder_local`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EmptySubfolders {
+    /// Подпапки не трогаются.
+    Keep,
+    /// Переезжают в «Удалённые» (ключ папки) вместе со своими письмами — `MoveToDeletedItems`.
+    ToTrash(i64),
+    /// Удаляются со всем содержимым — `SoftDelete` из «Удалённых» и «Нежелательной».
+    Delete,
+}
+
+/// Локальные счётчики папки для «Хранилища».
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FolderLocalStats {
+    pub folder_pk: i64,
+    pub items: i64,
+    /// Сумма размеров писем по данным сервера (`item:Size`), байт.
+    pub items_bytes: i64,
+    /// Скачанные вложения писем папки, байт.
+    pub cached_bytes: i64,
+}
+
+/// Итог локального удаления папки (`Store::delete_folder_local`) и очистки (`empty_folder_local`).
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct FolderDeleteStats {
     /// Папок в поддереве вместе с самой папкой.
@@ -785,6 +807,80 @@ impl Store {
                     Ok(FolderDeleteStats { folders: subtree.len(), items, conversation_pks })
                 }
             }
+        })
+    }
+
+    /// Папка очищена на сервере (`EmptyFolder`, docs/obkatka.md пп. 15–16): письма самой папки
+    /// помечены удалёнными, её счётчики обнулены; подпапки — по `subfolders`: остаются, переезжают
+    /// в «Удалённые» (вместе со своими письмами) или удаляются со всем содержимым.
+    pub fn empty_folder_local(&self, folder_pk: i64, subfolders: EmptySubfolders) -> Result<FolderDeleteStats> {
+        self.write_generation.fetch_add(1, Ordering::Relaxed);
+        self.with_tx(|tx| {
+            let account_id: i64 = tx
+                .query_row("SELECT account_id FROM folders WHERE folder_pk = ?1 AND deleted = 0", params![folder_pk], |r| r.get(0))
+                .optional()?
+                .ok_or_else(|| StoreError::Other(format!("папка #{folder_pk} не найдена")))?;
+            let subtree = folder_subtree(tx, account_id, folder_pk)?;
+            let children: Vec<i64> = tx
+                .prepare_cached("SELECT c.folder_pk FROM folders c JOIN folders p ON p.account_id = c.account_id AND p.server_id = c.parent_server_id WHERE p.folder_pk = ?1 AND c.account_id = ?2 AND c.deleted = 0")?
+                .query_map(params![folder_pk, account_id], |r| r.get::<_, i64>(0))?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            let now = now_ms();
+            // Чьи письма помечаются удалёнными: сама папка, при удалении подпапок — всё поддерево.
+            let emptied: Vec<i64> = match subfolders {
+                EmptySubfolders::Delete => subtree.clone(),
+                _ => vec![folder_pk],
+            };
+            let mut touched = Touched::default();
+            let mut items = 0usize;
+            for &pk in &emptied {
+                let rows: Vec<(i64, Option<i64>)> = tx
+                    .prepare_cached("SELECT item_pk, conversation_pk FROM items WHERE folder_pk = ?1 AND deleted = 0")?
+                    .query_map(params![pk], |r| Ok((r.get(0)?, r.get(1)?)))?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                for (item_pk, conv) in rows {
+                    fts_delete(tx, item_pk)?;
+                    touched.add(conv, pk);
+                    tx.prepare_cached("UPDATE items SET deleted = 1, updated_at = ?2 WHERE item_pk = ?1")?.execute(params![item_pk, now])?;
+                    items += 1;
+                }
+                let gone = (pk != folder_pk) as i64;
+                tx.prepare_cached("UPDATE folders SET deleted = ?3, total_count = 0, unread_count = 0, updated_at = ?2 WHERE folder_pk = ?1")?.execute(params![pk, now, gone])?;
+            }
+            let mut folders = 1usize;
+            if let EmptySubfolders::ToTrash(trash_pk) = subfolders {
+                if subtree.contains(&trash_pk) {
+                    return Err(StoreError::Other("подпапки нельзя перенести в их же поддерево".into()));
+                }
+                let trash_id: String = tx
+                    .query_row("SELECT server_id FROM folders WHERE account_id = ?1 AND folder_pk = ?2 AND deleted = 0", params![account_id, trash_pk], |r| r.get(0))
+                    .optional()?
+                    .ok_or_else(|| StoreError::Other(format!("папка «Удалённые» #{trash_pk} не найдена")))?;
+                for c in &children {
+                    tx.execute("UPDATE folders SET parent_server_id = ?2, updated_at = ?3 WHERE folder_pk = ?1", params![c, trash_id, now])?;
+                }
+                folders += children.len();
+            } else if subfolders == EmptySubfolders::Delete {
+                folders = subtree.len();
+            }
+            let conversation_pks = touched.recompute(tx)?;
+            Ok(FolderDeleteStats { folders, items, conversation_pks })
+        })
+    }
+
+    /// Локально по папкам для «Хранилища»: писем в базе, их размер по данным сервера и сколько
+    /// занимают скачанные вложения (байт).
+    pub fn folder_local_stats(&self, account: AccountId) -> Result<Vec<FolderLocalStats>> {
+        self.with_conn(|c| {
+            let mut st = c.prepare_cached(
+                "SELECT f.folder_pk,
+                        (SELECT COUNT(*) FROM items i WHERE i.folder_pk = f.folder_pk AND i.deleted = 0),
+                        (SELECT COALESCE(SUM(i.size), 0) FROM items i WHERE i.folder_pk = f.folder_pk AND i.deleted = 0),
+                        (SELECT COALESCE(SUM(a.size), 0) FROM attachments a JOIN items i ON i.item_pk = a.item_pk WHERE i.folder_pk = f.folder_pk AND i.deleted = 0 AND a.local_path IS NOT NULL)
+                   FROM folders f WHERE f.account_id = ?1 AND f.deleted = 0",
+            )?;
+            let rows = st.query_map(params![account.0], |r| Ok(FolderLocalStats { folder_pk: r.get(0)?, items: r.get(1)?, items_bytes: r.get(2)?, cached_bytes: r.get(3)? }))?.collect::<std::result::Result<Vec<_>, _>>()?;
+            Ok(rows)
         })
     }
 
@@ -2260,6 +2356,55 @@ mod tests {
         s.store_full_messages(acc, fpk, &[m]).unwrap();
         assert!(s.message_head(pk).unwrap().unwrap().reply_to.is_empty());
         assert_eq!(s.recipients(pk).unwrap().len(), 1);
+    }
+
+    /// Очистка папки (пп. 15–16): письма самой папки — удалённые; подпапки остаются, переезжают в
+    /// «Удалённые» с письмами или удаляются целиком; счётчики и агрегаты бесед пересчитаны.
+    #[test]
+    fn empty_folder_local_modes() {
+        let s = tmp_store("emptyfolder");
+        let acc = s.account("h", "u").unwrap();
+        s.upsert_folders(
+            acc,
+            &[
+                folder_with("Входящие", Some("inbox"), Some("IPF.Note"), Some("ROOT"), 1),
+                folder_with("Удаленные", Some("deleteditems"), Some("IPF.Note"), Some("ROOT"), 0),
+                folder_with("Проекты", None, Some("IPF.Note"), Some("ROOT"), 1),
+                folder_with("Старые", None, Some("IPF.Note"), Some("Проекты"), 1),
+            ],
+        )
+        .unwrap();
+        let (inbox, _) = s.folder_by_distinguished(acc, "inbox").unwrap().unwrap();
+        let (trash, _) = s.folder_by_distinguished(acc, "deleteditems").unwrap().unwrap();
+        let projects = s.resolve_folder(acc, "Проекты").unwrap().unwrap().folder_pk;
+        let old = s.resolve_folder(acc, "Старые").unwrap().unwrap().folder_pk;
+        s.apply_item_changes(acc, projects, &[ItemChange::Create(meta_at("P", "Проект", "2026-10-01T10:00:00Z", Some("c1")))]).unwrap();
+        s.apply_item_changes(acc, old, &[ItemChange::Create(meta_at("O", "Старое", "2026-10-02T10:00:00Z", None))]).unwrap();
+        s.apply_item_changes(acc, inbox, &[ItemChange::Create(meta_at("I", "RE: Проект", "2026-10-04T10:00:00Z", Some("c1")))]).unwrap();
+        let local = |pk: i64| s.folder_local_stats(acc).unwrap().into_iter().find(|f| f.folder_pk == pk).map(|f| f.items);
+        assert_eq!((local(projects), local(old)), (Some(1), Some(1)));
+
+        // Только сама папка: подпапка с письмом на месте, беседа во «Входящих» пересчитана.
+        let st = s.empty_folder_local(projects, EmptySubfolders::Keep).unwrap();
+        assert_eq!((st.folders, st.items), (1, 1));
+        assert_eq!((local(projects), local(old)), (Some(0), Some(1)));
+        assert!(s.folder_by_pk(acc, projects).unwrap().is_some(), "сама папка остаётся");
+        let conv = s.list_conversations(acc, inbox, 10).unwrap().into_iter().find(|c| c.topic.as_deref() == Some("Проект")).unwrap();
+        assert_eq!(conv.item_count, 1, "письмо очищенной папки ушло из беседы");
+
+        // Подпапки — в «Удалённые»: «Старые» меняет родителя, письмо в ней остаётся.
+        let st = s.empty_folder_local(projects, EmptySubfolders::ToTrash(trash)).unwrap();
+        assert_eq!(st.folders, 2);
+        let parent_of_old = s.list_folders(acc).unwrap().into_iter().find(|(pk, _)| *pk == old).unwrap().1.parent_id.unwrap().id;
+        assert_eq!(parent_of_old, "F-Удаленные");
+        assert_eq!(local(old), Some(1));
+
+        // Навсегда со всем содержимым: подпапка и её письма удалены, сама папка остаётся пустой.
+        let st = s.empty_folder_local(trash, EmptySubfolders::Delete).unwrap();
+        assert_eq!((st.folders, st.items), (2, 1));
+        assert!(s.folder_by_pk(acc, old).unwrap().is_none());
+        assert!(s.folder_by_pk(acc, trash).unwrap().is_some());
+        assert!(s.empty_folder_local(9999, EmptySubfolders::Keep).is_err());
     }
 
     #[test]

@@ -6,6 +6,7 @@
   import { layerOpen } from "../hotkeys";
   import ContextMenu, { type MenuItem } from "./ContextMenu.svelte";
   import ConfirmPopover from "./ConfirmPopover.svelte";
+  import ChoicePopover, { type ChoiceOption } from "./ChoicePopover.svelte";
 
   interface Props {
     folders: Folder[];
@@ -22,8 +23,46 @@
     ondelete?: (f: Folder, permanent: boolean) => Promise<void>;
     /** На папку сброшены беседы из списка. */
     ondrop?: (target: Folder, payload: DragPayload) => void;
+    /** Очистить папку (пп. 15–16 обкатки): письма — в «Удалённые» или навсегда, при `subfolders` — с подпапками. */
+    onempty?: (f: Folder, subfolders: boolean) => Promise<void>;
   }
-  let { folders, selected, onselect, onsync, syncing = false, oncreate, onrename, ondelete, ondrop }: Props = $props();
+  let { folders, selected, onselect, onsync, syncing = false, oncreate, onrename, ondelete, ondrop, onempty }: Props = $props();
+
+  /** Папку можно очистить: своя (не служебная) или «Удалённые» и «Нежелательная». */
+  function emptiable(f: Folder): boolean {
+    return f.distinguished == null || f.distinguished === "deleteditems" || f.distinguished === "junkemail";
+  }
+  /** Очистка навсегда: «Удалённые», «Нежелательная» и всё внутри «Удалённых». */
+  function emptiesForever(f: Folder): boolean {
+    return f.distinguished === "deleteditems" || f.distinguished === "junkemail" || isInsideDeleted(f, folders);
+  }
+
+  let confirmEmpty = $state<{ f: Folder; permanent: boolean; kids: number; anchor: Anchor } | null>(null);
+  const emptyOptions = $derived.by((): ChoiceOption[] => {
+    if (!confirmEmpty) return [];
+    const opts: ChoiceOption[] = [{ id: "items", label: confirmEmpty.kids ? "Только письма" : "Очистить", danger: true, primary: !confirmEmpty.kids }];
+    if (confirmEmpty.kids) opts.push({ id: "all", label: "Вместе с подпапками", danger: true });
+    return opts;
+  });
+
+  function requestEmpty(f: Folder, anchor: Anchor) {
+    if (!onempty || !emptiable(f)) return;
+    rowError = null;
+    returnPk = f.folder_pk;
+    confirmEmpty = { f, permanent: emptiesForever(f), kids: folders.filter((x) => x.parent_pk === f.folder_pk).length, anchor };
+  }
+
+  async function pickEmpty(id: string) {
+    const d = confirmEmpty;
+    confirmEmpty = null;
+    void focusRow(returnPk);
+    if (!d) return;
+    try {
+      await onempty?.(d.f, id === "all");
+    } catch (e) {
+      rowError = { pk: d.f.folder_pk, text: errorMessage(e) };
+    }
+  }
 
   function syncFolder(f: Folder, e: Event) {
     e.stopPropagation();
@@ -215,6 +254,7 @@
       { id: "rename", label: "Переименовать…", icon: ICON.rename, disabled: !onrename || service },
       { id: "delete", label: isInsideDeleted(f, folders) ? "Удалить папку навсегда…" : "Удалить папку…", icon: ICON.delete, danger: true, disabled: !ondelete || service },
     ];
+    if (onempty && emptiable(f)) items.push({ id: "empty", label: "Очистить папку…", icon: ICON.delete, danger: true });
     if (onsync && f.is_mail) items.push({ id: "sync", label: "Синхронизировать папку", separator: true, disabled: syncing });
     return items;
   });
@@ -258,6 +298,9 @@
         break;
       case "delete":
         if (m.f) requestDelete(m.f, m.anchor);
+        break;
+      case "empty":
+        if (m.f) requestEmpty(m.f, m.anchor);
         break;
       case "sync":
         if (m.f) onsync?.(m.f);
@@ -581,6 +624,24 @@
 
 {#if menu}
   <ContextMenu items={menuItems} anchor={menu.anchor} label={menu.f ? `Действия с папкой «${menu.f.name}»` : "Папки"} onpick={pickMenu} onclose={closeMenu} />
+{/if}
+{#if confirmEmpty}
+  {@const n = confirmEmpty.f.total}
+  <ChoicePopover
+    anchor={confirmEmpty.anchor}
+    align="start"
+    title={`Очистить папку «${confirmEmpty.f.name}»?`}
+    text={(confirmEmpty.permanent
+      ? `Письма (${n.toLocaleString("ru-RU")}) удалятся навсегда — в OWA их ещё можно вернуть через «Восстановить удалённые элементы».`
+      : `Письма (${n.toLocaleString("ru-RU")}) переместятся в «Удалённые».`) +
+      (confirmEmpty.kids ? ` Подпапок: ${confirmEmpty.kids}${confirmEmpty.permanent ? " — «Вместе с подпапками» удалит и их" : " — «Вместе с подпапками» перенесёт и их"}.` : "")}
+    options={emptyOptions}
+    onpick={(id) => void pickEmpty(id)}
+    oncancel={() => {
+      confirmEmpty = null;
+      void focusRow(returnPk);
+    }}
+  />
 {/if}
 {#if confirmDel}
   <ConfirmPopover

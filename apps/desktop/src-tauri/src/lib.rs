@@ -84,6 +84,7 @@ mod reminders;
 mod settings;
 mod setup;
 mod staged;
+mod storage;
 mod sync;
 mod updates;
 mod write;
@@ -818,6 +819,8 @@ pub fn run() {
             folders::folder_create,
             folders::folder_rename,
             folders::folder_delete,
+            folders::folder_empty,
+            storage::storage_info,
             compose::compose_context,
             compose::compose_send,
             compose::compose_save_draft,

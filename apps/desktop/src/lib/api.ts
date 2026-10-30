@@ -884,6 +884,31 @@ export type DarkMail = "dark" | "light";
 /** Ответ `settings_get`; изменяемые поля меняются через `settings_set` по одному или пачкой. */
 export type ExternalImagesMode = "ask" | "never";
 
+/** Папка ящика в «Хранилище»: с сервера и по базе (`folder_pk` — если приложение её знает). */
+export interface StorageFolder {
+  folder_pk: number | null;
+  server_id: string;
+  parent_id: string | null;
+  name: string;
+  folder_class: string | null;
+  distinguished: string | null;
+  total_count: number | null;
+  size_bytes: number | null;
+  local_items: number;
+  local_cached_bytes: number;
+}
+
+export interface StorageInfo {
+  quota_used: number | null;
+  /** 0 — предупреждения нет. */
+  quota_warning: number | null;
+  /** 0 — запрета отправки нет. */
+  quota_send: number | null;
+  folders: StorageFolder[];
+  db_size_bytes: number;
+  cache_size_bytes: number;
+}
+
 /** Внешние картинки письма: `data:` по исходному адресу, сколько их в письме и сколько не загрузилось. */
 export interface ExternalImages {
   images: Record<string, string>;
@@ -985,6 +1010,10 @@ export const api = {
   folderRename: (folderPk: number, name: string) => invoke<Folder>("folder_rename", { folderPk, name }),
   /** permanent=false — в «Удалённые» вместе с подпапками и письмами, permanent=true — навсегда. */
   folderDelete: (folderPk: number, permanent: boolean) => invoke<void>("folder_delete", { folderPk, permanent }),
+  /** Очистить папку: письма — в «Удалённые» или навсегда (из «Удалённых» и «Нежелательной»); `subfolders` — с подпапками. */
+  folderEmpty: (folderPk: number, subfolders: boolean) => invoke<{ items: number; permanent: boolean }>("folder_empty", { folderPk, subfolders }),
+  /** «Хранилище»: квота ящика, размеры всех папок на сервере и место на компьютере. */
+  storageInfo: () => invoke<StorageInfo>("storage_info"),
   /** Свёрнутые ветки дерева папок из базы учётной записи (удалённые на сервере папки выброшены). */
   foldersCollapsedGet: () => invoke<number[]>("folders_collapsed_get"),
   /** Сохранить свёрнутые ветки целиком; в базе — серверные идентификаторы папок. */

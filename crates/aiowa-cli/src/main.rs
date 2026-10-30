@@ -469,6 +469,16 @@ enum Cmd {
         #[arg(long)]
         rows_only: bool,
     },
+    /// «Хранилище» (только чтение): квота ящика и размеры всех папок на сервере. Печатает числа,
+    /// классы и известные имена папок, без отображаемых имён
+    Storage,
+    /// Проба очистки папки (EmptyFolder) на своей папке «[AIOWA] Очистка» с тестовыми черновиками;
+    /// без --yes-i-know только печатает план
+    EmptyFolderCheck {
+        /// Действительно записать на сервер (папка создаётся и удаляется)
+        #[arg(long)]
+        yes_i_know: bool,
+    },
     /// Проба записи личного контакта (§ 5r): CreatePersona «[AIOWA] Тест …» в «Контактах», правка
     /// полей по одному, перечитывание, связка ItemId → PersonaId, DeletePersonas. Без --yes-i-know
     /// только печатает план. Печатает коды, длительности и флаги, без значений
@@ -655,6 +665,111 @@ fn describe_event(ev: &NotificationEvent, folder_names: &std::collections::HashM
         NotificationEvent::InstantMessage { payload_type, presences, .. } => format!("InstantMessage {payload_type}: статусов {}", presences.len()),
         NotificationEvent::Unknown { raw_kind } => format!("Unknown: {raw_kind}"),
     }
+}
+
+/// Проба «Хранилища» (`aiowa storage`, только чтение): квота ящика из `sessiondata.ashx` и размеры
+/// всех папок (`FindFolder` с `PR_MESSAGE_SIZE_EXTENDED`). Имён папок не печатает — только
+/// известные (`inbox`, `deleteditems`, …), классы, числа и размеры.
+async fn storage_probe(t: &OwaTransport, store: &Store, account: AccountId) -> Result<()> {
+    match t.mailbox_quota().await {
+        Ok(q) => println!("Квота (SessionSettings): QuotaUsed {:?}, QuotaWarning {:?}, QuotaSend {:?}", q.used, q.warning, q.send),
+        Err(e) => println!("Квота: отказ {}", transport_error_code(&e)),
+    }
+    let started = std::time::Instant::now();
+    let sizes = t.folder_sizes().await.map_err(|e| anyhow!("FindFolder: {e}"))?;
+    let known: std::collections::HashMap<String, String> = store.list_folders(account)?.into_iter().filter_map(|(_, f)| f.distinguished.map(|d| (f.id.id, d))).collect();
+    let with_size = sizes.iter().filter(|f| f.size_bytes.is_some()).count();
+    let total: i64 = sizes.iter().filter_map(|f| f.size_bytes).sum();
+    let items: i64 = sizes.iter().filter_map(|f| f.total_count).sum();
+    println!(
+        "FindFolder Deep: {} мс, папок {}, с размером {}, сумма размеров {:.1} МБ, элементов {}",
+        started.elapsed().as_millis(),
+        sizes.len(),
+        with_size,
+        total as f64 / 1_048_576.0,
+        items
+    );
+    let mut top: Vec<_> = sizes.iter().filter(|f| f.size_bytes.is_some()).collect();
+    top.sort_by_key(|f| std::cmp::Reverse(f.size_bytes));
+    for f in top.iter().take(10) {
+        println!(
+            "  {:<14} {:<26} элементов {:>7}, {:>9.1} МБ",
+            known.get(&f.id).map(String::as_str).unwrap_or("—"),
+            f.folder_class.as_deref().unwrap_or("?"),
+            f.total_count.unwrap_or(0),
+            f.size_bytes.unwrap_or(0) as f64 / 1_048_576.0
+        );
+    }
+    Ok(())
+}
+
+const EMPTY_CHECK_NAME: &str = "[AIOWA] Очистка";
+
+/// Черновик «[AIOWA] …» без адресатов прямо в папку `folder` (`CreateItem SaveOnly`): ничего не уходит.
+async fn test_draft_in(t: &OwaTransport, folder: &FolderId, n: usize) -> Result<()> {
+    use aiowa_transport_owa::protocol;
+    let msg = aiowa_core::OutgoingMessage { to: vec![], cc: vec![], bcc: vec![], subject: format!("[AIOWA] проверка очистки {n}"), body_html: "<p>[AIOWA] тестовый черновик, его можно удалить</p>".into(), importance: aiowa_core::Importance::Normal };
+    let mut body = protocol::create_item_body(&aiowa_core::ComposeKind::New, &msg);
+    body["SavedItemFolderId"] = protocol::target_folder_json(&FolderRef::Id(folder.clone()));
+    t.call("CreateItem", protocol::V_2017, body).await.map_err(|e| anyhow!("CreateItem в тестовую папку: {e}"))?;
+    Ok(())
+}
+
+/// Число элементов и родитель папки по `FindFolder` (папки нет — `None`).
+async fn folder_state(t: &OwaTransport, id: &str) -> Result<Option<(i64, Option<String>)>> {
+    let sizes = t.folder_sizes().await.map_err(|e| anyhow!("FindFolder: {e}"))?;
+    Ok(sizes.into_iter().find(|f| f.id == id).map(|f| (f.total_count.unwrap_or(0), f.parent_id)))
+}
+
+/// Проба очистки папки (`aiowa empty-folder-check --yes-i-know`, пп. 15–16): своя папка
+/// «[AIOWA] Очистка» с тестовыми черновиками; `EmptyFolder MoveToDeletedItems` без подпапок, затем
+/// `SoftDelete` вместе с подпапкой; папка удаляется навсегда. Два тестовых черновика остаются в
+/// «Удалённых». Печатает коды, числа и длительности.
+async fn empty_folder_check(t: &OwaTransport, store: &Store, account: AccountId) -> Result<()> {
+    if store.resolve_folder(account, EMPTY_CHECK_NAME)?.is_some() {
+        bail!("папка «{EMPTY_CHECK_NAME}» уже есть в ящике: удалите её");
+    }
+    let deleted_id = store.folder_by_distinguished(account, "deleteditems")?.map(|(_, id)| id);
+    let folder = t.create_folder(&FolderRef::Distinguished(aiowa_core::DistinguishedFolder::MsgFolderRoot), EMPTY_CHECK_NAME).await.map_err(|e| anyhow!("CreateFolder: {e}"))?;
+    println!("CreateFolder «{EMPTY_CHECK_NAME}»: Ok");
+    let outcome = async {
+        test_draft_in(t, &folder, 1).await?;
+        test_draft_in(t, &folder, 2).await?;
+        println!("  черновиков в папке: {:?}", folder_state(t, &folder.id).await?.map(|s| s.0));
+        let started = std::time::Instant::now();
+        match t.empty_folder(&folder, "MoveToDeletedItems", false).await {
+            Ok(()) => println!("EmptyFolder MoveToDeletedItems: Ok за {} мс, в папке осталось {:?}", started.elapsed().as_millis(), folder_state(t, &folder.id).await?.map(|s| s.0)),
+            Err(e) => println!("EmptyFolder MoveToDeletedItems: отказ {}", transport_error_code(&e)),
+        }
+        let sub = t.create_folder(&FolderRef::Id(folder.clone()), "вложенная").await.map_err(|e| anyhow!("CreateFolder подпапки: {e}"))?;
+        test_draft_in(t, &sub, 3).await?;
+        test_draft_in(t, &folder, 4).await?;
+        println!("  в папке {:?}, в подпапке {:?}", folder_state(t, &folder.id).await?.map(|s| s.0), folder_state(t, &sub.id).await?.map(|s| s.0));
+        let started = std::time::Instant::now();
+        match t.empty_folder(&folder, "SoftDelete", true).await {
+            Ok(()) => {
+                let sub_after = folder_state(t, &sub.id).await?;
+                println!(
+                    "EmptyFolder SoftDelete с подпапками: Ok за {} мс, в папке {:?}, подпапка {}",
+                    started.elapsed().as_millis(),
+                    folder_state(t, &folder.id).await?.map(|s| s.0),
+                    match &sub_after {
+                        None => "удалена".to_string(),
+                        Some((_, parent)) if parent.is_some() && parent.as_deref() == deleted_id.as_deref() => "в «Удалённых»".to_string(),
+                        Some(_) => "ОСТАЛАСЬ".to_string(),
+                    }
+                );
+            }
+            Err(e) => println!("EmptyFolder SoftDelete с подпапками: отказ {}", transport_error_code(&e)),
+        }
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+    match t.delete_folder(&folder, true).await {
+        Ok(()) => println!("DeleteFolder HardDelete тестовой папки: Ok"),
+        Err(e) => println!("DeleteFolder HardDelete: {e} — папка «{EMPTY_CHECK_NAME}» осталась в ящике!"),
+    }
+    outcome
 }
 
 /// Поля персоны, которые проверяет `contact-check` правкой по одному: имя `FieldURI`, ключ массива в
@@ -3657,6 +3772,26 @@ async fn real_main() -> Result<()> {
             }
             SummaryTarget::One(path) => print_db_summary(&path)?,
         },
+        Cmd::Storage => {
+            let store = Store::open(&db_path)?;
+            let account = store.account(&cli.host, &cli.user)?;
+            let t = connect(&cli).await?;
+            let result = storage_probe(&t, &store, account).await;
+            t.logoff().await.ok();
+            result?;
+        }
+        Cmd::EmptyFolderCheck { yes_i_know } => {
+            if !*yes_i_know {
+                println!("План: CreateFolder «{EMPTY_CHECK_NAME}» в корне ящика, два черновика без адресатов, EmptyFolder MoveToDeletedItems, подпапка с черновиком, EmptyFolder SoftDelete с подпапками, DeleteFolder HardDelete. Запуск: --yes-i-know");
+                return Ok(());
+            }
+            let store = Store::open(&db_path)?;
+            let account = store.account(&cli.host, &cli.user)?;
+            let t = connect(&cli).await?;
+            let result = empty_folder_check(&t, &store, account).await;
+            t.logoff().await.ok();
+            result?;
+        }
         Cmd::ContactCheck { yes_i_know } => {
             if !*yes_i_know {
                 println!("План: CreatePersona «[AIOWA] Тест …» в «Контактах» (имя, адрес example.invalid, рабочий телефон), UpdatePersona {} полей по одному и замена телефона, GetItem после записи, FindPeople по папке, DeletePersonas. Запуск: --yes-i-know", PERSONA_PROBE_UPDATES.len());

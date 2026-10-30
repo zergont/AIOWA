@@ -1449,6 +1449,19 @@ impl OwaTransport {
         self.call_raw(op, payload).await
     }
 
+    /// Очистить папку (`EmptyFolder`, docs/obkatka.md пп. 15–16): содержимое — по `delete_type`, при
+    /// `delete_subfolders` — вместе с подпапками. Повтор после обрыва запрещён (`is_idempotent`).
+    pub async fn empty_folder(&self, id: &FolderId, delete_type: &str, delete_subfolders: bool) -> Result<()> {
+        self.folder_call("EmptyFolder", protocol::empty_folder_body(id, delete_type, delete_subfolders)).await?;
+        Ok(())
+    }
+
+    /// Размеры папок ящика на сервере: `FindFolder` всего дерева с `PR_MESSAGE_SIZE_EXTENDED`.
+    pub async fn folder_sizes(&self) -> Result<Vec<protocol::FolderSize>> {
+        let msg = self.folder_call("FindFolder", protocol::folder_sizes_body()).await?;
+        Ok(protocol::parse_folder_sizes(&msg))
+    }
+
     /// `DeletePersonas` по `PersonaId`; ответ — `true`.
     pub async fn delete_personas(&self, persona_ids: &[String]) -> Result<Value> {
         self.call_raw("DeletePersonas", protocol::delete_personas_request(persona_ids)).await

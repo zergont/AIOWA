@@ -26,6 +26,28 @@ pub struct MailboxInfo {
     pub display_name: Option<String>,
 }
 
+/// Квота ящика из `SessionSettings` (`QuotaUsed`, `QuotaWarning`, `QuotaSend`) — как сервер их
+/// отдаёт (единицы — по пробе `aiowa storage`); нет ключа — `None`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MailboxQuota {
+    pub used: Option<i64>,
+    pub warning: Option<i64>,
+    pub send: Option<i64>,
+}
+
+/// Квота из ответа `sessiondata.ashx` или `GetOwaUserConfiguration`.
+pub fn parse_mailbox_quota(v: &Value) -> MailboxQuota {
+    let Some(ss) = session_settings(v) else { return MailboxQuota::default() };
+    let num = |k: &str| -> Option<i64> {
+        match ss.get(k)? {
+            Value::Number(n) => n.as_i64(),
+            Value::String(s) => s.trim().parse().ok(),
+            _ => None,
+        }
+    };
+    MailboxQuota { used: num("QuotaUsed"), warning: num("QuotaWarning"), send: num("QuotaSend") }
+}
+
 impl MailboxInfo {
     /// Ничего не известно (ответ без нужных полей).
     pub fn is_empty(&self) -> bool {
@@ -88,6 +110,11 @@ pub fn parse_mailbox_info(v: &Value) -> MailboxInfo {
 }
 
 impl OwaTransport {
+    /// Квота ящика: `sessiondata.ashx` (`SessionSettings.Quota*`) — для страницы «Хранилище».
+    pub async fn mailbox_quota(&self) -> Result<MailboxQuota> {
+        Ok(parse_mailbox_quota(&self.session_data_value().await?))
+    }
+
     /// Сведения о ящике: `sessiondata.ashx`, а если там нет адреса или GUID —
     /// `GetOwaUserConfiguration`. Ошибка основного пути при удачном запасном — не ошибка.
     pub async fn mailbox_info(&self) -> Result<MailboxInfo> {

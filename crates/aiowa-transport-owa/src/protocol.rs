@@ -378,6 +378,83 @@ pub fn delete_folder_body(id: &FolderId, delete_type: &str) -> Value {
     })
 }
 
+/// `EmptyFolder` (docs/obkatka.md пп. 15–16): `delete_type` — `MoveToDeletedItems` (из обычной
+/// папки — в «Удалённые»), `SoftDelete` (из «Удалённых» и «Нежелательной» — навсегда, с
+/// возможностью восстановить в OWA), `HardDelete`; `delete_subfolders` — вместе с подпапками.
+pub fn empty_folder_body(id: &FolderId, delete_type: &str, delete_subfolders: bool) -> Value {
+    json!({
+        "__type": "EmptyFolderRequest:#Exchange",
+        "FolderIds": [ folder_ref_json(&FolderRef::Id(id.clone())) ],
+        "DeleteType": delete_type,
+        "DeleteSubFolders": delete_subfolders,
+    })
+}
+
+/// Тег `PR_MESSAGE_SIZE_EXTENDED`: размер содержимого папки на сервере, байт (`Long`).
+pub const FOLDER_SIZE_TAG: &str = "0x0e08";
+
+/// `FindFolder` всего дерева ящика (`msgfolderroot`, `Deep`) с именем, классом, числом писем и
+/// размером папки на сервере — для страницы «Хранилище» (п. 15 обкатки). Без `Paging` сервер тело
+/// не разбирает вовсе («Cannot deserialize object of type FindFolderJsonRequest»), `IdOnly` с
+/// дополнительными полями — тоже; `AllProperties` отдаёт имя, класс, родителя и счётчики (снято
+/// 31.10.2026, § 5t).
+pub fn folder_sizes_body() -> Value {
+    json!({
+        "__type": "FindFolderRequest:#Exchange",
+        "FolderShape": {
+            "__type": "FolderResponseShape:#Exchange",
+            "BaseShape": "AllProperties",
+            "AdditionalProperties": [
+                { "__type": "ExtendedPropertyUri:#Exchange", "PropertyTag": FOLDER_SIZE_TAG, "PropertyType": "Long" }
+            ]
+        },
+        "Paging": { "__type": "IndexedPageView:#Exchange", "BasePoint": "Beginning", "Offset": 0, "MaxEntriesReturned": 1000 },
+        "ParentFolderIds": [ { "__type": "DistinguishedFolderId:#Exchange", "Id": "msgfolderroot" } ],
+        "Traversal": "Deep"
+    })
+}
+
+/// Папка из `FindFolder` для «Хранилища»: идентификатор, родитель, имя, класс, число элементов и
+/// размер на сервере (`None` — сервер свойства не отдал).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FolderSize {
+    pub id: String,
+    pub parent_id: Option<String>,
+    pub name: Option<String>,
+    pub folder_class: Option<String>,
+    pub total_count: Option<i64>,
+    pub size_bytes: Option<i64>,
+}
+
+/// Папки ответа `FindFolder`: `RootFolder.Folders[]` первого сообщения (терпимо к `Folders` на
+/// уровне сообщения). Размер — расширенное свойство `0x0e08` строкой или числом.
+pub fn parse_folder_sizes(msg: &Value) -> Vec<FolderSize> {
+    let folders = msg.pointer("/RootFolder/Folders").or_else(|| msg.get("Folders")).and_then(Value::as_array);
+    let num = |v: Option<&Value>| -> Option<i64> {
+        match v? {
+            Value::Number(n) => n.as_i64(),
+            Value::String(s) => s.trim().parse().ok(),
+            _ => None,
+        }
+    };
+    folders
+        .map(|a| {
+            a.iter()
+                .filter_map(|f| {
+                    Some(FolderSize {
+                        id: f.pointer("/FolderId/Id").and_then(Value::as_str)?.to_string(),
+                        parent_id: f.pointer("/ParentFolderId/Id").and_then(Value::as_str).map(String::from),
+                        name: str_of(f, "DisplayName").map(String::from),
+                        folder_class: str_of(f, "FolderClass").map(String::from),
+                        total_count: num(f.get("TotalCount")),
+                        size_bytes: num(extended_value(f, FOLDER_SIZE_TAG)),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Идентификатор папки из сообщения ответа `CreateFolder`/`UpdateFolder`/`MoveFolder`:
 /// `Folders[0].FolderId`. Нет — `None` (у `DeleteFolder` папок в ответе нет).
 pub fn parse_written_folder_id(msg: &Value) -> Option<FolderId> {
@@ -2527,6 +2604,30 @@ mod tests {
 
     fn folder_id() -> FolderId {
         FolderId { id: "F1".into(), change_key: Some("fck".into()) }
+    }
+
+    #[test]
+    fn empty_folder_and_folder_sizes_forms() {
+        let id = FolderId { id: "F1".into(), change_key: Some("ck".into()) };
+        assert_eq!(
+            serde_json::to_string(&empty_folder_body(&id, "SoftDelete", true)).unwrap(),
+            r#"{"__type":"EmptyFolderRequest:#Exchange","FolderIds":[{"__type":"FolderId:#Exchange","Id":"F1","ChangeKey":"ck"}],"DeleteType":"SoftDelete","DeleteSubFolders":true}"#
+        );
+        let find = folder_sizes_body();
+        assert_eq!(find.pointer("/Traversal").and_then(Value::as_str), Some("Deep"));
+        assert_eq!(find.pointer("/FolderShape/AdditionalProperties/0/PropertyTag").and_then(Value::as_str), Some(FOLDER_SIZE_TAG));
+        assert_eq!(find.pointer("/Paging/__type").and_then(Value::as_str), Some("IndexedPageView:#Exchange"), "без Paging сервер тело не разбирает");
+        let msg: Value = serde_json::from_str(
+            r#"{"RootFolder":{"Folders":[
+                {"__type":"Folder:#Exchange","FolderId":{"Id":"A"},"ParentFolderId":{"Id":"R"},"DisplayName":"Входящие","FolderClass":"IPF.Note","TotalCount":5,
+                 "ExtendedProperty":[{"ExtendedFieldURI":{"PropertyTag":"0xe08","PropertyType":"Long"},"Value":"123456"}]},
+                {"FolderId":{"Id":"B"},"TotalCount":"0"}]}}"#,
+        )
+        .unwrap();
+        let got = parse_folder_sizes(&msg);
+        assert_eq!(got.len(), 2);
+        assert_eq!((got[0].size_bytes, got[0].total_count, got[0].parent_id.as_deref()), (Some(123_456), Some(5), Some("R")));
+        assert_eq!((got[1].size_bytes, got[1].total_count), (None, Some(0)));
     }
 
     #[test]

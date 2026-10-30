@@ -1110,6 +1110,39 @@ HAR нет, по аналогии ожидается `RemoveMemberFromPDL`; пр
 `InstantMessageSignIn` клиент не вызывал. Статусы коллег без входа в IM от имени пользователя
 сервер не отдаёт.
 
+## 5t. Квота, размеры папок, очистка папки (клиент `aiowa`, 31.10.2026)
+
+**Квота** — `sessiondata.ashx`, `SessionSettings` (§ 2): `QuotaUsed` в байтах (109 268 923 645 —
+ровно сумма размеров папок ниже), `QuotaWarning` и `QuotaSend` — 0: у ящика нет ограничений
+(`mailbox::parse_mailbox_quota`, `OwaTransport::mailbox_quota`).
+
+**Размеры папок** — `FindFolder` всего дерева (`protocol::folder_sizes_body`):
+
+```json
+{ "__type": "FindFolderRequest:#Exchange",
+  "FolderShape": { "__type": "FolderResponseShape:#Exchange", "BaseShape": "AllProperties",
+    "AdditionalProperties": [ { "__type": "ExtendedPropertyUri:#Exchange", "PropertyTag": "0x0e08", "PropertyType": "Long" } ] },
+  "Paging": { "__type": "IndexedPageView:#Exchange", "BasePoint": "Beginning", "Offset": 0, "MaxEntriesReturned": 1000 },
+  "ParentFolderIds": [ { "__type": "DistinguishedFolderId:#Exchange", "Id": "msgfolderroot" } ],
+  "Traversal": "Deep" }
+```
+
+**Без `Paging` сервер тело не разбирает вовсе** — HTTP 500 «Cannot deserialize object of type
+FindFolderJsonRequest» в обеих версиях схемы; так же — `IdOnly` с дополнительными полями без
+`Paging`. С `Paging` (`V2017_08_18` и `Exchange2013` одинаково): 55 папок за 54 мс, у всех
+`ExtendedProperty` с `PR_MESSAGE_SIZE_EXTENDED` (0x0E08, строкой), ключи папки `__type, FolderId,
+ParentFolderId, FolderClass, DisplayName, TotalCount, ChildFolderCount, ExtendedProperty,
+EffectiveRights, UnreadCount`; `ShapeName: "Folder"` отдаёт размер и без явного свойства. Сумма
+размеров — 104 203 МБ.
+
+**Очистка** — `EmptyFolder` (`protocol::empty_folder_body`, через `folder_call`):
+`{ "__type": "EmptyFolderRequest:#Exchange", "FolderIds": [ { "__type": "FolderId:#Exchange", "Id": "…" } ],
+"DeleteType": "MoveToDeletedItems" | "SoftDelete" | "HardDelete", "DeleteSubFolders": true | false }`.
+Проба `aiowa empty-folder-check --yes-i-know` на своей папке «[AIOWA] Очистка» с тестовыми
+черновиками (`CreateItem SaveOnly` прямо в папку): `MoveToDeletedItems` без подпапок — 479 мс, два
+черновика ушли в «Удалённые»; `SoftDelete` с подпапками — 147 мс, папка пуста, подпапка удалена;
+затем `DeleteFolder HardDelete` папки. Повтор после обрыва запрещён (`is_idempotent`).
+
 ## 6. Что это значит для клиента
 
 1. Вход: POST формы, затем `sessiondata.ashx` даёт профиль, дерево папок и первую страницу входящих.

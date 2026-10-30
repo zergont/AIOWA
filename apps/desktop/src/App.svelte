@@ -980,6 +980,13 @@
     await reloadFolders();
   }
 
+  /** Очистить папку (пп. 15–16 обкатки); список и дерево перечитает событие и `reloadFolders`. */
+  async function emptyFolder(f: Folder, subfolders: boolean) {
+    const r = await api.folderEmpty(f.folder_pk, subfolders);
+    await reloadFolders();
+    showNotice(r.permanent ? `Папка «${f.name}» очищена` : `Письма папки «${f.name}» перемещены в «Удалённые»`);
+  }
+
   async function deleteFolder(f: Folder, permanent: boolean) {
     await api.folderDelete(f.folder_pk, permanent);
     await reloadFolders();
@@ -1998,7 +2005,7 @@
 
   <nav class="nav" aria-label={section === "mail" ? "Папки" : section === "calendar" ? "Мини-календарь" : "Люди"}>
     <div class="folders" class:off={section !== "mail"}>
-      <FolderTree {folders} selected={selectedFolder} onselect={openFolder} onsync={startFolderSync} syncing={syncStatus?.running ?? false} oncreate={createFolder} onrename={renameFolder} ondelete={deleteFolder} ondrop={dropConversations} />
+      <FolderTree {folders} selected={selectedFolder} onselect={openFolder} onsync={startFolderSync} syncing={syncStatus?.running ?? false} oncreate={createFolder} onrename={renameFolder} ondelete={deleteFolder} ondrop={dropConversations} onempty={emptyFolder} />
     </div>
     {#if section === "calendar"}
       <MiniMonth selected={calendarAnchor} range={calendarKind === "month" ? null : calendarRange} eventDays={calendarEventDays} onselect={pickCalendarDay} />

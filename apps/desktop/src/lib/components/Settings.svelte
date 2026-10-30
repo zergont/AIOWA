@@ -6,6 +6,7 @@
   import { focusBack } from "../popover";
   import { hint, isTopLayer, layer } from "../hotkeys";
   import SignatureDialog from "./SignatureDialog.svelte";
+  import StorageView from "./StorageView.svelte";
   import AboutUpdates from "./AboutUpdates.svelte";
   import DataStores from "./DataStores.svelte";
 
@@ -25,7 +26,7 @@
   }
   let { syncing, onsync, unsavedDraft = false, onforget, onclose }: Props = $props();
 
-  type SectionId = "account" | "sync" | "reading" | "notify" | "signature" | "view" | "data" | "about";
+  type SectionId = "account" | "sync" | "reading" | "notify" | "signature" | "view" | "storage" | "data" | "about";
   const SECTIONS: { id: SectionId; label: string }[] = [
     { id: "account", label: "Учётная запись" },
     { id: "sync", label: "Синхронизация" },
@@ -33,6 +34,7 @@
     { id: "notify", label: "Уведомления" },
     { id: "signature", label: "Подпись" },
     { id: "view", label: "Вид" },
+    { id: "storage", label: "Хранилище" },
     { id: "data", label: "Данные" },
     { id: "about", label: "О программе" },
   ];
@@ -637,6 +639,9 @@
           </div>
           <p class="hint">В тёмных тонах светлые фоны письма темнеют, тёмный текст светлеет, оттенки и картинки остаются. Если перекраска что-то испортила, кнопка с солнцем на карточке письма покажет его как задумано — на светлом листе. В светлой теме письма всегда на светлом листе, печать — всегда в исходных цветах на белом.</p>
         </fieldset>
+      {:else if current === "storage"}
+        <h3 class="section-title">Хранилище</h3>
+        <StorageView />
       {:else if current === "data"}
         <h3 class="section-title">Данные</h3>
         <dl class="props">
