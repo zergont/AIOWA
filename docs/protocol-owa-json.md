@@ -143,7 +143,7 @@ X-OWA-UrlPostData: <JSON запроса в URL-кодировке>   — при 
 | `SubscribeToNotification` | старт и смена папки | `subscriptionData[{SubscriptionId, Parameters{NotificationType:"RowNotification", FolderId}}]`; ответ `[{SubscriptionId, SuccessfullyCreated, SubscriptionExists, ErrorInfo}]`. Типы: `RowNotification` (строки папки), `SuiteNotification` (не поддерживается без Broker), календарные. Точная форма и проверенные клиентом типы — § 5h, поток событий — § 4 |
 | `UpdateUserConfiguration` | OWA сама пишет настройки (`FrequentlyUsedFolders`) | операция записи, клиенту не нужна |
 | `GetExtensibilityContext` | старт | в ответе `EwsUrl: https://{host}/EWS/Exchange.asmx` и `RestUrl` — EWS доступен как резервный канал |
-| `GetPresence`, `ResetPresence`, `InstantMessageSignIn` | Lync | клиенту не нужны |
+| `GetPresence`, `ResetPresence`, `InstantMessageSignIn` | Lync | клиенту не нужны; статусы — только после входа в IM (§ 5s) |
 | `GetFavorites`, `GetAllowedOptions`, `GetUserVoiceData`, `GetUnseenLightningIds` | старт | второстепенны |
 
 Не наблюдалось в этой сессии (проверяется в Rust-спайке напрямую): `SyncFolderItems`, `SyncFolderHierarchy`, `MarkAllItemsAsRead`, `CreateItem`, `UpdateItem`, `GetAttachment`. Позже сняты клиентом: `SyncFolderItems`/`SyncFolderHierarchy`/`GetItem` (§ 5b'), `GetFileAttachment` (§ 5), `UpdateItem` (§ 5e), `CreateItem`/`CreateAttachment`/`SendItem`/`GetUserConfiguration` (§ 5f), `FindItem` с `CalendarView` и `GetItem` события (§ 5g), `CreateFolder`/`UpdateFolder`/`DeleteFolder` и `message:ReplyTo` поверх `ShapeName` (§ 5j), `FindPeople`/`ResolveNames` по справочнику (§ 5l; `ExpandDL` в форме EWS сервер отвергает), `FindItem` последних писем папки (§ 5m).
@@ -990,9 +990,103 @@ EWS ожидаются `GivenName`, `Surname`, `MiddleName`, `Nickname`, `Compan
 (`contact_items_keys`), значения — никогда. Фейковый сервер тестов контакты не моделирует
 (`SyncFolderItems` только с `IdOnly`); разбор покрыт тестами протокола и хранилища.
 
-Не снято: `CreateItem`/`UpdateItem`/`DeleteItem` контакта и группы (запись — после HAR автора,
-docs/patch2-people.md шаг 0), `FindPeople` по папке `contacts`, фото личного контакта
+Не снято: `CreateItem`/`UpdateItem`/`DeleteItem` контакта и группы (браузерная OWA пишет контакты
+не ими, а операциями персон — § 5r), `FindPeople` по папке `contacts`, фото личного контакта
 (`GetUserPhoto` или вложение `ContactPicture.jpg`).
+
+## 5r. Запись личных контактов и групп: операции персон (HAR браузерной OWA автора, 30.10.2026)
+
+Снято HAR из OWA автора (403 запроса; файл в `fixtures/raw`, вне git; ниже — только формы, без
+значений): создание контакта, правка телефона, «Добавить в контакты» из письма, создание группы с
+двумя участниками, удаление всех трёх. Браузерная OWA **не использует** `CreateItem`/`UpdateItem`
+для контактов: все записи — операции персон, `RequestServerVersion: Exchange2013`,
+`TimeZoneContext` пользователя в `Header`. Тело — в обёртке `request`, по `EP=1` — в заголовке
+`X-OWA-UrlPostData`, иначе в теле POST (сервер принимает оба, § 3.1).
+
+**`CreatePersona`** — `{ "request": { "__type": "CreatePersonaJsonRequest:#Exchange", "Header": {…}, "Body": … } }`:
+
+```json
+{ "__type": "CreatePersonaRequest:#Exchange", "PersonaId": null,
+  "PersonTypeString": "Person",
+  "PropertyUpdates": [
+    { "__type": "PersonaPropertyUpdate:#Exchange",
+      "Path": { "__type": "PropertyUri:#Exchange", "FieldURI": "PersonaGivenNames" },
+      "OldValue": "", "NewValue": "…" } ],
+  "ParentFolderId": { "__type": "TargetFolderId:#Exchange",
+    "BaseFolderId": { "__type": "FolderId:#Exchange", "Id": "…", "ChangeKey": "…" } } }
+```
+
+- Поля нового контакта (`FieldURI`): `PersonaGivenNames`, `PersonaEmails1`,
+  `PersonaEmails1OriginalDisplayNames`, `PersonaEmails1DisplayNames` (`NewValue: null`),
+  `PersonaBusinessPhoneNumbers`. У незаполненного поля `OldValue` — пустая строка или `null`.
+- «Добавить в контакты» из письма — та же операция; поля предзаполнены, и `OldValue` равен
+  предзаполненному значению (`PersonaGivenNames`, `PersonaEmails1`, `…OriginalDisplayNames`,
+  `…DisplayNames`).
+- Группа — `PersonTypeString: "DistributionList"`, поля `PersonaDisplayNames` и по одному
+  `PersonaMembers` на участника: вместо `OldValue/NewValue` — `AddMemberToPDL` с адресом
+  `{ Name, EmailAddress, RoutingType: "SMTP", MailboxType, RelevanceScore }`; у участника-контакта
+  ещё `ItemId { Id, ChangeKey: null }`, `OriginalDisplayName`, `EmailAddressIndex`.
+- Ответ — сразу запись персоны (без `ResponseMessages`): `PersonaId { Id }` (80 символов, не
+  `ItemId`), `PersonaTypeString` (`Person` / `DistributionList`), `DisplayName*`, `FileAs`,
+  `GivenName`, `EmailAddress`/`EmailAddresses` (`MailboxType: "Contact"`, `ItemId` контакта — 152
+  символа, ключ 8), `FolderIds`, `AttributionsArray [ { Id, SourceId { Id (ItemId контакта),
+  ChangeKey (40) }, FolderId, FolderName, IsWritable, IsQuickContact, IsHidden, IsGuest } ]`,
+  массивы значений с атрибуциями (`DisplayNamesArray`, `GivenNamesArray`,
+  `BusinessPhoneNumbersArray [ { Value { Number, Type: "Business", NormalizedNumber } } ]`,
+  `Emails1Array`). У группы `EmailAddress.RoutingType: "MAPIPDL"`, `MailboxType: "PrivateDL"`.
+
+**`UpdatePersona`** — та же обёртка (`UpdatePersonaJsonRequest`), тело:
+`{ "__type": "UpdatePersonaRequest:#Exchange", "PersonaId": { "__type": "ItemId:#Exchange", "Id": "<PersonaId>" },
+"PersonTypeString": "Person", "PropertyUpdates": [ … "FieldURI": "PersonaBusinessPhoneNumbers", "OldValue": "<прежнее>", "NewValue": "<новое>" ] }`
+— только изменённые поля, с прежним значением. Ответ — персона целиком, как у создания.
+
+**`DeletePersonas`** — `{ "request": { "__type": "DeletePersonasRequest:#Exchange", "ItemIds": [ { "__type": "ItemId:#Exchange", "Id": "<PersonaId>" } ] } }`
+(без `Header`), ответ — `true`. Куда уходит контакт (в «Удалённые» или навсегда) — не проверено.
+
+**Чтение для правки.** `GetPersona` — обычный конверт (`GetPersonaJsonRequest`), тело
+`{ "__type": "GetPersonaRequest:#Exchange", "PersonaId": { "__type": "ItemId:#Exchange", "Id": "…" } }`,
+ответ `{ ResponseCode, ResponseClass, Persona: {…} }` (у коллеги из справочника — ещё `Title`,
+`Department`, `CompanyName`, `ImAddress`, `WorkCity`, две атрибуции: контакт и справочник).
+`GetGroupInfo` — `{ "getGroupInfoRequest": { "__type": "GetGroupInfoRequest:#Exchange", "ItemId": { … ItemId группы }, "AdObjectId": null, "EmailAddress": null,
+"Paging": { "__type": "IndexedPageView:#Exchange", "BasePoint": "Beginning", "MaxEntriesReturned": 50, "Offset": 0 }, "ResultSet": 1 | 2, "ParentFolderId": { "__type": "TargetFolderId:#Exchange", "BaseFolderId": null } } }`
+→ `{ Description, Members, MembersCount, Notes, Owners, PersonaId }`; `ResultSet: 1` — без
+участников (`Members: null`), `2` — с участниками (записи персон с `EmailAddress`).
+`GetNotesForPersona` — `{ "getNotesForPersonaRequest": { "__type": "GetNotesForPersonaRequest:#Exchange", "EmailAddress": null, "PersonaId": "<строкой>", "MaxBytesToFetch": 512000 } }`.
+
+Не снято: правка состава группы (`UpdatePersona` с `PersonaMembers`; ключ удаления участника — в
+HAR нет, по аналогии ожидается `RemoveMemberFromPDL`), правка адреса и имени существующего
+контакта, другие поля (мобильный, компания, должность, адрес, день рождения, заметки). Связка
+`ItemId` контакта (его хранит синхронизация, § 5q) → `PersonaId` (нужен для правки и удаления):
+`AttributionsArray[].SourceId.Id` в ответах персон; обратный путь — `FindPeople` по папке
+контактов или `GetPersona` — пробой.
+
+**Фото в браузерной OWA** — `GET service.svc/s/GetPersonaPhoto?email=…&personId=…&adObjectId=…&UA=0&size=HR96x96[&sc=…]`
+(тегом `<img>`, без канарейки в адресе): фото — `image/jpeg`, «фото нет» — заглушка `image/gif` со
+статусом 200. Клиенту хватает `GetUserPhoto` (§ 5l'): у него «фото нет» — честный 404.
+
+## 5s. Статус присутствия: вход в IM через OWA (HAR браузерной OWA автора, 30.10.2026)
+
+Статусы коллег браузерная OWA получает через Skype for Business, **войдя в IM от имени
+пользователя**:
+
+1. `InstantMessageSignIn` (тело POST `{ "signedInManually": false }`, ответ `0`) сразу после загрузки.
+2. Подписка `SubscribeToNotification` с `NotificationType: "InstantMessageNotification"`.
+3. В поток уведомлений (`ev.owa2`, § 5h) приходят блоки `{ "EventType": "0", "id": "InstantMessageNotification", "PayloadType": … }`:
+   `SignOn` (`IsUserInUcsMode`, `SignOnStarted`), `AddToBuddyList` (`AddedContacts` — список
+   контактов Skype пользователя: `SipUri`, `DisplayName`, `AddressType`, `Tagged`, `GroupIds`; 23 в
+   записи), **`UpdateUserPresence` (`NewUserPresence` — свой статус: после входа `Online`,
+   затем `IdleOnline`, `Away`)**, `UserPresenceChange` (`UserPresenceChanges: [ { SipUri, UserName, Presence } ]`
+   — изменения статусов из списка контактов), `QueryUserPresenceChange`
+   (`UserPresenceChanges: [ { SipUri, Presence } ]` — ответ на `GetPresence`).
+4. `GetPresence` — тело POST `{ "sipUris": [ "sip:…", … ] }` (до 24 адресов за раз), ответ —
+   число; сами статусы приходят потоком (`QueryUserPresenceChange`). `ResetPresence` — `{}`.
+
+Значения `Presence` в записи: `Away` (53), `Offline` (78); у самого пользователя `Online`,
+`IdleOnline`, `Away`. **Вывод:** вход OWA в IM делает пользователя «в сети» в Skype — клиент,
+повторивший его, станет ещё одной точкой Skype пользователя. Не проверено: отвечает ли
+`GetPresence` без `InstantMessageSignIn` (проба этапа 8 плана `docs/patch2-people.md`: подписка
+`InstantMessageNotification` и `GetPresence` по одному адресу без входа; без ответа в потоке —
+«без входа недоступно»).
 
 ## 6. Что это значит для клиента
 
