@@ -315,7 +315,8 @@ impl ItemKind {
             Self::Contact
         } else if lower.starts_with("ipm.appointment") {
             Self::Appointment
-        } else if lower.starts_with("ipm.task") {
+        } else if lower == "ipm.task" || lower.starts_with("ipm.task.") {
+            // Только сама задача: `IPM.TaskRequest*` (поручение и ответы на него) — письмо.
             Self::Task
         } else if lower.starts_with("ipm.stickynote") {
             Self::Note
@@ -1252,6 +1253,11 @@ mod tests {
         assert_eq!(ItemKind::of(Some("IPM.DistList"), false), ItemKind::Contact);
         assert_eq!(ItemKind::of(Some("IPM.Appointment"), false), ItemKind::Appointment);
         assert_eq!(ItemKind::of(Some("IPM.Task"), false), ItemKind::Task);
+        assert_eq!(ItemKind::of(Some("ipm.task.Custom"), false), ItemKind::Task);
+        // Поручение задачи и ответы на него — письма, не задачи.
+        assert_eq!(ItemKind::of(Some("IPM.TaskRequest"), false), ItemKind::Mail);
+        assert_eq!(ItemKind::of(Some("IPM.TaskRequest.Accept"), false), ItemKind::Mail);
+        assert_eq!(ItemKind::of(Some("IPM.TaskRequest.Decline"), true), ItemKind::Draft);
         assert_eq!(ItemKind::of(Some("IPM.StickyNote"), false), ItemKind::Note);
         assert_eq!(ItemKind::of(Some("IPM.Schedule.Meeting.Request"), false), ItemKind::Mail);
         assert_eq!(ItemKind::of(Some("REPORT.IPM.Note.NDR"), false), ItemKind::Mail);

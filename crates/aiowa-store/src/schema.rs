@@ -586,16 +586,17 @@ CREATE INDEX IF NOT EXISTS contacts_email ON contacts(account_id, email);
 "#;
 
 /// Версия 8: снять «непрочитано» с контактов, встреч, задач и заметок, пересчитать беседы.
+/// Задача — ровно `IPM.Task` и `IPM.Task.*`: `IPM.TaskRequest*` — письмо со своим IsRead.
 const V8_NON_MAIL_READ: &str = r#"
 UPDATE items SET is_read = 1 WHERE is_read = 0 AND (item_class LIKE 'IPM.Contact%' OR item_class LIKE 'IPM.DistList%'
-  OR item_class LIKE 'IPM.Appointment%' OR item_class LIKE 'IPM.Task%' OR item_class LIKE 'IPM.StickyNote%' OR item_class LIKE 'IPM.Activity%');
+  OR item_class LIKE 'IPM.Appointment%' OR item_class LIKE 'IPM.Task' OR item_class LIKE 'IPM.Task.%' OR item_class LIKE 'IPM.StickyNote%' OR item_class LIKE 'IPM.Activity%');
 UPDATE conversation_folders SET unread_count = (SELECT COUNT(*) FROM items i WHERE i.conversation_pk = conversation_folders.conversation_pk
   AND i.folder_pk = conversation_folders.folder_pk AND i.deleted = 0 AND i.is_read = 0)
  WHERE conversation_pk IN (SELECT conversation_pk FROM items WHERE conversation_pk IS NOT NULL AND (item_class LIKE 'IPM.Contact%' OR item_class LIKE 'IPM.DistList%'
-  OR item_class LIKE 'IPM.Appointment%' OR item_class LIKE 'IPM.Task%' OR item_class LIKE 'IPM.StickyNote%' OR item_class LIKE 'IPM.Activity%'));
+  OR item_class LIKE 'IPM.Appointment%' OR item_class LIKE 'IPM.Task' OR item_class LIKE 'IPM.Task.%' OR item_class LIKE 'IPM.StickyNote%' OR item_class LIKE 'IPM.Activity%'));
 UPDATE conversations SET unread_count = (SELECT COUNT(*) FROM items i WHERE i.conversation_pk = conversations.conversation_pk AND i.deleted = 0 AND i.is_read = 0)
  WHERE conversation_pk IN (SELECT conversation_pk FROM items WHERE conversation_pk IS NOT NULL AND (item_class LIKE 'IPM.Contact%' OR item_class LIKE 'IPM.DistList%'
-  OR item_class LIKE 'IPM.Appointment%' OR item_class LIKE 'IPM.Task%' OR item_class LIKE 'IPM.StickyNote%' OR item_class LIKE 'IPM.Activity%'));
+  OR item_class LIKE 'IPM.Appointment%' OR item_class LIKE 'IPM.Task' OR item_class LIKE 'IPM.Task.%' OR item_class LIKE 'IPM.StickyNote%' OR item_class LIKE 'IPM.Activity%'));
 "#;
 
 /// После `rebuild` в индексе есть и удалённые письма (представление их не отличает):
@@ -643,6 +644,33 @@ mod tests {
         conn.execute(FTS_DELETE_SQL, [7i64]).unwrap();
         let n: i64 = conn.query_row("SELECT COUNT(*) FROM items_fts WHERE items_fts MATCH 'письм*'", [], |r| r.get(0)).unwrap();
         assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn v8_marks_tasks_read_but_not_task_requests() {
+        // База версии 7: непрочитанные задачи, поручение задачи и ответ на него, письмо. Версия 8
+        // снимает признак только с задач; поручение — письмо, его IsRead настоящий.
+        let conn = Connection::open_in_memory().unwrap();
+        register_functions(&conn).unwrap();
+        migrate(&conn).unwrap();
+        conn.pragma_update(None, "user_version", 7).unwrap();
+        conn.execute_batch(
+            "INSERT INTO accounts(account_id, host, login, created_at) VALUES (1, 'h', 'u', 0);
+             INSERT INTO folders(folder_pk, account_id, server_id, display_name, updated_at) VALUES (1, 1, 'F', 'Входящие', 0);
+             INSERT INTO conversations(conversation_pk, account_id, server_id, unread_count) VALUES (1, 1, 'C1', 3), (2, 1, 'C2', 2);
+             INSERT INTO conversation_folders(conversation_pk, folder_pk, last_received_at, item_count, unread_count) VALUES (1, 1, 0, 3, 3), (2, 1, 0, 2, 2);
+             INSERT INTO items(item_pk, account_id, server_id, folder_pk, conversation_pk, item_class, is_read, updated_at)
+               VALUES (1, 1, 'T', 1, 1, 'IPM.Task', 0, 0), (2, 1, 'TC', 1, 1, 'ipm.task.Custom', 0, 0), (3, 1, 'R', 1, 1, 'IPM.TaskRequest', 0, 0),
+                      (4, 1, 'RA', 1, 2, 'IPM.TaskRequest.Accept', 0, 0), (5, 1, 'N', 1, 2, 'IPM.Note', 0, 0);",
+        )
+        .unwrap();
+        migrate(&conn).unwrap();
+        let read = |pk: i64| conn.query_row("SELECT is_read FROM items WHERE item_pk = ?1", [pk], |r| r.get::<_, i64>(0)).unwrap();
+        assert_eq!((read(1), read(2)), (1, 1), "задачи прочитаны");
+        assert_eq!((read(3), read(4), read(5)), (0, 0, 0), "поручение задачи и ответ на него не тронуты");
+        let unread = |table: &str, pk: i64| conn.query_row(&format!("SELECT unread_count FROM {table} WHERE conversation_pk = ?1"), [pk], |r| r.get::<_, i64>(0)).unwrap();
+        assert_eq!((unread("conversations", 1), unread("conversation_folders", 1)), (1, 1), "в беседе непрочитанным осталось поручение");
+        assert_eq!((unread("conversations", 2), unread("conversation_folders", 2)), (2, 2), "беседа без задач не пересчитана");
     }
 
     #[test]

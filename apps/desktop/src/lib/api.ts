@@ -64,7 +64,8 @@ export function itemKindOf(itemClass: string | null | undefined, isDraft: boolea
   const c = (itemClass ?? "IPM.Note").toLowerCase();
   if (c.startsWith("ipm.contact") || c.startsWith("ipm.distlist")) return "contact";
   if (c.startsWith("ipm.appointment")) return "appointment";
-  if (c.startsWith("ipm.task")) return "task";
+  // Только сама задача: IPM.TaskRequest* (поручение и ответы на него) — письмо.
+  if (c === "ipm.task" || c.startsWith("ipm.task.")) return "task";
   if (c.startsWith("ipm.stickynote")) return "note";
   if (c.startsWith("ipm.activity") || c.startsWith("ipm.document")) return "other";
   return isDraft ? "draft" : "mail";

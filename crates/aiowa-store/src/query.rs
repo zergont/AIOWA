@@ -19,10 +19,11 @@ pub struct SearchQuery {
     pub terms: Vec<Term>,
     pub from: Vec<String>,
     pub to: Vec<String>,
-    /// `от:адрес@…` — точное равенство адреса отправителя (без учёта регистра), не поиск по словам:
+    /// `от:имя@домен.зона` — точное равенство адреса отправителя (без учёта регистра), не поиск по словам:
     /// так работает «Найти письма» из карточки и выбор человека в подсказках поиска (п. 9 обкатки).
     pub from_exact: Vec<String>,
-    /// `кому:адрес@…` — адрес среди получателей письма (Кому, Копия, Скрытая).
+    /// `кому:имя@домен.зона` — адрес среди получателей письма (Кому, Копия, Скрытая); каждый
+    /// адрес обязателен, как и остальные условия.
     pub to_exact: Vec<String>,
     pub subject: Vec<String>,
     pub has_attachment: bool,
@@ -120,20 +121,27 @@ fn parse_date_range(s: &str) -> Option<(i64, i64)> {
     }
 }
 
+/// Полный адрес `имя@домен.зона`: только он ищется точным равенством. Часть адреса (`@домен.ru`,
+/// `ivan@`, недонабранное `ivan@comp`) остаётся поиском по словам, как раньше.
+fn is_full_address(s: &str) -> bool {
+    let Some((local, domain)) = s.split_once('@') else { return false };
+    !local.is_empty() && !domain.contains('@') && !s.chars().any(char::is_whitespace) && domain.contains('.') && domain.split('.').all(|p| !p.is_empty())
+}
+
 pub fn parse(input: &str) -> SearchQuery {
     let mut q = SearchQuery::default();
     for t in split_tokens(input) {
         let value = fts_norm(t.value.trim());
         match t.key.as_deref() {
             Some("от" | "from") if !value.is_empty() => {
-                if t.value.contains('@') {
+                if is_full_address(t.value.trim()) {
                     q.from_exact.push(t.value.trim().to_lowercase());
                 } else {
                     q.from.push(value);
                 }
             }
             Some("кому" | "to") if !value.is_empty() => {
-                if t.value.contains('@') {
+                if is_full_address(t.value.trim()) {
                     q.to_exact.push(t.value.trim().to_lowercase());
                 } else {
                     q.to.push(value);
@@ -267,6 +275,25 @@ mod tests {
         let q = parse("from:ivan@x.ru");
         assert_eq!(q.from_exact, vec!["ivan@x.ru"]);
         assert!(q.fts_match().is_none() && !q.is_empty());
+    }
+
+    #[test]
+    fn partial_address_is_word_search() {
+        // Домен, начало адреса или недонабранный адрес — поиск по словам, как до точных условий.
+        let q = parse("от:@company.ru");
+        assert!(q.from_exact.is_empty());
+        assert_eq!(q.fts_match().as_deref(), Some("{from_name from_email}: (\"company.ru\"*)"));
+        let q = parse("от:ivan@comp кому:anna@ кому:@x.ru");
+        assert!(q.from_exact.is_empty() && q.to_exact.is_empty());
+        assert_eq!(q.from, vec!["ivan@comp"]);
+        assert_eq!(q.to, vec!["anna@", "@x.ru"]);
+        for partial in ["ivan@x.", "ivan@.ru", "a@b@x.ru", "\"ivan @x.ru\""] {
+            assert!(parse(&format!("кому:{partial}")).to_exact.is_empty(), "{partial}");
+        }
+        // Несколько полных адресов в кому: — каждый отдельным условием (все обязательны).
+        let q = parse("кому:a@x.ru кому:B@x.ru");
+        assert_eq!(q.to_exact, vec!["a@x.ru", "b@x.ru"]);
+        assert!(q.to.is_empty() && q.fts_match().is_none());
     }
 
     #[test]
