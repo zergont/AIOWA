@@ -1083,10 +1083,13 @@ HAR нет, по аналогии ожидается `RemoveMemberFromPDL`), п�
 
 Значения `Presence` в записи: `Away` (53), `Offline` (78); у самого пользователя `Online`,
 `IdleOnline`, `Away`. **Вывод:** вход OWA в IM делает пользователя «в сети» в Skype — клиент,
-повторивший его, станет ещё одной точкой Skype пользователя. Не проверено: отвечает ли
-`GetPresence` без `InstantMessageSignIn` (проба этапа 8 плана `docs/patch2-people.md`: подписка
-`InstantMessageNotification` и `GetPresence` по одному адресу без входа; без ответа в потоке —
-«без входа недоступно»).
+повторивший его, станет ещё одной точкой Skype пользователя.
+
+**Без входа — недоступно (проба `aiowa presence`, 30.10.2026).** Подписка `InstantMessageNotification`
+создана (41 мс), `GetPresence` по 8 SIP-адресам коллег (`ImAddress` из `FindPeople`) принят — 159 мс,
+ответ число, — но за 25 с в поток не пришло ни одного блока `InstantMessageNotification`:
+`InstantMessageSignIn` клиент не вызывал. Статусы коллег без входа в IM от имени пользователя
+сервер не отдаёт.
 
 ## 6. Что это значит для клиента
 

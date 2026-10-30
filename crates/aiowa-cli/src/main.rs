@@ -469,6 +469,20 @@ enum Cmd {
         #[arg(long)]
         rows_only: bool,
     },
+    /// Проба статусов коллег без входа в IM: SIP-адреса из FindPeople, подписка
+    /// InstantMessageNotification, GetPresence, поток уведомлений; InstantMessageSignIn не вызывается.
+    /// Печатает только число адресов, виды блоков и значения статусов
+    Presence {
+        /// Строка поиска коллег (в вывод не печатается); без неё — первое слово имени владельца ящика
+        #[arg(long)]
+        query: Option<String>,
+        /// Сколько SIP-адресов спросить
+        #[arg(long, default_value_t = 5)]
+        max: usize,
+        /// Сколько секунд читать поток
+        #[arg(long, default_value_t = 25)]
+        seconds: u64,
+    },
     /// Чей ящик: адрес, MailboxGuid и имя из sessiondata.ashx (запасной путь —
     /// GetOwaUserConfiguration). Печатает только наличие и длины, не значения
     Mailbox {
@@ -630,8 +644,103 @@ fn describe_event(ev: &NotificationEvent, folder_names: &std::collections::HashM
         NotificationEvent::Calendar { folder, .. } => format!("Calendar: {}", folder_name(folder)),
         NotificationEvent::KeepAlive => "KeepAlive".into(),
         NotificationEvent::Reload => "Reload (подписки потеряны)".into(),
+        NotificationEvent::InstantMessage { payload_type, presences, .. } => format!("InstantMessage {payload_type}: статусов {}", presences.len()),
         NotificationEvent::Unknown { raw_kind } => format!("Unknown: {raw_kind}"),
     }
+}
+
+/// Проба статусов без входа в IM (`aiowa presence`, этап 8 плана docs/patch2-people.md): SIP-адреса
+/// коллег из `FindPeople` (`ImAddress`), подписка `InstantMessageNotification`, `GetPresence` и поток
+/// уведомлений `seconds` секунд. `InstantMessageSignIn` не вызывается. Печатаются только число
+/// адресов, виды блоков и значения статусов — не адреса и не имена.
+async fn presence_probe(t: &OwaTransport, query: &str, max: usize, seconds: u64) -> Result<()> {
+    use aiowa_transport_owa::protocol;
+    let v = t.call("FindPeople", protocol::V_2017, protocol::find_people_body(query, 25)).await.map_err(|e| anyhow!("FindPeople: {e}"))?;
+    let mut uris: Vec<String> = Vec::new();
+    for p in protocol::find_people_array(&v).map(Vec::as_slice).unwrap_or_default() {
+        let im = protocol::first_text(p, &["ImAddress"]).unwrap_or_default();
+        if im.to_ascii_lowercase().starts_with("sip:") && !uris.contains(&im) {
+            uris.push(im);
+        }
+        if uris.len() >= max {
+            break;
+        }
+    }
+    println!("FindPeople: SIP-адресов у найденных {} (запрос {} символов)", uris.len(), query.chars().count());
+    if uris.is_empty() {
+        bail!("у найденных записей нет SIP-адреса (ImAddress) — проверять нечего");
+    }
+    let subs = vec![SubscriptionRequest { id: new_guid(), kind: NotificationKind::InstantMessage }];
+    subscribe_and_report(t, &subs, &Default::default()).await?;
+    let cid = new_guid();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<NotificationEvent>();
+    let sink = move |ev: NotificationEvent| {
+        let _ = tx.send(ev);
+    };
+    let started = std::time::Instant::now();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(seconds);
+    let ask_at = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+    let (mut asked, mut signed_in) = (false, false);
+    let mut values: std::collections::BTreeMap<String, usize> = Default::default();
+    let mut payloads: std::collections::BTreeMap<String, usize> = Default::default();
+    let mut answered = 0usize;
+    'outer: loop {
+        {
+            let stream = t.notification_stream(&cid, &sink);
+            tokio::pin!(stream);
+            loop {
+                tokio::select! {
+                    r = &mut stream => {
+                        if let Err(e) = r {
+                            println!("[{:>5.1} с] поток прерван: {e}", started.elapsed().as_secs_f32());
+                            break 'outer;
+                        }
+                        break;
+                    }
+                    Some(ev) = rx.recv() => {
+                        if let NotificationEvent::InstantMessage { payload_type, presences, own_presence } = &ev {
+                            *payloads.entry(payload_type.clone()).or_default() += 1;
+                            for p in presences {
+                                *values.entry(p.presence.clone()).or_default() += 1;
+                            }
+                            answered += presences.iter().filter(|p| uris.iter().any(|u| u.eq_ignore_ascii_case(&p.sip_uri))).count();
+                            if payload_type == "SignOn" || own_presence.is_some() {
+                                signed_in = true;
+                            }
+                            println!("[{:>5.1} с] InstantMessage {payload_type}: статусов {}{}", started.elapsed().as_secs_f32(), presences.len(), own_presence.as_ref().map(|o| format!(", свой статус {o}")).unwrap_or_default());
+                        } else if !matches!(ev, NotificationEvent::KeepAlive) {
+                            println!("[{:>5.1} с] {}", started.elapsed().as_secs_f32(), ev.kind_name());
+                        }
+                    }
+                    _ = tokio::time::sleep_until(ask_at), if !asked => {
+                        asked = true;
+                        let t0 = std::time::Instant::now();
+                        match t.get_presence(&uris).await {
+                            Ok(v) => println!("[{:>5.1} с] GetPresence ({} адресов): {} мс, ответ {}", started.elapsed().as_secs_f32(), uris.len(), t0.elapsed().as_millis(), protocol::json_shape(&v, 2)),
+                            Err(e) => println!("[{:>5.1} с] GetPresence: отказ {} за {} мс", started.elapsed().as_secs_f32(), transport_error_code(&e), t0.elapsed().as_millis()),
+                        }
+                    }
+                    _ = tokio::time::sleep_until(deadline) => break 'outer,
+                }
+            }
+        }
+        if let Err(e) = t.finish_notification_stream(&cid).await {
+            println!("FinishNotificationRequest: {e}");
+        }
+        if tokio::time::Instant::now() >= deadline {
+            break;
+        }
+    }
+    if let Err(e) = t.finish_notification_stream(&cid).await {
+        println!("FinishNotificationRequest: {e}");
+    }
+    println!("Итог: блоков IM по видам {payloads:?}; статусы {values:?}; ответов по спрошенным адресам {answered} из {}", uris.len());
+    if signed_in {
+        println!("ВНИМАНИЕ: в потоке был вход в IM (SignOn или свой статус) — сервер вошёл в IM сам");
+    } else if answered == 0 {
+        println!("Без входа в IM статусов не пришло");
+    }
+    Ok(())
 }
 
 /// Подписки для `notify`: строки каждой папки и, если не `rows_only`, остальные типы.
@@ -3379,6 +3488,18 @@ async fn real_main() -> Result<()> {
             }
             SummaryTarget::One(path) => print_db_summary(&path)?,
         },
+        Cmd::Presence { query, max, seconds } => {
+            let store = Store::open(&db_path)?;
+            let account = store.account(&cli.host, &cli.user)?;
+            let query = match query.as_deref().map(str::trim).filter(|q| !q.is_empty()) {
+                Some(q) => q.to_string(),
+                None => owner_surname(&store, account)?.0,
+            };
+            let t = connect(&cli).await?;
+            let result = presence_probe(&t, &query, *max, *seconds).await;
+            t.logoff().await.ok();
+            result?;
+        }
         Cmd::Notify { seconds, folders, rows_only } => {
             let store = Store::open(&db_path)?;
             let account = store.account(&cli.host, &cli.user)?;

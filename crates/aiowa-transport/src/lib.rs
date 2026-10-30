@@ -235,6 +235,9 @@ pub enum NotificationKind {
     Unseen,
     /// События календаря (`CalendarItemNotification`) по папке календаря.
     Calendar { folder: FolderId },
+    /// Мгновенные сообщения и присутствие (`InstantMessageNotification`): статусы коллег в ответ на
+    /// `GetPresence` (docs/protocol-owa-json.md § 5s).
+    InstantMessage,
 }
 
 impl NotificationKind {
@@ -246,6 +249,7 @@ impl NotificationKind {
             NotificationKind::Hierarchy => "HierarchyNotification",
             NotificationKind::Unseen => "UnseenItemNotification",
             NotificationKind::Calendar { .. } => "CalendarItemNotification",
+            NotificationKind::InstantMessage => "InstantMessageNotification",
         }
     }
 }
@@ -284,6 +288,9 @@ pub enum NotificationEvent {
     Unseen { subscription: String, count: Option<i64> },
     /// Изменился календарь.
     Calendar { subscription: String, folder: Option<FolderId> },
+    /// Блок мгновенных сообщений: `payload_type` (`QueryUserPresenceChange`, `UserPresenceChange`,
+    /// `UpdateUserPresence`, `SignOn`, …), статусы коллег и свой статус (`NewUserPresence`).
+    InstantMessage { payload_type: String, presences: Vec<PresenceChange>, own_presence: Option<String> },
     /// Сервер подтверждает, что поток жив.
     KeepAlive,
     /// Подписки потеряны (новая сессия или просьба сервера): нужно подписаться заново.
@@ -301,11 +308,20 @@ impl NotificationEvent {
             NotificationEvent::Hierarchy { .. } => "Hierarchy",
             NotificationEvent::Unseen { .. } => "Unseen",
             NotificationEvent::Calendar { .. } => "Calendar",
+            NotificationEvent::InstantMessage { .. } => "InstantMessage",
             NotificationEvent::KeepAlive => "KeepAlive",
             NotificationEvent::Reload => "Reload",
             NotificationEvent::Unknown { .. } => "Unknown",
         }
     }
+}
+
+/// Статус одного адреса в блоке мгновенных сообщений: `SipUri` и `Presence` (`Online`, `Away`,
+/// `Busy`, `Offline`, … как прислал сервер). Персональные данные: в журналы не пишутся.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PresenceChange {
+    pub sip_uri: String,
+    pub presence: String,
 }
 
 /// Итог одного цикла потока уведомлений.

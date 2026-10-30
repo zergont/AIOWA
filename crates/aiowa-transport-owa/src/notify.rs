@@ -7,7 +7,7 @@
 
 use crate::protocol::{self, str_of};
 use aiowa_core::{FolderId, ItemId, Participant};
-use aiowa_transport::{NotificationEvent, NotificationKind, SubscriptionRequest, SubscriptionResult};
+use aiowa_transport::{NotificationEvent, NotificationKind, PresenceChange, SubscriptionRequest, SubscriptionResult};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use tracing::debug;
@@ -319,6 +319,10 @@ fn kind_of(v: &Value, id: &str, subs: &HashMap<String, NotificationKind>) -> Opt
     if let Some(k) = subs.get(id) {
         return Some(k.clone());
     }
+    // Блоки мгновенных сообщений приходят с `id` = имени вида, а не идентификатором подписки (§ 5s).
+    if id.eq_ignore_ascii_case("InstantMessageNotification") {
+        return Some(NotificationKind::InstantMessage);
+    }
     let hint = [str_of(v, "__type"), str_of(v, "NotificationType"), str_of(v, "EventType")].into_iter().flatten().map(str::to_ascii_lowercase).collect::<Vec<_>>().join(" ");
     if hint.contains("newmail") {
         Some(NotificationKind::NewMail)
@@ -362,6 +366,15 @@ pub fn classify_event(v: &Value, subs: &HashMap<String, NotificationKind>) -> No
         Some(NotificationKind::Hierarchy) => NotificationEvent::Hierarchy { subscription: id, folder: folder_of(v, &["FolderId"]), event_type },
         Some(NotificationKind::Unseen) => NotificationEvent::Unseen { subscription: id, count: count_of(v) },
         Some(NotificationKind::Calendar { folder }) => NotificationEvent::Calendar { subscription: id, folder: Some(folder) },
+        Some(NotificationKind::InstantMessage) => NotificationEvent::InstantMessage {
+            payload_type: str_of(v, "PayloadType").unwrap_or("").to_string(),
+            presences: v
+                .get("UserPresenceChanges")
+                .and_then(Value::as_array)
+                .map(|a| a.iter().filter_map(|c| Some(PresenceChange { sip_uri: str_of(c, "SipUri")?.to_string(), presence: str_of(c, "Presence")?.to_string() })).collect())
+                .unwrap_or_default(),
+            own_presence: str_of(v, "NewUserPresence").map(String::from),
+        },
         None => {
             let raw_kind = if !type_name.is_empty() {
                 type_name.to_string()
@@ -400,6 +413,28 @@ mod tests {
             r#"{"__type":"SubscriptionData:#Exchange","SubscriptionId":"22222222-2222-2222-2222-222222222222","Parameters":{"__type":"SubscriptionParameters:#Exchange","NotificationType":"NewMailNotification","subscriptionIdSuffix":""}}]}"#
         );
         assert_eq!(s, expected);
+    }
+
+    /// Блоки мгновенных сообщений приходят с `id` = «InstantMessageNotification», не идентификатором
+    /// подписки (снято HAR браузерной OWA, § 5s): статусы коллег и свой статус.
+    #[test]
+    fn instant_message_blocks_carry_presence() {
+        let subs: HashMap<String, NotificationKind> = HashMap::new();
+        let block = r#"[{"EventType":"0","id":"InstantMessageNotification","PayloadType":"QueryUserPresenceChange","UserPresenceChanges":[{"SipUri":"sip:a@x.ru","Presence":"Away"},{"SipUri":"sip:b@x.ru","Presence":"Offline"}]}]"#;
+        assert_eq!(
+            parse_block(block, &subs),
+            vec![NotificationEvent::InstantMessage {
+                payload_type: "QueryUserPresenceChange".into(),
+                presences: vec![PresenceChange { sip_uri: "sip:a@x.ru".into(), presence: "Away".into() }, PresenceChange { sip_uri: "sip:b@x.ru".into(), presence: "Offline".into() }],
+                own_presence: None,
+            }]
+        );
+        let own = r#"[{"EventType":"0","id":"InstantMessageNotification","NewUserPresence":"Online","PayloadType":"UpdateUserPresence"}]"#;
+        assert_eq!(parse_block(own, &subs), vec![NotificationEvent::InstantMessage { payload_type: "UpdateUserPresence".into(), presences: vec![], own_presence: Some("Online".into()) }]);
+        let subs2 = [sub("im", NotificationKind::InstantMessage)];
+        let body = subscribe_body(&subs2, "UTC", SubscribeForm::FolderString);
+        assert_eq!(body.pointer("/subscriptionData/0/Parameters/NotificationType").and_then(Value::as_str), Some("InstantMessageNotification"));
+        assert!(body.pointer("/subscriptionData/0/Parameters/FolderId").is_none());
     }
 
     #[test]

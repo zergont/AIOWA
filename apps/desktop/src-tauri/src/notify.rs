@@ -582,7 +582,8 @@ impl<'a> Dispatcher<'a> {
             }
             NotificationEvent::Unseen { .. } => self.state.refresh_unread(self.app),
             NotificationEvent::Calendar { .. } => self.debounce.calendar(now),
-            NotificationEvent::KeepAlive => {}
+            // Окно на мгновенные сообщения не подписывается: статусы без входа в IM сервер не отдаёт (§ 5s).
+            NotificationEvent::KeepAlive | NotificationEvent::InstantMessage { .. } => {}
             NotificationEvent::Reload => self.reload.notify_one(),
             NotificationEvent::Unknown { raw_kind } => debug!(raw_kind, "канал: блок неизвестного вида"),
         }

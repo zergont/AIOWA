@@ -1374,7 +1374,7 @@ fn loose_text(v: &Value) -> Option<String> {
 }
 
 /// Первое непустое значение из ключей `keys` (в порядке перечисления).
-fn first_text(v: &Value, keys: &[&str]) -> Option<String> {
+pub fn first_text(v: &Value, keys: &[&str]) -> Option<String> {
     keys.iter().find_map(|k| v.get(*k).and_then(loose_text))
 }
 

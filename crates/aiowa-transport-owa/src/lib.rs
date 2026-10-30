@@ -1436,6 +1436,13 @@ impl OwaTransport {
         Ok(v)
     }
 
+    /// `GetPresence` по SIP-адресам (`{ "sipUris": [...] }` в теле POST, как у браузерной OWA): ответ —
+    /// число-подтверждение, сами статусы приходят потоком уведомлений (`InstantMessageNotification`,
+    /// § 5s). Входа в IM (`InstantMessageSignIn`) клиент не делает.
+    pub async fn get_presence(&self, sip_uris: &[String]) -> Result<Value> {
+        self.call_raw("GetPresence", serde_json::json!({ "sipUris": sip_uris })).await
+    }
+
     /// Ответ `ResolveNames` целиком.
     pub async fn resolve_names_value(&self, query: &str, full_contact: bool) -> Result<Value> {
         self.directory_call("ResolveNames", protocol::resolve_names_body(query, full_contact)).await
