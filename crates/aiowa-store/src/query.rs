@@ -19,6 +19,11 @@ pub struct SearchQuery {
     pub terms: Vec<Term>,
     pub from: Vec<String>,
     pub to: Vec<String>,
+    /// `от:адрес@…` — точное равенство адреса отправителя (без учёта регистра), не поиск по словам:
+    /// так работает «Найти письма» из карточки и выбор человека в подсказках поиска (п. 9 обкатки).
+    pub from_exact: Vec<String>,
+    /// `кому:адрес@…` — адрес среди получателей письма (Кому, Копия, Скрытая).
+    pub to_exact: Vec<String>,
     pub subject: Vec<String>,
     pub has_attachment: bool,
     pub folder: Option<String>,
@@ -120,8 +125,20 @@ pub fn parse(input: &str) -> SearchQuery {
     for t in split_tokens(input) {
         let value = fts_norm(t.value.trim());
         match t.key.as_deref() {
-            Some("от" | "from") if !value.is_empty() => q.from.push(value),
-            Some("кому" | "to") if !value.is_empty() => q.to.push(value),
+            Some("от" | "from") if !value.is_empty() => {
+                if t.value.contains('@') {
+                    q.from_exact.push(t.value.trim().to_lowercase());
+                } else {
+                    q.from.push(value);
+                }
+            }
+            Some("кому" | "to") if !value.is_empty() => {
+                if t.value.contains('@') {
+                    q.to_exact.push(t.value.trim().to_lowercase());
+                } else {
+                    q.to.push(value);
+                }
+            }
             Some("тема" | "subject") if !value.is_empty() => q.subject.push(value),
             Some("папка" | "in" | "folder") if !value.is_empty() => q.folder = Some(value),
             Some("вложение" | "вложения" | "attachment") => q.has_attachment = !matches!(value.to_lowercase().as_str(), "нет" | "no" | "0" | "false"),
@@ -169,7 +186,7 @@ fn fts_words(text: &str, prefix: bool) -> Vec<String> {
 impl SearchQuery {
     /// Есть ли хоть одно условие.
     pub fn is_empty(&self) -> bool {
-        self.terms.is_empty() && self.from.is_empty() && self.to.is_empty() && self.subject.is_empty() && !self.has_attachment && self.folder.is_none() && self.after_ms.is_none() && self.before_ms.is_none()
+        self.terms.is_empty() && self.from.is_empty() && self.to.is_empty() && self.from_exact.is_empty() && self.to_exact.is_empty() && self.subject.is_empty() && !self.has_attachment && self.folder.is_none() && self.after_ms.is_none() && self.before_ms.is_none()
     }
 
     /// Выражение `MATCH` для FTS5 или `None`, если текстовых условий нет (остались только фильтры).
@@ -225,6 +242,13 @@ mod tests {
         assert_eq!(q.folder.as_deref(), Some("Входящие"));
         assert!(q.after_ms.is_some() && q.before_ms.is_some() && q.after_ms < q.before_ms);
         assert_eq!(q.terms, vec![Term { text: "запчасти".into(), phrase: false }]);
+        assert!(q.from_exact.is_empty() && q.to_exact.is_empty());
+        let exact = parse("от:Ivan.Petrov@Example.ru кому:anna@x.ru отчёт");
+        assert_eq!(exact.from_exact, vec!["ivan.petrov@example.ru"]);
+        assert_eq!(exact.to_exact, vec!["anna@x.ru"]);
+        assert!(exact.from.is_empty() && exact.to.is_empty(), "адрес не уходит в поиск по словам");
+        assert_eq!(exact.fts_match().as_deref(), Some("\"отчет\"*"));
+        assert!(!parse("от:ivan@x.ru").is_empty() && parse("от:ivan@x.ru").fts_match().is_none(), "одно точное условие — без FTS");
         let m = q.fts_match().unwrap();
         assert_eq!(m, "\"запчасти\"* AND {from_name from_email}: (\"иванов\"*) AND recipients: (\"Петр\"* \"Сидоров\"*) AND subject: (\"счет\"*)");
     }
@@ -239,8 +263,10 @@ mod tests {
         // Неизвестный оператор не теряется, а ищется как текст.
         let q = parse("http:сайт");
         assert_eq!(q.terms[0].text, "http сайт");
-        // Email целиком в одном токене.
-        assert_eq!(parse("from:ivan@x.ru").fts_match().unwrap(), "{from_name from_email}: (\"ivan@x.ru\"*)");
+        // Email целиком в одном токене: адрес — точное условие, не поиск по словам (п. 9 обкатки).
+        let q = parse("from:ivan@x.ru");
+        assert_eq!(q.from_exact, vec!["ivan@x.ru"]);
+        assert!(q.fts_match().is_none() && !q.is_empty());
     }
 
     #[test]

@@ -1461,6 +1461,23 @@ impl Store {
             let n = args.len();
             sql.push_str(&format!(" AND (f.distinguished = ?{n} OR norm_lower(f.display_name) = norm_lower(?{n}) OR norm_lower(f.display_name) LIKE norm_lower(?{n}) || '%')"));
         }
+        // Точные адреса: по индексам `items_from_lower` и `recipients_email_lower`.
+        if !q.from_exact.is_empty() {
+            let mut marks = Vec::with_capacity(q.from_exact.len());
+            for e in &q.from_exact {
+                args.push(SqlValue::Text(e.clone()));
+                marks.push(format!("?{}", args.len()));
+            }
+            sql.push_str(&format!(" AND lower(i.from_email) IN ({})", marks.join(", ")));
+        }
+        if !q.to_exact.is_empty() {
+            let mut marks = Vec::with_capacity(q.to_exact.len());
+            for e in &q.to_exact {
+                args.push(SqlValue::Text(e.clone()));
+                marks.push(format!("?{}", args.len()));
+            }
+            sql.push_str(&format!(" AND EXISTS (SELECT 1 FROM recipients r WHERE r.item_pk = i.item_pk AND r.kind IN (1, 2, 3) AND lower(r.email) IN ({}))", marks.join(", ")));
+        }
         args.push(SqlValue::Integer(limit as i64));
         // Как в OWA: результаты от новых к старым; релевантность (bm25) только разводит письма
         // с одинаковой датой и остаётся в `SearchHit::rank`.
@@ -2208,6 +2225,10 @@ mod tests {
         // Reply-To не попадает в индекс получателей (представление берёт kind 1 и 2) и в подсказки не мешает «Кому».
         assert!(s.search(acc, "кому:шлепанцев", 10).unwrap().is_empty(), "Reply-To не индексируется как получатель");
         assert_eq!(s.search(acc, "кому:я", 10).unwrap().len(), 1);
+        // Точный адрес: от:/кому: с «@» — равенство адреса, без поиска по словам.
+        assert!(!s.search(acc, "от:VP@x.ru", 10).unwrap().is_empty(), "адрес отправителя без учёта регистра");
+        assert!(s.search(acc, "от:vp@x.ru.evil", 10).unwrap().is_empty(), "похожий, но другой адрес не подходит");
+        assert!(s.search(acc, "кому:nobody@x.ru", 10).unwrap().is_empty());
         // Повторная запись без Reply-To (заголовок исчез) убирает строки kind 4.
         m.reply_to.clear();
         s.store_full_messages(acc, fpk, &[m]).unwrap();

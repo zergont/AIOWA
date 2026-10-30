@@ -7,13 +7,15 @@
   import { hint, keysOf, matchHotkey, preventBrowserKeys } from "./lib/hotkeys";
   import { printMessage } from "./lib/print";
   import { mergeRecipients, sameEmail } from "./lib/addresses";
-  import { loadDirectoryCaps, provideContactCard, type ContactRef } from "./lib/contact";
+  import { contactCardOpener, directoryLine, loadDirectoryCaps, provideContactCard, type ContactRef } from "./lib/contact";
+  import type { DirectoryPerson, SuggestPerson } from "./lib/api";
   import ContactCard from "./lib/components/ContactCard.svelte";
   import ChoicePopover from "./lib/components/ChoicePopover.svelte";
   import FolderTree from "./lib/components/FolderTree.svelte";
   import ConversationList from "./lib/components/ConversationList.svelte";
   import ReadingPane from "./lib/components/ReadingPane.svelte";
   import SearchResults from "./lib/components/SearchResults.svelte";
+  import SearchSuggest from "./lib/components/SearchSuggest.svelte";
   import StatusBar from "./lib/components/StatusBar.svelte";
   import Logo from "./lib/components/Logo.svelte";
   import Composer, { type CloseReason } from "./lib/components/Composer.svelte";
@@ -1054,6 +1056,8 @@
   function onQueryInput() {
     cancelSearch();
     const q = query.trim();
+    suggestOpen = true;
+    updateSuggestions(q);
     if (!q) {
       searchHits = null;
       return;
@@ -1076,6 +1080,155 @@
     cancelSearch();
     query = "";
     searchHits = null;
+    suggestOpen = false;
+    localPeople = [];
+    dirPeople = [];
+  }
+
+  /** Поиск сразу, без паузы ввода: Enter, выбор подсказки, «Искать во всей почте». */
+  function runSearchNow() {
+    cancelSearch();
+    const q = query.trim();
+    if (!q) {
+      searchHits = null;
+      return;
+    }
+    const seq = searchSeq;
+    searching = true;
+    api
+      .search(q, 100)
+      .then((hits) => {
+        if (seq === searchSeq) searchHits = hits;
+      })
+      .catch((e) => {
+        if (seq === searchSeq) error = errorMessage(e);
+      })
+      .finally(() => {
+        if (seq === searchSeq) searching = false;
+      });
+  }
+
+  // --- подсказки поиска (п. 9 обкатки) ----------------------------------------------------
+  // Под строкой поиска: раздел «От» — частые корреспонденты из базы (сразу, без сети), затем кэш
+  // справочника и FindPeople с паузой; недавние запросы (localStorage); «Искать … во всей почте».
+  // Выбор человека ставит «от:адрес» — точное условие по адресу, не поиск по словам.
+
+  const RECENT_KEY = "aiowa.search.recent";
+  const RECENT_MAX = 8;
+  let suggestOpen = $state(false);
+  let localPeople = $state<SuggestPerson[]>([]);
+  let dirPeople = $state<SuggestPerson[]>([]);
+  let suggestLoading = $state(false);
+  let recentQueries = $state<string[]>(loadRecentQueries());
+  let suggestSeq = 0;
+  let suggestTimer: ReturnType<typeof setTimeout> | undefined;
+  const suggestPeople = $derived(mergePeople(localPeople, dirPeople));
+  const suggestVisible = $derived(suggestOpen && section === "mail" && (suggestPeople.length > 0 || suggestLoading || query.trim() !== "" || recentQueries.length > 0));
+
+  function loadRecentQueries(): string[] {
+    try {
+      const v = JSON.parse(localStorage.getItem(RECENT_KEY) ?? "[]");
+      return Array.isArray(v) ? v.filter((x): x is string => typeof x === "string").slice(0, RECENT_MAX) : [];
+    } catch {
+      return [];
+    }
+  }
+  function rememberQuery(q: string) {
+    const t = q.trim();
+    if (!t) return;
+    recentQueries = [t, ...recentQueries.filter((x) => x !== t)].slice(0, RECENT_MAX);
+    try {
+      localStorage.setItem(RECENT_KEY, JSON.stringify(recentQueries));
+    } catch {
+      // Хранилище окна недоступно: подсказки живут до перезапуска.
+    }
+  }
+  function mergePeople(base: SuggestPerson[], more: SuggestPerson[]): SuggestPerson[] {
+    const seen = new Set(base.map((p) => p.email.toLowerCase()));
+    const out = [...base];
+    for (const p of more) {
+      const k = p.email.toLowerCase();
+      if (!seen.has(k)) {
+        seen.add(k);
+        out.push(p);
+      }
+    }
+    return out.slice(0, 8);
+  }
+  function toSuggest(p: DirectoryPerson): SuggestPerson | null {
+    const email = (p.email ?? "").trim();
+    if (!email) return null;
+    return { name: p.name?.trim() || null, email, source: "directory", title: directoryLine(p) || null };
+  }
+  /** Подсказки людей по тексту: без операторов и от двух символов. */
+  function updateSuggestions(q: string) {
+    clearTimeout(suggestTimer);
+    const seq = ++suggestSeq;
+    if (q.length < 2 || /(^|\s)[^\s:]+:/.test(q)) {
+      localPeople = [];
+      dirPeople = [];
+      suggestLoading = false;
+      return;
+    }
+    suggestLoading = true;
+    api
+      .recipientsSuggest(q, 5)
+      .then((rows) => {
+        if (seq === suggestSeq) localPeople = rows.map((r) => ({ name: r.name, email: r.email, source: "local" as const }));
+      })
+      .catch(() => {});
+    api
+      .directorySearch(q, 5, true)
+      .then((d) => {
+        if (seq === suggestSeq) dirPeople = d.people.map(toSuggest).filter((p): p is SuggestPerson => p != null);
+      })
+      .catch(() => {});
+    suggestTimer = setTimeout(() => {
+      api
+        .directorySearch(q, 5, false)
+        .then((d) => {
+          if (seq === suggestSeq) dirPeople = mergePeople(dirPeople, d.people.map(toSuggest).filter((p): p is SuggestPerson => p != null));
+        })
+        .catch(() => {})
+        .finally(() => {
+          if (seq === suggestSeq) suggestLoading = false;
+        });
+    }, 350);
+  }
+  function pickFrom(p: SuggestPerson) {
+    query = `от:${p.email}`;
+    finishPick();
+  }
+  function pickTo(p: SuggestPerson) {
+    query = `кому:${p.email}`;
+    finishPick();
+  }
+  function pickRecent(q: string) {
+    query = q;
+    finishPick();
+  }
+  function searchAll() {
+    finishPick();
+  }
+  function finishPick() {
+    rememberQuery(query);
+    suggestOpen = false;
+    clearTimeout(suggestTimer);
+    suggestSeq++;
+    localPeople = [];
+    dirPeople = [];
+    suggestLoading = false;
+    runSearchNow();
+  }
+  function suggestCard(p: SuggestPerson, anchor: HTMLElement) {
+    suggestOpen = false;
+    contactCardOpener()?.({ name: p.name, email: p.email }, anchor);
+  }
+  function onSearchKey(e: KeyboardEvent) {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      searchAll();
+    }
   }
 
   // --- карточка контакта ------------------------------------------------------------------
@@ -1114,7 +1267,7 @@
     closeContact();
     section = "mail";
     query = `от:${email}`;
-    onQueryInput();
+    finishPick();
   }
 
   // --- синхронизация ---------------------------------------------------------
@@ -1712,8 +1865,11 @@
     </button>
     <div class="search" class:active={query.length > 0} class:off={section !== "mail"}>
       <svg class="search-icon" width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><circle cx="7" cy="7" r="4.5" fill="none" stroke="currentColor" stroke-width="1.4" /><path d="M10.5 10.5 14 14" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" /></svg>
-      <input id="search-input" type="search" placeholder="Поиск в почте: тема, текст, от:имя, вложение:" bind:value={query} oninput={onQueryInput} autocomplete="off" spellcheck="false" />
+      <input id="search-input" type="search" placeholder="Поиск в почте: тема, текст, от:имя, вложение:" bind:value={query} oninput={onQueryInput} onkeydown={onSearchKey} onfocus={() => (suggestOpen = true)} onblur={() => (suggestOpen = false)} autocomplete="off" spellcheck="false" />
       <kbd class="search-kbd">{keysOf("search").replace("+", " ")}</kbd>
+      {#if suggestVisible}
+        <SearchSuggest {query} people={suggestPeople} recent={recentQueries} loading={suggestLoading} onfrom={pickFrom} onto={pickTo} oncard={suggestCard} onrecent={pickRecent} onall={searchAll} />
+      {/if}
     </div>
     <div class="top-right">
       <div class="account caption">
