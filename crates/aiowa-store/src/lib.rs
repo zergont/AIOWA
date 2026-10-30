@@ -18,7 +18,7 @@ pub mod text;
 pub mod ui;
 pub mod view_state;
 
-use aiowa_core::{AccountId, Folder, FolderChange, FolderId, ItemChange, ItemId, LastVerb, MessageFull, MessageMeta, RecipientKind, SyncState};
+use aiowa_core::{AccountId, Folder, FolderChange, FolderId, ItemChange, ItemId, ItemKind, LastVerb, MessageFull, MessageMeta, RecipientKind, SyncState};
 use jiff::Timestamp;
 use rusqlite::types::Value as SqlValue;
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension, Transaction};
@@ -306,6 +306,8 @@ pub struct ConversationRow {
     /// Последнее действие с самым свежим письмом беседы в этой папке (код `PR_LAST_VERB_EXECUTED`:
     /// 102 ответ, 103 ответ всем, 104 пересылка); значок в строке списка.
     pub last_verb: Option<i64>,
+    /// Вид самого свежего элемента беседы в этой папке: письмо, черновик, контакт, встреча…
+    pub kind: ItemKind,
 }
 
 /// Подзапрос «в беседе есть письмо с флагом» для списков бесед (`c` — `conversations`).
@@ -1544,17 +1546,19 @@ impl Store {
                         item_count: r.get(2)?,
                         unread_count: r.get(3)?,
                         total_count: r.get(4)?,
-                        last_received_at: ms_ts(r.get::<_, Option<i64>>(5)?),
+                        // 0 — у элементов беседы нет ни одной даты (контакты, заметки): не «1 января 1970».
+                        last_received_at: ms_ts(r.get::<_, Option<i64>>(5)?).filter(|t| t.as_millisecond() > 0),
                         has_attachments: r.get::<_, i64>(6)? != 0,
                         has_flagged: r.get::<_, i64>(7)? != 0,
                         preview: None,
                         last_verb: None,
+                        kind: ItemKind::Mail,
                     })
                 })?
                 .collect::<std::result::Result<Vec<_>, _>>()?;
             ui::fill_previews(c, folder_pk, &mut rows)?;
             let mut people = c.prepare_cached(
-                "SELECT COALESCE(from_name, from_email) FROM items WHERE conversation_pk = ?1 AND deleted = 0
+                "SELECT COALESCE(from_name, from_email, CASE WHEN is_draft = 1 THEN display_to END) FROM items WHERE conversation_pk = ?1 AND deleted = 0
                  ORDER BY COALESCE(received_at, sent_at) DESC LIMIT 50",
             )?;
             let mut out = Vec::with_capacity(rows.len());

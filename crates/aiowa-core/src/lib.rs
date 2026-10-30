@@ -291,6 +291,63 @@ impl LastVerb {
     }
 }
 
+/// Вид элемента папки по классу (`ItemClass`): в почтовых папках, особенно в «Удалённых», кроме
+/// писем лежат контакты, встречи, задачи и заметки; список показывает их по виду, а не как
+/// письма без темы и отправителя (docs/obkatka.md п. 14). `Draft` — письмо-черновик.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ItemKind {
+    Mail,
+    Draft,
+    Contact,
+    Appointment,
+    Task,
+    Note,
+    Other,
+}
+
+impl ItemKind {
+    /// По классу элемента; `is_draft` — признак черновика у письма.
+    pub fn of(item_class: Option<&str>, is_draft: bool) -> Self {
+        let class = item_class.unwrap_or("IPM.Note");
+        let lower = class.to_ascii_lowercase();
+        if lower.starts_with("ipm.contact") || lower.starts_with("ipm.distlist") {
+            Self::Contact
+        } else if lower.starts_with("ipm.appointment") {
+            Self::Appointment
+        } else if lower.starts_with("ipm.task") {
+            Self::Task
+        } else if lower.starts_with("ipm.stickynote") {
+            Self::Note
+        } else if lower.starts_with("ipm.note") || lower.starts_with("ipm.schedule") || lower.starts_with("report.") || lower.starts_with("ipm.recall") || lower.starts_with("ipm.outlook.recall") || lower.starts_with("ipm.post") {
+            if is_draft { Self::Draft } else { Self::Mail }
+        } else if lower.starts_with("ipm.activity") || lower.starts_with("ipm.document") {
+            Self::Other
+        } else if is_draft {
+            Self::Draft
+        } else {
+            Self::Mail
+        }
+    }
+
+    /// Письмо (в том числе черновик, приглашение, отчёт о доставке): у него есть отправитель и тема.
+    pub fn is_mail(self) -> bool {
+        matches!(self, Self::Mail | Self::Draft)
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Mail => "mail",
+            Self::Draft => "draft",
+            Self::Contact => "contact",
+            Self::Appointment => "appointment",
+            Self::Task => "task",
+            Self::Note => "note",
+            Self::Other => "other",
+        }
+    }
+}
+
 /// Метаданные письма: то, что нужно списку и индексу без тела.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MessageMeta {
@@ -1033,6 +1090,23 @@ pub struct FolderChanges {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn item_kind_by_class() {
+        assert_eq!(ItemKind::of(Some("IPM.Note"), false), ItemKind::Mail);
+        assert_eq!(ItemKind::of(Some("IPM.Note"), true), ItemKind::Draft);
+        assert_eq!(ItemKind::of(None, false), ItemKind::Mail);
+        assert_eq!(ItemKind::of(Some("IPM.Contact"), false), ItemKind::Contact);
+        assert_eq!(ItemKind::of(Some("IPM.DistList"), false), ItemKind::Contact);
+        assert_eq!(ItemKind::of(Some("IPM.Appointment"), false), ItemKind::Appointment);
+        assert_eq!(ItemKind::of(Some("IPM.Task"), false), ItemKind::Task);
+        assert_eq!(ItemKind::of(Some("IPM.StickyNote"), false), ItemKind::Note);
+        assert_eq!(ItemKind::of(Some("IPM.Schedule.Meeting.Request"), false), ItemKind::Mail);
+        assert_eq!(ItemKind::of(Some("REPORT.IPM.Note.NDR"), false), ItemKind::Mail);
+        assert_eq!(ItemKind::of(Some("IPM.Activity"), false), ItemKind::Other);
+        assert!(ItemKind::Draft.is_mail() && !ItemKind::Contact.is_mail());
+        assert_eq!(ItemKind::Contact.as_str(), "contact");
+    }
 
     #[test]
     fn distinguished_roundtrip() {

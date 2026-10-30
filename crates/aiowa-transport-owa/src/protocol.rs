@@ -1617,7 +1617,8 @@ pub fn parse_message_meta(v: &Value) -> Option<MessageMeta> {
         received_at: parse_timestamp(str_of(v, "DateTimeReceived")),
         sent_at: parse_timestamp(str_of(v, "DateTimeSent")),
         last_modified_at: parse_timestamp(str_of(v, "LastModifiedTime")),
-        is_read: bool_of(v, "IsRead"),
+        // Нет ключа `IsRead` — элемент не письмо (контакт, встреча): он не «непрочитанный».
+        is_read: v.get("IsRead").map(|b| b.as_bool().unwrap_or(false)).unwrap_or(true),
         is_draft: bool_of(v, "IsDraft"),
         has_attachments: bool_of(v, "HasAttachments"),
         importance: str_of(v, "Importance").map(Importance::parse).unwrap_or_default(),
@@ -2076,6 +2077,14 @@ mod tests {
         let sync = serde_json::to_string(&sync_folder_items_body(&FolderRef::Distinguished(DistinguishedFolder::Inbox), None, 10, true)).unwrap();
         assert!(sync.contains(r#"{"__type":"PropertyUri:#Exchange","FieldURI":"item:IconIndex"}"#), "{sync}");
         assert!(sync.contains(r#"{"__type":"ExtendedPropertyUri:#Exchange","PropertyTag":"0x1081","PropertyType":"Integer"},{"__type":"ExtendedPropertyUri:#Exchange","PropertyTag":"0x1082","PropertyType":"SystemTime"}]},"SyncFolderId""#), "{sync}");
+    }
+
+    #[test]
+    fn item_without_is_read_is_not_unread() {
+        let v: Value = serde_json::from_str(r#"{"ItemId":{"Id":"C","ChangeKey":"k"},"ItemClass":"IPM.Contact","Subject":"Имя"}"#).unwrap();
+        assert!(parse_message_meta(&v).unwrap().is_read, "контакт без IsRead — прочитан");
+        let v: Value = serde_json::from_str(r#"{"ItemId":{"Id":"M","ChangeKey":"k"},"ItemClass":"IPM.Note","IsRead":false}"#).unwrap();
+        assert!(!parse_message_meta(&v).unwrap().is_read);
     }
 
     #[test]

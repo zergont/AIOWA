@@ -1,7 +1,7 @@
 <script lang="ts">
   import { tick, untrack } from "svelte";
   import { SvelteSet } from "svelte/reactivity";
-  import { conversationsText, errorMessage, listDate, type ComposeKind, type Conversation, type Folder, LAST_VERB, lastVerbText} from "../api";
+  import { conversationsText, errorMessage, listDate, type ComposeKind, type Conversation, type Folder, LAST_VERB, lastVerbText, itemKindLabel, type ItemKind} from "../api";
   import { COMPOSE_ACTIONS, DND_CONVERSATIONS, ICON, conversationActionLabels, isDeletedFolder, type DragPayload, type ItemAction } from "../actions";
   import { focusBack, type Anchor } from "../popover";
   import { hint, layerOpen } from "../hotkeys";
@@ -121,6 +121,33 @@
     if (c.participants.length === 0) return "";
     const names = c.participants.map((p) => p.split(",")[0].trim().split(" ").slice(0, 2).join(" "));
     return names.length > 3 ? `${names.slice(0, 3).join(", ")} +${names.length - 3}` : names.join(", ");
+  }
+
+  /** Первая строка: у письма — участники, у черновика — «Черновик: адресаты», у контакта и прочих — вид элемента. */
+  function peopleLine(c: Conversation): string {
+    const kindLabel = itemKindLabel(c.kind);
+    if (c.kind === "draft") {
+      const to = participantsLabel(c);
+      return to ? `${kindLabel}: ${to}` : kindLabel!;
+    }
+    if (kindLabel) return kindLabel;
+    return participantsLabel(c) || "(без отправителя)";
+  }
+
+  /** Значок вида для не почтовых элементов (контакт, встреча, задача, заметка). */
+  function kindIcon(kind: ItemKind | null | undefined): string | null {
+    switch (kind) {
+      case "contact":
+        return "M8 8a3 3 0 1 0 0-6 3 3 0 0 0 0 6Zm-5 6a5 5 0 0 1 10 0";
+      case "appointment":
+        return "M2 4h12v10H2V4Zm0 3h12M5 2v3m6-3v3";
+      case "task":
+        return "M3 8.5 6 11.5 13 4.5M2 2.5h12v11H2z";
+      case "note":
+        return "M3 2.5h10v8l-3 3H3v-11Zm7 11v-3h3";
+      default:
+        return null;
+    }
   }
 
   // --- выбор: одиночный, Ctrl/Shift+клик, Ctrl+A, Shift+стрелки ---------------------------------
@@ -601,7 +628,10 @@
             <svg width="12" height="12" viewBox="0 0 12 12" aria-hidden="true"><path d="M2.5 6.2 5 8.7l4.5-5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" /></svg>
           </button>
           <div class="line1">
-            <span class="people">{participantsLabel(c) || "(без отправителя)"}</span>
+            {#if kindIcon(c.kind)}
+              <svg class="kind" width="13" height="13" viewBox="0 0 16 16" role="img" aria-label={itemKindLabel(c.kind) ?? ""}><path d={kindIcon(c.kind)} fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round" /></svg>
+            {/if}
+            <span class="people">{peopleLine(c)}</span>
             {#if c.total_count > 1}<span class="count">{c.total_count}</span>{/if}
             {#if c.last_verb}
               <svg class="verb" width="13" height="13" viewBox="0 0 16 16" role="img" aria-label={lastVerbText(c.last_verb) ?? ""}><title>{lastVerbText(c.last_verb)}</title><path d={c.last_verb === LAST_VERB.forwarded ? ICON.forward : c.last_verb === LAST_VERB.repliedAll ? ICON.replyAll : ICON.reply} fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" /></svg>
@@ -947,7 +977,8 @@
     color: var(--fg-3);
     white-space: nowrap;
   }
-  .verb {
+  .verb,
+  .kind {
     flex: none;
     color: var(--fg-3);
   }

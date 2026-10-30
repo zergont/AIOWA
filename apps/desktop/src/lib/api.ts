@@ -32,6 +32,42 @@ export interface Conversation {
   preview?: string | null;
   /** Последнее действие с самым свежим письмом беседы в папке: 102 ответ, 103 ответ всем, 104 пересылка. */
   last_verb?: number | null;
+  /** Вид самого свежего элемента беседы в папке; нет у заглушки беседы, открытой из поиска. */
+  kind?: ItemKind;
+}
+
+/** Вид элемента папки (см. `aiowa_core::ItemKind`): в «Удалённых» рядом с письмами лежат контакты и встречи. */
+export type ItemKind = "mail" | "draft" | "contact" | "appointment" | "task" | "note" | "other";
+
+/** Подпись вида для не почтовых элементов и черновиков; у письма — null. */
+export function itemKindLabel(kind: ItemKind | null | undefined): string | null {
+  switch (kind) {
+    case "draft":
+      return "Черновик";
+    case "contact":
+      return "Контакт";
+    case "appointment":
+      return "Встреча";
+    case "task":
+      return "Задача";
+    case "note":
+      return "Заметка";
+    case "other":
+      return "Элемент";
+    default:
+      return null;
+  }
+}
+
+/** Вид по классу элемента, как считает хранилище (для карточки письма). */
+export function itemKindOf(itemClass: string | null | undefined, isDraft: boolean): ItemKind {
+  const c = (itemClass ?? "IPM.Note").toLowerCase();
+  if (c.startsWith("ipm.contact") || c.startsWith("ipm.distlist")) return "contact";
+  if (c.startsWith("ipm.appointment")) return "appointment";
+  if (c.startsWith("ipm.task")) return "task";
+  if (c.startsWith("ipm.stickynote")) return "note";
+  if (c.startsWith("ipm.activity") || c.startsWith("ipm.document")) return "other";
+  return isDraft ? "draft" : "mail";
 }
 
 /** Код последнего действия с письмом (PR_LAST_VERB_EXECUTED): ответ, ответ всем, пересылка. */

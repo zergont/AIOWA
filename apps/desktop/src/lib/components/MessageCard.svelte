@@ -5,7 +5,7 @@
 
 <script lang="ts">
   import { onDestroy, untrack } from "svelte";
-  import { api, errorMessage, formatSize, fullDate, isInlinePicture, isPreviewable, listDate, meetingKindOf, messageNeedsFetch, personLabel, senderResponseOf, type Attachment, type ComposeKind, type Folder, type MeetingInfo, type MeetingResponse, type Message, type ResponseType, LAST_VERB, lastVerbText} from "../api";
+  import { api, errorMessage, formatSize, fullDate, isInlinePicture, isPreviewable, listDate, meetingKindOf, messageNeedsFetch, personLabel, senderResponseOf, type Attachment, type ComposeKind, type Folder, type MeetingInfo, type MeetingResponse, type Message, type ResponseType, LAST_VERB, lastVerbText, itemKindLabel, itemKindOf} from "../api";
   import { COMPOSE_ACTIONS, ICON, type ItemAction } from "../actions";
   import { meetingWhen } from "../calendar";
   import { contactCardOpener, copyText } from "../contact";
@@ -57,6 +57,12 @@
     return when ? `${text} ${when}` : text;
   });
   const verbIcon = $derived(message.last_verb === LAST_VERB.forwarded ? ICON.forward : message.last_verb === LAST_VERB.repliedAll ? ICON.replyAll : ICON.reply);
+
+  /** Не почтовый элемент (контакт, встреча, задача, заметка): подпись вида рядом с именем (п. 14 обкатки). */
+  const kindBadge = $derived.by(() => {
+    const kind = itemKindOf(message.item_class, false);
+    return kind === "mail" ? null : (itemKindLabel(kind)?.toLowerCase() ?? null);
+  });
 
   /** Черновик: по признаку письма или по папке — у него вместо панели действий «Открыть черновик». */
   const isDraft = $derived(message.is_draft || (draftsFolderPk != null && message.folder_pk === draftsFolderPk));
@@ -535,6 +541,7 @@
           {#if message.from_name && message.from_email}<span class="email caption">{message.from_email}</span>{/if}
           {#if message.importance === "High"}<span class="badge high">важное</span>{/if}
           {#if message.is_draft}<span class="badge">черновик</span>{/if}
+          {#if kindBadge}<span class="badge">{kindBadge}</span>{/if}
         </div>
         {#if verbNote}
           <div class="line caption verb-note" role="status">

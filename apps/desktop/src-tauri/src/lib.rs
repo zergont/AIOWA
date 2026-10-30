@@ -184,6 +184,8 @@ struct ConversationDto {
     preview: Option<String>,
     /// Последнее действие с самым свежим письмом беседы в папке: 102 ответ, 103 ответ всем, 104 пересылка.
     last_verb: Option<i64>,
+    /// Вид самого свежего элемента беседы в папке: mail, draft, contact, appointment, task, note, other.
+    kind: &'static str,
 }
 
 #[derive(Serialize)]
@@ -529,6 +531,7 @@ fn conversations(state: State<'_, AppState>, folder_pk: i64, after_ms: Option<i6
             has_flagged: r.has_flagged,
             preview: r.preview,
             last_verb: r.last_verb,
+            kind: r.kind.as_str(),
         })
         .collect())
 }

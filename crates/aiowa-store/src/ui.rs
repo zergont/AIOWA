@@ -2,7 +2,7 @@
 //! Пагинация keyset: `(last_received_at, conversation_pk)` строго убывают, OFFSET не используется.
 
 use crate::{decompress, ms_ts, ConversationRow, Result, Store, HAS_FLAGGED_SQL};
-use aiowa_core::{AccountId, BodyType, Participant, RecipientKind};
+use aiowa_core::{AccountId, BodyType, ItemKind, Participant, RecipientKind};
 use jiff::Timestamp;
 use rusqlite::{params, Connection, OptionalExtension};
 
@@ -110,7 +110,7 @@ fn head_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<MessageHead> {
 
 /// Начало текста самого свежего письма беседы `?1` в папке `?2` (см. `fill_previews`). Тот же
 /// текст проверяет на план тест: запрос должен идти по индексу `items_conv_folder`.
-const PREVIEW_SQL: &str = "SELECT preview, last_verb FROM items WHERE conversation_pk = ?1 AND folder_pk = ?2 AND deleted = 0
+const PREVIEW_SQL: &str = "SELECT preview, last_verb, item_class, is_draft FROM items WHERE conversation_pk = ?1 AND folder_pk = ?2 AND deleted = 0
  ORDER BY COALESCE(received_at, sent_at) DESC, item_pk DESC LIMIT 1";
 
 /// Дописывает строкам бесед начало текста самого свежего письма беседы в папке `folder_pk`
@@ -120,9 +120,12 @@ const PREVIEW_SQL: &str = "SELECT preview, last_verb FROM items WHERE conversati
 pub(crate) fn fill_previews(c: &Connection, folder_pk: i64, rows: &mut [ConversationRow]) -> rusqlite::Result<()> {
     let mut st = c.prepare_cached(PREVIEW_SQL)?;
     for row in rows {
-        let latest = st.query_row(params![row.conversation_pk, folder_pk], |r| Ok((r.get::<_, Option<String>>(0)?, r.get::<_, Option<i64>>(1)?))).optional()?;
-        row.preview = latest.as_ref().and_then(|(p, _)| p.clone()).filter(|p| !p.trim().is_empty());
-        row.last_verb = latest.and_then(|(_, v)| v);
+        let latest = st
+            .query_row(params![row.conversation_pk, folder_pk], |r| Ok((r.get::<_, Option<String>>(0)?, r.get::<_, Option<i64>>(1)?, r.get::<_, Option<String>>(2)?, r.get::<_, i64>(3)? != 0)))
+            .optional()?;
+        row.preview = latest.as_ref().and_then(|(p, ..)| p.clone()).filter(|p| !p.trim().is_empty());
+        row.last_verb = latest.as_ref().and_then(|(_, v, ..)| *v);
+        row.kind = latest.as_ref().map(|(_, _, class, is_draft)| ItemKind::of(class.as_deref(), *is_draft)).unwrap_or(ItemKind::Mail);
     }
     Ok(())
 }
@@ -159,17 +162,18 @@ impl Store {
                         item_count: r.get(2)?,
                         unread_count: r.get(3)?,
                         total_count: r.get(4)?,
-                        last_received_at: ms_ts(r.get::<_, Option<i64>>(5)?),
+                        last_received_at: ms_ts(r.get::<_, Option<i64>>(5)?).filter(|t| t.as_millisecond() > 0),
                         has_attachments: r.get::<_, i64>(6)? != 0,
                         has_flagged: r.get::<_, i64>(7)? != 0,
                         preview: None,
                         last_verb: None,
+                        kind: ItemKind::Mail,
                     })
                 })?
                 .collect::<std::result::Result<Vec<_>, _>>()?;
             fill_previews(c, folder_pk, &mut rows)?;
             let mut people = c.prepare_cached(
-                "SELECT COALESCE(from_name, from_email) FROM items WHERE conversation_pk = ?1 AND deleted = 0
+                "SELECT COALESCE(from_name, from_email, CASE WHEN is_draft = 1 THEN display_to END) FROM items WHERE conversation_pk = ?1 AND deleted = 0
                  ORDER BY COALESCE(received_at, sent_at) DESC LIMIT 30",
             )?;
             let mut out = Vec::with_capacity(rows.len());

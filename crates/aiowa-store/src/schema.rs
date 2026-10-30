@@ -12,7 +12,7 @@ use rusqlite::types::ValueRef;
 use rusqlite::Connection;
 use tracing::info;
 
-pub const CURRENT_VERSION: i64 = 7;
+pub const CURRENT_VERSION: i64 = 8;
 
 /// Состояния текста вложения (`attachments.text_state`).
 pub const TEXT_PENDING: i64 = 0;
@@ -503,8 +503,39 @@ pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
         }
         info!("схема базы обновлена до версии 7: последнее действие с письмом");
     }
+    if version < 8 {
+        // Не почтовые элементы (контакты, встречи, задачи, заметки в почтовых папках) записывались
+        // непрочитанными: у них нет IsRead. Снимаем признак и пересчитываем счётчики бесед.
+        conn.execute_batch("BEGIN IMMEDIATE;")?;
+        let result = (|| -> rusqlite::Result<()> {
+            conn.execute_batch(V8_NON_MAIL_READ)?;
+            conn.pragma_update(None, "user_version", 8)?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => conn.execute_batch("COMMIT;")?,
+            Err(e) => {
+                let _ = conn.execute_batch("ROLLBACK;");
+                return Err(e);
+            }
+        }
+        info!("схема базы обновлена до версии 8: не почтовые элементы не считаются непрочитанными");
+    }
     Ok(())
 }
+
+/// Версия 8: снять «непрочитано» с контактов, встреч, задач и заметок, пересчитать беседы.
+const V8_NON_MAIL_READ: &str = r#"
+UPDATE items SET is_read = 1 WHERE is_read = 0 AND (item_class LIKE 'IPM.Contact%' OR item_class LIKE 'IPM.DistList%'
+  OR item_class LIKE 'IPM.Appointment%' OR item_class LIKE 'IPM.Task%' OR item_class LIKE 'IPM.StickyNote%' OR item_class LIKE 'IPM.Activity%');
+UPDATE conversation_folders SET unread_count = (SELECT COUNT(*) FROM items i WHERE i.conversation_pk = conversation_folders.conversation_pk
+  AND i.folder_pk = conversation_folders.folder_pk AND i.deleted = 0 AND i.is_read = 0)
+ WHERE conversation_pk IN (SELECT conversation_pk FROM items WHERE conversation_pk IS NOT NULL AND (item_class LIKE 'IPM.Contact%' OR item_class LIKE 'IPM.DistList%'
+  OR item_class LIKE 'IPM.Appointment%' OR item_class LIKE 'IPM.Task%' OR item_class LIKE 'IPM.StickyNote%' OR item_class LIKE 'IPM.Activity%'));
+UPDATE conversations SET unread_count = (SELECT COUNT(*) FROM items i WHERE i.conversation_pk = conversations.conversation_pk AND i.deleted = 0 AND i.is_read = 0)
+ WHERE conversation_pk IN (SELECT conversation_pk FROM items WHERE conversation_pk IS NOT NULL AND (item_class LIKE 'IPM.Contact%' OR item_class LIKE 'IPM.DistList%'
+  OR item_class LIKE 'IPM.Appointment%' OR item_class LIKE 'IPM.Task%' OR item_class LIKE 'IPM.StickyNote%' OR item_class LIKE 'IPM.Activity%'));
+"#;
 
 /// После `rebuild` в индексе есть и удалённые письма (представление их не отличает):
 /// снимаем их поштучно.
