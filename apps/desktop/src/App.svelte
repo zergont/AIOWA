@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount, tick, untrack } from "svelte";
-  import { api, conversationKeyOf, conversationsText, errorMessage, itemKindOf, messageNeedsFetch, messagesKey, newMailSender, onCalendarChanged, onCloseRequested, onFoldersChanged, onItemsChanged, onNewMail, onNotifyStatus, onReminder, onSyncProgress, onWriteFailed, type AccountInfo, type ComposeContext, type ComposeKind, type ComposeRecipient, type Conversation, type Folder, type ItemsChanged, type Message, type NewMail, type NotifyStatus, type ReminderDto, type SearchHit, type StageAction, type StagedDto, type SyncStatus, type WriteReport } from "./lib/api";
+  import { api, conversationKeyOf, conversationsText, errorMessage, itemKindOf, messageNeedsFetch, messagesKey, newMailSender, onCalendarChanged, onCloseRequested, onFoldersChanged, onItemsChanged, onNewMail, onNotifyStatus, onReminder, onSyncProgress, onWriteFailed, type AccountInfo, type ComposeContext, type ComposeKind, type ComposeRecipient, type ContactForm, type Conversation, type Folder, type ItemsChanged, type Message, type NewMail, type NotifyStatus, type ReminderDto, type SearchHit, type StageAction, type StagedDto, type SyncStatus, type WriteReport } from "./lib/api";
   import { onSyncLive, type SyncLive } from "./lib/api";
   import { ICON, failureText, findArchiveFolder, type DragPayload, type ItemAction } from "./lib/actions";
   import { focusBack, type Anchor } from "./lib/popover";
@@ -10,6 +10,7 @@
   import { directoryLine, loadDirectoryCaps, provideContactCard, type ContactRef } from "./lib/contact";
   import type { DirectoryPerson, SuggestPerson } from "./lib/api";
   import ContactCard from "./lib/components/ContactCard.svelte";
+  import ContactEditor from "./lib/components/ContactEditor.svelte";
   import ChoicePopover from "./lib/components/ChoicePopover.svelte";
   import FolderTree from "./lib/components/FolderTree.svelte";
   import ConversationList, { mailActionsApply } from "./lib/components/ConversationList.svelte";
@@ -1313,6 +1314,13 @@
     contact = { who, anchor, blocked };
   }
 
+  /** «Добавить в контакты» из карточки: форма нового личного контакта поверх окна. */
+  let contactEditor = $state<ContactForm | null>(null);
+  function addToContacts(form: ContactForm) {
+    closeContact(false);
+    contactEditor = form;
+  }
+
   function closeContact(returnFocus = true) {
     const anchor = contact?.anchor;
     contact = null;
@@ -1957,6 +1965,10 @@
       <svg class="search-icon" width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><circle cx="7" cy="7" r="4.5" fill="none" stroke="currentColor" stroke-width="1.4" /><path d="M10.5 10.5 14 14" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" /></svg>
       <input id="search-input" type="search" placeholder="Поиск в почте: тема, текст, от:имя, вложение:" bind:value={query} oninput={onQueryInput} onkeydown={onSearchKey} onfocus={onSearchFocus} onblur={() => (suggestOpen = false)} autocomplete="off" spellcheck="false" />
       <kbd class="search-kbd">{keysOf("search").replace("+", " ")}</kbd>
+      {#if query.length > 0}
+        <!-- Кнопка не забирает фокус у поля (mousedown): после сброса можно сразу набирать новый запрос. -->
+        <button type="button" class="search-clear" onmousedown={(e) => e.preventDefault()} onclick={clearSearch} aria-label="Очистить поиск" title={hint("Очистить поиск", "search-clear")}><svg width="12" height="12" viewBox="0 0 16 16" aria-hidden="true"><path d="M4 4l8 8M12 4l-8 8" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" /></svg></button>
+      {/if}
       {#if suggestVisible}
         <SearchSuggest {query} people={suggestPeople} recent={recentQueries} loading={suggestLoading} onfrom={pickFrom} onto={pickTo} oncard={suggestCard} onrecent={pickRecent} onall={searchAll} />
       {/if}
@@ -2022,8 +2034,11 @@
 
   {#if contact}
     {#key contact}
-      <ContactCard who={contact.who} anchor={contact.anchor} actionsBlocked={contact.blocked} onclose={() => closeContact()} oncompose={composeToContact} onsearch={searchContact} />
+      <ContactCard who={contact.who} anchor={contact.anchor} actionsBlocked={contact.blocked} onclose={() => closeContact()} oncompose={composeToContact} onsearch={searchContact} onaddcontact={addToContacts} />
     {/key}
+  {/if}
+  {#if contactEditor}
+    <ContactEditor contactPk={null} initial={contactEditor} onsaved={() => { contactEditor = null; showNotice("Контакт добавлен в «Контакты»"); }} onclose={() => (contactEditor = null)} />
   {/if}
 
   {#if closeRequest}
@@ -2191,6 +2206,27 @@
   }
   .search.active .search-kbd {
     display: none;
+  }
+  .search-clear {
+    position: absolute;
+    right: 6px;
+    width: 24px;
+    height: 24px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: var(--radius-control);
+    color: var(--fg-3);
+    transition:
+      background var(--dur-fast) var(--ease-in),
+      color var(--dur-fast) var(--ease-in);
+  }
+  .search-clear:hover {
+    background: var(--bg-hover);
+    color: var(--fg-1);
+  }
+  .search-clear:active {
+    background: var(--bg-pressed);
   }
 
   .nav {

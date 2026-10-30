@@ -4,7 +4,7 @@
 //! JSON и колонки для списка, поиска и подсказок адресатов; состояние синхронизации папки — в
 //! `folders.contact_sync_state`, отдельно от почтового `sync_state`. Полная выгрузка папки (без
 //! состояния) по концу убирает контакты, которых сервер не вернул (`stale`). Запись на сервер
-//! (создание, правка) — отдельный этап.
+//! (создание, правка, удаление) — операциями персон из окна (`put_contact`, `remove_contact`).
 //! Персональные данные в журнал не пишутся: только счётчики.
 
 use crate::{now_ms, text, word_prefix_match, Result, Store, StoreError, SyncFolder};
@@ -47,6 +47,44 @@ pub struct ContactRecipient {
     pub name: Option<String>,
     /// В нижнем регистре.
     pub email: String,
+}
+
+/// Строка контакта (вставка или замена по `server_id`): `(contact_pk, была ли строка)`.
+fn write_contact(tx: &rusqlite::Transaction<'_>, account: AccountId, folder_pk: i64, c: &ContactItem, now: i64) -> Result<(i64, bool)> {
+    let item = plain_notes(c);
+    let json = serde_json::to_string(&item).map_err(|e| StoreError::Other(format!("контакт не сериализован: {e}")))?;
+    let existed: Option<i64> = tx.query_row("SELECT contact_pk FROM contacts WHERE account_id = ?1 AND server_id = ?2", params![account.0, item.item_id.id], |r| r.get(0)).optional()?;
+    tx.execute(
+        "INSERT INTO contacts(account_id, folder_pk, server_id, change_key, item_class, is_group, display_name, email, company, job_title, sort_key, search_text, json, modified_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+         ON CONFLICT(account_id, server_id) DO UPDATE SET
+           folder_pk = excluded.folder_pk, change_key = excluded.change_key, item_class = excluded.item_class, is_group = excluded.is_group,
+           display_name = excluded.display_name, email = excluded.email, company = excluded.company, job_title = excluded.job_title,
+           sort_key = excluded.sort_key, search_text = excluded.search_text, json = excluded.json, modified_at = excluded.modified_at,
+           updated_at = excluded.updated_at, stale = 0",
+        params![
+            account.0,
+            folder_pk,
+            item.item_id.id,
+            item.item_id.change_key,
+            item.item_class,
+            item.is_group() as i64,
+            item.list_name(),
+            item.primary_email(),
+            item.company,
+            item.job_title,
+            sort_key(&item),
+            search_text(&item),
+            json,
+            item.modified_at.map(|t| t.as_millisecond()),
+            now
+        ],
+    )?;
+    let pk = match existed {
+        Some(pk) => pk,
+        None => tx.query_row("SELECT contact_pk FROM contacts WHERE account_id = ?1 AND server_id = ?2", params![account.0, item.item_id.id], |r| r.get(0))?,
+    };
+    Ok((pk, existed.is_some()))
 }
 
 const CONTACT_SELECT: &str = "SELECT contact_pk, folder_pk, json, search_text FROM contacts";
@@ -98,36 +136,7 @@ impl Store {
             for ch in changes {
                 match ch {
                     ContactChange::Create(c) | ContactChange::Update(c) => {
-                        let item = plain_notes(c);
-                        let json = serde_json::to_string(&item).map_err(|e| StoreError::Other(format!("контакт не сериализован: {e}")))?;
-                        let existed: Option<i64> = tx.query_row("SELECT contact_pk FROM contacts WHERE account_id = ?1 AND server_id = ?2", params![account.0, item.item_id.id], |r| r.get(0)).optional()?;
-                        tx.execute(
-                            "INSERT INTO contacts(account_id, folder_pk, server_id, change_key, item_class, is_group, display_name, email, company, job_title, sort_key, search_text, json, modified_at, updated_at)
-                             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
-                             ON CONFLICT(account_id, server_id) DO UPDATE SET
-                               folder_pk = excluded.folder_pk, change_key = excluded.change_key, item_class = excluded.item_class, is_group = excluded.is_group,
-                               display_name = excluded.display_name, email = excluded.email, company = excluded.company, job_title = excluded.job_title,
-                               sort_key = excluded.sort_key, search_text = excluded.search_text, json = excluded.json, modified_at = excluded.modified_at,
-                               updated_at = excluded.updated_at, stale = 0",
-                            params![
-                                account.0,
-                                folder_pk,
-                                item.item_id.id,
-                                item.item_id.change_key,
-                                item.item_class,
-                                item.is_group() as i64,
-                                item.list_name(),
-                                item.primary_email(),
-                                item.company,
-                                item.job_title,
-                                sort_key(&item),
-                                search_text(&item),
-                                json,
-                                item.modified_at.map(|t| t.as_millisecond()),
-                                now
-                            ],
-                        )?;
-                        if existed.is_some() {
+                        if write_contact(tx, account, folder_pk, c, now)?.1 {
                             stats.updated += 1;
                         } else {
                             stats.created += 1;
@@ -149,6 +158,25 @@ impl Store {
             self.write_generation.fetch_add(1, Ordering::Relaxed);
         }
         Ok(stats)
+    }
+
+    /// Контакт, записанный на сервер из окна (создание, правка — § 5r протокола), сразу в базу —
+    /// той же строкой, что даёт синхронизация; следующая синхронизация папки её подтвердит.
+    /// Возвращает ключ строки.
+    pub fn put_contact(&self, account: AccountId, folder_pk: i64, item: &ContactItem) -> Result<i64> {
+        let pk = self.with_tx(|tx| Ok(write_contact(tx, account, folder_pk, item, now_ms())?.0))?;
+        self.write_generation.fetch_add(1, Ordering::Relaxed);
+        Ok(pk)
+    }
+
+    /// Контакт удалён на сервере из окна (ушёл в «Удалённые»): строка убирается сразу, не дожидаясь
+    /// синхронизации. `false` — такой строки уже нет.
+    pub fn remove_contact(&self, account: AccountId, contact_pk: i64) -> Result<bool> {
+        let n = self.with_conn(|c| Ok(c.execute("DELETE FROM contacts WHERE account_id = ?1 AND contact_pk = ?2", params![account.0, contact_pk])?))?;
+        if n > 0 {
+            self.write_generation.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(n > 0)
     }
 
     /// Контакты и группы ящика: группы после контактов, по имени списка; `query` — слова, каждое
@@ -353,6 +381,26 @@ mod tests {
         c.emails = vec![ContactEmail { key: Some("EmailAddress1".into()), email: email.into(), name: Some(name.into()) }];
         c.phones = vec![ContactPhone { key: Some("MobilePhone".into()), number: "+7 (916) 123-45-67".into() }];
         c
+    }
+
+    /// Запись из окна: строка как у синхронизации, правка того же контакта — та же строка,
+    /// удаление — сразу; подсказки адресатов (поколение записи) перестраиваются.
+    #[test]
+    fn put_and_remove_contact_from_window() {
+        let (store, account, folder_pk) = store_with_contacts_folder("put");
+        let gen0 = store.write_generation.load(Ordering::Relaxed);
+        let pk = store.put_contact(account, folder_pk, &contact("C9", "Анна Смирнова", "anna@example.com")).unwrap();
+        assert!(store.write_generation.load(Ordering::Relaxed) > gen0);
+        let row = store.contact(account, pk).unwrap().unwrap();
+        assert_eq!(row.item.primary_email().as_deref(), Some("anna@example.com"));
+        let mut edited = contact("C9", "Анна Смирнова", "anna.s@example.com");
+        edited.company = Some("Компания".into());
+        assert_eq!(store.put_contact(account, folder_pk, &edited).unwrap(), pk, "правка — та же строка");
+        assert_eq!(store.contact(account, pk).unwrap().unwrap().item.company.as_deref(), Some("Компания"));
+        assert_eq!(store.contact_by_email(account, "anna.s@example.com").unwrap().map(|r| r.contact_pk), Some(pk));
+        assert!(store.remove_contact(account, pk).unwrap());
+        assert!(store.contact(account, pk).unwrap().is_none());
+        assert!(!store.remove_contact(account, pk).unwrap(), "второй раз удалять нечего");
     }
 
     #[test]

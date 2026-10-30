@@ -1,15 +1,18 @@
 <script lang="ts">
   import { onMount, tick, untrack } from "svelte";
-  import { api, errorMessage, isDirectoryList, listDate, onContactsChanged, plural, type ComposeRecipient, type DirectoryPerson, type PersonalContact } from "../api";
+  import { api, contactFormOf, errorMessage, isDirectoryList, listDate, onContactsChanged, plural, type ComposeRecipient, type ContactForm, type DirectoryPerson, type PersonalContact } from "../api";
   import { ICON } from "../actions";
   import { CONTACT_ICON, addressLabel, contactCardOpener, copyText, directoryLine, emailKey, emailLabel, phoneLabel, rememberKinds, telHref } from "../contact";
   import { primePhotos } from "../photos.svelte";
   import Avatar from "./Avatar.svelte";
+  import ConfirmPopover from "./ConfirmPopover.svelte";
+  import ContactEditor from "./ContactEditor.svelte";
 
   /**
    * Раздел «Люди» (docs/obkatka.md п. 8): личные контакты ящика из локальной базы — список с
    * поиском и страница контакта (адреса, телефоны, компания, почтовые адреса, заметки, участники
-   * группы) — и вкладка справочника организации с тем же поиском. Контакты приходят синхронизацией
+   * группы), создание, правка и удаление контакта (группы — только просмотр и письмо) — и вкладка
+   * справочника организации с тем же поиском. Контакты приходят синхронизацией
    * вместе с почтой; событие `contacts-changed` перечитывает список. Карточка справочника у
    * человека — та же, что в письме (через контекст App).
    */
@@ -49,6 +52,12 @@
   let dirRequest = 0;
   let dirTimer: ReturnType<typeof setTimeout> | undefined;
 
+  /** Форма контакта: новый (`pk` null) или правка выбранного. */
+  let editor = $state<{ pk: number | null; form: ContactForm } | null>(null);
+  let confirmDelete = $state(false);
+  let deleting = $state(false);
+  let deleteBtn = $state<HTMLButtonElement | null>(null);
+
   let status = $state<string | null>(null);
   let statusTimer: ReturnType<typeof setTimeout> | undefined;
   let searchEl = $state<HTMLInputElement | null>(null);
@@ -82,6 +91,12 @@
     } finally {
       if (n === request) loading = false;
     }
+  }
+
+  /** Крестик в поле поиска: запрос пустой, список — снова весь. */
+  function clearQuery() {
+    query = "";
+    onQueryInput();
   }
 
   let queryTimer: ReturnType<typeof setTimeout> | undefined;
@@ -154,6 +169,38 @@
       await api.openExternal(telHref(phone));
     } catch {
       flash((await copyText(phone)) ? "Номер скопирован" : "Не удалось открыть номер");
+    }
+  }
+
+  function newContact() {
+    editor = { pk: null, form: contactFormOf(null) };
+  }
+
+  function editContact(c: PersonalContact) {
+    editor = { pk: c.contact_pk, form: contactFormOf(c) };
+  }
+
+  function onSaved(c: PersonalContact) {
+    const created = editor?.pk == null;
+    editor = null;
+    if (tab !== "contacts") switchTab("contacts");
+    selectedPk = c.contact_pk;
+    flash(created ? "Контакт создан" : "Контакт сохранён");
+    void load();
+  }
+
+  async function deleteNow(c: PersonalContact) {
+    confirmDelete = false;
+    deleting = true;
+    try {
+      await api.contactDelete(c.contact_pk);
+      if (selectedPk === c.contact_pk) selectedPk = null;
+      flash("Контакт удалён — он в «Удалённых»");
+      void load();
+    } catch (e) {
+      flash(errorMessage(e));
+    } finally {
+      deleting = false;
     }
   }
 
@@ -243,9 +290,16 @@
     <div class="search" class:active={query.length > 0}>
       <svg class="search-icon" width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><circle cx="7" cy="7" r="4.5" fill="none" stroke="currentColor" stroke-width="1.4" /><path d="M10.5 10.5 14 14" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" /></svg>
       <input type="search" placeholder={tab === "contacts" ? "Имя, адрес, компания, телефон" : "Имя или адрес в справочнике"} bind:value={query} bind:this={searchEl} oninput={onQueryInput} onkeydown={onListKey} autocomplete="off" spellcheck="false" aria-label={tab === "contacts" ? "Поиск по моим контактам" : "Поиск по справочнику"} />
+      {#if query.length > 0}
+        <button type="button" class="search-clear" onmousedown={(e) => e.preventDefault()} onclick={clearQuery} aria-label="Очистить поиск" title="Очистить поиск"><svg width="12" height="12" viewBox="0 0 16 16" aria-hidden="true"><path d="M4 4l8 8M12 4l-8 8" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" /></svg></button>
+      {/if}
     </div>
 
     {#if tab === "contacts"}
+      <button class="btn new-contact" onclick={newContact} disabled={!folderNames.length}>
+        <svg width="14" height="14" viewBox="0 0 16 16" aria-hidden="true"><path d="M8 3v10M3 8h10" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" /></svg>
+        Новый контакт
+      </button>
       <div class="summary caption" role="status">
         {#if failure}
           <span class="error">{failure}</span>
@@ -360,6 +414,11 @@
               Найти письма
             </button>
             <button class="btn" onclick={(e) => c.email && openDirectoryCard({ name: c.name, email: c.email }, e.currentTarget)} disabled={!c.email} title="Запись справочника организации по этому адресу" aria-haspopup="dialog">В справочнике</button>
+            <button class="btn" onclick={() => editContact(c)} disabled={deleting}>Изменить</button>
+            <button class="btn danger" bind:this={deleteBtn} onclick={() => (confirmDelete = !confirmDelete)} disabled={deleting} aria-haspopup="dialog" aria-busy={deleting}>Удалить…</button>
+            {#if confirmDelete && deleteBtn}
+              <ConfirmPopover anchor={deleteBtn} title="Удалить контакт?" text="Он уйдёт в «Удалённые» на сервере — оттуда его можно вернуть в OWA." confirmLabel="Удалить" onconfirm={() => void deleteNow(c)} oncancel={() => (confirmDelete = false)} />
+            {/if}
           {/if}
         </div>
       </div>
@@ -448,7 +507,7 @@
     {:else if tab === "contacts"}
       <div class="placeholder caption">
         {#if loaded && !total && synced}
-          В ящике нет личных контактов. Контакт, созданный в OWA или Outlook, появится здесь после синхронизации.
+          В ящике нет личных контактов. Создайте контакт кнопкой «Новый контакт» — или он появится здесь после синхронизации, если создан в OWA или Outlook.
         {:else}
           Выберите контакт слева
         {/if}
@@ -459,6 +518,10 @@
   </div>
 </div>
 
+
+{#if editor}
+  <ContactEditor contactPk={editor.pk} initial={editor.form} onsaved={onSaved} onclose={() => (editor = null)} />
+{/if}
 <style>
   .people {
     display: grid;
@@ -476,6 +539,10 @@
   }
   .tabs {
     align-self: start;
+  }
+  .new-contact {
+    align-self: flex-start;
+    margin: 0 0 var(--space-2);
   }
   .search {
     position: relative;
@@ -503,8 +570,23 @@
     border: 0;
     outline: 0;
     background: transparent;
-    padding: 0 var(--space-3) 0 32px;
+    padding: 0 34px 0 32px;
     user-select: text;
+  }
+  .search-clear {
+    position: absolute;
+    right: 6px;
+    width: 24px;
+    height: 24px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: var(--radius-control);
+    color: var(--fg-3);
+  }
+  .search-clear:hover {
+    background: var(--bg-hover);
+    color: var(--fg-1);
   }
   .search input::placeholder {
     color: var(--fg-3);
@@ -628,6 +710,7 @@
   }
   .badge {
     display: inline-block;
+    align-self: flex-start;
     margin-top: var(--space-1);
     font: var(--text-caption);
     line-height: 16px;
@@ -740,5 +823,45 @@
   .status {
     margin-top: var(--space-3);
     color: var(--fg-3);
+  }
+  .btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    height: var(--control-height);
+    padding: 0 14px;
+    border: 1px solid var(--stroke-2);
+    border-radius: var(--radius-control);
+    background: var(--bg-layer-alt);
+    color: var(--fg-1);
+    white-space: nowrap;
+    transition: background var(--dur-fast) var(--ease-in);
+  }
+  .btn:hover:not(:disabled) {
+    background: var(--bg-hover);
+  }
+  .btn:active:not(:disabled) {
+    background: var(--bg-pressed);
+  }
+  .btn:disabled {
+    color: var(--fg-disabled);
+  }
+  .btn.primary {
+    background: var(--accent);
+    border-color: var(--accent);
+    color: var(--fg-on-accent);
+  }
+  .btn.primary:hover:not(:disabled) {
+    background: var(--accent-hover);
+  }
+  .btn.primary:active:not(:disabled) {
+    background: var(--accent-pressed);
+  }
+  .btn.primary:disabled {
+    opacity: 0.6;
+    color: var(--fg-on-accent);
+  }
+  .btn.danger {
+    color: var(--danger);
   }
 </style>

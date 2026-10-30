@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onDestroy, onMount, tick, untrack } from "svelte";
-  import { api, errorMessage, isDirectoryList, listDate, plural, type ComposeRecipient, type ContactCard, type DirectoryPerson, type PersonalContact } from "../api";
+  import { api, contactFormFromPerson, errorMessage, isDirectoryList, listDate, plural, type ComposeRecipient, type ContactCard, type ContactForm, type DirectoryPerson, type PersonalContact } from "../api";
   import { ICON } from "../actions";
   import { CONTACT_ICON, KIND_LABEL, copyText, directoryLine, emailKey, expandSupported, noteExpandError, phoneLabel, rememberKinds, telHref, type ContactRef } from "../contact";
   import { notePhoto } from "../photos.svelte";
@@ -27,8 +27,10 @@
      * окна — редактора встречи: уход в почту оставил бы его открытым за кадром); null — доступны.
      */
     actionsBlocked?: string | null;
+    /** «Добавить в контакты»: форма нового личного контакта с тем, что известно о человеке. */
+    onaddcontact?: (form: ContactForm) => void;
   }
-  let { who, anchor, onclose, oncompose, onsearch, actionsBlocked = null }: Props = $props();
+  let { who, anchor, onclose, oncompose, onsearch, actionsBlocked = null, onaddcontact }: Props = $props();
 
   const uid = $props.id();
   let el = $state<HTMLDivElement | null>(null);
@@ -165,6 +167,11 @@
     status = text;
     clearTimeout(statusTimer);
     statusTimer = setTimeout(() => (status = null), 3000);
+  }
+
+  function addContact() {
+    if (actionsBlocked !== null) return;
+    onaddcontact?.(contactFormFromPerson({ name, email, title: person?.title, department: person?.department, company: person?.company, office: person?.office, business_phone: person?.business_phone, mobile_phone: person?.mobile_phone }));
   }
 
   async function copyAddress() {
@@ -403,6 +410,9 @@
       Найти письма
     </button>
     <button class="btn" onclick={copyAddress}>Копировать адрес</button>
+    {#if onaddcontact && !personal && !isList && !loading && email.includes("@")}
+      <button class="btn" onclick={addContact} disabled={actionsBlocked !== null} title={actionsBlocked ?? "Новый личный контакт с этим адресом в «Контактах»"}>Добавить в контакты</button>
+    {/if}
   </div>
   {#if actionsBlocked}<div class="status caption" id="{uid}-blocked">{actionsBlocked}</div>{/if}
   {#if status}<div class="status caption" role="status">{status}</div>{/if}

@@ -545,6 +545,63 @@ export interface PersonalContact {
   modified_ms?: number | null;
   item: ContactItem;
 }
+/**
+ * Форма личного контакта (создание и правка, § 5r протокола): пустая строка — поле не заполнено.
+ * Заметок нет: на этом сервере они через персоны не пишутся.
+ */
+export interface ContactForm {
+  given_name: string;
+  surname: string;
+  email: string;
+  business_phone: string;
+  mobile_phone: string;
+  home_phone: string;
+  company: string;
+  job_title: string;
+  department: string;
+  office: string;
+}
+
+const phoneOf = (c: ContactItem, key: string) => c.phones.find((p) => (p.key ?? "").toLowerCase() === key.toLowerCase())?.number ?? "";
+
+/** Форма из контакта (правка) или пустая (новый). Адрес — `EmailAddress1`, иначе первый. */
+export function contactFormOf(c?: PersonalContact | null): ContactForm {
+  const i = c?.item;
+  const email = i ? (i.emails.find((e) => (e.key ?? "").toLowerCase() === "emailaddress1") ?? i.emails[0])?.email ?? "" : "";
+  return {
+    given_name: i?.given_name ?? "",
+    surname: i?.surname ?? "",
+    email,
+    business_phone: i ? phoneOf(i, "BusinessPhone") : "",
+    mobile_phone: i ? phoneOf(i, "MobilePhone") : "",
+    home_phone: i ? phoneOf(i, "HomePhone") : "",
+    company: i?.company ?? "",
+    job_title: i?.job_title ?? "",
+    department: i?.department ?? "",
+    office: i?.office ?? "",
+  };
+}
+
+/**
+ * Форма «Добавить в контакты» из письма или справочника: имя целиком — в «Имя» (так делает OWA),
+ * остальное — что известно о человеке.
+ */
+export function contactFormFromPerson(p: { name?: string | null; email?: string | null; title?: string | null; department?: string | null; company?: string | null; office?: string | null; business_phone?: string | null; mobile_phone?: string | null }): ContactForm {
+  const email = (p.email ?? "").trim();
+  const name = (p.name ?? "").trim();
+  return {
+    ...contactFormOf(null),
+    given_name: name && name.toLowerCase() !== email.toLowerCase() ? name : "",
+    email,
+    company: p.company ?? "",
+    job_title: p.title ?? "",
+    department: p.department ?? "",
+    office: p.office ?? "",
+    business_phone: p.business_phone ?? "",
+    mobile_phone: p.mobile_phone ?? "",
+  };
+}
+
 export interface ContactFolder {
   folder_pk: number;
   name: string;
@@ -960,6 +1017,10 @@ export const api = {
   contactPersonal: (email: string) => invoke<PersonalContact | null>("contact_personal", { email }),
   /** Сколько контактов в базе и какие папки контактов есть. */
   contactsStatus: () => invoke<ContactsStatus>("contacts_status"),
+  /** Создать (`contactPk` null) или изменить личный контакт на сервере; возвращает его из базы. */
+  contactSave: (contactPk: number | null, form: ContactForm) => invoke<PersonalContact>("contact_save", { contactPk, form }),
+  /** Удалить личный контакт (на сервере он уходит в «Удалённые»). */
+  contactDelete: (contactPk: number) => invoke<void>("contact_delete", { contactPk }),
   /** Что умеет справочник на этом сервере: раскрытие списков рассылки бывает не реализовано (§ 5l). */
   directoryCapabilities: () => invoke<{ can_expand: boolean }>("directory_capabilities"),
   ownAddresses: () => invoke<string[]>("own_addresses"),

@@ -838,6 +838,8 @@ pub fn run() {
             people::contacts_list,
             people::contact_personal,
             people::contacts_status,
+            people::contact_save,
+            people::contact_delete,
             directory::directory_expand,
             directory::directory_capabilities,
             calendar::calendar_events,
