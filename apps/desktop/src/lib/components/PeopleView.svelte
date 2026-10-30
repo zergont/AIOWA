@@ -34,6 +34,10 @@
   let loading = $state(false);
   let failure = $state<string | null>(null);
   let selectedPk = $state<number | null>(null);
+  /** Сколько контактов (и отдельно групп) в списке; остальные — через поиск. */
+  const LIST_LIMIT = 1000;
+  /** Список обрезан по `LIST_LIMIT` (строка под поиском об этом говорит). */
+  let truncated = $state(false);
   /** Папки контактов и общее число (строка под поиском). */
   let total = $state(0);
   let folderNames = $state<string[]>([]);
@@ -59,8 +63,13 @@
     loading = true;
     failure = null;
     try {
-      const [list, st] = await Promise.all([api.contactsList(query.trim()), api.contactsStatus()]);
+      // На одну запись больше предела: так видно, что список обрезан.
+      const [all, st] = await Promise.all([api.contactsList(query.trim(), LIST_LIMIT + 1), api.contactsStatus()]);
       if (n !== request) return;
+      const ppl = all.filter((c) => !c.is_group);
+      const grp = all.filter((c) => c.is_group);
+      truncated = ppl.length > LIST_LIMIT || grp.length > LIST_LIMIT;
+      const list = [...ppl.slice(0, LIST_LIMIT), ...grp.slice(0, LIST_LIMIT)];
       contacts = list;
       total = st.total;
       folderNames = st.folders.map((f) => f.name);
@@ -247,9 +256,9 @@
         {:else if !synced}
           Контакты ещё не загружены с сервера: ждут синхронизации
         {:else if query.trim()}
-          Найдено: {contacts.length.toLocaleString("ru-RU")} из {total.toLocaleString("ru-RU")}
+          Найдено: {truncated ? `больше ${LIST_LIMIT.toLocaleString("ru-RU")}` : contacts.length.toLocaleString("ru-RU")} из {total.toLocaleString("ru-RU")}{truncated ? " · уточните запрос" : ""}
         {:else}
-          {total.toLocaleString("ru-RU")} {plural(total, "запись", "записи", "записей")}{folderNames.length > 1 ? ` в ${folderNames.length} папках` : ""}
+          {total.toLocaleString("ru-RU")} {plural(total, "запись", "записи", "записей")}{folderNames.length > 1 ? ` в ${folderNames.length} папках` : ""}{truncated ? ` · в списке первые ${LIST_LIMIT.toLocaleString("ru-RU")}, остальные — поиском` : ""}
         {/if}
       </div>
       <div class="list" role="listbox" aria-label="Мои контакты" tabindex="-1">

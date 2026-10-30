@@ -29,6 +29,8 @@ pub enum SyncError {
     Store(#[from] StoreError),
     #[error("папка {0} не найдена в иерархии")]
     FolderNotFound(String),
+    #[error("папка {0} не почтовая: письма в ней не синхронизируются")]
+    NotMailFolder(String),
     #[error("папка {0}: сервер {1} раз подряд вернул пустую выдачу без признака конца")]
     StuckFolder(String, u32),
     #[error("отменено пользователем")]
@@ -43,9 +45,11 @@ pub enum FolderSelection {
     /// Все почтовые папки (`IPF.Note*`) кроме служебных и их подпапок: входящие,
     /// отправленные, затем остальные по убыванию числа писем.
     AllMail,
-    /// Явный список: известные имена (`inbox`, `sentitems`) или отображаемые имена.
+    /// Явный список: известные имена (`inbox`, `sentitems`) или отображаемые имена. Не почтовая
+    /// папка — ошибка `NotMailFolder`.
     Named(Vec<String>),
-    /// Явный список по первичным ключам папок в локальной базе (кнопка на папке в окне).
+    /// Явный список по первичным ключам папок в локальной базе (кнопка на папке в окне,
+    /// уведомление об изменении папки). Не почтовые папки пропускаются.
     Ids(Vec<i64>),
 }
 
@@ -214,29 +218,7 @@ impl Engine {
 
     /// Папки по выбору пользователя, в порядке синхронизации.
     pub fn plan_folders(&self, selection: &FolderSelection) -> Result<Vec<SyncFolder>> {
-        match selection {
-            FolderSelection::AllMail => Ok(self.store.folders_for_sync(self.account)?),
-            FolderSelection::Named(names) => {
-                let mut out: Vec<SyncFolder> = Vec::new();
-                for name in names {
-                    let f = self.store.resolve_folder(self.account, name)?.ok_or_else(|| SyncError::FolderNotFound(name.clone()))?;
-                    if !out.iter().any(|x| x.folder_pk == f.folder_pk) {
-                        out.push(f);
-                    }
-                }
-                Ok(out)
-            }
-            FolderSelection::Ids(pks) => {
-                let mut out: Vec<SyncFolder> = Vec::new();
-                for pk in pks {
-                    let f = self.store.folder_by_pk(self.account, *pk)?.ok_or_else(|| SyncError::FolderNotFound(format!("#{pk}")))?;
-                    if !out.iter().any(|x| x.folder_pk == f.folder_pk) {
-                        out.push(f);
-                    }
-                }
-                Ok(out)
-            }
-        }
+        plan_folders(&self.store, self.account, selection)
     }
 
     pub async fn run(&self, opts: &SyncOptions) -> Result<SyncReport> {
@@ -775,6 +757,46 @@ impl Engine {
     }
 }
 
+/// Папки по выбору пользователя. Явный выбор — только почтовые папки (`Folder::is_mail`, как у
+/// команды «Синхронизировать папку» в окне): письмами не синхронизируются контакты, календарь и
+/// прочее. Иначе синхронизация писем по папке контактов (уведомление об изменении папки, `--folders
+/// contacts`) забрала бы новые контакты в письма и сдвинула состояние папки.
+fn plan_folders(store: &Store, account: AccountId, selection: &FolderSelection) -> Result<Vec<SyncFolder>> {
+    let mail_pks = || -> Result<HashSet<i64>> { Ok(store.list_folders(account)?.into_iter().filter(|(_, f)| f.is_mail()).map(|(pk, _)| pk).collect()) };
+    match selection {
+        FolderSelection::AllMail => Ok(store.folders_for_sync(account)?),
+        FolderSelection::Named(names) => {
+            let mail = mail_pks()?;
+            let mut out: Vec<SyncFolder> = Vec::new();
+            for name in names {
+                let f = store.resolve_folder(account, name)?.ok_or_else(|| SyncError::FolderNotFound(name.clone()))?;
+                if !mail.contains(&f.folder_pk) {
+                    return Err(SyncError::NotMailFolder(f.name));
+                }
+                if !out.iter().any(|x| x.folder_pk == f.folder_pk) {
+                    out.push(f);
+                }
+            }
+            Ok(out)
+        }
+        FolderSelection::Ids(pks) => {
+            let mail = mail_pks()?;
+            let mut out: Vec<SyncFolder> = Vec::new();
+            for pk in pks {
+                let f = store.folder_by_pk(account, *pk)?.ok_or_else(|| SyncError::FolderNotFound(format!("#{pk}")))?;
+                if !mail.contains(&f.folder_pk) {
+                    info!(folder_pk = pk, "папка не почтовая, письма в ней не синхронизируются");
+                    continue;
+                }
+                if !out.iter().any(|x| x.folder_pk == f.folder_pk) {
+                    out.push(f);
+                }
+            }
+            Ok(out)
+        }
+    }
+}
+
 /// Повторы для временных ошибок: троттлинг, сеть, лимит сессий. Истечение сессии
 /// транспорт обрабатывает сам (один повторный вход), сюда оно приходит уже как окончательное.
 async fn with_retry<T, F, Fut>(op: &str, mut f: F) -> Result<T>
@@ -798,5 +820,45 @@ where
             }
             Err(e) => return Err(e.into()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aiowa_core::Folder;
+
+    #[test]
+    fn explicit_selection_keeps_only_mail_folders() {
+        let path = std::env::temp_dir().join(format!("aiowa-sync-plan-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let store = Store::open(&path).unwrap();
+        let account = store.account("h", "l").unwrap();
+        let folder = |id: &str, name: &str, dist: &str, class: &str| Folder {
+            id: FolderId { id: id.into(), change_key: None },
+            parent_id: None,
+            display_name: name.into(),
+            distinguished: Some(dist.into()),
+            folder_class: Some(class.into()),
+            total_count: 1,
+            unread_count: 0,
+            child_folder_count: 0,
+        };
+        store.upsert_folders(account, &[folder("F-I", "Входящие", "inbox", "IPF.Note"), folder("F-C", "Контакты", "contacts", "IPF.Contact"), folder("F-K", "Календарь", "calendar", "IPF.Appointment")]).unwrap();
+        let pk = |id: &str| store.folder_pk(account, id).unwrap().unwrap();
+        let names = |v: Vec<SyncFolder>| v.into_iter().map(|f| f.name).collect::<Vec<_>>();
+
+        // Уведомление об изменении папки контактов: письмами она не синхронизируется, прогон не падает.
+        let got = plan_folders(&store, account, &FolderSelection::Ids(vec![pk("F-C"), pk("F-I"), pk("F-K")])).unwrap();
+        assert_eq!(names(got), ["Входящие"]);
+        assert!(plan_folders(&store, account, &FolderSelection::Ids(vec![pk("F-C")])).unwrap().is_empty());
+
+        assert_eq!(names(plan_folders(&store, account, &FolderSelection::Named(vec!["inbox".into()])).unwrap()), ["Входящие"]);
+        let r = plan_folders(&store, account, &FolderSelection::Named(vec!["inbox".into(), "contacts".into()]));
+        assert!(matches!(r, Err(SyncError::NotMailFolder(ref n)) if n == "Контакты"), "{r:?}");
+        assert!(matches!(plan_folders(&store, account, &FolderSelection::Ids(vec![9999])), Err(SyncError::FolderNotFound(_))));
+        assert_eq!(names(plan_folders(&store, account, &FolderSelection::AllMail).unwrap()), ["Входящие"]);
+        drop(store);
+        let _ = std::fs::remove_file(&path);
     }
 }

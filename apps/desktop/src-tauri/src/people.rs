@@ -9,7 +9,7 @@ use aiowa_store::{ContactFolderInfo, ContactRow};
 use serde::Serialize;
 use tauri::State;
 
-/// Сколько контактов отдаёт список по умолчанию и самое большее.
+/// Сколько контактов (и отдельно групп) отдаёт список по умолчанию и самое большее.
 const LIST_DEFAULT: usize = 1000;
 const LIST_MAX: usize = 10_000;
 
@@ -70,7 +70,8 @@ pub(crate) struct ContactsStatusDto {
     folders: Vec<ContactFolderDto>,
 }
 
-/// Контакты и группы по словам запроса (пустой — все), группы после контактов.
+/// Контакты и группы по словам запроса (пустой — все), группы после контактов; предел — на
+/// каждый вид отдельно.
 #[tauri::command]
 pub(crate) async fn contacts_list(query: Option<String>, limit: Option<usize>, state: State<'_, AppState>) -> CmdResult<Vec<ContactDto>> {
     let store = state.store.clone();

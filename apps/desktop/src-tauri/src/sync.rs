@@ -555,16 +555,22 @@ impl SyncState {
         };
         let body_days = opts.body_days;
         let report = engine.run(&opts).await.map_err(Self::failed)?;
-        self.repair_change_keys(&transport).await;
-        self.backfill_verbs(&transport, body_days).await;
+        self.repair_change_keys(&transport, &cancel).await;
+        self.backfill_verbs(&transport, body_days, &cancel).await;
         self.sync_contacts(app, &transport, &cancel).await;
+        // Остановка на дозапросах или контактах — тоже остановка, а не удачный прогон.
+        if cancel.load(Ordering::Relaxed) {
+            return Err(Outcome::Cancelled);
+        }
         Ok(report)
     }
 
     /// Личные контакты (docs/obkatka.md п. 8): после почты — `SyncFolderItems` формой
     /// `AllProperties` по папкам класса ровно `IPF.Contact` (служебные `IPF.Contact.*` не
-    /// трогаются), состояние — в `folders.sync_state`, как у почты. Отказ сервера по папке не
-    /// прерывает прогон: папка ждёт следующего. Об изменениях окну сообщает событие
+    /// трогаются), состояние — в `folders.contact_sync_state`, отдельно от почтового. Полная
+    /// выгрузка (состояния нет или сервер его отверг) по концу убирает контакты папки, которых
+    /// сервер не вернул: удаления, случившиеся до сброса, иначе не придут. Отказ сервера по папке
+    /// не прерывает прогон: папка ждёт следующего. Об изменениях окну сообщает событие
     /// `contacts-changed`.
     async fn sync_contacts(&self, app: &AppHandle, transport: &OwaTransport, cancel: &AtomicBool) {
         const PAGE: u32 = 100;
@@ -587,7 +593,7 @@ impl SyncState {
                 return;
             }
             let folder = FolderRef::Id(FolderId { id: f.server_id.clone(), change_key: None });
-            let mut state = match self.store.folder_sync_state(f.folder_pk) {
+            let mut state = match self.store.contact_sync_state(f.folder_pk) {
                 Ok(s) => s,
                 Err(e) => {
                     warn!(folder_pk = f.folder_pk, error = %e, "состояние папки контактов не прочитано");
@@ -595,6 +601,11 @@ impl SyncState {
                     continue;
                 }
             };
+            if state.is_none()
+                && let Err(e) = self.store.begin_contact_full_sync(f.folder_pk)
+            {
+                warn!(folder_pk = f.folder_pk, error = %e, "контакты папки не помечены к сверке с полной выгрузкой");
+            }
             let mut reset_once = false;
             let mut pages = 0u32;
             while pages < MAX_PAGES && !cancel.load(Ordering::Relaxed) {
@@ -604,7 +615,7 @@ impl SyncState {
                         warn!(folder_pk = f.folder_pk, "состояние папки контактов недействительно, синхронизация заново");
                         reset_once = true;
                         state = None;
-                        if let Err(e) = self.store.set_folder_sync_state(f.folder_pk, None, false) {
+                        if let Err(e) = self.store.begin_contact_full_sync(f.folder_pk) {
                             warn!(folder_pk = f.folder_pk, error = %e, "состояние папки контактов не сброшено");
                         }
                         continue;
@@ -655,7 +666,8 @@ impl SyncState {
     /// Письма окна тел, скачанные до того, как клиент стал запрашивать последнее действие
     /// (ответ, пересылка; docs/obkatka.md п. 20): дозапрос `GetItem` формой списка пачками по 25,
     /// до 1000 писем за прогон; письмо, по которому сервер отказал, считается проверенным.
-    async fn backfill_verbs(&self, transport: &OwaTransport, body_days: Option<u32>) {
+    /// Остановка синхронизации прерывает дозапрос перед следующей пачкой.
+    async fn backfill_verbs(&self, transport: &OwaTransport, body_days: Option<u32>, cancel: &AtomicBool) {
         const BATCH: usize = 25;
         const PER_RUN: usize = 1000;
         let days = body_days.unwrap_or(365);
@@ -673,6 +685,9 @@ impl SyncState {
         let started = std::time::Instant::now();
         let (mut checked, mut with_verb) = (0usize, 0usize);
         for chunk in rows.chunks(BATCH) {
+            if cancel.load(Ordering::Relaxed) {
+                break;
+            }
             let ids: Vec<ItemId> = chunk.iter().map(|(_, id)| id.clone()).collect();
             let results = match tokio::time::timeout(Duration::from_secs(60), transport.get_items(&ids, aiowa_transport::ItemFetchShape::Meta)).await {
                 Ok(Ok(r)) => r,
@@ -708,8 +723,9 @@ impl SyncState {
     /// Письма с усечённым ключом изменений (8 символов из ответа `UpdateItem`, записанные до
     /// второго патча; docs/obkatka.md п. 19) перечитываются пачками `GetItem` только с
     /// идентификаторами, полный ключ ложится в базу. Пачка, которую сервер не отдал, ждёт
-    /// следующего прогона; письма, которых нет на сервере, уберёт синхронизация.
-    async fn repair_change_keys(&self, transport: &OwaTransport) {
+    /// следующего прогона; письма, которых нет на сервере, уберёт синхронизация. Остановка
+    /// синхронизации прерывает починку перед следующей пачкой.
+    async fn repair_change_keys(&self, transport: &OwaTransport, cancel: &AtomicBool) {
         const BATCH: usize = 25;
         const PER_RUN: usize = 1000;
         let rows = match self.store.items_with_short_change_keys(self.account, ItemId::MIN_FULL_CHANGE_KEY, PER_RUN) {
@@ -724,6 +740,9 @@ impl SyncState {
         }
         let (mut fixed, mut failed) = (0usize, 0usize);
         for chunk in rows.chunks(BATCH) {
+            if cancel.load(Ordering::Relaxed) {
+                break;
+            }
             let ids: Vec<ItemId> = chunk.iter().map(|(_, id)| id.clone()).collect();
             let results = match tokio::time::timeout(Duration::from_secs(60), transport.refresh_item_ids(&ids)).await {
                 Ok(Ok(r)) => r,

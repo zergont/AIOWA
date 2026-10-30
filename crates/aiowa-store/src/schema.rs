@@ -12,7 +12,7 @@ use rusqlite::types::ValueRef;
 use rusqlite::Connection;
 use tracing::info;
 
-pub const CURRENT_VERSION: i64 = 10;
+pub const CURRENT_VERSION: i64 = 11;
 
 /// Состояния текста вложения (`attachments.text_state`).
 pub const TEXT_PENDING: i64 = 0;
@@ -555,12 +555,33 @@ pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
         }
         info!("схема базы обновлена до версии 10: личные контакты");
     }
+    if version < 11 {
+        conn.execute_batch("BEGIN IMMEDIATE;")?;
+        let result = (|| -> rusqlite::Result<()> {
+            // Состояние синхронизации папки контактов — своё, не почтовое `sync_state`: курсор,
+            // сдвинутый синхронизацией писем, контакты не продолжают, первая синхронизация контактов
+            // после обновления — полная выгрузка. `stale` — контакт не подтверждён идущей полной
+            // выгрузкой своей папки; по её концу такие удаляются.
+            add_column_if_missing(conn, "folders", "contact_sync_state", "TEXT")?;
+            add_column_if_missing(conn, "contacts", "stale", "INTEGER NOT NULL DEFAULT 0")?;
+            conn.pragma_update(None, "user_version", 11)?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => conn.execute_batch("COMMIT;")?,
+            Err(e) => {
+                let _ = conn.execute_batch("ROLLBACK;");
+                return Err(e);
+            }
+        }
+        info!("схема базы обновлена до версии 11: своё состояние синхронизации контактов");
+    }
     Ok(())
 }
 
 /// Версия 10: личные контакты ящика (docs/obkatka.md п. 8) — разобранный контакт как JSON и
 /// колонки для списка, поиска и подсказок адресатов. Состояние синхронизации папки контактов —
-/// в `folders.sync_state`.
+/// с версии 11 в `folders.contact_sync_state`.
 const V10_TABLES: &str = r#"
 CREATE TABLE IF NOT EXISTS contacts (
   contact_pk   INTEGER PRIMARY KEY,
@@ -741,5 +762,26 @@ mod tests {
         assert!(plan.contains("items_from_lower"), "{plan}");
         let plan: String = conn.query_row("EXPLAIN QUERY PLAN SELECT item_pk FROM recipients WHERE lower(email) = 'a@x.ru'", [], |r| r.get::<_, String>(3)).unwrap();
         assert!(plan.contains("recipients_email_lower"), "{plan}");
+    }
+
+    #[test]
+    fn migrates_v10_contacts_to_own_sync_state() {
+        // База версии 10: папка контактов с курсором в почтовом `sync_state` (его могла сдвинуть
+        // синхронизация писем). После миграции у контактов своё состояние, пустое: полная выгрузка.
+        let conn = Connection::open_in_memory().unwrap();
+        register_functions(&conn).unwrap();
+        migrate(&conn).unwrap();
+        conn.execute_batch("ALTER TABLE folders DROP COLUMN contact_sync_state; ALTER TABLE contacts DROP COLUMN stale;").unwrap();
+        conn.pragma_update(None, "user_version", 10).unwrap();
+        conn.execute("INSERT INTO accounts(account_id, host, login, created_at) VALUES (1, 'h', 'u', 0)", []).unwrap();
+        conn.execute("INSERT INTO folders(folder_pk, account_id, server_id, display_name, folder_class, sync_state, updated_at) VALUES (1, 1, 'F', 'Контакты', 'IPF.Contact', 'mail-cursor', 0)", []).unwrap();
+        conn.execute("INSERT INTO contacts(account_id, folder_pk, server_id, updated_at) VALUES (1, 1, 'C1', 0)", []).unwrap();
+        migrate(&conn).unwrap();
+        migrate(&conn).unwrap();
+        let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(v, CURRENT_VERSION);
+        let (mail, contacts): (Option<String>, Option<String>) = conn.query_row("SELECT sync_state, contact_sync_state FROM folders WHERE folder_pk = 1", [], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+        assert_eq!((mail.as_deref(), contacts), (Some("mail-cursor"), None));
+        assert_eq!(conn.query_row("SELECT stale FROM contacts WHERE server_id = 'C1'", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
     }
 }

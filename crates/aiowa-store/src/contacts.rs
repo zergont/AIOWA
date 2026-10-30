@@ -2,7 +2,9 @@
 //! созданные пользователем; служебные `IPF.Contact.*` (кэш получателей, контакты Skype,
 //! справочника) не трогаются. Таблица `contacts` хранит разобранный контакт (`ContactItem`) как
 //! JSON и колонки для списка, поиска и подсказок адресатов; состояние синхронизации папки — в
-//! `folders.sync_state`, как у почты. Запись на сервер (создание, правка) — отдельный этап.
+//! `folders.contact_sync_state`, отдельно от почтового `sync_state`. Полная выгрузка папки (без
+//! состояния) по концу убирает контакты, которых сервер не вернул (`stale`). Запись на сервер
+//! (создание, правка) — отдельный этап.
 //! Персональные данные в журнал не пишутся: только счётчики.
 
 use crate::{now_ms, text, word_prefix_match, Result, Store, StoreError, SyncFolder};
@@ -69,8 +71,26 @@ impl Store {
         })
     }
 
+    /// Состояние синхронизации папки контактов (`None` — нужна полная выгрузка).
+    pub fn contact_sync_state(&self, folder_pk: i64) -> Result<Option<SyncState>> {
+        self.with_conn(|c| Ok(c.query_row("SELECT contact_sync_state FROM folders WHERE folder_pk = ?1", params![folder_pk], |r| r.get::<_, Option<String>>(0)).optional()?.flatten().map(SyncState)))
+    }
+
+    /// Начало полной выгрузки папки контактов (состояния нет или сервер его отверг): состояние
+    /// сбрасывается, контакты папки помечаются неподтверждёнными. Выгрузка снимает пометку с
+    /// каждого, кого вернёт сервер, а по её концу `apply_contact_batch` удаляет остальных. До конца
+    /// выгрузки (и если она растянется на несколько прогонов) контакты видны как были.
+    pub fn begin_contact_full_sync(&self, folder_pk: i64) -> Result<()> {
+        self.with_tx(|tx| {
+            tx.execute("UPDATE folders SET contact_sync_state = NULL, sync_complete = 0 WHERE folder_pk = ?1", params![folder_pk])?;
+            tx.execute("UPDATE contacts SET stale = 1 WHERE folder_pk = ?1", params![folder_pk])?;
+            Ok(())
+        })
+    }
+
     /// Применяет пачку изменений папки контактов и записывает её состояние синхронизации
-    /// (`complete` — сервер сообщил, что изменений больше нет). Заметки в разметке сводятся к тексту.
+    /// (`complete` — сервер сообщил, что изменений больше нет; тогда же удаляются контакты папки,
+    /// которых полная выгрузка не подтвердила). Заметки в разметке сводятся к тексту.
     pub fn apply_contact_batch(&self, account: AccountId, folder_pk: i64, changes: &[ContactChange], state: &SyncState, complete: bool) -> Result<ContactApplyStats> {
         let now = now_ms();
         let stats = self.with_tx(|tx| {
@@ -88,7 +108,7 @@ impl Store {
                                folder_pk = excluded.folder_pk, change_key = excluded.change_key, item_class = excluded.item_class, is_group = excluded.is_group,
                                display_name = excluded.display_name, email = excluded.email, company = excluded.company, job_title = excluded.job_title,
                                sort_key = excluded.sort_key, search_text = excluded.search_text, json = excluded.json, modified_at = excluded.modified_at,
-                               updated_at = excluded.updated_at",
+                               updated_at = excluded.updated_at, stale = 0",
                             params![
                                 account.0,
                                 folder_pk,
@@ -118,7 +138,10 @@ impl Store {
                     }
                 }
             }
-            tx.execute("UPDATE folders SET sync_state = ?2, sync_complete = ?3, last_synced_at = ?4 WHERE folder_pk = ?1", params![folder_pk, state.0, complete as i64, now])?;
+            if complete {
+                stats.deleted += tx.execute("DELETE FROM contacts WHERE folder_pk = ?1 AND stale = 1", params![folder_pk])?;
+            }
+            tx.execute("UPDATE folders SET contact_sync_state = ?2, sync_complete = ?3, last_synced_at = ?4 WHERE folder_pk = ?1", params![folder_pk, state.0, complete as i64, now])?;
             Ok(stats)
         })?;
         if stats.created + stats.updated + stats.deleted > 0 {
@@ -129,21 +152,25 @@ impl Store {
     }
 
     /// Контакты и группы ящика: группы после контактов, по имени списка; `query` — слова, каждое
-    /// должно начинать слово имени, адреса, компании, должности или цифр телефона.
+    /// должно начинать слово имени, адреса, компании, должности или цифр телефона. `limit` — предел
+    /// на каждый вид отдельно: группы не вытесняются контактами.
     pub fn contacts_list(&self, account: AccountId, query: &str, limit: usize) -> Result<Vec<ContactRow>> {
         let words: Vec<String> = text::norm_lower(query).split_whitespace().map(String::from).collect();
         self.with_conn(|c| {
-            let mut st = c.prepare_cached(&format!("{CONTACT_SELECT} WHERE account_id = ?1 AND {LIVE_FOLDER} ORDER BY is_group, sort_key, contact_pk"))?;
-            let rows = st.query_map(params![account.0], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, String>(2)?, r.get::<_, String>(3)?)))?;
+            let mut st = c.prepare_cached(&format!("SELECT contact_pk, folder_pk, json, search_text, is_group FROM contacts WHERE account_id = ?1 AND {LIVE_FOLDER} ORDER BY is_group, sort_key, contact_pk"))?;
+            let rows = st.query_map(params![account.0], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, String>(2)?, r.get::<_, String>(3)?, r.get::<_, i64>(4)? != 0)))?;
             let mut out = Vec::new();
+            let (mut people, mut groups) = (0usize, 0usize);
             for r in rows {
-                let (contact_pk, folder_pk, json, search) = r?;
-                if !words.iter().all(|w| word_prefix_match(&search, w)) {
+                let (contact_pk, folder_pk, json, search, is_group) = r?;
+                let taken = if is_group { &mut groups } else { &mut people };
+                if *taken >= limit || !words.iter().all(|w| word_prefix_match(&search, w)) {
                     continue;
                 }
                 let Some(item) = row_item(&json) else { continue };
                 out.push(ContactRow { contact_pk, folder_pk, item });
-                if out.len() >= limit {
+                *taken += 1;
+                if groups >= limit {
                     break;
                 }
             }
@@ -370,7 +397,7 @@ mod tests {
         let infos = store.contact_folder_infos(account).unwrap();
         assert_eq!(infos.len(), 1);
         assert_eq!((infos[0].contacts, infos[0].sync_complete), (3, true));
-        assert_eq!(store.folder_sync_state(folder_pk).unwrap(), Some(SyncState("s1".into())));
+        assert_eq!(store.contact_sync_state(folder_pk).unwrap(), Some(SyncState("s1".into())));
 
         let mut renamed = contact("C1", "Иван Петров-Водкин", "ivan@example.com");
         renamed.item_id.change_key = Some("ck2".into());
@@ -391,5 +418,83 @@ mod tests {
         assert_eq!((got[0].name.as_deref(), got[0].email.as_str()), (Some("Зоя Личная"), "zoya@example.com"));
         assert!(got[0].weight >= crate::CONTACT_WEIGHT);
         assert!(store.suggest_recipients(account, "нет", 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn contact_sync_state_is_separate_from_mail_sync_state() {
+        // Курсор, сдвинутый синхронизацией писем по этой папке, контакты не продолжают, и наоборот.
+        let (store, account, folder_pk) = store_with_contacts_folder("cursor");
+        store.set_folder_sync_state(folder_pk, Some(&SyncState("mail".into())), true).unwrap();
+        assert_eq!(store.contact_sync_state(folder_pk).unwrap(), None, "почтовый курсор — не курсор контактов");
+        store.apply_contact_batch(account, folder_pk, &[ContactChange::Create(contact("C1", "Иван Петров", "ivan@example.com"))], &SyncState("contacts".into()), true).unwrap();
+        assert_eq!(store.contact_sync_state(folder_pk).unwrap(), Some(SyncState("contacts".into())));
+        assert_eq!(store.folder_sync_state(folder_pk).unwrap(), Some(SyncState("mail".into())), "почтовый курсор не тронут");
+    }
+
+    #[test]
+    fn full_resync_removes_contacts_the_server_did_not_return() {
+        let (store, account, folder_pk) = store_with_contacts_folder("resync");
+        let other = Folder {
+            id: FolderId { id: "F-C2".into(), change_key: None },
+            parent_id: None,
+            display_name: "Работа".into(),
+            distinguished: None,
+            folder_class: Some("IPF.Contact".into()),
+            total_count: 1,
+            unread_count: 0,
+            child_folder_count: 0,
+        };
+        store.upsert_folders(account, &[other]).unwrap();
+        let other_pk = store.contact_folders(account).unwrap().iter().find(|f| f.folder_pk != folder_pk).unwrap().folder_pk;
+        let all = |s: &Store| s.contacts_list(account, "", 100).unwrap().into_iter().map(|r| r.item.item_id.id).collect::<Vec<_>>();
+        store
+            .apply_contact_batch(
+                account,
+                folder_pk,
+                &[ContactChange::Create(contact("C1", "Анна", "a@example.com")), ContactChange::Create(contact("C2", "Борис", "b@example.com")), ContactChange::Create(contact("C3", "Вера", "v@example.com"))],
+                &SyncState("s1".into()),
+                true,
+            )
+            .unwrap();
+        store.apply_contact_batch(account, other_pk, &[ContactChange::Create(contact("D1", "Глеб", "g@example.com"))], &SyncState("o1".into()), true).unwrap();
+
+        // Сервер отверг состояние: полная выгрузка; Бориса на сервере уже нет, Delete о нём не придёт.
+        store.begin_contact_full_sync(folder_pk).unwrap();
+        assert_eq!(store.contact_sync_state(folder_pk).unwrap(), None);
+        assert_eq!(all(&store), ["C1", "C2", "C3", "D1"], "до конца выгрузки контакты видны как были");
+        let stats = store.apply_contact_batch(account, folder_pk, &[ContactChange::Create(contact("C1", "Анна", "a@example.com"))], &SyncState("p1".into()), false).unwrap();
+        assert_eq!(stats, ContactApplyStats { created: 0, updated: 1, deleted: 0 });
+        assert_eq!(all(&store).len(), 4, "выгрузка не закончена — никто не удалён");
+        let stats = store.apply_contact_batch(account, folder_pk, &[ContactChange::Create(contact("C3", "Вера", "v@example.com"))], &SyncState("p2".into()), true).unwrap();
+        assert_eq!(stats, ContactApplyStats { created: 0, updated: 1, deleted: 1 });
+        assert_eq!(all(&store), ["C1", "C3", "D1"], "неподтверждённый контакт удалён, другая папка не тронута");
+        assert!(store.contact_by_email(account, "b@example.com").unwrap().is_none());
+        assert!(store.contact_recipients(account).unwrap().iter().all(|r| r.email != "b@example.com"), "и из подсказок адресатов");
+
+        // Обычная инкрементальная пачка с признаком конца никого не удаляет.
+        let stats = store.apply_contact_batch(account, folder_pk, &[], &SyncState("p3".into()), true).unwrap();
+        assert_eq!(stats, ContactApplyStats::default());
+        assert_eq!(all(&store).len(), 3);
+    }
+
+    #[test]
+    fn list_limit_applies_to_contacts_and_groups_separately() {
+        // Контактов больше предела: группы всё равно в списке, хвост контактов — нет.
+        let (store, account, folder_pk) = store_with_contacts_folder("limit");
+        let mut group = ContactItem::new(ItemId { id: "G1".into(), change_key: None });
+        group.item_class = Some("IPM.DistList".into());
+        group.display_name = Some("Альфа-группа".into());
+        store
+            .apply_contact_batch(
+                account,
+                folder_pk,
+                &[ContactChange::Create(contact("C1", "Анна", "a@example.com")), ContactChange::Create(contact("C2", "Борис", "b@example.com")), ContactChange::Create(contact("C3", "Вера", "v@example.com")), ContactChange::Create(group)],
+                &SyncState("s1".into()),
+                true,
+            )
+            .unwrap();
+        let got = store.contacts_list(account, "", 2).unwrap();
+        assert_eq!(got.iter().map(|r| r.item.item_id.id.as_str()).collect::<Vec<_>>(), ["C1", "C2", "G1"]);
+        assert_eq!(store.contacts_list(account, "", 100).unwrap().len(), 4);
     }
 }
