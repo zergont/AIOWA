@@ -12,7 +12,7 @@ use rusqlite::types::ValueRef;
 use rusqlite::Connection;
 use tracing::info;
 
-pub const CURRENT_VERSION: i64 = 6;
+pub const CURRENT_VERSION: i64 = 7;
 
 /// Состояния текста вложения (`attachments.text_state`).
 pub const TEXT_PENDING: i64 = 0;
@@ -483,6 +483,26 @@ pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
         }
         info!("схема базы обновлена до версии 6: локальные черновики");
     }
+    if version < 7 {
+        conn.execute_batch("BEGIN IMMEDIATE;")?;
+        let result = (|| -> rusqlite::Result<()> {
+            // Последнее действие с письмом (ответ, пересылка): код PR_LAST_VERB_EXECUTED, когда,
+            // и запрашивалось ли оно у сервера (для дозапроса по уже скачанным письмам).
+            add_column_if_missing(conn, "items", "last_verb", "INTEGER")?;
+            add_column_if_missing(conn, "items", "last_verb_at", "INTEGER")?;
+            add_column_if_missing(conn, "items", "verb_checked", "INTEGER NOT NULL DEFAULT 0")?;
+            conn.pragma_update(None, "user_version", 7)?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => conn.execute_batch("COMMIT;")?,
+            Err(e) => {
+                let _ = conn.execute_batch("ROLLBACK;");
+                return Err(e);
+            }
+        }
+        info!("схема базы обновлена до версии 7: последнее действие с письмом");
+    }
     Ok(())
 }
 
@@ -591,8 +611,9 @@ mod tests {
         migrate(&conn).unwrap();
         migrate(&conn).unwrap();
         let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(v, 6);
+        assert_eq!(v, CURRENT_VERSION);
         assert_eq!(conn.query_row("SELECT count(*) FROM local_drafts", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+        assert!(has_column(&conn, "items", "last_verb").unwrap() && has_column(&conn, "items", "verb_checked").unwrap());
         let plan: String = conn
             .query_row("EXPLAIN QUERY PLAN SELECT COUNT(*) FROM items WHERE account_id = 1 AND lower(from_email) = 'a@x.ru'", [], |r| r.get::<_, String>(3))
             .unwrap();

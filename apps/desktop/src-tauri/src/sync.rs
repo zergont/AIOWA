@@ -545,9 +545,64 @@ impl SyncState {
             attachment_cache_bytes: prefs.attachment_cache_bytes(),
             ..SyncOptions::default()
         };
+        let body_days = opts.body_days;
         let report = engine.run(&opts).await.map_err(Self::failed)?;
         self.repair_change_keys(&transport).await;
+        self.backfill_verbs(&transport, body_days).await;
         Ok(report)
+    }
+
+    /// Письма окна тел, скачанные до того, как клиент стал запрашивать последнее действие
+    /// (ответ, пересылка; docs/obkatka.md п. 20): дозапрос `GetItem` формой списка пачками по 25,
+    /// до 1000 писем за прогон; письмо, по которому сервер отказал, считается проверенным.
+    async fn backfill_verbs(&self, transport: &OwaTransport, body_days: Option<u32>) {
+        const BATCH: usize = 25;
+        const PER_RUN: usize = 1000;
+        let days = body_days.unwrap_or(365);
+        let since = jiff::Timestamp::now() - jiff::SignedDuration::from_hours(24 * i64::from(days));
+        let rows = match self.store.items_to_check_verbs(self.account, since, PER_RUN) {
+            Ok(rows) => rows,
+            Err(e) => {
+                warn!(error = %e, "письма без сведений о последнем действии не выбраны");
+                return;
+            }
+        };
+        if rows.is_empty() {
+            return;
+        }
+        let started = std::time::Instant::now();
+        let (mut checked, mut with_verb) = (0usize, 0usize);
+        for chunk in rows.chunks(BATCH) {
+            let ids: Vec<ItemId> = chunk.iter().map(|(_, id)| id.clone()).collect();
+            let results = match tokio::time::timeout(Duration::from_secs(60), transport.get_items(&ids, aiowa_transport::ItemFetchShape::Meta)).await {
+                Ok(Ok(r)) => r,
+                Ok(Err(e)) => {
+                    warn!(error = %e.chain(), checked, "дозапрос последнего действия прерван отказом сервера");
+                    return;
+                }
+                Err(_) => {
+                    warn!(checked, "дозапрос последнего действия прерван: сервер не ответил за 60 с");
+                    return;
+                }
+            };
+            for ((pk, _), r) in chunk.iter().zip(results) {
+                let (verb, at) = match r {
+                    aiowa_transport::ItemResult::Ok(m) => (m.meta.last_verb, m.meta.last_verb_at),
+                    aiowa_transport::ItemResult::Failed { code, .. } => {
+                        info!(item_pk = pk, code, "последнее действие не получено, письмо считается проверенным");
+                        (None, None)
+                    }
+                };
+                if verb.is_some() {
+                    with_verb += 1;
+                }
+                match self.store.set_last_verb(*pk, verb, at) {
+                    Ok(()) => checked += 1,
+                    Err(e) => warn!(item_pk = pk, error = %e, "последнее действие не записано"),
+                }
+            }
+        }
+        info!(checked, with_verb, total = rows.len(), elapsed_ms = started.elapsed().as_millis() as u64, "последнее действие дозапрошено по скачанным письмам");
     }
 
     /// Письма с усечённым ключом изменений (8 символов из ответа `UpdateItem`, записанные до

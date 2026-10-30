@@ -18,7 +18,7 @@ pub mod text;
 pub mod ui;
 pub mod view_state;
 
-use aiowa_core::{AccountId, Folder, FolderChange, FolderId, ItemChange, ItemId, MessageFull, MessageMeta, RecipientKind, SyncState};
+use aiowa_core::{AccountId, Folder, FolderChange, FolderId, ItemChange, ItemId, LastVerb, MessageFull, MessageMeta, RecipientKind, SyncState};
 use jiff::Timestamp;
 use rusqlite::types::Value as SqlValue;
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension, Transaction};
@@ -303,6 +303,9 @@ pub struct ConversationRow {
     /// Начало текста самого свежего письма беседы в этой папке (серверный `Preview`), как в
     /// третьей строке списка OWA; `None` — у письма его нет.
     pub preview: Option<String>,
+    /// Последнее действие с самым свежим письмом беседы в этой папке (код `PR_LAST_VERB_EXECUTED`:
+    /// 102 ответ, 103 ответ всем, 104 пересылка); значок в строке списка.
+    pub last_verb: Option<i64>,
 }
 
 /// Подзапрос «в беседе есть письмо с флагом» для списков бесед (`c` — `conversations`).
@@ -1315,6 +1318,24 @@ impl Store {
         })
     }
 
+    /// Письма окна, у которых последнее действие (ответ, пересылка) ещё не запрашивалось у
+    /// сервера: скачаны до того, как клиент стал запрашивать `PR_LAST_VERB_EXECUTED`.
+    pub fn items_to_check_verbs(&self, account: AccountId, since: Timestamp, limit: usize) -> Result<Vec<(i64, ItemId)>> {
+        self.with_conn(|c| {
+            let mut st = c.prepare_cached("SELECT item_pk, server_id, change_key FROM items WHERE account_id = ?1 AND deleted = 0 AND verb_checked = 0 AND received_at >= ?2 ORDER BY received_at DESC LIMIT ?3")?;
+            let rows = st.query_map(params![account.0, ts_ms(Some(since)), limit as i64], |r| Ok((r.get::<_, i64>(0)?, ItemId { id: r.get(1)?, change_key: r.get(2)? })))?;
+            rows.collect::<std::result::Result<Vec<_>, _>>().map_err(Into::into)
+        })
+    }
+
+    /// Записать последнее действие с письмом (или его отсутствие) и отметить, что оно запрошено.
+    pub fn set_last_verb(&self, item_pk: i64, verb: Option<LastVerb>, at: Option<Timestamp>) -> Result<()> {
+        self.with_conn(|c| {
+            c.execute("UPDATE items SET last_verb = ?2, last_verb_at = ?3, verb_checked = 1 WHERE item_pk = ?1", params![item_pk, verb.map(LastVerb::code), ts_ms(at)])?;
+            Ok(())
+        })
+    }
+
     /// Письма с усечённым ключом изменений (короче `min_len` символов): их ключи нужно
     /// перечитать с сервера, иначе ответ и пересылка на них отказывают (`ErrorStaleObject`).
     pub fn items_with_short_change_keys(&self, account: AccountId, min_len: usize, limit: usize) -> Result<Vec<(i64, ItemId)>> {
@@ -1527,6 +1548,7 @@ impl Store {
                         has_attachments: r.get::<_, i64>(6)? != 0,
                         has_flagged: r.get::<_, i64>(7)? != 0,
                         preview: None,
+                        last_verb: None,
                     })
                 })?
                 .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -2007,8 +2029,9 @@ fn upsert_meta(tx: &Transaction, account: AccountId, folder_pk: i64, m: &Message
     tx.prepare_cached(
         "INSERT INTO items(account_id, server_id, change_key, folder_pk, conversation_id, internet_message_id, item_class, subject,
                            from_name, from_email, sender_email, display_to, received_at, sent_at, last_modified_at,
-                           is_read, is_draft, has_attachments, importance, flag_status, size, preview, body_state, deleted, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, 0, 0, ?23)
+                           is_read, is_draft, has_attachments, importance, flag_status, size, preview, body_state, deleted, updated_at,
+                           last_verb, last_verb_at, verb_checked)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, 0, 0, ?23, ?24, ?25, 1)
          ON CONFLICT(account_id, server_id) DO UPDATE SET
            change_key = excluded.change_key, folder_pk = excluded.folder_pk,
            conversation_id = COALESCE(excluded.conversation_id, items.conversation_id),
@@ -2021,7 +2044,8 @@ fn upsert_meta(tx: &Transaction, account: AccountId, folder_pk: i64, m: &Message
            last_modified_at = COALESCE(excluded.last_modified_at, items.last_modified_at),
            is_read = excluded.is_read, is_draft = excluded.is_draft, has_attachments = excluded.has_attachments,
            importance = excluded.importance, flag_status = excluded.flag_status, size = COALESCE(excluded.size, items.size),
-           preview = COALESCE(excluded.preview, items.preview), deleted = 0, updated_at = excluded.updated_at",
+           preview = COALESCE(excluded.preview, items.preview), deleted = 0, updated_at = excluded.updated_at,
+           last_verb = COALESCE(excluded.last_verb, items.last_verb), last_verb_at = COALESCE(excluded.last_verb_at, items.last_verb_at), verb_checked = 1",
     )?
     .execute(params![
         account.0,
@@ -2046,7 +2070,9 @@ fn upsert_meta(tx: &Transaction, account: AccountId, folder_pk: i64, m: &Message
         m.flag.as_str(),
         m.size,
         m.preview,
-        now
+        now,
+        m.last_verb.map(LastVerb::code),
+        ts_ms(m.last_verb_at),
     ])?;
     let item_pk: i64 = tx.prepare_cached("SELECT item_pk FROM items WHERE account_id = ?1 AND server_id = ?2")?.query_row(params![account.0, m.item_id.id], |r| r.get(0))?;
     Ok(Upserted { item_pk, existed, adopted_from })
@@ -2139,6 +2165,8 @@ mod tests {
             flag: Default::default(),
             size: Some(100),
             preview: None,
+            last_verb: None,
+            last_verb_at: None,
         }
     }
 
@@ -2738,6 +2766,20 @@ mod tests {
         assert_eq!((r.id.id.as_str(), r.id.change_key.as_deref()), ("A3", Some("CQAAAA==")), "новый идентификатор после переноса берётся целиком");
         let short = s.items_with_short_change_keys(acc, ItemId::MIN_FULL_CHANGE_KEY, 10).unwrap();
         assert!(short.iter().any(|(pk, id)| *pk == a && id.id == "A3"), "усечённый ключ попадает в выборку на починку: {short:?}");
+
+        // Последнее действие: письма из синхронизации считаются запрошенными (verb_checked = 1),
+        // set_last_verb пишет код и время, а дозапрос их больше не выбирает.
+        let since = Timestamp::from_second(0).unwrap();
+        assert!(s.items_to_check_verbs(acc, since, 10).unwrap().is_empty(), "пачка синхронизации уже с признаком");
+        s.with_conn(|c| Ok(c.execute("UPDATE items SET verb_checked = 0 WHERE item_pk = ?1", params![a])?)).unwrap();
+        assert_eq!(s.items_to_check_verbs(acc, since, 10).unwrap().iter().map(|(pk, _)| *pk).collect::<Vec<_>>(), vec![a]);
+        let when = Timestamp::from_second(1_793_000_000).unwrap();
+        s.set_last_verb(a, Some(LastVerb::Forwarded), Some(when)).unwrap();
+        let head = s.message_head(a).unwrap().unwrap();
+        assert_eq!((head.last_verb, head.last_verb_at), (Some(104), Some(when)));
+        assert!(s.items_to_check_verbs(acc, since, 10).unwrap().is_empty());
+        s.set_last_verb(a, None, None).unwrap();
+        assert_eq!(s.message_head(a).unwrap().unwrap().last_verb, None);
 
         // mark_deleted_local и восстановление: агрегаты, индекс, счётчики папки.
         assert_eq!(s.search(acc, "тема:договор", 10).unwrap().len(), 3);

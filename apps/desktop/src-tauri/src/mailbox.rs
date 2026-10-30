@@ -332,6 +332,8 @@ mod tests {
             flag: Default::default(),
             size: None,
             preview: None,
+            last_verb: None,
+            last_verb_at: None,
         }
     }
 

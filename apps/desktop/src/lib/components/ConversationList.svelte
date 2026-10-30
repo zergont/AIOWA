@@ -1,7 +1,7 @@
 <script lang="ts">
   import { tick, untrack } from "svelte";
   import { SvelteSet } from "svelte/reactivity";
-  import { conversationsText, errorMessage, listDate, type ComposeKind, type Conversation, type Folder } from "../api";
+  import { conversationsText, errorMessage, listDate, type ComposeKind, type Conversation, type Folder, LAST_VERB, lastVerbText} from "../api";
   import { COMPOSE_ACTIONS, DND_CONVERSATIONS, ICON, conversationActionLabels, isDeletedFolder, type DragPayload, type ItemAction } from "../actions";
   import { focusBack, type Anchor } from "../popover";
   import { hint, layerOpen } from "../hotkeys";
@@ -603,6 +603,9 @@
           <div class="line1">
             <span class="people">{participantsLabel(c) || "(без отправителя)"}</span>
             {#if c.total_count > 1}<span class="count">{c.total_count}</span>{/if}
+            {#if c.last_verb}
+              <svg class="verb" width="13" height="13" viewBox="0 0 16 16" role="img" aria-label={lastVerbText(c.last_verb) ?? ""}><title>{lastVerbText(c.last_verb)}</title><path d={c.last_verb === LAST_VERB.forwarded ? ICON.forward : c.last_verb === LAST_VERB.repliedAll ? ICON.replyAll : ICON.reply} fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" /></svg>
+            {/if}
             <span class="date">{listDate(c.last_received_ms)}</span>
           </div>
           <div class="line2">
@@ -943,6 +946,10 @@
     font: var(--text-caption);
     color: var(--fg-3);
     white-space: nowrap;
+  }
+  .verb {
+    flex: none;
+    color: var(--fg-3);
   }
   .row.unread .date {
     color: var(--unread);

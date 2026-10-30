@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onDestroy, untrack } from "svelte";
-  import { api, errorMessage, formatSize, fullDate, isInlinePicture, isPreviewable, listDate, meetingKindOf, messageNeedsFetch, personLabel, senderResponseOf, type Attachment, type ComposeKind, type Folder, type MeetingInfo, type MeetingResponse, type Message, type ResponseType } from "../api";
+  import { api, errorMessage, formatSize, fullDate, isInlinePicture, isPreviewable, listDate, meetingKindOf, messageNeedsFetch, personLabel, senderResponseOf, type Attachment, type ComposeKind, type Folder, type MeetingInfo, type MeetingResponse, type Message, type ResponseType, LAST_VERB, lastVerbText} from "../api";
   import { COMPOSE_ACTIONS, ICON, type ItemAction } from "../actions";
   import { meetingWhen } from "../calendar";
   import { contactCardOpener } from "../contact";
@@ -35,12 +35,23 @@
     oncompose: (kind: ComposeKind) => void;
     /** Открыть этот черновик в композере. */
     onopendraft?: () => void;
+    /** Показать ответ или пересылку этого письма в «Отправленных» (плашка «Вы ответили…»). */
+    onfindsent?: () => void;
     /** Черновик открывается (может читаться с сервера): кнопка занята. */
     draftOpening?: boolean;
     /** Дан ответ на приглашение или отменённая встреча убрана из календаря: родитель перечитывает беседу. */
     onmeeting?: () => void;
   }
-  let { message, expanded, ontoggle, onfetch, folders, deletedFolderPk, archiveFolderPk = null, draftsFolderPk = null, onaction, oncompose, onopendraft, draftOpening = false, onmeeting }: Props = $props();
+  let { message, expanded, ontoggle, onfetch, folders, deletedFolderPk, archiveFolderPk = null, draftsFolderPk = null, onaction, oncompose, onopendraft, draftOpening = false, onmeeting, onfindsent }: Props = $props();
+
+  /** Плашка «Вы ответили / переслали это сообщение <когда>», как в OWA; null — действия не было. */
+  const verbNote = $derived.by(() => {
+    const text = lastVerbText(message.last_verb);
+    if (!text) return null;
+    const when = message.last_verb_ms != null ? fullDate(message.last_verb_ms) : "";
+    return when ? `${text} ${when}` : text;
+  });
+  const verbIcon = $derived(message.last_verb === LAST_VERB.forwarded ? ICON.forward : message.last_verb === LAST_VERB.repliedAll ? ICON.replyAll : ICON.reply);
 
   /** Черновик: по признаку письма или по папке — у него вместо панели действий «Открыть черновик». */
   const isDraft = $derived(message.is_draft || (draftsFolderPk != null && message.folder_pk === draftsFolderPk));
@@ -499,6 +510,15 @@
           {#if message.importance === "High"}<span class="badge high">важное</span>{/if}
           {#if message.is_draft}<span class="badge">черновик</span>{/if}
         </div>
+        {#if verbNote}
+          <div class="line caption verb-note" role="status">
+            <svg width="12" height="12" viewBox="0 0 16 16" aria-hidden="true"><path d={verbIcon} fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" /></svg>
+            <span>{verbNote}</span>
+            {#if onfindsent}
+              <button type="button" class="verb-link" onclick={(e) => { e.stopPropagation(); onfindsent?.(); }} title="Открыть эту беседу в «Отправленных»">Найти в «Отправленных»</button>
+            {/if}
+          </div>
+        {/if}
         {#if expanded}
           {#if replyTo.length}<div class="line caption reply-to" title="Ответ уйдёт по адресу из заголовка Reply-To, а не отправителю">Ответ на: {@render people(replyTo)}</div>{/if}
           <div class="line caption" title={to.length ? peopleText(to) : undefined}>Кому: {#if to.length}{@render people(to)}{:else}{message.display_to || "—"}{/if}</div>
@@ -812,6 +832,23 @@
   }
   .person:focus-visible {
     outline-offset: 0;
+  }
+  .verb-note {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    color: var(--fg-2);
+  }
+  .verb-note svg {
+    flex: none;
+    color: var(--accent);
+  }
+  .verb-link {
+    color: var(--accent);
+    white-space: nowrap;
+  }
+  .verb-link:hover {
+    text-decoration: underline;
   }
   .badge {
     font: var(--text-caption);

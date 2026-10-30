@@ -5,8 +5,7 @@
 use aiowa_core::{
     response_from_item_class, AttachmentMeta, Attendee, BodyType, CalendarEvent, CalendarEventDetails, CalendarItemChanges, CalendarItemType, ComposeKind, ConversationId, DistinguishedFolder,
     DirectoryPerson, DraftContent, FlagStatus, Folder, FolderChange, FolderId, FolderRef, FreeBusy, Importance, ItemChange, ItemId, MeetingMessageKind, MeetingRequestInfo, MeetingResponse, MessageBody, MessageFull,
-    MessageMeta, NewCalendarItem, OutgoingAttachment, OutgoingMessage, Participant, PersonKind, ResponseType, Signature, SyncState,
-};
+    MessageMeta, NewCalendarItem, OutgoingAttachment, OutgoingMessage, Participant, PersonKind, ResponseType, Signature, SyncState, LastVerb};
 use aiowa_transport::WriteResult;
 use base64::prelude::*;
 use jiff::Timestamp;
@@ -35,6 +34,7 @@ pub const META_FIELDS: &[&str] = &[
     "item:Size",
     "item:ItemClass",
     "item:ConversationId",
+    "item:IconIndex",
     "message:InternetMessageId",
     "item:Preview",
     "item:Flag",
@@ -114,10 +114,25 @@ pub fn sync_folder_hierarchy_body(state: Option<&SyncState>, with_distinguished:
     body
 }
 
+/// Расширенные свойства «последнее действие с письмом»: `PR_LAST_VERB_EXECUTED` (0x1081, код
+/// 102 ответ, 103 ответ всем, 104 пересылка) и `PR_LAST_VERB_EXECUTION_TIME` (0x1082). Идут вместе
+/// с `META_FIELDS` в `SyncFolderItems`, `FindItem` и `GetItem` формы списка (docs/obkatka.md п. 20).
+pub fn verb_extended_props() -> Vec<Value> {
+    vec![
+        json!({ "__type": "ExtendedPropertyUri:#Exchange", "PropertyTag": "0x1081", "PropertyType": "Integer" }),
+        json!({ "__type": "ExtendedPropertyUri:#Exchange", "PropertyTag": "0x1082", "PropertyType": "SystemTime" }),
+    ]
+}
+
+/// Свойства списка: `META_FIELDS` и расширенные свойства последнего действия.
+fn meta_properties() -> Vec<Value> {
+    META_FIELDS.iter().map(|f| property_uri(f)).chain(verb_extended_props()).collect()
+}
+
 pub fn sync_folder_items_body(folder: &FolderRef, state: Option<&SyncState>, max_changes: u32, with_meta: bool) -> Value {
     let mut shape = json!({ "__type": "ItemResponseShape:#Exchange", "BaseShape": "IdOnly" });
     if with_meta {
-        shape["AdditionalProperties"] = Value::Array(META_FIELDS.iter().map(|f| property_uri(f)).collect());
+        shape["AdditionalProperties"] = Value::Array(meta_properties());
     }
     let mut body = json!({
         "__type": "SyncFolderItemsRequest:#Exchange",
@@ -144,7 +159,7 @@ pub fn find_recent_items_body(folder: &FolderRef, max: u32, offset: u32) -> Valu
         "ItemShape": {
             "__type": "ItemResponseShape:#Exchange",
             "BaseShape": "IdOnly",
-            "AdditionalProperties": META_FIELDS.iter().map(|f| property_uri(f)).collect::<Vec<_>>()
+            "AdditionalProperties": meta_properties()
         },
         "ParentFolderIds": [ folder_ref_json(folder) ],
         "Traversal": "Shallow",
@@ -171,6 +186,10 @@ pub fn get_item_body(ids: &[ItemId], shape_name: &str, max_body: u64, with_reply
     });
     if with_reply_to {
         shape["AdditionalProperties"] = json!([property_uri(REPLY_TO_FIELD)]);
+    }
+    // Форма списка (дозапрос метаданных без тел) — ещё и последнее действие с письмом.
+    if shape_name == "MailListItem" {
+        shape["AdditionalProperties"] = Value::Array(verb_extended_props());
     }
     json!({
         "__type": "GetItemRequest:#Exchange",
@@ -1605,7 +1624,37 @@ pub fn parse_message_meta(v: &Value) -> Option<MessageMeta> {
         flag: v.get("Flag").and_then(|f| str_of(f, "FlagStatus")).map(FlagStatus::parse).unwrap_or_default(),
         size: i64_of(v, "Size"),
         preview: str_of(v, "Preview").map(String::from),
+        last_verb: extended_value(v, "0x1081").and_then(verb_code).and_then(LastVerb::from_code).or_else(|| str_of(v, "IconIndex").and_then(LastVerb::from_icon_index)),
+        last_verb_at: extended_value(v, "0x1082").and_then(Value::as_str).and_then(|s| parse_timestamp(Some(s))),
     })
+}
+
+/// Значение расширенного свойства по тегу (`ExtendedProperty[].ExtendedFieldURI.PropertyTag`,
+/// без учёта регистра; десятичная форма тега тоже принимается).
+fn extended_value<'a>(v: &'a Value, tag: &str) -> Option<&'a Value> {
+    let wanted = u32::from_str_radix(tag.trim_start_matches("0x"), 16).ok()?;
+    v.get("ExtendedProperty")?.as_array()?.iter().find_map(|p| {
+        let uri = p.get("ExtendedFieldURI")?;
+        let raw = uri.get("PropertyTag")?;
+        let found = match raw {
+            Value::String(s) => {
+                let s = s.trim();
+                if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) { u32::from_str_radix(hex, 16).ok() } else { s.parse::<u32>().ok() }
+            }
+            Value::Number(n) => n.as_u64().map(|n| n as u32),
+            _ => None,
+        }?;
+        (found == wanted).then(|| p.get("Value")).flatten()
+    })
+}
+
+/// Код из значения расширенного свойства: число или строка с числом.
+fn verb_code(v: &Value) -> Option<i64> {
+    match v {
+        Value::Number(n) => n.as_i64(),
+        Value::String(s) => s.trim().parse().ok(),
+        _ => None,
+    }
 }
 
 fn parse_body(v: &Value) -> Option<(BodyType, String, bool)> {
@@ -2021,9 +2070,32 @@ mod tests {
         let s = serde_json::to_string(&get_item_body(&ids(), "MailListItem", 4096, false)).unwrap();
         assert_eq!(
             s,
-            r#"{"__type":"GetItemRequest:#Exchange","ItemShape":{"__type":"ItemResponseShape:#Exchange","BaseShape":"IdOnly","FilterHtmlContent":true,"BlockExternalImagesIfSenderUntrusted":true,"MaximumBodySize":4096,"MaximumRecipientsToReturn":200},"ItemIds":[{"__type":"ItemId:#Exchange","Id":"A","ChangeKey":"ck1"},{"__type":"ItemId:#Exchange","Id":"B"}],"ShapeName":"MailListItem"}"#,
-            "без Reply-To форма прежняя, снятая с сервера"
+            r#"{"__type":"GetItemRequest:#Exchange","ItemShape":{"__type":"ItemResponseShape:#Exchange","BaseShape":"IdOnly","FilterHtmlContent":true,"BlockExternalImagesIfSenderUntrusted":true,"MaximumBodySize":4096,"MaximumRecipientsToReturn":200,"AdditionalProperties":[{"__type":"ExtendedPropertyUri:#Exchange","PropertyTag":"0x1081","PropertyType":"Integer"},{"__type":"ExtendedPropertyUri:#Exchange","PropertyTag":"0x1082","PropertyType":"SystemTime"}]},"ItemIds":[{"__type":"ItemId:#Exchange","Id":"A","ChangeKey":"ck1"},{"__type":"ItemId:#Exchange","Id":"B"}],"ShapeName":"MailListItem"}"#,
+            "форма списка: без Reply-To, с расширенными свойствами последнего действия"
         );
+        let sync = serde_json::to_string(&sync_folder_items_body(&FolderRef::Distinguished(DistinguishedFolder::Inbox), None, 10, true)).unwrap();
+        assert!(sync.contains(r#"{"__type":"PropertyUri:#Exchange","FieldURI":"item:IconIndex"}"#), "{sync}");
+        assert!(sync.contains(r#"{"__type":"ExtendedPropertyUri:#Exchange","PropertyTag":"0x1081","PropertyType":"Integer"},{"__type":"ExtendedPropertyUri:#Exchange","PropertyTag":"0x1082","PropertyType":"SystemTime"}]},"SyncFolderId""#), "{sync}");
+    }
+
+    #[test]
+    fn last_verb_parsed_from_extended_props_or_icon_index() {
+        let v: Value = serde_json::from_str(
+            r#"{"ItemId":{"Id":"A","ChangeKey":"k"},"Subject":"S","IconIndex":"MailReplied",
+                "ExtendedProperty":[{"ExtendedFieldURI":{"PropertyTag":"0x1081","PropertyType":"Integer"},"Value":"104"},
+                                    {"ExtendedFieldURI":{"PropertyTag":"0x1082","PropertyType":"SystemTime"},"Value":"2026-10-26T05:02:11Z"}]}"#,
+        )
+        .unwrap();
+        let m = parse_message_meta(&v).unwrap();
+        assert_eq!(m.last_verb, Some(LastVerb::Forwarded), "расширенное свойство важнее значка");
+        assert_eq!(m.last_verb_at.map(|t| t.to_string()), Some("2026-10-26T05:02:11Z".into()));
+        let v: Value = serde_json::from_str(r#"{"ItemId":{"Id":"A","ChangeKey":"k"},"IconIndex":"MailForwarded"}"#).unwrap();
+        let m = parse_message_meta(&v).unwrap();
+        assert_eq!((m.last_verb, m.last_verb_at), (Some(LastVerb::Forwarded), None));
+        let v: Value = serde_json::from_str(r#"{"ItemId":{"Id":"A","ChangeKey":"k"},"IconIndex":"MailRead","ExtendedProperty":[{"ExtendedFieldURI":{"PropertyTag":"4225","PropertyType":"Integer"},"Value":103}]}"#).unwrap();
+        assert_eq!(parse_message_meta(&v).unwrap().last_verb, Some(LastVerb::RepliedAll), "десятичный тег и число в Value");
+        let v: Value = serde_json::from_str(r#"{"ItemId":{"Id":"A","ChangeKey":"k"},"IconIndex":"MailRead"}"#).unwrap();
+        assert_eq!(parse_message_meta(&v).unwrap().last_verb, None);
     }
 
     #[test]
@@ -2896,7 +2968,7 @@ mod tests {
         assert_eq!(body["__type"], "FindItemRequest:#Exchange");
         assert_eq!(body["Paging"], json!({ "__type": "IndexedPageView:#Exchange", "BasePoint": "Beginning", "Offset": 100, "MaxEntriesReturned": 50 }));
         assert_eq!(body["SortOrder"][0]["Path"]["FieldURI"], RECENT_SORT_FIELD);
-        assert_eq!(body["ItemShape"]["AdditionalProperties"].as_array().map(Vec::len), Some(META_FIELDS.len()));
+        assert_eq!(body["ItemShape"]["AdditionalProperties"].as_array().map(Vec::len), Some(META_FIELDS.len() + verb_extended_props().len()), "свойства списка и два расширенных свойства последнего действия");
         assert_eq!(body.as_object().and_then(|o| o.keys().next()).map(String::as_str), Some("__type"));
         let msg = json!({
             "__type": "FindItemResponseMessage:#Exchange", "ResponseCode": "NoError", "ResponseClass": "Success", "HighlightTerms": null,

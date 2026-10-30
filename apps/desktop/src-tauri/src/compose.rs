@@ -1648,6 +1648,8 @@ mod tests {
                 flag: aiowa_core::FlagStatus::NotFlagged,
                 size: None,
                 preview: None,
+                last_verb: None,
+                last_verb_at: None,
             }
         };
         let metas = vec![meta("old", "Тема", 3600), meta("other", "Другая", 5), meta("fresh", "Тема ", 10), meta("fresher", "Тема", 2), meta("nostamp", "Тема", i64::MAX)];
@@ -1814,6 +1816,8 @@ mod tests {
                     flag: Default::default(),
                     size: Some(100),
                     preview: None,
+                    last_verb: None,
+                    last_verb_at: None,
                 },
                 to: vec![p("Анна", "a@y.ru"), Participant { name: Some("Старый адрес".into()), email: Some("/o=Org/cn=old".into()), routing_type: Some("EX".into()) }],
                 cc: vec![p("Вера", "v@z.ru")],

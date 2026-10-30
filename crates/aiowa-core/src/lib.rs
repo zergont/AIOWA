@@ -251,6 +251,46 @@ impl FlagStatus {
     }
 }
 
+/// Последнее действие пользователя с письмом: ответ, ответ всем, пересылка. Источник — свойство
+/// MAPI `PR_LAST_VERB_EXECUTED` (0x1081: 102, 103, 104) и значок OWA `IconIndex`
+/// (`MailReplied`, `MailForwarded`); сервер ставит его сам после своего ответа или пересылки.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum LastVerb {
+    Replied,
+    RepliedAll,
+    Forwarded,
+}
+
+impl LastVerb {
+    /// Код `PR_LAST_VERB_EXECUTED`.
+    pub const fn code(self) -> i64 {
+        match self {
+            Self::Replied => 102,
+            Self::RepliedAll => 103,
+            Self::Forwarded => 104,
+        }
+    }
+
+    pub const fn from_code(code: i64) -> Option<Self> {
+        match code {
+            102 => Some(Self::Replied),
+            103 => Some(Self::RepliedAll),
+            104 => Some(Self::Forwarded),
+            _ => None,
+        }
+    }
+
+    /// По значку OWA (`IconIndex`); у «ответа всем» значок тот же, что у ответа.
+    pub fn from_icon_index(icon: &str) -> Option<Self> {
+        match icon {
+            "MailReplied" => Some(Self::Replied),
+            "MailRepliedAll" => Some(Self::RepliedAll),
+            "MailForwarded" => Some(Self::Forwarded),
+            _ => None,
+        }
+    }
+}
+
 /// Метаданные письма: то, что нужно списку и индексу без тела.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MessageMeta {
@@ -275,6 +315,9 @@ pub struct MessageMeta {
     pub flag: FlagStatus,
     pub size: Option<i64>,
     pub preview: Option<String>,
+    /// Последнее действие с письмом (ответ, пересылка) и когда оно было, если сервер их отдал.
+    pub last_verb: Option<LastVerb>,
+    pub last_verb_at: Option<Timestamp>,
 }
 
 /// Тип тела.

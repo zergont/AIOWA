@@ -30,6 +30,25 @@ export interface Conversation {
   has_flagged: boolean;
   /** Начало текста самого свежего письма беседы в этой папке (третья строка); нет у заглушки беседы, открытой из поиска. */
   preview?: string | null;
+  /** Последнее действие с самым свежим письмом беседы в папке: 102 ответ, 103 ответ всем, 104 пересылка. */
+  last_verb?: number | null;
+}
+
+/** Код последнего действия с письмом (PR_LAST_VERB_EXECUTED): ответ, ответ всем, пересылка. */
+export const LAST_VERB = { replied: 102, repliedAll: 103, forwarded: 104 } as const;
+
+/** Подпись плашки «Вы ответили / переслали это сообщение» по коду; null — действия не было. */
+export function lastVerbText(code: number | null | undefined): string | null {
+  switch (code) {
+    case LAST_VERB.replied:
+      return "Вы ответили на это сообщение";
+    case LAST_VERB.repliedAll:
+      return "Вы ответили всем на это сообщение";
+    case LAST_VERB.forwarded:
+      return "Вы переслали это сообщение";
+    default:
+      return null;
+  }
 }
 
 export interface Recipient {
@@ -72,6 +91,9 @@ export interface Message {
   has_attachments: boolean;
   importance: string | null;
   preview: string | null;
+  /** Последнее действие с письмом (102 ответ, 103 ответ всем, 104 пересылка) и когда оно было. */
+  last_verb?: number | null;
+  last_verb_ms?: number | null;
   body_state: number;
   body_html: string | null;
   /**

@@ -288,6 +288,8 @@ mod tests {
                 flag: Default::default(),
                 size: Some(100),
                 preview: None,
+                last_verb: None,
+                last_verb_at: None,
             },
             to: vec![],
             cc: vec![],

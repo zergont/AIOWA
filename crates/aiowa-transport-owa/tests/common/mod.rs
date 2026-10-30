@@ -1438,6 +1438,7 @@ fn field_key(field: &str) -> Result<&'static str, String> {
         "item:Size" => "Size",
         "item:ItemClass" => "ItemClass",
         "item:ConversationId" => "ConversationId",
+        "item:IconIndex" => "IconIndex",
         "message:InternetMessageId" => "InternetMessageId",
         "item:Preview" => "Preview",
         "item:Flag" => "Flag",
@@ -1546,15 +1547,21 @@ fn type_first_everywhere(v: &Value, path: &str) -> Result<(), String> {
 }
 
 /// `AdditionalProperties` формы: `[{ "__type": "PropertyUri:#Exchange", "FieldURI": … }]`.
+/// Расширенные свойства (`ExtendedPropertyUri` с `PropertyTag`, п. 20 обкатки) фейк принимает,
+/// но не отдаёт: у его писем нет последнего действия.
 fn additional_properties(shape: &Value) -> Result<Vec<String>, String> {
     let Some(list) = shape.get("AdditionalProperties") else { return Ok(vec![]) };
     list.as_array()
         .ok_or("AdditionalProperties не массив")?
         .iter()
-        .map(|p| match ty(p) {
-            Some("PropertyUri:#Exchange") => p.get("FieldURI").and_then(Value::as_str).map(String::from).ok_or_else(|| "PropertyUri без FieldURI".to_string()),
-            None => Err(ABSTRACT_CLASS.to_string()),
-            Some(other) => Err(format!("фейк: путь {other} не поддерживается")),
+        .filter_map(|p| match ty(p) {
+            Some("PropertyUri:#Exchange") => Some(p.get("FieldURI").and_then(Value::as_str).map(String::from).ok_or_else(|| "PropertyUri без FieldURI".to_string())),
+            Some("ExtendedPropertyUri:#Exchange") => match p.get("PropertyTag").and_then(Value::as_str) {
+                Some(_) => None,
+                None => Some(Err("ExtendedPropertyUri без PropertyTag".to_string())),
+            },
+            None => Some(Err(ABSTRACT_CLASS.to_string())),
+            Some(other) => Some(Err(format!("фейк: путь {other} не поддерживается"))),
         })
         .collect()
 }

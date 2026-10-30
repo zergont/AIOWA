@@ -26,6 +26,8 @@
     oncompose: (itemPk: number, kind: ComposeKind) => void;
     /** Открыть черновик с карточки в композере. */
     onopendraft?: (itemPk: number) => void;
+    /** Открыть беседу письма в «Отправленных» (плашка «Вы ответили…» в карточке). */
+    onfindsent?: (itemPk: number) => void;
     /** Черновик открывается (может читаться с сервера): кнопка карточки показывает это и не жмётся повторно. */
     draftOpening?: boolean;
     /** Композер: над карточками беседы, а при `composerAlone` — вместо неё (новое письмо, чужая беседа). */
@@ -36,7 +38,7 @@
     /** С карточки дан ответ на приглашение (или отмена убрана из календаря): беседу стоит перечитать. */
     onmeeting?: () => void;
   }
-  let { conversation, messages, loading, onfetch, folders, deletedFolderPk, archiveFolderPk = null, draftsFolderPk = null, multiCount = 0, onaction, oncompose, onopendraft, draftOpening = false, composer, composerAlone = false, topExpandedPk = $bindable(null), onmeeting }: Props = $props();
+  let { conversation, messages, loading, onfetch, folders, deletedFolderPk, archiveFolderPk = null, draftsFolderPk = null, multiCount = 0, onaction, oncompose, onopendraft, draftOpening = false, composer, composerAlone = false, topExpandedPk = $bindable(null), onmeeting, onfindsent }: Props = $props();
 
   // Письма идут от новых к старым; самое свежее развёрнуто, остальные свёрнуты до заголовка.
   // Раскрытие пересчитывается только при смене беседы: точечная замена письма (догрузка тела)
@@ -126,7 +128,7 @@
           <div class="caption loading">Загрузка…</div>
         {/if}
         {#each messages as m (m.item_pk)}
-          <MessageCard message={m} expanded={expanded.has(m.item_pk)} ontoggle={() => toggle(m.item_pk)} {onfetch} {folders} {deletedFolderPk} {archiveFolderPk} {draftsFolderPk} onaction={(a, el) => onaction(m.item_pk, a, el)} oncompose={(kind) => oncompose(m.item_pk, kind)} onopendraft={onopendraft ? () => onopendraft(m.item_pk) : undefined} {draftOpening} {onmeeting} />
+          <MessageCard message={m} expanded={expanded.has(m.item_pk)} ontoggle={() => toggle(m.item_pk)} {onfetch} {folders} {deletedFolderPk} {archiveFolderPk} {draftsFolderPk} onaction={(a, el) => onaction(m.item_pk, a, el)} oncompose={(kind) => oncompose(m.item_pk, kind)} onopendraft={onopendraft ? () => onopendraft(m.item_pk) : undefined} {draftOpening} {onmeeting} onfindsent={onfindsent ? () => onfindsent(m.item_pk) : undefined} />
         {/each}
       {/if}
     </div>

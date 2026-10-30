@@ -182,6 +182,8 @@ struct ConversationDto {
     has_flagged: bool,
     /// Начало текста самого свежего письма беседы в этой папке (третья строка списка).
     preview: Option<String>,
+    /// Последнее действие с самым свежим письмом беседы в папке: 102 ответ, 103 ответ всем, 104 пересылка.
+    last_verb: Option<i64>,
 }
 
 #[derive(Serialize)]
@@ -236,6 +238,9 @@ pub(crate) struct MessageDto {
     has_attachments: bool,
     importance: Option<String>,
     preview: Option<String>,
+    /// Последнее действие с письмом (102 ответ, 103 ответ всем, 104 пересылка) и когда (мс UTC).
+    last_verb: Option<i64>,
+    last_verb_ms: Option<i64>,
     body_state: i64,
     /// Очищенный HTML тела без цитируемой истории; `None`, если тело не загружено. Цвета письма в
     /// нём — `var(--aiowa-<метка>-dN, исходный)` (`mail_dark.rs`): только для показа и печати, на
@@ -478,6 +483,8 @@ pub(crate) fn build_message(store: &Store, h: MessageHead) -> CmdResult<MessageD
         attachments,
         item_class: h.item_class,
         reply_to,
+        last_verb: h.last_verb,
+        last_verb_ms: ms(h.last_verb_at),
     })
 }
 
@@ -521,6 +528,7 @@ fn conversations(state: State<'_, AppState>, folder_pk: i64, after_ms: Option<i6
             has_attachments: r.has_attachments,
             has_flagged: r.has_flagged,
             preview: r.preview,
+            last_verb: r.last_verb,
         })
         .collect())
 }

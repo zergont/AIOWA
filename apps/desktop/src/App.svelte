@@ -274,6 +274,22 @@
     }
   }
 
+  /** Плашка «Вы ответили / переслали»: та же беседа в «Отправленных», где лежит ответ или пересылка. */
+  async function findSentOfSelected() {
+    const pk = selected?.conversation_pk;
+    const sent = folders.find((f) => f.folder_pk === sentFolderPk);
+    if (pk == null || !sent) {
+      error = "Папка «Отправленные» ещё не синхронизирована";
+      return;
+    }
+    try {
+      if (selectedFolder?.folder_pk !== sent.folder_pk) await openFolder(sent);
+      await openConversationByPk(pk);
+    } catch (e) {
+      error = errorMessage(e);
+    }
+  }
+
   /** Пока идёт отправка, композер не заменяется: иначе её итог пришёл бы уже в другой композер. */
   function busyText(): string {
     return composerBusy === "send" ? "Подожди: письмо отправляется" : "Подожди: черновик сохраняется";
@@ -1729,7 +1745,7 @@
   <div class="splitter" class:off={section !== "mail"} role="separator" aria-orientation="vertical" aria-label="Ширина списка" onpointerdown={startDrag}></div>
 
   <section class="reader" class:off={section !== "mail"} aria-label="Чтение" bind:this={readerEl}>
-    <ReadingPane conversation={multiCount ? null : selected} messages={multiCount ? [] : messages} loading={loadingMessages} onfetch={fetchMessage} {folders} {deletedFolderPk} archiveFolderPk={archiveFolder?.folder_pk ?? null} {draftsFolderPk} {multiCount} onaction={onMessageAction} oncompose={composeFromMessage} onopendraft={(itemPk) => openDraft(itemPk, selected?.conversation_pk ?? null)} draftOpening={composeLoading === "draft"} composer={compose ? composerSnippet : undefined} {composerAlone} bind:topExpandedPk onmeeting={() => void rereadConversation()} />
+    <ReadingPane conversation={multiCount ? null : selected} messages={multiCount ? [] : messages} loading={loadingMessages} onfetch={fetchMessage} {folders} {deletedFolderPk} archiveFolderPk={archiveFolder?.folder_pk ?? null} {draftsFolderPk} {multiCount} onaction={onMessageAction} oncompose={composeFromMessage} onopendraft={(itemPk) => openDraft(itemPk, selected?.conversation_pk ?? null)} onfindsent={findSentOfSelected} draftOpening={composeLoading === "draft"} composer={compose ? composerSnippet : undefined} {composerAlone} bind:topExpandedPk onmeeting={() => void rereadConversation()} />
   </section>
 
   {#if calendarMounted}

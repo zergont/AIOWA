@@ -47,6 +47,8 @@ fn meta(id: &str, subject: &str, days_ago: i64) -> MessageMeta {
         flag: FlagStatus::NotFlagged,
         size: Some(1000),
         preview: None,
+        last_verb: None,
+        last_verb_at: None,
     }
 }
 

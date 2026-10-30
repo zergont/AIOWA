@@ -205,7 +205,7 @@ async fn folder_sync_through_trait() {
         let st = server.state();
         let calls = st.calls_of("SyncFolderItems");
         assert_eq!(calls[0].version, "Exchange2013");
-        assert_eq!(calls[0].body["ItemShape"]["AdditionalProperties"].as_array().map(Vec::len), Some(protocol::META_FIELDS.len()));
+        assert_eq!(calls[0].body["ItemShape"]["AdditionalProperties"].as_array().map(Vec::len), Some(protocol::META_FIELDS.len() + 2), "свойства списка и два расширенных свойства последнего действия");
         assert_eq!(calls[0].body["SyncFolderId"]["BaseFolderId"], json!({ "__type": "FolderId:#Exchange", "Id": INBOX }));
         assert_eq!((calls[0].body["MaxChangesReturned"].as_u64(), calls[0].body.get("SyncState").is_none()), (Some(2), true));
         assert!(calls[1].body["SyncState"].is_string(), "следующая пачка — с состоянием из ответа");
@@ -243,7 +243,8 @@ async fn folder_sync_through_trait() {
     let meta_only = t.get_items(std::slice::from_ref(&shipment.item_id), ItemFetchShape::Meta).await.unwrap();
     assert!(matches!(&meta_only[0], ItemResult::Ok(m) if m.body.is_none() && m.to.is_empty() && m.meta.subject.as_deref() == Some(SHIPMENT)));
     let body = last_body(&server, "GetItem");
-    assert_eq!((body["ShapeName"].as_str(), body["ItemShape"].get("AdditionalProperties")), (Some("MailListItem"), None));
+    assert_eq!(body["ShapeName"].as_str(), Some("MailListItem"));
+    assert_eq!(body["ItemShape"]["AdditionalProperties"], json!(protocol::verb_extended_props()), "форма списка: без Reply-To, с последним действием");
     let normalized = t.get_items(std::slice::from_ref(&shipment.item_id), ItemFetchShape::WithFullBody).await.unwrap();
     assert!(matches!(&normalized[0], ItemResult::Ok(m) if m.body.as_ref().and_then(|b| b.full_body.as_deref()).is_some_and(|b| b.contains("Колыму"))));
     assert_eq!(last_body(&server, "GetItem")["ShapeName"], "ItemNormalizedBody");

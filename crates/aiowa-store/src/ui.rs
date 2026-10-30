@@ -33,6 +33,10 @@ pub struct MessageHead {
     /// Адреса `Reply-To` письма (`recipients.kind = 4`), как прислал сервер; пусто без заголовка
     /// или пока тело не загружено. Что из них ставить в «Кому» ответа — `aiowa_core::effective_reply_to`.
     pub reply_to: Vec<Participant>,
+    /// Последнее действие с письмом: код `PR_LAST_VERB_EXECUTED` (102 ответ, 103 ответ всем,
+    /// 104 пересылка) и когда; `None` — не было или сервер не отдал.
+    pub last_verb: Option<i64>,
+    pub last_verb_at: Option<Timestamp>,
 }
 
 /// Тело письма для показа.
@@ -76,7 +80,7 @@ pub struct MessageKey {
 
 /// Выборка заголовка письма в порядке, который разбирает `head_row`.
 const HEAD_SELECT: &str = "SELECT i.item_pk, i.folder_pk, f.display_name, i.subject, i.from_name, i.from_email, i.display_to, i.received_at, i.sent_at,
-        i.is_read, i.is_draft, i.has_attachments, i.importance, i.preview, i.body_state, i.flag_status = 'Flagged', i.item_class
+        i.is_read, i.is_draft, i.has_attachments, i.importance, i.preview, i.body_state, i.flag_status = 'Flagged', i.item_class, i.last_verb, i.last_verb_at
  FROM items i LEFT JOIN folders f ON f.folder_pk = i.folder_pk";
 
 fn head_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<MessageHead> {
@@ -99,12 +103,14 @@ fn head_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<MessageHead> {
         is_flagged: r.get::<_, Option<i64>>(15)?.unwrap_or(0) != 0,
         item_class: r.get(16)?,
         reply_to: Vec::new(),
+        last_verb: r.get(17)?,
+        last_verb_at: ms_ts(r.get(18)?),
     })
 }
 
 /// Начало текста самого свежего письма беседы `?1` в папке `?2` (см. `fill_previews`). Тот же
 /// текст проверяет на план тест: запрос должен идти по индексу `items_conv_folder`.
-const PREVIEW_SQL: &str = "SELECT preview FROM items WHERE conversation_pk = ?1 AND folder_pk = ?2 AND deleted = 0
+const PREVIEW_SQL: &str = "SELECT preview, last_verb FROM items WHERE conversation_pk = ?1 AND folder_pk = ?2 AND deleted = 0
  ORDER BY COALESCE(received_at, sent_at) DESC, item_pk DESC LIMIT 1";
 
 /// Дописывает строкам бесед начало текста самого свежего письма беседы в папке `folder_pk`
@@ -114,7 +120,9 @@ const PREVIEW_SQL: &str = "SELECT preview FROM items WHERE conversation_pk = ?1 
 pub(crate) fn fill_previews(c: &Connection, folder_pk: i64, rows: &mut [ConversationRow]) -> rusqlite::Result<()> {
     let mut st = c.prepare_cached(PREVIEW_SQL)?;
     for row in rows {
-        row.preview = st.query_row(params![row.conversation_pk, folder_pk], |r| r.get::<_, Option<String>>(0)).optional()?.flatten().filter(|p| !p.trim().is_empty());
+        let latest = st.query_row(params![row.conversation_pk, folder_pk], |r| Ok((r.get::<_, Option<String>>(0)?, r.get::<_, Option<i64>>(1)?))).optional()?;
+        row.preview = latest.as_ref().and_then(|(p, _)| p.clone()).filter(|p| !p.trim().is_empty());
+        row.last_verb = latest.and_then(|(_, v)| v);
     }
     Ok(())
 }
@@ -155,6 +163,7 @@ impl Store {
                         has_attachments: r.get::<_, i64>(6)? != 0,
                         has_flagged: r.get::<_, i64>(7)? != 0,
                         preview: None,
+                        last_verb: None,
                     })
                 })?
                 .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -301,6 +310,8 @@ mod tests {
             flag: Default::default(),
             size: Some(100),
             preview: preview.map(String::from),
+            last_verb: None,
+            last_verb_at: None,
         }
     }
 

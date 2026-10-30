@@ -881,6 +881,27 @@ CLI: `aiowa directory [--query Q] [--resolve] [--prefix3] [--expand first|АДР
 повторяется. Вход (`auth.owa`) повторяется только при неустановленном соединении: ушедший вход мог
 создать сессию. В ошибке транспорта эти случаи различимы: `Connect` и `Network`.
 
+## 5p. Последнее действие с письмом: `IconIndex` и `PR_LAST_VERB_*` (клиент, 30.10.2026)
+
+Для пометок «ответил» и «переслал» (docs/obkatka.md п. 20) к свойствам списка (`META_FIELDS`,
+§ 5b') добавлены `item:IconIndex` и два расширенных свойства:
+
+```json
+{ "__type": "ExtendedPropertyUri:#Exchange", "PropertyTag": "0x1081", "PropertyType": "Integer" },
+{ "__type": "ExtendedPropertyUri:#Exchange", "PropertyTag": "0x1082", "PropertyType": "SystemTime" }
+```
+
+Они идут в `AdditionalProperties` `SyncFolderItems` (`IdOnly`), `FindItem` последних писем (§ 5m) и
+`GetItem` формы списка (`ShapeName: MailListItem` + `AdditionalProperties`). Сервер принял все три
+(снято 30.10.2026: пачки `SyncFolderItems` прошли, `GetItem` по 25 писем — 638 писем за 6,2 с).
+Ответ: у элемента `IconIndex` (`MailReplied`, `MailForwarded`, у непрочитанных/прочитанных без
+действия — другие значения) и `ExtendedProperty: [ { "ExtendedFieldURI": { "PropertyTag": "0x1081",
+"PropertyType": "Integer" }, "Value": "104" }, { … "0x1082" …, "Value": "2026-10-29T10:46:03Z" } ]`;
+`Value` — строка. Коды: 102 ответ отправителю, 103 ответ всем, 104 пересылка. Разбор —
+`protocol::parse_message_meta` (`last_verb`, `last_verb_at`; расширенное свойство важнее значка,
+значок — запасной путь без времени). Фейковый сервер тестов принимает `ExtendedPropertyUri`, но
+не отдаёт значений.
+
 ## 6. Что это значит для клиента
 
 1. Вход: POST формы, затем `sessiondata.ashx` даёт профиль, дерево папок и первую страницу входящих.
