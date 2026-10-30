@@ -5,7 +5,7 @@ members = ["crates/*", "apps/desktop/src-tauri"]
 exclude = ["spike/owa-probe"]
 
 [workspace.package]
-version = "0.2.1"
+version = "0.2.2"
 edition = "2024"
 publish = false
 
