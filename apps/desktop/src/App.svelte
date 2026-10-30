@@ -330,6 +330,9 @@
       } catch (e) {
         console.warn("compose_context для локального черновика:", errorMessage(e));
         ctx = await api.composeContext("new", null);
+        // Ответ или пересылка уже на сервере: вид и оригинал остаются, чтобы сохранение не заменило
+        // тело с цитатой одним новым текстом, а сказало, что цитату не собрать.
+        if (d.draft_server_id && d.kind !== "new") ctx = { ...ctx, kind: d.kind, reference_item_pk: d.reference_item_pk };
       }
       compose = { ...ctx, to: d.to, cc: d.cc, bcc: d.bcc, subject: d.subject, body_html: d.body_html, restore: d };
       composeConversationPk = null;

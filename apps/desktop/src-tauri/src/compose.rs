@@ -32,7 +32,7 @@
 use crate::ondemand::{describe_transport, is_stale_object, timed_out};
 use crate::sync::SyncState;
 use crate::{build_message, err, prepare_attachments, AppState, CmdResult, ComposeRecipientDto, InlineMap, MessageDto, ParticipantDto, RecipientDto};
-use aiowa_core::{AccountId, AttachmentMeta, BodyType, ComposeKind, DistinguishedFolder, FolderRef, Importance, ItemId, MessageFull, MessageMeta, OutgoingAttachment, OutgoingMessage, Participant};
+use aiowa_core::{AccountId, AttachmentMeta, BodyType, ComposeKind, DistinguishedFolder, DraftContent, FolderRef, Importance, ItemId, MessageFull, MessageMeta, OutgoingAttachment, OutgoingMessage, Participant};
 use aiowa_store::ui::RecipientRow;
 use aiowa_store::{AttachmentRow, LocalDraft as StoredDraft, Store};
 use aiowa_transport::{DeleteMode, ItemFetchShape, ItemResult, MailTransport, TransportError, WriteResult};
@@ -56,6 +56,10 @@ const SEND_TIMEOUT: Duration = Duration::from_secs(60);
 const REREAD_TIMEOUT: Duration = Duration::from_secs(15);
 /// Сколько цитат оригиналов держать в памяти (композер один, хватит с запасом).
 const QUOTE_CACHE: usize = 4;
+/// Сколько попыток `CreateItem` с неизвестным исходом помнить на композер.
+const LOST_KEPT: usize = 4;
+/// Сколько черновиков-кандидатов читать (`GetItem`), сверяя адреса с оборванной попыткой.
+const ADOPT_CHECKS: usize = 3;
 /// Лимит одного файла вложения.
 pub(crate) const MAX_ATTACHMENT_BYTES: u64 = 25 * 1024 * 1024;
 /// Лимит всех вложений письма вместе.
@@ -70,6 +74,10 @@ const SIGNATURE_AUTO_KEY: &str = "desktop.signature_auto";
 
 /// Текст для окна, когда черновик создан, а дальше не вышло.
 const DRAFT_KEPT: &str = "Письмо не отправлено, черновик сохранён на сервере в «Черновиках»";
+/// Цитату ответа или пересылки не собрать: оригинала нет ни в базе, ни на сервере.
+const ORIGINAL_GONE: &str = "Исходное письмо удалено или перенесено: цитату не собрать, черновик на сервере не обновлён — в «Черновиках» он остался с цитатой, но без последних правок";
+/// `UpdateItem` черновика, которого на сервере нет.
+const DRAFT_GONE: &str = "Черновика на сервере нет: он удалён или письмо уже ушло раньше. Проверьте «Отправленные», прежде чем отправлять заново";
 
 /// Отказ команды композера для окна: текст и что с ним делать. Окно показывает «Повторить»
 /// только при `retry`, а при `network` само повторяет автосохранение и говорит, что текст пока
@@ -125,17 +133,48 @@ impl From<String> for ComposeFail {
 }
 
 /// Состояние композера: один замок на отправку и сохранение черновика, последние известные
-/// ключи изменений черновиков, с которыми работало окно (окно передаёт только серверный `Id`), и
+/// ключи изменений черновиков, с которыми работало окно (окно передаёт только серверный `Id`),
 /// цитаты оригиналов для обновляемых черновиков ответа и пересылки (ключ — `item_pk` оригинала:
-/// полное тело читается с сервера один раз, а не на каждое автосохранение).
+/// полное тело читается с сервера один раз, а не на каждое автосохранение) и попытки `CreateItem`
+/// с неизвестным исходом по локальному черновику композера (`ComposeRequest::local_draft_id`):
+/// черновик такой попытки может появиться на сервере и после поиска, следующая попытка ищет его первой.
 #[derive(Default)]
 pub(crate) struct ComposeState {
     sending: tokio::sync::Mutex<()>,
     change_keys: std::sync::Mutex<HashMap<String, Option<String>>>,
     quotes: std::sync::Mutex<Vec<(i64, Arc<String>)>>,
+    lost: std::sync::Mutex<HashMap<String, Vec<LostCreate>>>,
 }
 
 impl ComposeState {
+    /// Черновики, с которыми работали композеры этого запуска (созданные, открытые, обновлённые):
+    /// черновик оборванной попытки другого композера среди них быть не может.
+    fn known_ids(&self) -> HashSet<String> {
+        self.change_keys.lock().unwrap_or_else(|p| p.into_inner()).keys().cloned().collect()
+    }
+
+    fn lost(&self, local: Option<&str>) -> Vec<LostCreate> {
+        let Some(local) = local else { return Vec::new() };
+        self.lost.lock().unwrap_or_else(|p| p.into_inner()).get(local).cloned().unwrap_or_default()
+    }
+
+    fn remember_lost(&self, local: Option<&str>, attempt: LostCreate) {
+        let Some(local) = local else { return };
+        let mut lost = self.lost.lock().unwrap_or_else(|p| p.into_inner());
+        let list = lost.entry(local.to_string()).or_default();
+        list.push(attempt);
+        if list.len() > LOST_KEPT {
+            list.remove(0);
+        }
+    }
+
+    /// У композера есть черновик на сервере: оборванные попытки больше не ищутся.
+    fn clear_lost(&self, local: Option<&str>) {
+        if let Some(local) = local {
+            self.lost.lock().unwrap_or_else(|p| p.into_inner()).remove(local);
+        }
+    }
+
     /// Идентификатор черновика с последним известным `ChangeKey` (без него — только `Id`:
     /// `UpdateItem` идёт с `AlwaysOverwrite`, устаревший ключ ему не помеха).
     fn item_id(&self, server_id: &str) -> ItemId {
@@ -350,6 +389,27 @@ impl LocalDraftDto {
             attachments: list(&d.attachments_json),
             removed_attachment_ids: list(&d.removed_json),
             updated_ms: d.updated_at,
+        }
+    }
+
+    /// Локальный черновик из запроса отправки, уже записанного в черновик на сервере (`server_id`):
+    /// пишется перед `SendItem`. Если окно закроется или приложение упадёт во время отправки,
+    /// «Открыть» из полосы «Несохранённое письмо» пойдёт через этот черновик (`UpdateItem`, а у уже
+    /// отправленного — отказ), а не создаст новый и не отправит письмо второй раз.
+    fn sending(draft_id: &str, req: &ComposeRequest, server_id: &str, attachments: Vec<PickedFile>) -> Self {
+        Self {
+            draft_id: draft_id.to_string(),
+            kind: req.kind,
+            reference_item_pk: req.reference_item_pk,
+            draft_server_id: Some(server_id.to_string()),
+            subject: req.subject.trim().to_string(),
+            to: req.to.clone(),
+            cc: req.cc.clone(),
+            bcc: req.bcc.clone(),
+            body_html: req.body_html.clone(),
+            attachments,
+            removed_attachment_ids: req.removed_attachment_ids.clone(),
+            updated_ms: 0,
         }
     }
 }
@@ -596,6 +656,11 @@ fn draft_id_of(req: &ComposeRequest) -> Option<String> {
     req.draft_server_id.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(String::from)
 }
 
+/// Локальный черновик композера из запроса; пустая строка — «нет».
+fn local_id_of(req: &ComposeRequest) -> Option<&str> {
+    req.local_draft_id.as_deref().map(str::trim).filter(|s| !s.is_empty())
+}
+
 /// `AttachmentId` убранных вложений: без пустых и повторов, порядок сохранён.
 fn removed_ids(req: &ComposeRequest) -> Vec<String> {
     let mut seen = HashSet::new();
@@ -682,8 +747,8 @@ fn store_signature(store: &Store, account: AccountId, sig: &SignatureDto) -> Cmd
 }
 
 /// Вид письма для транспорта: у ответа и пересылки — идентификатор оригинала из базы. Если
-/// черновик уже на сервере (`existing`), оригинал нужен только для цитаты: удалённый оригинал
-/// не мешает ни обновить, ни отправить черновик — вид становится `New`.
+/// черновик уже на сервере (`existing`), вид для его обновления не нужен и удалённый оригинал
+/// здесь не мешает — вид становится `New`; цитату без оригинала не собрать, это решает `append_quote`.
 fn compose_kind(store: &Store, kind: ComposeKindDto, reference_item_pk: Option<i64>, existing: bool) -> CmdResult<ComposeKind> {
     if !kind.needs_reference() {
         return Ok(ComposeKind::New);
@@ -696,7 +761,7 @@ fn compose_kind(store: &Store, kind: ComposeKindDto, reference_item_pk: Option<i
     let reference = match store.item_ref(pk).map_err(err)? {
         Some(r) => r.id,
         None if existing => {
-            warn!(reference_pk = pk, "исходное письмо удалено, черновик на сервере остаётся: продолжаем без оригинала");
+            warn!(reference_pk = pk, "исходное письмо удалено, черновик уже на сервере: вид для его обновления не нужен");
             return Ok(ComposeKind::New);
         }
         None => return Err("Исходное письмо удалено".to_string()),
@@ -829,12 +894,22 @@ async fn step<T>(sync: &SyncState, what: &'static str, limit: Duration, fut: imp
         Ok(Err(e)) => {
             warn!(step = what, ms = started.elapsed().as_millis() as u64, error = %e.chain(), "шаг композера отклонён");
             sync.invalidate_on(&e).await;
-            Err(ComposeFail::from_transport(&e))
+            Err(step_fail(what, &e))
         }
         Err(_) => {
             warn!(step = what, limit_s = limit.as_secs(), "шаг композера не уложился в таймаут");
             Err(ComposeFail::timed_out(limit))
         }
+    }
+}
+
+/// Отказ шага для окна. `UpdateItem` черновика, которого на сервере нет, — не голый код, а что
+/// могло случиться: черновик удалён или письмо уже ушло (окно закрылось во время отправки, и
+/// письмо открыто из полосы «Несохранённое письмо»); новое письмо из того же текста стало бы дублем.
+fn step_fail(what: &str, e: &TransportError) -> ComposeFail {
+    match e {
+        TransportError::Server { code, .. } if what == "UpdateItem" && code == ITEM_NOT_FOUND => ComposeFail::fixed(DRAFT_GONE),
+        _ => ComposeFail::from_transport(e),
     }
 }
 
@@ -869,36 +944,53 @@ async fn server_files(sync: &SyncState, transport: &impl MailTransport, item: &I
 }
 
 /// Дописывает к телу обновляемого черновика цитату оригинала (ответ, ответ всем, пересылка):
-/// `UpdateItem` заменяет тело целиком, а сервер цитирует только при создании. Тело оригинала
-/// читается с сервера полностью (`ItemNormalizedBody`: в базе только `UniqueBody`, без истории
-/// переписки) и запоминается в `ComposeState`. Сервер не ответил — ошибка: без цитаты черновик не
-/// обновляется. Оригинала больше нет (удалён в базе или на сервере) — черновик обновляется без
-/// цитаты: сохранённый черновик не должен зависеть от исходного письма (п. 22 обкатки).
+/// `UpdateItem` заменяет тело целиком, а сервер цитирует только при создании. Цитата — из
+/// `original_quote`. Не вышло (сервер не ответил, оригинала больше нет) — ошибка: без цитаты
+/// черновик не обновляется, иначе тело с цитатой сервера молча заменилось бы одним новым текстом.
+/// Текст при этом остаётся в окне и в локальном черновике.
 async fn append_quote(state: &AppState, sync: &SyncState, transport: &impl MailTransport, cs: &ComposeState, req: &ComposeRequest, msg: &mut OutgoingMessage) -> Result<(), ComposeFail> {
     let (true, Some(pk)) = (req.kind.needs_reference(), req.reference_item_pk) else { return Ok(()) };
-    let quote = match cs.cached_quote(pk) {
-        Some(q) => q,
-        None => {
-            let Some(reference) = state.store.item_ref(pk).map_err(err)?.map(|r| r.id) else {
-                warn!(reference_pk = pk, "исходное письмо удалено: черновик обновляется без цитаты");
-                return Ok(());
-            };
-            let got = step(sync, "GetItem", CREATE_TIMEOUT, transport.get_items(std::slice::from_ref(&reference), ItemFetchShape::WithFullBody)).await?;
-            let q = match got.into_iter().next() {
-                Some(ItemResult::Ok(m)) => Arc::new(quote_from_full(&m)?),
-                Some(ItemResult::Failed { code, .. }) if code == ITEM_NOT_FOUND => {
-                    warn!(reference_pk = pk, "исходного письма нет на сервере: черновик обновляется без цитаты");
-                    return Ok(());
-                }
-                Some(ItemResult::Failed { code, .. }) => return Err(ComposeFail::retryable(format!("Исходное письмо не прочитано с сервера ({code}) — цитату не собрать, черновик не обновлён"))),
-                None => return Err(ComposeFail::retryable("Сервер не вернул исходное письмо — цитату не собрать, черновик не обновлён")),
-            };
-            cs.remember_quote(pk, q.clone());
-            q
-        }
-    };
+    let quote = original_quote(state, sync, transport, cs, pk).await?;
     msg.body_html.push_str(&quote);
     Ok(())
+}
+
+/// Цитата оригинала `pk` из памяти или с сервера: тело читается полностью (`ItemNormalizedBody`:
+/// в базе только `UniqueBody`, без истории переписки) и запоминается в `ComposeState`.
+async fn original_quote(state: &AppState, sync: &SyncState, transport: &impl MailTransport, cs: &ComposeState, pk: i64) -> Result<Arc<String>, ComposeFail> {
+    if let Some(q) = cs.cached_quote(pk) {
+        return Ok(q);
+    }
+    let reference = quote_reference(&state.store, pk)?;
+    let got = step(sync, "GetItem", CREATE_TIMEOUT, transport.get_items(std::slice::from_ref(&reference), ItemFetchShape::WithFullBody)).await?;
+    let q = Arc::new(quote_of(pk, got.into_iter().next())?);
+    cs.remember_quote(pk, q.clone());
+    Ok(q)
+}
+
+/// Идентификатор оригинала для цитаты; удалён в базе — отказ без повтора.
+fn quote_reference(store: &Store, pk: i64) -> Result<ItemId, ComposeFail> {
+    match store.item_ref(pk).map_err(err)? {
+        Some(r) => Ok(r.id),
+        None => {
+            warn!(reference_pk = pk, "исходное письмо удалено: цитату не собрать, черновик не обновляется");
+            Err(ComposeFail::fixed(ORIGINAL_GONE))
+        }
+    }
+}
+
+/// Цитата из ответа `GetItem` оригинала. Оригинала нет на сервере (`ErrorItemNotFound`: удалён или
+/// перенесён в другом клиенте) — отказ без повтора; другой отказ или пустой ответ — с повтором.
+fn quote_of(pk: i64, got: Option<ItemResult>) -> Result<String, ComposeFail> {
+    match got {
+        Some(ItemResult::Ok(m)) => Ok(quote_from_full(&m)?),
+        Some(ItemResult::Failed { code, .. }) if code == ITEM_NOT_FOUND => {
+            warn!(reference_pk = pk, "исходного письма нет на сервере: цитату не собрать, черновик не обновляется");
+            Err(ComposeFail::fixed(ORIGINAL_GONE))
+        }
+        Some(ItemResult::Failed { code, .. }) => Err(ComposeFail::retryable(format!("Исходное письмо не прочитано с сервера ({code}) — цитату не собрать, черновик не обновлён"))),
+        None => Err(ComposeFail::retryable("Сервер не вернул исходное письмо — цитату не собрать, черновик не обновлён")),
+    }
 }
 
 /// Чем кончилась запись черновика с вложениями (`write_draft`), если не всем.
@@ -910,21 +1002,23 @@ enum DraftFailure {
 }
 
 /// Записать письмо в черновик на сервере вместе с вложениями: нового — `CreateItem`, существующего
-/// (`existing`) — цитата у ответа и `UpdateItem`; затем сверка с сервером, новые файлы и удаление
-/// убранных. `prepared` — то, что вернул `prepare`. Ключ черновика запоминается после каждого
-/// шага. Возвращает черновик и признак, что вложения менялись.
+/// (`existing`) и найденного после оборванного `CreateItem` — цитата у ответа и `UpdateItem`
+/// (`rewrite_draft`); затем сверка с сервером, новые файлы и удаление убранных. `prepared` — то,
+/// что вернул `prepare`. Ключ черновика запоминается после каждого шага. Возвращает черновик и
+/// признак, что вложения менялись.
 async fn write_draft(state: &AppState, sync: &SyncState, transport: &impl MailTransport, cs: &ComposeState, req: &ComposeRequest, prepared: (ComposeKind, OutgoingMessage, Vec<OutgoingAttachment>), existing: Option<&str>) -> Result<(ItemId, bool), DraftFailure> {
     let (kind, mut msg, files) = prepared;
-    let (mut current, files, removed) = match existing {
-        None => {
-            let draft = create_draft_fresh(state, sync, transport, kind, &msg, req.reference_item_pk).await.map_err(DraftFailure::Before)?;
+    let target = match existing {
+        Some(sid) => DraftTarget::Existing(cs.item_id(sid)),
+        None => create_draft_fresh(state, sync, transport, cs, kind, &msg, req).await.map_err(DraftFailure::Before)?,
+    };
+    let (mut current, files, removed) = match target {
+        DraftTarget::Created(draft) => {
             cs.remember(&draft);
             (draft, files, Vec::new())
         }
-        Some(sid) => {
-            append_quote(state, sync, transport, cs, req, &mut msg).await.map_err(DraftFailure::Before)?;
-            let current = step(sync, "UpdateItem", CREATE_TIMEOUT, transport.update_draft(&cs.item_id(sid), &msg)).await.map_err(DraftFailure::Before)?;
-            cs.remember(&current);
+        DraftTarget::Existing(item) => {
+            let current = rewrite_draft(state, sync, transport, cs, req, &mut msg, &item).await.map_err(DraftFailure::Before)?;
             let (files, removed) = reconcile(sync, transport, &current, removed_ids(req), files).await;
             (current, files, removed)
         }
@@ -949,6 +1043,26 @@ async fn write_draft(state: &AppState, sync: &SyncState, transport: &impl MailTr
         }
     }
     Ok((current, touched))
+}
+
+/// Черновик, в который пишется письмо.
+enum DraftTarget {
+    /// Только что создан `CreateItem`: текст в нём текущий, вложений ещё нет.
+    Created(ItemId),
+    /// Уже есть на сервере: существующий или найденный после `CreateItem` с неизвестным исходом (в
+    /// нём текст той попытки, а не текущий). Текущий текст пишется `rewrite_draft`.
+    Existing(ItemId),
+}
+
+/// Текущее письмо в черновик на сервере: цитата у ответа и пересылки (`append_quote`) и
+/// `UpdateItem`. После удачной записи у композера есть свой черновик — оборванные попытки
+/// `CreateItem` больше не ищутся.
+async fn rewrite_draft(state: &AppState, sync: &SyncState, transport: &impl MailTransport, cs: &ComposeState, req: &ComposeRequest, msg: &mut OutgoingMessage, item: &ItemId) -> Result<ItemId, ComposeFail> {
+    append_quote(state, sync, transport, cs, req, msg).await?;
+    let current = step(sync, "UpdateItem", CREATE_TIMEOUT, transport.update_draft(item, msg)).await?;
+    cs.remember(&current);
+    cs.clear_lost(local_id_of(req));
+    Ok(current)
 }
 
 /// Тот же вид письма с другим идентификатором оригинала.
@@ -990,81 +1104,165 @@ async fn fresh_reference(state: &AppState, sync: &SyncState, transport: &impl Ma
 /// Код отказа сервера «письма нет».
 const ITEM_NOT_FOUND: &str = "ErrorItemNotFound";
 
-/// `CreateItem` черновика. У ответа и пересылки ключ оригинала (`reference_pk`) сначала
+/// `CreateItem` черновика. У ответа и пересылки ключ оригинала (`reference_item_pk`) сначала
 /// перечитывается с сервера; если сервер всё же ответил `ErrorStaleObject` (письмо изменилось
 /// между запросами), ещё одна попытка с заново перечитанным ключом, и только потом ошибка.
-/// Обрыв после отправки `CreateItem` (исход неизвестен): черновик ищется в «Черновиках» по теме и
-/// времени, чтобы повтор не создал второй; не нашёлся — ошибка с повтором.
-async fn create_draft_fresh(state: &AppState, sync: &SyncState, transport: &impl MailTransport, kind: ComposeKind, msg: &OutgoingMessage, reference_pk: Option<i64>) -> Result<ItemId, ComposeFail> {
-    let kind = match reference_pk {
+/// Исход `CreateItem` неизвестен (обрыв после отправки, неразобранный ответ или шлюз, таймаут):
+/// попытка запоминается за локальным черновиком композера, и её черновик ищется в «Черновиках»
+/// (`adopt_lost_draft`) — сразу и перед следующим `CreateItem` того же композера (сервер мог
+/// закончить уже после поиска), чтобы повтор не создал второй. Найденный черновик — `Existing`:
+/// в нём текст той попытки, текущий записывает вызывающий. Не нашёлся — ошибка с повтором.
+async fn create_draft_fresh(state: &AppState, sync: &SyncState, transport: &impl MailTransport, cs: &ComposeState, kind: ComposeKind, msg: &OutgoingMessage, req: &ComposeRequest) -> Result<DraftTarget, ComposeFail> {
+    let reference_pk = req.reference_item_pk;
+    let local = local_id_of(req);
+    let lost = cs.lost(local);
+    if !lost.is_empty()
+        && let Some(found) = adopt_lost_draft(state, transport, cs, local, &lost).await
+    {
+        info!(?reference_pk, attempts = lost.len(), "черновик прошлой попытки найден в «Черновиках», продолжаем с ним");
+        return Ok(DraftTarget::Existing(found));
+    }
+    let mut kind = match reference_pk {
         Some(pk) if kind.reference().is_some() => with_reference(kind, fresh_reference(state, sync, transport, pk).await?),
         _ => kind,
     };
-    let started = Timestamp::now();
-    match tokio::time::timeout(CREATE_TIMEOUT, transport.create_draft(&kind, msg)).await {
-        Ok(Ok(id)) => Ok(id),
-        Ok(Err(e)) if is_stale_object(&e) && reference_pk.is_some() => {
-            let pk = reference_pk.expect("проверено выше");
-            warn!(reference_pk = pk, ck_len = kind.reference().and_then(ItemId::change_key_len), "CreateItem: ErrorStaleObject после перечитывания ключа, ещё одна попытка");
-            let kind = with_reference(kind, fresh_reference(state, sync, transport, pk).await?);
-            step(sync, "CreateItem", CREATE_TIMEOUT, transport.create_draft(&kind, msg)).await
-        }
-        Ok(Err(e)) if matches!(e, TransportError::Network(_)) => {
-            warn!(step = "CreateItem", ?reference_pk, error = %e.chain(), "обрыв после отправки CreateItem: исход неизвестен, ищу черновик в «Черновиках»");
-            sync.invalidate_on(&e).await;
-            match adopt_recent_draft(transport, &msg.subject, started).await {
-                Some(id) => {
-                    info!(?reference_pk, ck_len = id.change_key_len(), "черновик найден в «Черновиках» после обрыва, продолжаем с ним");
-                    Ok(id)
-                }
-                None => Err(ComposeFail::from_transport(&e)),
+    let mut stale_retried = false;
+    loop {
+        let started = Timestamp::now();
+        let fail = match tokio::time::timeout(CREATE_TIMEOUT, transport.create_draft(&kind, msg)).await {
+            Ok(Ok(id)) => {
+                cs.clear_lost(local);
+                return Ok(DraftTarget::Created(id));
             }
-        }
-        Ok(Err(e)) => {
-            warn!(step = "CreateItem", ?reference_pk, error = %e.chain(), "шаг композера отклонён");
-            sync.invalidate_on(&e).await;
-            Err(ComposeFail::from_transport(&e))
-        }
-        Err(_) => {
-            warn!(step = "CreateItem", ?reference_pk, limit_s = CREATE_TIMEOUT.as_secs(), "шаг композера не уложился в таймаут");
-            Err(ComposeFail::timed_out(CREATE_TIMEOUT))
-        }
+            Ok(Err(e)) if is_stale_object(&e) && !stale_retried && reference_pk.is_some() => {
+                let pk = reference_pk.expect("проверено выше");
+                warn!(reference_pk = pk, ck_len = kind.reference().and_then(ItemId::change_key_len), "CreateItem: ErrorStaleObject после перечитывания ключа, ещё одна попытка");
+                kind = with_reference(kind, fresh_reference(state, sync, transport, pk).await?);
+                stale_retried = true;
+                continue;
+            }
+            Ok(Err(e)) if outcome_unknown(&e) => {
+                warn!(step = "CreateItem", ?reference_pk, error = %e.chain(), "CreateItem без ответа: исход неизвестен, ищу черновик в «Черновиках»");
+                sync.invalidate_on(&e).await;
+                ComposeFail::from_transport(&e)
+            }
+            Ok(Err(e)) => {
+                warn!(step = "CreateItem", ?reference_pk, error = %e.chain(), "шаг композера отклонён");
+                sync.invalidate_on(&e).await;
+                return Err(ComposeFail::from_transport(&e));
+            }
+            Err(_) => {
+                warn!(step = "CreateItem", ?reference_pk, limit_s = CREATE_TIMEOUT.as_secs(), "CreateItem не уложился в таймаут: исход неизвестен, ищу черновик в «Черновиках»");
+                ComposeFail::timed_out(CREATE_TIMEOUT)
+            }
+        };
+        let attempt = LostCreate::of(msg, started);
+        cs.remember_lost(local, attempt.clone());
+        let attempts: Vec<LostCreate> = lost.iter().cloned().chain(std::iter::once(attempt)).collect();
+        return match adopt_lost_draft(state, transport, cs, local, &attempts).await {
+            Some(found) => {
+                info!(?reference_pk, ck_len = found.change_key_len(), "черновик найден в «Черновиках» после обрыва, продолжаем с ним");
+                Ok(DraftTarget::Existing(found))
+            }
+            None => Err(fail),
+        };
     }
 }
 
-/// Черновик, который сервер мог создать по оборванному `CreateItem`: самый свежий в «Черновиках»
-/// с той же темой, изменённый не раньше начала попытки (с запасом на расхождение часов). Поиск —
-/// `FindItem` последних писем папки (§ 5m), без новых форм запросов. Сбой поиска — `None`.
-async fn adopt_recent_draft(transport: &impl MailTransport, subject: &str, started: Timestamp) -> Option<ItemId> {
+/// Попытка `CreateItem` с неизвестным исходом: когда начата и что ушло на сервер (тема и адреса).
+/// По ним черновик этой попытки отличается от других черновиков с той же темой.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LostCreate {
+    started: Timestamp,
+    subject: String,
+    /// Адреса «Кому», «Копия», «Скрытая» (`address_sets`).
+    recipients: [Vec<String>; 3],
+}
+
+impl LostCreate {
+    fn of(msg: &OutgoingMessage, started: Timestamp) -> Self {
+        Self { started, subject: msg.subject.trim().to_string(), recipients: address_sets(&msg.to, &msg.cc, &msg.bcc) }
+    }
+
+    /// Письмо из списка «Черновиков» может быть черновиком этой попытки: та же тема, изменено не
+    /// раньше начала попытки (с запасом на расхождение часов).
+    fn may_be(&self, m: &MessageMeta) -> bool {
+        let since = self.started - jiff::SignedDuration::from_secs(60);
+        m.subject.as_deref().unwrap_or("").trim() == self.subject && draft_stamp(m).is_some_and(|t| t >= since)
+    }
+
+    /// Черновик с сервера — этой попытки: та же тема и те же адреса во всех трёх полях.
+    fn is(&self, d: &DraftContent) -> bool {
+        d.subject.trim() == self.subject && address_sets(&d.to, &d.cc, &d.bcc) == self.recipients
+    }
+}
+
+/// Адреса «Кому», «Копия», «Скрытая» для сравнения: без регистра и пробелов по краям, без повторов,
+/// по порядку. Участник без адреса — пустая строка: с адресом его не спутать.
+fn address_sets(to: &[Participant], cc: &[Participant], bcc: &[Participant]) -> [Vec<String>; 3] {
+    let set = |ps: &[Participant]| {
+        let mut v: Vec<String> = ps.iter().map(|p| p.email.as_deref().unwrap_or("").trim().to_lowercase()).collect();
+        v.sort();
+        v.dedup();
+        v
+    };
+    [set(to), set(cc), set(bcc)]
+}
+
+fn draft_stamp(m: &MessageMeta) -> Option<Timestamp> {
+    m.last_modified_at.or(m.received_at).or(m.sent_at)
+}
+
+/// Черновик, который сервер мог создать по `CreateItem` без ответа (`lost` — такие попытки
+/// композера): среди последних 20 в «Черновиках» (`FindItem` § 5m) кандидаты по теме и времени
+/// (`adoption_candidates`), у самых свежих `GetItem` сверяет адреса. Черновики других композеров
+/// этого запуска и других локальных черновиков (`local` — свой) не берутся: чужое письмо не должно
+/// уйти вместо этого или затереться им. Сбой поиска — `None`.
+async fn adopt_lost_draft(state: &AppState, transport: &impl MailTransport, cs: &ComposeState, local: Option<&str>, lost: &[LostCreate]) -> Option<ItemId> {
     let folder = FolderRef::Distinguished(DistinguishedFolder::Drafts);
-    match tokio::time::timeout(REREAD_TIMEOUT, transport.find_recent_items(&folder, 20)).await {
-        Ok(Ok(metas)) => pick_adopted(&metas, subject, started),
+    let metas = match tokio::time::timeout(REREAD_TIMEOUT, transport.find_recent_items(&folder, 20)).await {
+        Ok(Ok(metas)) => metas,
         Ok(Err(e)) => {
             warn!(error = %e.chain(), "черновик после обрыва не найден: FindItem отклонён");
-            None
+            return None;
         }
         Err(_) => {
             warn!("черновик после обрыва не найден: FindItem не уложился в таймаут");
-            None
+            return None;
+        }
+    };
+    let mut taken = cs.known_ids();
+    match state.store.local_draft_server_ids(state.account, local) {
+        Ok(ids) => taken.extend(ids),
+        Err(e) => {
+            warn!(error = %e, "черновик после обрыва не ищется: локальные черновики не прочитаны");
+            return None;
         }
     }
+    for m in adoption_candidates(&metas, lost, &taken).into_iter().take(ADOPT_CHECKS) {
+        match tokio::time::timeout(REREAD_TIMEOUT, transport.get_draft(&m.item_id)).await {
+            Ok(Ok(d)) if lost.iter().any(|a| a.may_be(m) && a.is(&d)) => return Some(d.id),
+            Ok(Ok(_)) => debug!("черновик с той же темой — не этой попытки: адреса другие"),
+            Ok(Err(e)) => warn!(error = %e.chain(), "черновик-кандидат после обрыва не прочитан"),
+            Err(_) => warn!("черновик-кандидат после обрыва не прочитан за таймаут"),
+        }
+    }
+    None
 }
 
-/// Выбор черновика по теме и времени среди последних писем «Черновиков» (чистая часть `adopt_recent_draft`).
-fn pick_adopted(metas: &[MessageMeta], subject: &str, started: Timestamp) -> Option<ItemId> {
-    let since = started - jiff::SignedDuration::from_secs(60);
-    let stamp = |m: &MessageMeta| m.last_modified_at.or(m.received_at).or(m.sent_at);
-    metas
-        .iter()
-        .filter(|m| m.subject.as_deref().unwrap_or("").trim() == subject.trim())
-        .filter(|m| stamp(m).is_some_and(|t| t >= since))
-        .max_by_key(|m| stamp(m))
-        .map(|m| m.item_id.clone())
+/// Кандидаты на черновик оборванных попыток среди последних писем «Черновиков», свежие первыми:
+/// похожие на одну из попыток (`LostCreate::may_be`) и не занятые (`taken`). Чистая часть
+/// `adopt_lost_draft`; адреса сверяются уже по `GetItem`.
+fn adoption_candidates<'a>(metas: &'a [MessageMeta], lost: &[LostCreate], taken: &HashSet<String>) -> Vec<&'a MessageMeta> {
+    let mut out: Vec<&MessageMeta> = metas.iter().filter(|m| !taken.contains(&m.item_id.id) && lost.iter().any(|a| a.may_be(m))).collect();
+    out.sort_by_key(|m| std::cmp::Reverse(draft_stamp(m)));
+    out
 }
 
-/// Ошибка транспорта на `SendItem`, при которой письмо могло уйти: обрыв связи (в том числе при
-/// чтении ответа после того, как сервер выполнил запрос) и неразобранный ответ или шлюз (ответ
-/// был, но что сервер сделал — неизвестно). Явный отказ сервера (`Server`, вход, лимиты) — нет.
+/// Ошибка транспорта на `CreateItem` и `SendItem`, при которой запрос мог быть выполнен: обрыв
+/// связи (в том числе при чтении ответа после того, как сервер выполнил запрос) и неразобранный
+/// ответ или шлюз (ответ был, но что сервер сделал — неизвестно). Явный отказ сервера (`Server`,
+/// вход, лимиты) и неустановленное соединение — нет.
 fn outcome_unknown(e: &aiowa_transport::TransportError) -> bool {
     use aiowa_transport::TransportError;
     matches!(e, TransportError::Network(_) | TransportError::Protocol { .. })
@@ -1125,6 +1323,7 @@ pub(crate) async fn compose_send(req: ComposeRequest, app: AppHandle, state: Sta
     let (kind, msg, files) = prepare(&state, &req, true).await?;
     let existing = draft_id_of(&req);
     let attached = files.len();
+    let picked: Vec<PickedFile> = req.attachments.iter().zip(&files).map(|(path, f)| PickedFile { path: path.clone(), name: f.name.clone(), size: f.bytes.len() as u64 }).collect();
     let (to, cc, bcc) = (msg.to.len(), msg.cc.len(), msg.bcc.len());
     let started = Instant::now();
     let transport = sync.transport().await.map_err(|e| ComposeFail::connect(&e).prefixed(NOT_SENT))?;
@@ -1139,6 +1338,13 @@ pub(crate) async fn compose_send(req: ComposeRequest, app: AppHandle, state: Sta
             return Ok(kept(why).with_draft(draft_ref(&state, &id), files));
         }
     };
+    // Окно может закрыться (или приложение упасть) до ответа на SendItem: локальный черновик
+    // должен знать черновик на сервере, иначе повтор из полосы «Несохранённое письмо» отправит письмо второй раз.
+    if let Some(local) = local_id_of(&req)
+        && let Err(e) = LocalDraftDto::sending(local, &req, &current.id, picked).to_row().and_then(|row| state.store.local_draft_save(state.account, &row).map_err(err))
+    {
+        warn!(error = %e, "черновик на сервере не записан в локальный черновик перед отправкой");
+    }
     match tokio::time::timeout(SEND_TIMEOUT, transport.send_draft(&current)).await {
         Ok(Ok(())) => {
             // Сервер перенёс черновик в «Отправленные» под новым идентификатором.
@@ -1235,15 +1441,25 @@ pub(crate) async fn compose_autosave(req: ComposeRequest, draft_server_id: Optio
     let mut msg = outgoing(&req, false)?;
     let started = Instant::now();
     let transport = sync.transport().await.map_err(|e| ComposeFail::connect(&e))?;
-    let id = match existing.as_deref() {
+    let target = match existing.as_deref() {
         None => {
             let kind = compose_kind(&state.store, req.kind, req.reference_item_pk, false)?;
-            create_draft_fresh(&state, &sync, &transport, kind, &msg, req.reference_item_pk).await?
+            create_draft_fresh(&state, &sync, &transport, &cs, kind, &msg, &req).await?
         }
-        Some(sid) => {
-            append_quote(&state, &sync, &transport, &cs, &req, &mut msg).await?;
-            step(&sync, "UpdateItem", CREATE_TIMEOUT, transport.update_draft(&cs.item_id(sid), &msg)).await?
+        Some(sid) => DraftTarget::Existing(cs.item_id(sid)),
+    };
+    let id = match target {
+        DraftTarget::Created(id) => {
+            // Цитата оригинала — сразу, пока он есть: следующее обновление черновика без неё не
+            // обойдётся, а оригинал до него могут удалить или перенести.
+            if let (true, Some(pk)) = (req.kind.needs_reference(), req.reference_item_pk)
+                && let Err(why) = original_quote(&state, &sync, &transport, &cs, pk).await
+            {
+                warn!(why = %why.message, "цитата оригинала не прочитана заранее");
+            }
+            id
         }
+        DraftTarget::Existing(item) => rewrite_draft(&state, &sync, &transport, &cs, &req, &mut msg, &item).await?,
     };
     cs.remember(&id);
     info!(kind = ?req.kind, updated = existing.is_some(), to = msg.to.len(), cc = msg.cc.len(), bcc = msg.bcc.len(), ms = started.elapsed().as_millis() as u64, "черновик автосохранён");
@@ -1624,38 +1840,140 @@ mod tests {
         assert_eq!((v["retry"].as_bool(), v["network"].as_bool()), (Some(true), Some(true)));
     }
 
+    fn person(email: &str) -> Participant {
+        Participant { name: Some("Имя".into()), email: Some(email.into()), routing_type: Some("SMTP".into()) }
+    }
+
+    fn letter(subject: &str, to: &[&str], cc: &[&str], bcc: &[&str]) -> OutgoingMessage {
+        let ps = |xs: &[&str]| xs.iter().map(|e| person(e)).collect::<Vec<_>>();
+        OutgoingMessage { to: ps(to), cc: ps(cc), bcc: ps(bcc), subject: subject.into(), body_html: "<p>текст</p>".into(), importance: Importance::Normal }
+    }
+
+    fn server_draft(id: &str, msg: &OutgoingMessage) -> DraftContent {
+        DraftContent { id: ItemId { id: id.into(), change_key: Some("full".into()) }, subject: msg.subject.clone(), body_html: msg.body_html.clone(), to: msg.to.clone(), cc: msg.cc.clone(), bcc: msg.bcc.clone(), importance: Importance::Normal, attachments: vec![], is_truncated: false }
+    }
+
+    fn draft_meta(id: &str, subject: &str, stamp: Option<Timestamp>) -> MessageMeta {
+        MessageMeta {
+            item_id: ItemId { id: id.into(), change_key: Some("k".into()) },
+            parent_folder_id: None,
+            conversation_id: None,
+            internet_message_id: None,
+            item_class: None,
+            subject: Some(subject.into()),
+            from: None,
+            sender: None,
+            display_to: None,
+            received_at: None,
+            sent_at: None,
+            last_modified_at: stamp,
+            is_read: true,
+            is_draft: true,
+            has_attachments: false,
+            importance: Importance::Normal,
+            flag: aiowa_core::FlagStatus::NotFlagged,
+            size: None,
+            preview: None,
+            last_verb: None,
+            last_verb_at: None,
+        }
+    }
+
     #[test]
-    fn adopted_draft_is_newest_with_same_subject_after_attempt() {
+    fn adoption_candidates_are_fresh_same_subject_and_not_taken() {
         let started = Timestamp::now();
-        let meta = |id: &str, subject: &str, secs_ago: i64| {
-            aiowa_core::MessageMeta {
-                item_id: ItemId { id: id.into(), change_key: Some("k".into()) },
-                parent_folder_id: None,
-                conversation_id: None,
-                internet_message_id: None,
-                item_class: None,
-                subject: Some(subject.into()),
-                from: None,
-                sender: None,
-                display_to: None,
-                received_at: None,
-                sent_at: None,
-                last_modified_at: (secs_ago != i64::MAX).then(|| started - jiff::SignedDuration::from_secs(secs_ago)),
-                is_read: true,
-                is_draft: true,
-                has_attachments: false,
-                importance: Importance::Normal,
-                flag: aiowa_core::FlagStatus::NotFlagged,
-                size: None,
-                preview: None,
-                last_verb: None,
-                last_verb_at: None,
-            }
-        };
-        let metas = vec![meta("old", "Тема", 3600), meta("other", "Другая", 5), meta("fresh", "Тема ", 10), meta("fresher", "Тема", 2), meta("nostamp", "Тема", i64::MAX)];
-        assert_eq!(pick_adopted(&metas, "Тема", started).map(|i| i.id), Some("fresher".into()), "самый свежий с той же темой, пробелы не в счёт");
-        assert_eq!(pick_adopted(&metas, "Нет такой", started), None);
-        assert_eq!(pick_adopted(&[meta("old", "Тема", 3600)], "Тема", started), None, "старый черновик с той же темой не берётся");
+        let ago = |s: i64| Some(started - jiff::SignedDuration::from_secs(s));
+        let lost = [LostCreate::of(&letter("Тема", &["a@y.ru"], &[], &[]), started)];
+        let metas = vec![
+            draft_meta("old", "Тема", ago(3600)),
+            draft_meta("other", "Другая", ago(5)),
+            draft_meta("fresh", "Тема ", ago(10)),
+            draft_meta("fresher", "Тема", ago(2)),
+            draft_meta("nostamp", "Тема", None),
+            draft_meta("taken", "Тема", ago(1)),
+        ];
+        let taken: HashSet<String> = ["taken".to_string()].into();
+        let ids = |v: Vec<&MessageMeta>| v.into_iter().map(|m| m.item_id.id.clone()).collect::<Vec<_>>();
+        assert_eq!(ids(adoption_candidates(&metas, &lost, &taken)), vec!["fresher", "fresh"], "свежие первыми, пробелы в теме не в счёт; старый, без отметки времени и занятый другим композером — нет");
+        assert!(adoption_candidates(&metas, &[], &taken).is_empty(), "без оборванных попыток не ищется ничего");
+        // Попытка, начатая раньше (прошлое автосохранение), видит и черновики, изменённые с тех пор.
+        let earlier = [LostCreate::of(&letter("Тема", &[], &[], &[]), started - jiff::SignedDuration::from_secs(4000))];
+        assert_eq!(ids(adoption_candidates(&metas, &earlier, &HashSet::new())), vec!["taken", "fresher", "fresh", "old"]);
+    }
+
+    #[test]
+    fn lost_attempt_matches_only_a_draft_with_the_same_subject_and_addresses() {
+        let msg = letter(" RE: Смета ", &["A@y.ru", "b@y.ru"], &["v@z.ru"], &["h@y.ru"]);
+        let attempt = LostCreate::of(&msg, Timestamp::now());
+        assert_eq!(attempt.subject, "RE: Смета");
+        // Тот же черновик с сервера: регистр, порядок и повторы адресов не в счёт.
+        let mut same = server_draft("D1", &msg);
+        same.to = vec![person("b@y.ru"), person(" a@Y.ru "), person("b@y.ru")];
+        assert!(attempt.is(&same));
+        // Черновик другого ответа с той же темой: другие «Кому» — не наш (его текст не должен уйти вместо этого письма).
+        assert!(!attempt.is(&server_draft("D2", &letter("RE: Смета", &["a@y.ru"], &["v@z.ru"], &["h@y.ru"]))));
+        assert!(!attempt.is(&server_draft("D3", &letter("RE: Смета", &["a@y.ru", "b@y.ru"], &["v@z.ru", "x@z.ru"], &["h@y.ru"]))), "лишний в копии");
+        assert!(!attempt.is(&server_draft("D4", &letter("RE: Смета", &["a@y.ru", "b@y.ru"], &["v@z.ru", "h@y.ru"], &[]))), "скрытый перенесён в копию");
+        assert!(!attempt.is(&server_draft("D5", &letter("RE: Другая", &["a@y.ru", "b@y.ru"], &["v@z.ru"], &["h@y.ru"]))));
+        let mut no_email = server_draft("D6", &msg);
+        no_email.bcc = vec![Participant { name: Some("h@y.ru".into()), email: None, routing_type: None }];
+        assert!(!attempt.is(&no_email), "участник без адреса не равен адресу");
+    }
+
+    #[test]
+    fn lost_attempts_are_kept_per_local_draft() {
+        let cs = ComposeState::default();
+        let attempt = |subject: &str| LostCreate::of(&letter(subject, &[], &[], &[]), Timestamp::now());
+        assert!(cs.lost(Some("L1")).is_empty());
+        cs.remember_lost(None, attempt("без композера"));
+        cs.remember_lost(Some("L1"), attempt("первая"));
+        cs.remember_lost(Some("L2"), attempt("другой композер"));
+        assert_eq!(cs.lost(None), vec![], "без локального черновика попытка не помнится");
+        assert_eq!(cs.lost(Some("L1")).iter().map(|a| a.subject.as_str()).collect::<Vec<_>>(), vec!["первая"]);
+        for i in 0..LOST_KEPT {
+            cs.remember_lost(Some("L1"), attempt(&format!("повтор {i}")));
+        }
+        let kept = cs.lost(Some("L1"));
+        assert_eq!(kept.len(), LOST_KEPT);
+        assert_eq!(kept[0].subject, "повтор 0", "самая старая вытесняется");
+        cs.clear_lost(Some("L1"));
+        assert!(cs.lost(Some("L1")).is_empty());
+        assert_eq!(cs.lost(Some("L2")).len(), 1, "попытки другого композера не трогаются");
+        // Черновики, с которыми работали композеры, известны: чужой композер их не подберёт.
+        cs.remember(&ItemId { id: "D1".into(), change_key: None });
+        assert!(cs.known_ids().contains("D1"));
+    }
+
+    #[test]
+    fn update_of_a_missing_draft_says_it_may_be_sent_already() {
+        let gone = TransportError::Server { code: ITEM_NOT_FOUND.into(), message: String::new() };
+        let fail = step_fail("UpdateItem", &gone);
+        assert_eq!(fail, ComposeFail::fixed(DRAFT_GONE), "черновика нет: повтор не поможет, а новое письмо могло бы стать дублем");
+        assert!(fail.message.contains("«Отправленные»"));
+        assert_eq!(step_fail("GetItem", &gone), ComposeFail::from_transport(&gone), "другие шаги — как раньше");
+        let net = TransportError::Network("обрыв".into());
+        assert_eq!(step_fail("UpdateItem", &net), ComposeFail::from_transport(&net));
+    }
+
+    #[test]
+    fn quote_is_not_dropped_silently_when_the_original_is_gone() {
+        let gone = quote_of(1, Some(ItemResult::Failed { id: ItemId { id: "O".into(), change_key: None }, code: ITEM_NOT_FOUND.into(), message: String::new() })).unwrap_err();
+        assert_eq!(gone, ComposeFail::fixed(ORIGINAL_GONE), "оригинала нет на сервере: черновик не обновляется, повтор не поможет");
+        assert!(gone.message.contains("цитату не собрать") && gone.message.contains("не обновлён"), "{gone:?}");
+        let busy = quote_of(1, Some(ItemResult::Failed { id: ItemId { id: "O".into(), change_key: None }, code: "ErrorServerBusy".into(), message: String::new() })).unwrap_err();
+        assert!(busy.retry && busy.message.contains("ErrorServerBusy"));
+        assert!(quote_of(1, None).unwrap_err().retry);
+    }
+
+    #[test]
+    fn local_draft_before_send_keeps_the_server_draft() {
+        let req = request(r#"{"kind":"reply","reference_item_pk":5,"to":[{"name":"Анна","email":"a@y.ru"}],"subject":" RE: Смета ","body_html":"<p>ок</p>","attachments":["C:/a.pdf"],"draft_server_id":null,"removed_attachment_ids":["att1"],"local_draft_id":" L1 "}"#);
+        assert_eq!(local_id_of(&req), Some("L1"));
+        let picked = vec![PickedFile { path: "C:/a.pdf".into(), name: "a.pdf".into(), size: 3 }];
+        let row = LocalDraftDto::sending("L1", &req, "SRV", picked).to_row().unwrap();
+        assert_eq!((row.draft_id.as_str(), row.kind.as_str(), row.reference_item_pk, row.draft_server_id.as_deref(), row.subject.as_str()), ("L1", "reply", Some(5), Some("SRV"), "RE: Смета"));
+        assert!(row.to_json.contains("a@y.ru") && row.body_html == "<p>ок</p>" && row.attachments_json.contains("a.pdf") && row.removed_json.contains("att1"));
+        assert_eq!(local_id_of(&request(r#"{"kind":"new","reference_item_pk":null,"local_draft_id":"  "}"#)), None);
     }
 
     #[test]
@@ -1877,6 +2195,17 @@ mod tests {
             assert!(local_draft(&store, pks[1]).unwrap().body_html.is_none());
             assert_eq!(local_draft(&store, pks[2]).err().as_deref(), Some("Это письмо не черновик"));
             assert_eq!(local_draft(&store, 999_999).err().as_deref(), Some("Черновик удалён"));
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn quote_reference_refuses_when_the_original_is_deleted() {
+            let (store, dir, pks) = setup("quote-ref", &[full("M1", false, "<p>оригинал</p>", None, vec![])]);
+            assert_eq!(quote_reference(&store, pks[0]).unwrap().id, "M1");
+            // Оригинал удалён в базе: черновик ответа не обновляется одним новым текстом без цитаты.
+            store.mark_deleted_local(&[pks[0]]).unwrap();
+            assert_eq!(quote_reference(&store, pks[0]).unwrap_err(), ComposeFail::fixed(ORIGINAL_GONE));
+            assert_eq!(quote_reference(&store, 999_999).unwrap_err(), ComposeFail::fixed(ORIGINAL_GONE));
             let _ = std::fs::remove_dir_all(&dir);
         }
 

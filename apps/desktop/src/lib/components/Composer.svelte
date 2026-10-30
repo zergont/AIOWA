@@ -377,8 +377,9 @@
     return () => clearTimeout(t);
   });
 
-  async function saveLocal(key: string): Promise<void> {
-    if (!alive) return;
+  /** Записать локальный черновик; null — записан, иначе текст ошибки. */
+  async function saveLocal(key: string): Promise<string | null> {
+    if (!alive) return "окно письма уже закрыто";
     try {
       await api.composeLocalSave({
         draft_id: localId,
@@ -395,8 +396,10 @@
         updated_ms: Date.now(),
       });
       if (alive) lastLocalKey = key;
+      return null;
     } catch (e) {
       console.warn("compose_local_save:", errorMessage(e));
+      return errorMessage(e);
     }
   }
 
@@ -605,9 +608,15 @@
       if (!alive) return;
       if (failNetwork(e)) {
         // Сервер недоступен: текст остаётся локальным черновиком, его предложат открыть позже.
-        await saveLocal(localSnapshot);
+        const localFailed = await saveLocal(localSnapshot);
         if (!alive) return;
-        finish("local");
+        if (!localFailed) {
+          finish("local");
+          return;
+        }
+        // Не записался и локально: закрыть — значит потерять текст.
+        error = `${errorMessage(e)}. Сохранить письмо в приложении тоже не вышло (${localFailed}) — оно есть только в этом окне.`;
+        settleClose(null);
         return;
       }
       error = errorMessage(e);
