@@ -1,9 +1,14 @@
+<script module lang="ts">
+  /** Письма, у которых получатели развёрнуты, — на время сеанса (п. 21 обкатки): карточка перерисовывается, множество живёт. */
+  const sessionRecipientsOpen = new Set<number>();
+</script>
+
 <script lang="ts">
   import { onDestroy, untrack } from "svelte";
   import { api, errorMessage, formatSize, fullDate, isInlinePicture, isPreviewable, listDate, meetingKindOf, messageNeedsFetch, personLabel, senderResponseOf, type Attachment, type ComposeKind, type Folder, type MeetingInfo, type MeetingResponse, type Message, type ResponseType, LAST_VERB, lastVerbText} from "../api";
   import { COMPOSE_ACTIONS, ICON, type ItemAction } from "../actions";
   import { meetingWhen } from "../calendar";
-  import { contactCardOpener } from "../contact";
+  import { contactCardOpener, copyText } from "../contact";
   import { focusBack } from "../popover";
   import { hint, keysOf } from "../hotkeys";
   import { printMessage } from "../print";
@@ -64,13 +69,34 @@
     return (message.reply_to ?? []).filter((p) => ((p.email ?? "").trim().toLowerCase() !== from || !p.email) && personLabel(p.name, p.email));
   });
 
+  // --- строки «Кому» и «Копия» (п. 21 обкатки) ---------------------------------------------
+  // Свёрнуто: первые имена одной строкой (длинное обрезается по буквам, не пропадает целиком) и
+  // «и ещё N»; шеврон разворачивает полный список с переносом, развёрнутость помнится на сеанс.
+  /** Сколько имён показывать в свёрнутой строке. */
+  const SHOWN_NAMES = 3;
+  let recipientsOpen = $state(untrack(() => sessionRecipientsOpen.has(message.item_pk)));
+  function toggleRecipients() {
+    recipientsOpen = !recipientsOpen;
+    if (recipientsOpen) sessionRecipientsOpen.add(message.item_pk);
+    else sessionRecipientsOpen.delete(message.item_pk);
+  }
+  const recipientsExpandable = $derived(to.length + cc.length > 1);
+  const allAddresses = $derived([...to, ...cc].map((p) => p.email?.trim() ?? "").filter((e) => e !== ""));
+  let copyNote = $state<string | null>(null);
+  let copyTimer: ReturnType<typeof setTimeout> | undefined;
+  async function copyAllAddresses() {
+    copyNote = (await copyText([...new Set(allAddresses)].join("; "))) ? "Адреса скопированы" : "Не удалось скопировать";
+    clearTimeout(copyTimer);
+    copyTimer = setTimeout(() => (copyNote = null), 2500);
+  }
+
   // --- карточка контакта ------------------------------------------------------
   // Имя отправителя и получатели развёрнутого письма открывают карточку контакта (её держит App).
   // У свёрнутого письма заголовок целиком — кнопка «развернуть», имена в нём не кликаются.
 
   const openContact = contactCardOpener();
 
-  function showContact(e: MouseEvent, name: string | null, email: string | null) {
+  function showContact(e: Event, name: string | null, email: string | null) {
     // Щелчок по имени не должен сворачивать письмо.
     e.stopPropagation();
     const addr = (email ?? "").trim();
@@ -482,7 +508,7 @@
 
 <!-- Люди через запятую; с адресом — кнопка карточки контакта. В одну строку: иначе лишние пробелы перед запятыми. -->
 {#snippet people(list: { name: string | null; email: string | null }[])}
-  {#each list as p, i (i)}{#if i}{", "}{/if}{#if openContact && p.email}<button type="button" class="person" onclick={(e) => showContact(e, p.name, p.email)} aria-haspopup="dialog" title={p.name ? `${p.email} — карточка контакта` : "Карточка контакта"}>{personLabel(p.name, p.email)}</button>{:else}{personLabel(p.name, p.email)}{/if}{/each}
+  {#each list as p, i (i)}{#if i}{", "}{/if}{#if openContact && p.email}<span role="button" tabindex="0" class="person" onclick={(e) => showContact(e, p.name, p.email)} onkeydown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); showContact(e, p.name, p.email); } }} aria-haspopup="dialog" title={p.name ? `${p.email} — карточка контакта` : "Карточка контакта"}>{personLabel(p.name, p.email)}</span>{:else}{personLabel(p.name, p.email)}{/if}{/each}
 {/snippet}
 
 <!-- Переключатель тёмных тонов письма: в панели действий письма и черновика, только в тёмной теме. -->
@@ -521,8 +547,31 @@
         {/if}
         {#if expanded}
           {#if replyTo.length}<div class="line caption reply-to" title="Ответ уйдёт по адресу из заголовка Reply-To, а не отправителю">Ответ на: {@render people(replyTo)}</div>{/if}
-          <div class="line caption" title={to.length ? peopleText(to) : undefined}>Кому: {#if to.length}{@render people(to)}{:else}{message.display_to || "—"}{/if}</div>
-          {#if cc.length}<div class="line caption" title={peopleText(cc)}>Копия: {@render people(cc)}</div>{/if}
+          <div class="line caption recipients">
+            <span class="rcpt-body" class:wrap={recipientsOpen} title={!recipientsOpen && to.length ? peopleText(to) : undefined}>
+              Кому:
+              {#if to.length}{@render people(recipientsOpen ? to : to.slice(0, SHOWN_NAMES))}{#if !recipientsOpen && to.length > SHOWN_NAMES}<button type="button" class="more" onclick={(e) => { e.stopPropagation(); toggleRecipients(); }}>и ещё {to.length - SHOWN_NAMES}</button>{/if}{:else if needsFetch}<span class="muted">загружаю получателей…</span>{:else}{message.display_to || "—"}{/if}
+            </span>
+            {#if recipientsExpandable}
+              <button type="button" class="chev" onclick={(e) => { e.stopPropagation(); toggleRecipients(); }} aria-expanded={recipientsOpen} aria-label={recipientsOpen ? "Свернуть получателей" : "Показать всех получателей"} title={recipientsOpen ? "Свернуть" : "Все получатели"}>
+                <svg class:open={recipientsOpen} width="12" height="12" viewBox="0 0 12 12" aria-hidden="true"><path d="M4 2.5 7.5 6 4 9.5" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" /></svg>
+              </button>
+            {/if}
+          </div>
+          {#if cc.length}
+            <div class="line caption recipients">
+              <span class="rcpt-body" class:wrap={recipientsOpen} title={recipientsOpen ? undefined : peopleText(cc)}>
+                Копия:
+                {@render people(recipientsOpen ? cc : cc.slice(0, SHOWN_NAMES))}{#if !recipientsOpen && cc.length > SHOWN_NAMES}<button type="button" class="more" onclick={(e) => { e.stopPropagation(); toggleRecipients(); }}>и ещё {cc.length - SHOWN_NAMES}</button>{/if}
+              </span>
+            </div>
+          {/if}
+          {#if recipientsOpen && allAddresses.length}
+            <div class="line caption rcpt-tools">
+              <button type="button" class="link-btn" onclick={(e) => { e.stopPropagation(); void copyAllAddresses(); }}>Копировать все адреса</button>
+              {#if copyNote}<span class="copy-note" role="status">{copyNote}</span>{/if}
+            </div>
+          {/if}
         {:else}
           <div class="line caption preview">{message.preview || ""}</div>
         {/if}
@@ -874,6 +923,69 @@
   .line:has(.person:focus-visible) {
     overflow: visible;
     white-space: normal;
+  }
+  /* Строки получателей: тело строки режется по буквам (имена — inline), шеврон всегда виден справа. */
+  .recipients {
+    display: flex;
+    align-items: flex-start;
+    gap: 4px;
+    overflow: visible;
+    white-space: normal;
+  }
+  .rcpt-body {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .rcpt-body.wrap,
+  .rcpt-body:has(.person:focus-visible) {
+    white-space: normal;
+    overflow: visible;
+  }
+  .rcpt-body .person {
+    display: inline;
+    cursor: default;
+  }
+  .chev {
+    flex: none;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 16px;
+    height: 16px;
+    margin-top: 1px;
+    border-radius: 3px;
+    color: var(--fg-3);
+  }
+  .chev:hover {
+    background: var(--bg-hover);
+    color: var(--fg-1);
+  }
+  .chev svg {
+    transition: transform var(--dur-fast) var(--ease-in);
+  }
+  .chev svg.open {
+    transform: rotate(90deg);
+  }
+  .more,
+  .link-btn {
+    font: inherit;
+    color: var(--accent);
+    padding: 0;
+    white-space: nowrap;
+  }
+  .more {
+    margin-left: 4px;
+  }
+  .more:hover,
+  .link-btn:hover {
+    text-decoration: underline;
+  }
+  .copy-note {
+    margin-left: 8px;
+    color: var(--fg-3);
   }
   .reply-to {
     color: var(--fg-2);
