@@ -1053,9 +1053,28 @@ EWS ожидаются `GivenName`, `Surname`, `MiddleName`, `Nickname`, `Compan
 участников (`Members: null`), `2` — с участниками (записи персон с `EmailAddress`).
 `GetNotesForPersona` — `{ "getNotesForPersonaRequest": { "__type": "GetNotesForPersonaRequest:#Exchange", "EmailAddress": null, "PersonaId": "<строкой>", "MaxBytesToFetch": 512000 } }`.
 
+**Проба записи (`aiowa contact-check --yes-i-know`, 30.10.2026, два прогона, контакт «[AIOWA] Тест …»
+с адресом `example.invalid`).** `CreatePersona` формой выше — 140–231 мс; `GetItem` (§ 5q) после
+создания видит имя, адрес и рабочий телефон. `UpdatePersona` по одному полю с `OldValue: ""`
+принят (60–70 мс) и подтверждён перечитыванием: `PersonaSurnames`, `PersonaMobilePhones`,
+`PersonaHomePhones`, `PersonaCompanyNames`, `PersonaTitles`, `PersonaDepartments`,
+`PersonaOfficeLocations` (в ответе — массивы `SurnamesArray`, `MobilePhonesArray`, …; `GetItem` —
+фамилия, компания, должность, отдел, офис, телефоны `BusinessPhone`, `HomePhone`, `MobilePhone`).
+**`PersonaNotes` — HTTP 500** `Invalid value 'PersonaNotes' for enum …PropertyUriEnum`: заметки
+персонами не пишутся. Замена заполненного поля (`OldValue` = прежнее) заменяет, а не добавляет:
+рабочий телефон — один номер; имя (`PersonaGivenNames`) и адрес (`PersonaEmails1` +
+`PersonaEmails1OriginalDisplayNames`) одним запросом — у контакта новое имя и один адрес, новый.
+`FindPeople` по папке контактов с `PersonaAttributions` (`protocol::find_folder_personas_body`)
+находит персону по `AttributionsArray[].SourceId.Id` = `ItemId` контакта, `PersonaId` совпадает с
+ответом создания. `DeletePersonas` — ответ `true`, контакт уходит в «Удалённые» (там он с классом
+`IPM.Contact`, по старому `ItemId` — `ErrorItemNotFound`). Повтор после обрыва у трёх операций
+запрещён (`is_idempotent`): повтор создания — второй контакт. Третий прогон: `CreatePersona` сразу со всеми полями
+(имя, фамилия, адрес, рабочий и мобильный телефоны, компания, должность) — все на месте при
+перечитывании; **очистка поля — `NewValue: ""`** (мобильный пропал из ответа и из `GetItem`).
+
 Не снято: правка состава группы (`UpdatePersona` с `PersonaMembers`; ключ удаления участника — в
-HAR нет, по аналогии ожидается `RemoveMemberFromPDL`), правка адреса и имени существующего
-контакта, другие поля (мобильный, компания, должность, адрес, день рождения, заметки). Связка
+HAR нет, по аналогии ожидается `RemoveMemberFromPDL`; правка групп не нужна — решение автора
+30.10.2026), почтовый адрес, день рождения, заметки. Связка
 `ItemId` контакта (его хранит синхронизация, § 5q) → `PersonaId` (нужен для правки и удаления):
 `AttributionsArray[].SourceId.Id` в ответах персон; обратный путь — `FindPeople` по папке
 контактов или `GetPersona` — пробой.

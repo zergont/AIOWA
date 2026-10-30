@@ -225,6 +225,11 @@ pub(crate) fn is_idempotent(op: &str) -> bool {
             | "EmptyFolder"
             | "SubscribeToNotification"
             | "UnsubscribeFromNotification"
+            // Персоны (личные контакты, § 5r): повтор создания — второй контакт, правки — запись
+            // поверх с уже устаревшим `OldValue`.
+            | "CreatePersona"
+            | "UpdatePersona"
+            | "DeletePersonas"
     )
 }
 
@@ -1436,6 +1441,19 @@ impl OwaTransport {
         Ok(v)
     }
 
+    /// Операция персон (`CreatePersona`, `UpdatePersona`, `GetPersona`) в конверте браузерной OWA
+    /// (`protocol::persona_envelope`, пояс пользователя из настроек транспорта). Ответ — как прислал
+    /// сервер: у записи — сама персона, у `GetPersona` — `{ ResponseCode, Persona }`.
+    pub async fn persona_call(&self, op: &str, body: Value) -> Result<Value> {
+        let payload = protocol::persona_envelope(op, &self.inner.config.time_zone, body);
+        self.call_raw(op, payload).await
+    }
+
+    /// `DeletePersonas` по `PersonaId`; ответ — `true`.
+    pub async fn delete_personas(&self, persona_ids: &[String]) -> Result<Value> {
+        self.call_raw("DeletePersonas", protocol::delete_personas_request(persona_ids)).await
+    }
+
     /// `GetPresence` по SIP-адресам (`{ "sipUris": [...] }` в теле POST, как у браузерной OWA): ответ —
     /// число-подтверждение, сами статусы приходят потоком уведомлений (`InstantMessageNotification`,
     /// § 5s). Входа в IM (`InstantMessageSignIn`) клиент не делает.
@@ -1522,7 +1540,7 @@ impl OwaTransport {
     /// Контакты и группы по идентификаторам: `GetItem` формой `AllProperties` (§ 5q) пачками по 25.
     /// Элемент, по которому сервер отказал (`ErrorItemNotFound` — удалён между вызовами) или не
     /// вернул ответ, — `None` на своей позиции. В журнал — только имена ключей первой записи.
-    async fn get_contact_items(&self, ids: &[ItemId]) -> Result<Vec<Option<ContactItem>>> {
+    pub async fn get_contact_items(&self, ids: &[ItemId]) -> Result<Vec<Option<ContactItem>>> {
         const BATCH: usize = 25;
         let mut out = Vec::with_capacity(ids.len());
         let mut logged = false;

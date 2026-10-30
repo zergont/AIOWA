@@ -469,6 +469,14 @@ enum Cmd {
         #[arg(long)]
         rows_only: bool,
     },
+    /// Проба записи личного контакта (§ 5r): CreatePersona «[AIOWA] Тест …» в «Контактах», правка
+    /// полей по одному, перечитывание, связка ItemId → PersonaId, DeletePersonas. Без --yes-i-know
+    /// только печатает план. Печатает коды, длительности и флаги, без значений
+    ContactCheck {
+        /// Действительно записать на сервер (тестовый контакт создаётся и удаляется)
+        #[arg(long)]
+        yes_i_know: bool,
+    },
     /// Проба статусов коллег без входа в IM: SIP-адреса из FindPeople, подписка
     /// InstantMessageNotification, GetPresence, поток уведомлений; InstantMessageSignIn не вызывается.
     /// Печатает только число адресов, виды блоков и значения статусов
@@ -647,6 +655,167 @@ fn describe_event(ev: &NotificationEvent, folder_names: &std::collections::HashM
         NotificationEvent::InstantMessage { payload_type, presences, .. } => format!("InstantMessage {payload_type}: статусов {}", presences.len()),
         NotificationEvent::Unknown { raw_kind } => format!("Unknown: {raw_kind}"),
     }
+}
+
+/// Поля персоны, которые проверяет `contact-check` правкой по одному: имя `FieldURI`, ключ массива в
+/// ответе персоны и тестовое значение (печатается только факт, не значение).
+const PERSONA_PROBE_UPDATES: &[(&str, &str, &str)] = &[
+    ("PersonaHomePhones", "HomePhonesArray", "+7 000 000-00-03"),
+    ("PersonaDepartments", "DepartmentsArray", "Отдел"),
+    ("PersonaOfficeLocations", "OfficeLocationsArray", "Офис"),
+];
+
+/// Проба записи личного контакта (`aiowa contact-check --yes-i-know`, § 5r): `CreatePersona`
+/// «[AIOWA] Тест …» в папке «Контакты» полями из HAR браузерной OWA, правка полей по одному
+/// (`UpdatePersona`), перечитывание `GetItem` после записи, связка `ItemId` → `PersonaId` через
+/// `FindPeople` по папке и удаление `DeletePersonas`. Печатаются коды, длительности, имена полей и
+/// флаги «записалось», без значений.
+async fn contact_check(t: &OwaTransport, store: &Store, account: AccountId) -> Result<()> {
+    use aiowa_transport_owa::protocol::{self, persona_update as upd, PERSONA_PERSON};
+    let (_, folder_server_id) = store.folder_by_distinguished(account, "contacts")?.ok_or_else(|| anyhow!("папки «Контакты» нет в локальной базе: сначала синхронизация"))?;
+    let deleted_server_id = store.folder_by_distinguished(account, "deleteditems")?.map(|(_, id)| id);
+    let folder = FolderId { id: folder_server_id, change_key: None };
+    let arrays = |v: &serde_json::Value| -> Vec<String> { v.as_object().map(|o| o.keys().filter(|k| k.ends_with("Array") || *k == "Notes").cloned().collect()).unwrap_or_default() };
+    let stamp = jiff::Zoned::now().strftime("%H:%M:%S").to_string();
+    let name = format!("[AIOWA] Тест {stamp}");
+    let email = "aiowa-test@example.invalid";
+    let phone = "+7 000 000-00-01";
+    let started = std::time::Instant::now();
+    let created = t
+        .persona_call(
+            "CreatePersona",
+            protocol::create_persona_body(
+                &folder,
+                PERSONA_PERSON,
+                vec![
+                    upd("PersonaGivenNames", Some(""), Some(&name)),
+                    upd("PersonaEmails1", None, Some(email)),
+                    upd("PersonaEmails1OriginalDisplayNames", None, Some(email)),
+                    upd("PersonaEmails1DisplayNames", None, None),
+                    upd("PersonaBusinessPhoneNumbers", Some(""), Some(phone)),
+                    // Поля сверх HAR — сразу при создании.
+                    upd("PersonaSurnames", Some(""), Some("Проверка")),
+                    upd("PersonaMobilePhones", Some(""), Some("+7 000 000-00-02")),
+                    upd("PersonaCompanyNames", Some(""), Some("[AIOWA] Компания")),
+                    upd("PersonaTitles", Some(""), Some("Тест")),
+                ],
+            ),
+        )
+        .await
+        .map_err(|e| anyhow!("CreatePersona: {}", transport_error_code(&e)))?;
+    let Some((persona_id, item_id)) = protocol::parse_persona_written(&created) else {
+        bail!("CreatePersona: в ответе нет PersonaId (ключи: {})", created.as_object().map(|o| o.keys().cloned().collect::<Vec<_>>().join(",")).unwrap_or_default());
+    };
+    println!("CreatePersona: {} мс, PersonaId {} символов, контакт {}, массивы ответа: {}", started.elapsed().as_millis(), persona_id.len(), item_id.as_ref().map(|i| format!("{} символов", i.id.len())).unwrap_or_else(|| "не найден".into()), arrays(&created).join(", "));
+    let outcome = async {
+        let item_id = item_id.ok_or_else(|| anyhow!("в ответе нет идентификатора контакта"))?;
+        let reread = |label: &'static str| {
+            let id = item_id.clone();
+            async move {
+                match t.get_contact_items(std::slice::from_ref(&id)).await {
+                    Ok(v) => match v.into_iter().next().flatten() {
+                        Some(c) => println!(
+                            "  GetItem ({label}): имя {}, фамилия {}, компания {}, должность {}, отдел {}, офис {}, адресов {}, телефонов {} [{}], заметки {}",
+                            c.given_name.is_some(), c.surname.is_some(), c.company.is_some(), c.job_title.is_some(), c.department.is_some(), c.office.is_some(),
+                            c.emails.len(), c.phones.len(), c.phones.iter().map(|p| p.key.clone().unwrap_or_else(|| "?".into())).collect::<Vec<_>>().join(","), c.notes.as_deref().is_some_and(|n| !n.trim().is_empty())
+                        ),
+                        None => println!("  GetItem ({label}): контакта нет"),
+                    },
+                    Err(e) => println!("  GetItem ({label}): отказ {}", transport_error_code(&e)),
+                }
+            }
+        };
+        reread("после создания").await;
+        // Связка ItemId → PersonaId, как для контакта, созданного не в AIOWA.
+        match t.call("FindPeople", protocol::V_2017, protocol::find_folder_personas_body(&folder, 0, 200)).await {
+            Ok(v) => {
+                let people = protocol::find_people_array(&v).cloned().unwrap_or_default();
+                let found = people.iter().find(|p| p.get("AttributionsArray").and_then(serde_json::Value::as_array).is_some_and(|a| a.iter().any(|x| x.pointer("/SourceId/Id").and_then(serde_json::Value::as_str) == Some(item_id.id.as_str()))));
+                println!("FindPeople по папке: персон {}, контакт найден по атрибуции {}, PersonaId совпал {}", people.len(), found.is_some(), found.and_then(|p| p.pointer("/PersonaId/Id")).and_then(serde_json::Value::as_str) == Some(persona_id.as_str()));
+            }
+            Err(e) => println!("FindPeople по папке: отказ {}", transport_error_code(&e)),
+        }
+        // Поля по одному: принято ли и появилось ли в ответе.
+        for (field, key, value) in PERSONA_PROBE_UPDATES {
+            let started = std::time::Instant::now();
+            match t.persona_call("UpdatePersona", protocol::update_persona_body(&persona_id, PERSONA_PERSON, vec![upd(field, Some(""), Some(value))])).await {
+                Ok(v) => println!("UpdatePersona {field}: {} мс, в ответе {key}: {}", started.elapsed().as_millis(), v.get(*key).is_some_and(|x| !x.is_null())),
+                Err(e) => println!("UpdatePersona {field}: отказ {} за {} мс", transport_error_code(&e), started.elapsed().as_millis()),
+            }
+        }
+        // Правка заполненного поля: прежнее значение — как у OWA.
+        let started = std::time::Instant::now();
+        match t.persona_call("UpdatePersona", protocol::update_persona_body(&persona_id, PERSONA_PERSON, vec![upd("PersonaBusinessPhoneNumbers", Some(phone), Some("+7 000 000-00-09"))])).await {
+            Ok(v) => println!(
+                "UpdatePersona рабочий телефон (замена): {} мс, номеров в ответе {}",
+                started.elapsed().as_millis(),
+                v.get("BusinessPhoneNumbersArray").and_then(serde_json::Value::as_array).map(Vec::len).unwrap_or(0)
+            ),
+            Err(e) => println!("UpdatePersona рабочий телефон (замена): отказ {}", transport_error_code(&e)),
+        }
+        // Очистка поля: пустое новое значение.
+        match t.persona_call("UpdatePersona", protocol::update_persona_body(&persona_id, PERSONA_PERSON, vec![upd("PersonaMobilePhones", Some("+7 000 000-00-02"), Some(""))])).await {
+            Ok(v) => println!("UpdatePersona очистка мобильного: в ответе MobilePhonesArray {}", v.get("MobilePhonesArray").is_some_and(|x| !x.is_null())),
+            Err(e) => println!("UpdatePersona очистка мобильного: отказ {}", transport_error_code(&e)),
+        }
+        // Смена имени и адреса: в HAR их не было.
+        let new_name = format!("{name} 2");
+        let new_email = "aiowa-test-2@example.invalid";
+        let started = std::time::Instant::now();
+        match t
+            .persona_call(
+                "UpdatePersona",
+                protocol::update_persona_body(
+                    &persona_id,
+                    PERSONA_PERSON,
+                    vec![upd("PersonaGivenNames", Some(&name), Some(&new_name)), upd("PersonaEmails1", Some(email), Some(new_email)), upd("PersonaEmails1OriginalDisplayNames", Some(email), Some(new_email))],
+                ),
+            )
+            .await
+        {
+            Ok(_) => println!("UpdatePersona имя и адрес: {} мс", started.elapsed().as_millis()),
+            Err(e) => println!("UpdatePersona имя и адрес: отказ {}", transport_error_code(&e)),
+        }
+        match t.get_contact_items(std::slice::from_ref(&item_id)).await {
+            Ok(v) => match v.into_iter().next().flatten() {
+                Some(c) => println!(
+                    "  GetItem (после смены имени и адреса): имя новое {}, адресов {}, адрес новый {}, старый остался {}",
+                    c.given_name.as_deref() == Some(new_name.as_str()),
+                    c.emails.len(),
+                    c.emails.iter().any(|e| e.email.eq_ignore_ascii_case(new_email)),
+                    c.emails.iter().any(|e| e.email.eq_ignore_ascii_case(email))
+                ),
+                None => println!("  GetItem (после смены имени и адреса): контакта нет"),
+            },
+            Err(e) => println!("  GetItem (после смены имени и адреса): отказ {}", transport_error_code(&e)),
+        }
+        reread("после правок").await;
+        Ok::<ItemId, anyhow::Error>(item_id)
+    }
+    .await;
+    // Удаление — всегда, даже если проверки выше упали.
+    let started = std::time::Instant::now();
+    match t.delete_personas(std::slice::from_ref(&persona_id)).await {
+        Ok(v) => println!("DeletePersonas: {} мс, ответ {}", started.elapsed().as_millis(), protocol::json_shape(&v, 1)),
+        Err(e) => println!("DeletePersonas: отказ {} — тестовый контакт «{name}» удалить вручную", transport_error_code(&e)),
+    }
+    if let Ok(item_id) = &outcome {
+        match t.call("GetItem", protocol::V_2017, protocol::get_contact_items_body(std::slice::from_ref(item_id))).await {
+            Ok(v) => {
+                let msgs = protocol::response_messages(&v);
+                let m = msgs.first().map(|m| (*m).clone()).unwrap_or_default();
+                match protocol::message_error(&m) {
+                    Some((code, _)) => println!("После удаления GetItem: {code}"),
+                    None => {
+                        let parent = m.pointer("/Items/0/ParentFolderId/Id").and_then(serde_json::Value::as_str);
+                        println!("После удаления контакт на сервере есть, в «Удалённых»: {}", parent.is_some() && parent == deleted_server_id.as_deref());
+                    }
+                }
+            }
+            Err(e) => println!("После удаления GetItem: отказ {}", transport_error_code(&e)),
+        }
+    }
+    outcome.map(|_| ())
 }
 
 /// Проба статусов без входа в IM (`aiowa presence`, этап 8 плана docs/patch2-people.md): SIP-адреса
@@ -3488,6 +3657,18 @@ async fn real_main() -> Result<()> {
             }
             SummaryTarget::One(path) => print_db_summary(&path)?,
         },
+        Cmd::ContactCheck { yes_i_know } => {
+            if !*yes_i_know {
+                println!("План: CreatePersona «[AIOWA] Тест …» в «Контактах» (имя, адрес example.invalid, рабочий телефон), UpdatePersona {} полей по одному и замена телефона, GetItem после записи, FindPeople по папке, DeletePersonas. Запуск: --yes-i-know", PERSONA_PROBE_UPDATES.len());
+                return Ok(());
+            }
+            let store = Store::open(&db_path)?;
+            let account = store.account(&cli.host, &cli.user)?;
+            let t = connect(&cli).await?;
+            let result = contact_check(&t, &store, account).await;
+            t.logoff().await.ok();
+            result?;
+        }
         Cmd::Presence { query, max, seconds } => {
             let store = Store::open(&db_path)?;
             let account = store.account(&cli.host, &cli.user)?;

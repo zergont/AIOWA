@@ -1312,6 +1312,84 @@ pub fn find_people_body(query: &str, max: usize) -> Value {
     })
 }
 
+// ---------------------------------------------------------------------------
+// Личные контакты: операции персон браузерной OWA (снято HAR автора, § 5r)
+
+/// Вид персоны в `PersonTypeString`: человек.
+pub const PERSONA_PERSON: &str = "Person";
+
+/// Изменение поля персоны (`PersonaPropertyUpdate`): `old` — прежнее значение (у незаполненного
+/// поля — пустая строка), `new` — новое (`None` — `null`, как `PersonaEmails1DisplayNames` у OWA).
+pub fn persona_update(field: &str, old: Option<&str>, new: Option<&str>) -> Value {
+    json!({ "__type": "PersonaPropertyUpdate:#Exchange", "Path": property_uri(field), "OldValue": old, "NewValue": new })
+}
+
+/// Конверт операций персон: тело в обёртке `request` со своим `Header` (`Exchange2013`), как у
+/// браузерной OWA (`CreatePersonaJsonRequest`, `UpdatePersonaJsonRequest`).
+pub fn persona_envelope(op: &str, tz: &str, body: Value) -> Value {
+    json!({ "request": { "__type": format!("{op}JsonRequest:#Exchange"), "Header": request_header(V_2013, tz), "Body": body } })
+}
+
+/// Тело `CreatePersona`: новая персона вида `person_type` в папке контактов `folder`.
+pub fn create_persona_body(folder: &FolderId, person_type: &str, updates: Vec<Value>) -> Value {
+    let mut folder_id = json!({ "__type": "FolderId:#Exchange", "Id": folder.id });
+    if let Some(ck) = &folder.change_key {
+        folder_id["ChangeKey"] = json!(ck);
+    }
+    json!({
+        "__type": "CreatePersonaRequest:#Exchange",
+        "PersonaId": null,
+        "PersonTypeString": person_type,
+        "PropertyUpdates": updates,
+        "ParentFolderId": { "__type": "TargetFolderId:#Exchange", "BaseFolderId": folder_id }
+    })
+}
+
+/// Тело `UpdatePersona`: только изменённые поля, у каждого — прежнее значение.
+pub fn update_persona_body(persona_id: &str, person_type: &str, updates: Vec<Value>) -> Value {
+    json!({
+        "__type": "UpdatePersonaRequest:#Exchange",
+        "PersonaId": { "__type": "ItemId:#Exchange", "Id": persona_id },
+        "PersonTypeString": person_type,
+        "PropertyUpdates": updates
+    })
+}
+
+/// Запрос `DeletePersonas` целиком (без `Header`, как у браузерной OWA).
+pub fn delete_personas_request(persona_ids: &[String]) -> Value {
+    json!({ "request": { "__type": "DeletePersonasRequest:#Exchange", "ItemIds": persona_ids.iter().map(|id| json!({ "__type": "ItemId:#Exchange", "Id": id })).collect::<Vec<_>>() } })
+}
+
+/// `FindPeople` по папке контактов со свойством `PersonaAttributions`: у каждой персоны —
+/// `AttributionsArray[].SourceId.Id`, идентификатор контакта (связка `ItemId` → `PersonaId`).
+pub fn find_folder_personas_body(folder: &FolderId, offset: usize, max: usize) -> Value {
+    json!({
+        "__type": "FindPeopleRequest:#Exchange",
+        "IndexedPageItemView": { "__type": "IndexedPageView:#Exchange", "BasePoint": "Beginning", "Offset": offset, "MaxEntriesReturned": max },
+        "QueryString": null,
+        "ParentFolderId": { "__type": "TargetFolderId:#Exchange", "BaseFolderId": { "__type": "FolderId:#Exchange", "Id": folder.id } },
+        "PersonaShape": { "__type": "PersonaResponseShape:#Exchange", "BaseShape": "Default", "AdditionalProperties": [property_uri("PersonaAttributions")] },
+        "ShouldResolveOneOffEmailAddress": false,
+        "SearchPeopleSuggestionIndex": false
+    })
+}
+
+/// Персона из ответа `CreatePersona`/`UpdatePersona` (запись персоны без `ResponseMessages`) или
+/// `GetPersona` (`Persona`): её `PersonaId` и идентификатор контакта — первая атрибуция с `FolderId`
+/// (сам контакт, а не справочник), иначе `EmailAddress.ItemId`.
+pub fn parse_persona_written(v: &Value) -> Option<(String, Option<ItemId>)> {
+    let p = v.get("Persona").filter(|p| p.is_object()).unwrap_or(v);
+    let persona_id = p.pointer("/PersonaId/Id").and_then(Value::as_str)?.to_string();
+    let item = p
+        .get("AttributionsArray")
+        .and_then(Value::as_array)
+        .and_then(|a| a.iter().find(|x| x.get("FolderId").is_some_and(Value::is_object)))
+        .and_then(|x| x.get("SourceId"))
+        .or_else(|| p.pointer("/EmailAddress/ItemId"))
+        .and_then(|s| Some(ItemId { id: str_of(s, "Id")?.to_string(), change_key: str_of(s, "ChangeKey").map(String::from) }));
+    Some((persona_id, item))
+}
+
 /// Дополнительные свойства записи `FindPeople` для подсказок: в форме `Default` нет должности,
 /// офиса и телефонов. Сервер (Exchange 2019) принимает их и отдаёт под ключами `Title` (строка),
 /// `OfficeLocationsArray`, `BusinessPhoneNumbersArray`, `MobilePhonesArray` (атрибутированные
@@ -2532,6 +2610,49 @@ mod tests {
         );
         let s = serde_json::to_string(&move_item_body(&ids()[..1], &FolderRef::Distinguished(aiowa_core::DistinguishedFolder::DeletedItems))).unwrap();
         assert!(s.contains(r#""BaseFolderId":{"__type":"DistinguishedFolderId:#Exchange","Id":"deleteditems"}"#), "{s}");
+    }
+
+    /// Формы операций персон — как у браузерной OWA в HAR автора (§ 5r): `__type` первым ключом,
+    /// обёртка `request`, `OldValue` пустой строкой у нового поля, `null` у `…DisplayNames`.
+    #[test]
+    fn persona_bodies_exact() {
+        let folder = FolderId { id: "CF".into(), change_key: Some("ck".into()) };
+        let body = create_persona_body(&folder, PERSONA_PERSON, vec![persona_update("PersonaGivenNames", Some(""), Some("Анна")), persona_update("PersonaEmails1DisplayNames", None, None)]);
+        assert_eq!(
+            serde_json::to_string(&body).unwrap(),
+            concat!(
+                r#"{"__type":"CreatePersonaRequest:#Exchange","PersonaId":null,"PersonTypeString":"Person","PropertyUpdates":["#,
+                r#"{"__type":"PersonaPropertyUpdate:#Exchange","Path":{"__type":"PropertyUri:#Exchange","FieldURI":"PersonaGivenNames"},"OldValue":"","NewValue":"Анна"},"#,
+                r#"{"__type":"PersonaPropertyUpdate:#Exchange","Path":{"__type":"PropertyUri:#Exchange","FieldURI":"PersonaEmails1DisplayNames"},"OldValue":null,"NewValue":null}],"#,
+                r#""ParentFolderId":{"__type":"TargetFolderId:#Exchange","BaseFolderId":{"__type":"FolderId:#Exchange","Id":"CF","ChangeKey":"ck"}}}"#
+            )
+        );
+        let env = persona_envelope("CreatePersona", "UTC", body);
+        assert_eq!(env.pointer("/request/__type").and_then(Value::as_str), Some("CreatePersonaJsonRequest:#Exchange"));
+        assert_eq!(env.pointer("/request/Header/RequestServerVersion").and_then(Value::as_str), Some("Exchange2013"));
+        assert_eq!(env.pointer("/request/Body/__type").and_then(Value::as_str), Some("CreatePersonaRequest:#Exchange"));
+        let upd = update_persona_body("P1", PERSONA_PERSON, vec![persona_update("PersonaBusinessPhoneNumbers", Some("1"), Some("2"))]);
+        assert_eq!(serde_json::to_string(&upd["PersonaId"]).unwrap(), r#"{"__type":"ItemId:#Exchange","Id":"P1"}"#);
+        assert_eq!(
+            serde_json::to_string(&delete_personas_request(&["P1".into()])).unwrap(),
+            r#"{"request":{"__type":"DeletePersonasRequest:#Exchange","ItemIds":[{"__type":"ItemId:#Exchange","Id":"P1"}]}}"#
+        );
+        let find = find_folder_personas_body(&folder, 0, 100);
+        assert_eq!(find.pointer("/PersonaShape/AdditionalProperties/0/FieldURI").and_then(Value::as_str), Some("PersonaAttributions"));
+        assert_eq!(find.pointer("/ParentFolderId/BaseFolderId/Id").and_then(Value::as_str), Some("CF"));
+    }
+
+    /// Ответ персоны: `PersonaId` и контакт — атрибуция с папкой (не справочник), иначе адрес.
+    #[test]
+    fn persona_written_gives_persona_and_contact_ids() {
+        let v: Value = serde_json::from_str(r#"{"PersonaId":{"Id":"P1"},"EmailAddress":{"ItemId":{"Id":"E1","ChangeKey":"ck8"}},
+            "AttributionsArray":[{"Id":"1","SourceId":{"Id":"AD1"},"FolderId":null},{"Id":"0","SourceId":{"Id":"C1","ChangeKey":"ck40"},"FolderId":{"Id":"CF"}}]}"#).unwrap();
+        let (pid, item) = parse_persona_written(&v).unwrap();
+        assert_eq!(pid, "P1");
+        assert_eq!(item, Some(ItemId { id: "C1".into(), change_key: Some("ck40".into()) }));
+        let got: Value = serde_json::from_str(r#"{"ResponseCode":"NoError","Persona":{"PersonaId":{"Id":"P2"},"EmailAddress":{"ItemId":{"Id":"E2"}}}}"#).unwrap();
+        assert_eq!(parse_persona_written(&got), Some(("P2".into(), Some(ItemId { id: "E2".into(), change_key: None }))));
+        assert_eq!(parse_persona_written(&json!({ "ResponseCode": "NoError" })), None);
     }
 
     #[test]
