@@ -50,7 +50,7 @@ dependencies = [
 
 [[package]]
 name = "aiowa-cli"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "aiowa-core",
  "aiowa-store",
@@ -71,7 +71,7 @@ dependencies = [
 
 [[package]]
 name = "aiowa-core"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "jiff",
  "serde",
@@ -80,7 +80,7 @@ dependencies = [
 
 [[package]]
 name = "aiowa-desktop"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "aiowa-core",
  "aiowa-store",
@@ -116,7 +116,7 @@ dependencies = [
 
 [[package]]
 name = "aiowa-extract"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "calamine",
  "encoding_rs",
@@ -128,7 +128,7 @@ dependencies = [
 
 [[package]]
 name = "aiowa-store"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "aiowa-core",
  "jiff",
@@ -142,7 +142,7 @@ dependencies = [
 
 [[package]]
 name = "aiowa-sync"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "aiowa-core",
  "aiowa-extract",
@@ -156,7 +156,7 @@ dependencies = [
 
 [[package]]
 name = "aiowa-transport"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "aiowa-core",
  "async-trait",
@@ -170,7 +170,7 @@ dependencies = [
 
 [[package]]
 name = "aiowa-transport-owa"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "aiowa-core",
  "aiowa-store",
