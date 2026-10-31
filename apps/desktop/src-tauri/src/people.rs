@@ -1,5 +1,6 @@
 //! Раздел «Люди» (docs/obkatka.md п. 8): личные контакты ящика из локальной базы — список с
-//! поиском, контакт по адресу для карточки и состояние папок контактов. Контакты приходят
+//! поиском, контакт по адресу для карточки и состояние папок контактов; контакты Skype для бизнеса
+//! (п. 25) — там же, только для просмотра. Контакты приходят
 //! синхронизацией вместе с почтой (`sync::SyncState`), о новых окну сообщает событие
 //! `contacts-changed`. Запись — создание, правка, удаление — операциями персон браузерной OWA
 //! (`contact_save`, `contact_delete`, docs/protocol-owa-json.md § 5r). В журнал имена и адреса не
@@ -32,6 +33,8 @@ pub(crate) struct ContactDto {
     /// Первый SMTP-адрес в нижнем регистре.
     email: Option<String>,
     is_group: bool,
+    /// Контакт Skype для бизнеса: только для просмотра (п. 25).
+    skype: bool,
     birthday_ms: Option<i64>,
     modified_ms: Option<i64>,
     /// Все поля контакта, как их отдал сервер (`aiowa_core::ContactItem`).
@@ -47,6 +50,7 @@ impl From<ContactRow> for ContactDto {
             name: item.list_name().unwrap_or_else(|| "Без имени".to_string()),
             email: item.primary_email(),
             is_group: item.is_group(),
+            skype: r.skype,
             birthday_ms: item.birthday.map(|t| t.as_millisecond()),
             modified_ms: item.modified_at.map(|t| t.as_millisecond()),
             item,
@@ -116,6 +120,8 @@ pub(crate) async fn contacts_status(state: State<'_, AppState>) -> CmdResult<Con
 
 /// Таймаут одной записи контакта на сервер (вместе с перечитыванием).
 const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Отказ правки и удаления контакта Skype: список контактов Skype ведёт сам Skype.
+const SKYPE_READ_ONLY: &str = "Контакт Skype для бизнеса — только для просмотра: его меняют в Skype";
 /// Персон в одной странице `FindPeople` по папке и самое большее страниц при поиске персоны.
 const PERSONA_PAGE: usize = 200;
 const PERSONA_PAGES: usize = 25;
@@ -263,6 +269,9 @@ pub(crate) async fn contact_save(contact_pk: Option<i64>, form: ContactFormDto, 
         Some(pk) => Some(store.contact(account, pk).map_err(err)?.ok_or("Контакта уже нет")?),
         None => None,
     };
+    if existing.as_ref().is_some_and(|r| r.skype) {
+        return Err(SKYPE_READ_ONLY.into());
+    }
     let (folder_pk, folder) = match &existing {
         Some(row) => {
             let f = store.folder_by_pk(account, row.folder_pk).map_err(err)?.ok_or("Папки контакта уже нет")?;
@@ -323,6 +332,9 @@ pub(crate) async fn contact_delete(contact_pk: i64, app: AppHandle, state: State
     let (store, account) = (state.store.clone(), state.account);
     let _lock = ws.lock().await;
     let row = store.contact(account, contact_pk).map_err(err)?.ok_or("Контакта уже нет")?;
+    if row.skype {
+        return Err(SKYPE_READ_ONLY.into());
+    }
     let folder = store.folder_by_pk(account, row.folder_pk).map_err(err)?.ok_or("Папки контакта уже нет")?;
     let folder = FolderId { id: folder.server_id, change_key: None };
     let transport = sync.transport().await.map_err(|e| e.to_string())?;

@@ -11,7 +11,7 @@ use aiowa_core::{
     AccountId, CalendarItemChanges, CalendarItemType, ComposeKind, DirectoryPerson, DraftContent, FolderChange, FolderId, FolderRef, FreeBusy, Importance, ItemId, NewCalendarItem, OutgoingAttachment, OutgoingMessage,
     Participant, PersonKind, RecipientKind, SyncState,
 };
-use aiowa_store::{AttachmentTodo, CalendarRow, Store};
+use aiowa_store::{AttachmentTodo, CalendarRow, Store, SyncFolder};
 use aiowa_sync::{Engine, FolderSelection, SyncOptions};
 use aiowa_transport::{new_guid, Credentials, DeleteMode, MailTransport, NotificationEvent, NotificationKind, SubscriptionRequest, TransportError, WriteResult};
 use aiowa_transport_owa::{OwaConfig, OwaTransport};
@@ -494,6 +494,14 @@ enum Cmd {
         /// Действительно записать на сервер (тестовый контакт создаётся и удаляется)
         #[arg(long)]
         yes_i_know: bool,
+    },
+    /// Проба контактов Skype (только чтение): SyncFolderItems + GetItem формой AllProperties по
+    /// служебным папкам `quickcontacts` и `imcontactlist`. Печатает классы, ключи ответа и
+    /// счётчики (адреса, SIP, телефоны, повторы), без значений
+    SkypeContacts {
+        /// Папки по DistinguishedFolderId через запятую
+        #[arg(long, default_value = "quickcontacts,imcontactlist")]
+        folders: String,
     },
     /// Проба статусов коллег без входа в IM: SIP-адреса из FindPeople, подписка
     /// InstantMessageNotification, GetPresence, поток уведомлений; InstantMessageSignIn не вызывается.
@@ -1090,6 +1098,194 @@ async fn contact_check(t: &OwaTransport, store: &Store, account: AccountId) -> R
         }
     }
     outcome.map(|_| ())
+}
+
+/// Проба контактов Skype (`aiowa skype-contacts`): папки `folders` (из локальной базы) целиком
+/// через `sync_contact_items` без состояния, затем счётчики по разобранным элементам. Значения —
+/// имена, адреса, телефоны — не печатаются; повторы считаются по адресу и SIP в нижнем регистре.
+async fn skype_contacts_probe(t: &OwaTransport, folders: &[SyncFolder]) -> Result<()> {
+    use std::collections::{BTreeMap, HashMap};
+    for f in folders {
+        let folder = FolderRef::Id(FolderId { id: f.server_id.clone(), change_key: None });
+        let started = std::time::Instant::now();
+        let mut state: Option<SyncState> = None;
+        let mut items: Vec<aiowa_core::ContactItem> = Vec::new();
+        let (mut pages, mut deletes) = (0usize, 0usize);
+        loop {
+            let ch = t.sync_contact_items(&folder, state.as_ref(), 100).await.map_err(|e| anyhow!("SyncFolderItems «{}»: {e}", f.distinguished.as_deref().unwrap_or("?")))?;
+            pages += 1;
+            for c in ch.changes {
+                match c {
+                    aiowa_core::ContactChange::Create(c) | aiowa_core::ContactChange::Update(c) => items.push(c),
+                    aiowa_core::ContactChange::Delete(_) => deletes += 1,
+                }
+            }
+            state = Some(ch.state);
+            if ch.includes_last || pages >= 20 {
+                break;
+            }
+        }
+        println!("папка {} (на сервере {}): элементов {}, удалений {deletes}, страниц {pages}, {} мс", f.distinguished.as_deref().unwrap_or("?"), f.total_count, items.len(), started.elapsed().as_millis());
+        let mut classes: BTreeMap<String, usize> = BTreeMap::new();
+        let mut fields: BTreeMap<&str, usize> = BTreeMap::new();
+        let mut email_keys: HashMap<String, usize> = HashMap::new();
+        let mut sip_keys: HashMap<String, usize> = HashMap::new();
+        let mut name_keys: HashMap<String, usize> = HashMap::new();
+        let (mut no_email, mut no_email_no_sip, mut groups, mut members) = (0usize, 0usize, 0usize, 0usize);
+        for c in &items {
+            *classes.entry(c.item_class.clone().unwrap_or_else(|| "—".into())).or_default() += 1;
+            for (k, v) in [
+                ("display_name", c.display_name.is_some()),
+                ("file_as", c.file_as.is_some()),
+                ("given/surname", c.given_name.is_some() || c.surname.is_some()),
+                ("company", c.company.is_some()),
+                ("job_title", c.job_title.is_some()),
+                ("department", c.department.is_some()),
+                ("office", c.office.is_some()),
+                ("emails", !c.emails.is_empty()),
+                ("phones", !c.phones.is_empty()),
+                ("im_addresses", !c.im_addresses.is_empty()),
+                ("notes", c.notes.is_some()),
+                ("has_photo", c.has_photo),
+            ] {
+                if v {
+                    *fields.entry(k).or_default() += 1;
+                }
+            }
+            if c.is_group() {
+                groups += 1;
+                members += c.members.len();
+            }
+            match c.primary_email() {
+                Some(e) => *email_keys.entry(e).or_default() += 1,
+                None => no_email += 1,
+            }
+            let sip = c.im_addresses.iter().map(|s| s.trim().to_lowercase()).find(|s| !s.is_empty());
+            if c.primary_email().is_none() && sip.is_none() {
+                no_email_no_sip += 1;
+            }
+            if let Some(s) = sip {
+                *sip_keys.entry(s).or_default() += 1;
+            }
+            if let Some(n) = c.list_name() {
+                *name_keys.entry(n.to_lowercase()).or_default() += 1;
+            }
+        }
+        let dups = |m: &HashMap<String, usize>| (m.len(), m.values().filter(|n| **n > 1).count(), m.values().copied().max().unwrap_or(0));
+        println!("  классы: {classes:?}");
+        println!("  поля (у скольких есть): {fields:?}");
+        let (u, d, mx) = dups(&email_keys);
+        println!("  адрес: без адреса {no_email}, разных адресов {u}, повторяется {d} (до {mx} раз)");
+        let (u, d, mx) = dups(&sip_keys);
+        println!("  SIP: разных {u}, повторяется {d} (до {mx} раз); без адреса и без SIP {no_email_no_sip}");
+        let (u, d, mx) = dups(&name_keys);
+        println!("  имя: разных {u}, повторяется {d} (до {mx} раз); групп {groups}, участников в них {members}");
+        let notes: Vec<&str> = items.iter().filter_map(|c| c.notes.as_deref()).collect();
+        let distinct_notes: std::collections::HashSet<&str> = notes.iter().copied().collect();
+        let lens: Vec<usize> = notes.iter().map(|n| n.chars().count()).collect();
+        println!(
+            "  заметки: {} (разных {}), длина {}–{}, html {}, со «sip:» {}, с «http» {}, многострочных {}",
+            notes.len(),
+            distinct_notes.len(),
+            lens.iter().min().unwrap_or(&0),
+            lens.iter().max().unwrap_or(&0),
+            items.iter().filter(|c| c.notes_is_html).count(),
+            notes.iter().filter(|n| n.to_lowercase().contains("sip:")).count(),
+            notes.iter().filter(|n| n.to_lowercase().contains("http")).count(),
+            notes.iter().filter(|n| n.contains('\n')).count()
+        );
+        let mut keys: BTreeMap<String, usize> = BTreeMap::new();
+        for c in &items {
+            for e in &c.emails {
+                *keys.entry(format!("email:{}:{}", e.key.as_deref().unwrap_or("-"), e.email.contains('@'))).or_default() += 1;
+            }
+            for ph in &c.phones {
+                *keys.entry(format!("phone:{}", ph.key.as_deref().unwrap_or("-"))).or_default() += 1;
+            }
+            for im in &c.im_addresses {
+                *keys.entry(format!("im:sip={}", im.to_lowercase().starts_with("sip:"))).or_default() += 1;
+            }
+            for ad in &c.addresses {
+                *keys.entry(format!("addr:{}", ad.key.as_deref().unwrap_or("-"))).or_default() += 1;
+            }
+        }
+        println!("  ключи словарей: {keys:?}");
+        // Повторы по SIP: одинаковы ли они по составу полей, и совпадает ли SIP с адресом.
+        let mut by_sip: HashMap<String, Vec<&aiowa_core::ContactItem>> = HashMap::new();
+        for c in &items {
+            if let Some(s) = c.im_addresses.iter().map(|s| s.trim().to_lowercase()).find(|s| !s.is_empty()) {
+                by_sip.entry(s).or_default().push(c);
+            }
+        }
+        let (mut same, mut differ, mut sip_eq_mail) = (0usize, 0usize, 0usize);
+        for (sip, group) in &by_sip {
+            let shape = |c: &aiowa_core::ContactItem| (c.primary_email(), c.company.clone(), c.job_title.clone(), c.phones.len(), c.notes.is_some(), c.list_name());
+            if group.len() > 1 {
+                if group.iter().all(|c| shape(c) == shape(group[0])) { same += 1 } else { differ += 1 }
+            }
+            if group.iter().any(|c| c.primary_email().is_some_and(|m| sip.trim_start_matches("sip:") == m)) {
+                sip_eq_mail += 1;
+            }
+        }
+        println!("  повторы по SIP: одинаковых {same}, различаются {differ}; SIP = адресу у {sip_eq_mail} из {}", by_sip.len());
+        // Форма адреса Skype (домен и имя — как у почты ли), без значений.
+        let mut im_shape: BTreeMap<String, usize> = BTreeMap::new();
+        for c in &items {
+            for im in &c.im_addresses {
+                let l = im.trim().to_lowercase();
+                let dom = l.rsplit_once('@').map(|(_, d)| d.to_string());
+                let same_dom = c.primary_email().zip(dom.clone()).is_some_and(|(m, d)| m.ends_with(&format!("@{d}")));
+                let local_eq = c.primary_email().is_some_and(|m| m.split('@').next() == l.split('@').next());
+                *im_shape.entry(format!("@{} домен-как-почта {same_dom} имя-как-почта {local_eq} пробелы {}", dom.is_some(), l.contains(' '))).or_default() += 1;
+            }
+        }
+        println!("  форма SIP: {im_shape:?}");
+        let mut diff_fields: BTreeMap<&str, usize> = BTreeMap::new();
+        for group in by_sip.values().filter(|g| g.len() > 1) {
+            let a = group[0];
+            for b in &group[1..] {
+                for (k, d) in [
+                    ("email", a.primary_email() != b.primary_email()),
+                    ("company", a.company != b.company),
+                    ("job_title", a.job_title != b.job_title),
+                    ("phones", a.phones != b.phones),
+                    ("notes", a.notes != b.notes),
+                    ("list_name", a.list_name() != b.list_name()),
+                    ("display_name", a.display_name != b.display_name),
+                    ("modified_at", a.modified_at != b.modified_at),
+                ] {
+                    if d {
+                        *diff_fields.entry(k).or_default() += 1;
+                    }
+                }
+            }
+        }
+        println!("  чем различаются повторы: {diff_fields:?}");
+        // Что теряет показ одной, самой свежей копии: у скольких людей поле есть хоть в одной копии
+        // и сколько из них — в самой свежей.
+        let mut kept: BTreeMap<&str, (usize, usize)> = BTreeMap::new();
+        for group in by_sip.values() {
+            let newest = group.iter().max_by_key(|c| c.modified_at).copied().unwrap_or(group[0]);
+            for (k, has) in [
+                ("phones", (|c: &aiowa_core::ContactItem| !c.phones.is_empty()) as fn(&aiowa_core::ContactItem) -> bool),
+                ("email", |c| c.primary_email().is_some()),
+                ("company", |c| c.company.is_some()),
+                ("job_title", |c| c.job_title.is_some()),
+                ("office", |c| c.office.is_some()),
+                ("addresses", |c| !c.addresses.is_empty()),
+            ] {
+                let e = kept.entry(k).or_default();
+                if group.iter().any(|c| has(c)) {
+                    e.0 += 1;
+                    if has(newest) {
+                        e.1 += 1;
+                    }
+                }
+            }
+        }
+        println!("  людей с полем (в любой копии, в самой свежей): {kept:?}");
+    }
+    Ok(())
 }
 
 /// Проба статусов без входа в IM (`aiowa presence`, этап 8 плана docs/patch2-people.md): SIP-адреса
@@ -3972,6 +4168,22 @@ async fn real_main() -> Result<()> {
             let account = store.account(&cli.host, &cli.user)?;
             let t = connect(&cli).await?;
             let result = contact_check(&t, &store, account).await;
+            t.logoff().await.ok();
+            result?;
+        }
+        Cmd::SkypeContacts { folders } => {
+            let store = Store::open(&db_path)?;
+            let account = store.account(&cli.host, &cli.user)?;
+            let mut list = Vec::new();
+            for name in folders.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                let f = store.resolve_folder(account, name)?.ok_or_else(|| anyhow!("папка «{name}» не найдена в локальной базе"))?;
+                if f.distinguished.as_deref() != Some(name) {
+                    bail!("«{name}» — не служебное имя папки");
+                }
+                list.push(f);
+            }
+            let t = connect(&cli).await?;
+            let result = skype_contacts_probe(&t, &list).await;
             t.logoff().await.ok();
             result?;
         }

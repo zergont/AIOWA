@@ -180,6 +180,11 @@
     editor = { pk: c.contact_pk, form: contactFormOf(c) };
   }
 
+  /** Контакт Skype — в свои контакты: новый контакт с его полями (копия Skype затем не показывается). */
+  function copyToContacts(c: PersonalContact) {
+    editor = { pk: null, form: contactFormOf(c) };
+  }
+
   function onSaved(c: PersonalContact) {
     const created = editor?.pk == null;
     editor = null;
@@ -396,7 +401,11 @@
         <div class="who">
           <h2 class="title">{c.name}</h2>
           {#if orgLine(c)}<div class="sub">{orgLine(c)}</div>{/if}
-          <span class="badge">{c.is_group ? "Группа контактов" : "Личный контакт"}</span>
+          {#if c.skype}
+            <span class="badge" title="Только для просмотра: список контактов Skype ведёт сам Skype">Контакт Skype для бизнеса</span>
+          {:else}
+            <span class="badge">{c.is_group ? "Группа контактов" : "Личный контакт"}</span>
+          {/if}
         </div>
         <div class="head-actions">
           {#if c.is_group}
@@ -414,10 +423,14 @@
               Найти письма
             </button>
             <button class="btn" onclick={(e) => c.email && openDirectoryCard({ name: c.name, email: c.email }, e.currentTarget)} disabled={!c.email} title="Запись справочника организации по этому адресу" aria-haspopup="dialog">В справочнике</button>
-            <button class="btn" onclick={() => editContact(c)} disabled={deleting}>Изменить</button>
-            <button class="btn danger" bind:this={deleteBtn} onclick={() => (confirmDelete = !confirmDelete)} disabled={deleting} aria-haspopup="dialog" aria-busy={deleting}>Удалить…</button>
-            {#if confirmDelete && deleteBtn}
-              <ConfirmPopover anchor={deleteBtn} title="Удалить контакт?" text="Он уйдёт в «Удалённые» на сервере — оттуда его можно вернуть в OWA." confirmLabel="Удалить" onconfirm={() => void deleteNow(c)} oncancel={() => (confirmDelete = false)} />
+            {#if c.skype}
+              <button class="btn" onclick={() => copyToContacts(c)} title="Новый личный контакт в «Контактах» с полями этого контакта Skype">Добавить в контакты</button>
+            {:else}
+              <button class="btn" onclick={() => editContact(c)} disabled={deleting}>Изменить</button>
+              <button class="btn danger" bind:this={deleteBtn} onclick={() => (confirmDelete = !confirmDelete)} disabled={deleting} aria-haspopup="dialog" aria-busy={deleting}>Удалить…</button>
+              {#if confirmDelete && deleteBtn}
+                <ConfirmPopover anchor={deleteBtn} title="Удалить контакт?" text="Он уйдёт в «Удалённые» на сервере — оттуда его можно вернуть в OWA." confirmLabel="Удалить" onconfirm={() => void deleteNow(c)} oncancel={() => (confirmDelete = false)} />
+              {/if}
             {/if}
           {/if}
         </div>
@@ -444,7 +457,7 @@
         {/each}
         {#each c.item.im_addresses as im, i (`${im}:${i}`)}
           <div class="fact">
-            <dt>Мессенджер</dt>
+            <dt>{c.skype ? "Skype" : "Мессенджер"}</dt>
             <dd>{im}</dd>
           </div>
         {/each}

@@ -1,16 +1,23 @@
 //! Личные контакты ящика (docs/obkatka.md п. 8): папки класса ровно `IPF.Contact` — «Контакты» и
-//! созданные пользователем; служебные `IPF.Contact.*` (кэш получателей, контакты Skype,
-//! справочника) не трогаются. Таблица `contacts` хранит разобранный контакт (`ContactItem`) как
-//! JSON и колонки для списка, поиска и подсказок адресатов; состояние синхронизации папки — в
+//! созданные пользователем — и, только для просмотра, «Контакты Skype для бизнеса» (`quickcontacts`,
+//! класс `IPF.Contact.MOC.QuickContacts`, docs/obkatka.md п. 25); остальные служебные
+//! `IPF.Contact.*` (кэш получателей, группы Skype, справочник) не трогаются. Skype хранит человека
+//! по разу на каждую свою группу, поэтому в списках остаётся одна, самая свежая копия, а человек,
+//! который есть и в своих контактах, — только своим контактом (`skype_view`). Таблица `contacts`
+//! хранит разобранный контакт (`ContactItem`) как JSON и колонки для списка, поиска и подсказок адресатов; состояние синхронизации папки — в
 //! `folders.contact_sync_state`, отдельно от почтового `sync_state`. Полная выгрузка папки (без
 //! состояния) по концу убирает контакты, которых сервер не вернул (`stale`). Запись на сервер
 //! (создание, правка, удаление) — операциями персон из окна (`put_contact`, `remove_contact`).
 //! Персональные данные в журнал не пишутся: только счётчики.
 
 use crate::{now_ms, text, word_prefix_match, Result, Store, StoreError, SyncFolder};
-use aiowa_core::{AccountId, ContactChange, ContactItem, SyncState};
+use aiowa_core::{AccountId, ContactChange, ContactItem, ContactPhone, SyncState};
 use rusqlite::{params, OptionalExtension};
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::Ordering;
+
+/// Служебное имя папки контактов Skype для бизнеса: её контакты — только для просмотра.
+pub const SKYPE_CONTACTS_FOLDER: &str = "quickcontacts";
 
 /// Итог применения пачки изменений контактов.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -25,6 +32,8 @@ pub struct ContactApplyStats {
 pub struct ContactRow {
     pub contact_pk: i64,
     pub folder_pk: i64,
+    /// Контакт Skype для бизнеса (папка `quickcontacts`): только для просмотра.
+    pub skype: bool,
     pub item: ContactItem,
 }
 
@@ -87,21 +96,97 @@ fn write_contact(tx: &rusqlite::Transaction<'_>, account: AccountId, folder_pk: 
     Ok((pk, existed.is_some()))
 }
 
-const CONTACT_SELECT: &str = "SELECT contact_pk, folder_pk, json, search_text FROM contacts";
 /// Контакты папок, которых на сервере больше нет, в списки не идут (строки остаются до следующей
 /// синхронизации папки, если она вернётся).
 const LIVE_FOLDER: &str = "folder_pk IN (SELECT folder_pk FROM folders WHERE deleted = 0)";
+/// Строка контакта — из папки контактов Skype (`SKYPE_CONTACTS_FOLDER`).
+const SKYPE_ROW: &str = "folder_pk IN (SELECT folder_pk FROM folders WHERE distinguished = 'quickcontacts')";
+/// Папки, контакты которых синхронизируются: класс ровно `IPF.Contact` и папка контактов Skype.
+const CONTACT_FOLDER: &str = "(folder_class = 'IPF.Contact' OR distinguished = 'quickcontacts')";
+
+fn contact_select() -> String {
+    format!("SELECT contact_pk, folder_pk, json, {SKYPE_ROW} FROM contacts")
+}
+
+/// Ключ человека в контактах Skype: адрес Skype (без `sip:`), иначе адрес почты.
+fn skype_key(c: &ContactItem) -> Option<String> {
+    c.im_addresses
+        .iter()
+        .map(|s| s.trim().to_lowercase())
+        .map(|s| s.strip_prefix("sip:").map(str::to_string).unwrap_or(s))
+        .find(|s| !s.is_empty())
+        .or_else(|| c.primary_email())
+}
+
+/// Как показывать контакты Skype живых папок (`skype_view`).
+#[derive(Debug, Default)]
+struct SkypeView {
+    /// Строки, которых нет в списках: человек, чей адрес есть у своего контакта, и все копии одного
+    /// человека, кроме самой свежей (по времени изменения, затем по ключу строки).
+    hidden: HashSet<i64>,
+    /// Телефоны для показанной копии без своих — из самой свежей копии, где они есть: Skype пишет
+    /// телефоны не во все копии (в ящике автора телефоны есть у 9 человек, в самой свежей копии — у 4).
+    phones: HashMap<i64, Vec<ContactPhone>>,
+}
+
+impl SkypeView {
+    /// Контакт для показа: телефоны из другой копии, если своих нет.
+    fn fill(&self, contact_pk: i64, item: &mut ContactItem) {
+        if item.phones.is_empty()
+            && let Some(p) = self.phones.get(&contact_pk)
+        {
+            item.phones = p.clone();
+        }
+    }
+}
+
+fn skype_view(c: &rusqlite::Connection, account: AccountId) -> Result<SkypeView> {
+    let mut st = c.prepare_cached(&format!("SELECT email FROM contacts WHERE account_id = ?1 AND is_group = 0 AND email IS NOT NULL AND {LIVE_FOLDER} AND NOT {SKYPE_ROW}"))?;
+    let own: HashSet<String> = st.query_map(params![account.0], |r| r.get::<_, String>(0))?.collect::<std::result::Result<_, _>>()?;
+    let mut st = c.prepare_cached(&format!("SELECT contact_pk, json, COALESCE(modified_at, 0) FROM contacts WHERE account_id = ?1 AND {LIVE_FOLDER} AND {SKYPE_ROW}"))?;
+    let rows = st.query_map(params![account.0], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?)))?;
+    let mut view = SkypeView::default();
+    // Копии одного человека: (время изменения, ключ строки, телефоны).
+    let mut people: HashMap<String, Vec<(i64, i64, Vec<ContactPhone>)>> = HashMap::new();
+    for r in rows {
+        let (pk, json, modified) = r?;
+        let Some(item) = row_item(&json) else { continue };
+        if item.primary_email().is_some_and(|e| own.contains(&e)) {
+            view.hidden.insert(pk);
+            continue;
+        }
+        let Some(key) = skype_key(&item) else { continue };
+        people.entry(key).or_default().push((modified, pk, item.phones));
+    }
+    for mut copies in people.into_values() {
+        copies.sort_by_key(|c| std::cmp::Reverse((c.0, c.1)));
+        let (_, shown, phones) = &copies[0];
+        view.hidden.extend(copies[1..].iter().map(|c| c.1));
+        if phones.is_empty()
+            && let Some((_, _, p)) = copies[1..].iter().find(|c| !c.2.is_empty())
+        {
+            view.phones.insert(*shown, p.clone());
+        }
+    }
+    Ok(view)
+}
+
+/// Телефоны для поиска (как в `search_text`: как есть и только цифры).
+fn phones_text(phones: &[ContactPhone]) -> String {
+    let parts: Vec<String> = phones.iter().flat_map(|p| [p.number.clone(), p.number.chars().filter(|ch| ch.is_ascii_digit()).collect()]).collect();
+    text::norm_lower(&parts.join(" | "))
+}
 
 impl Store {
-    /// Папки личных контактов: класс ровно `IPF.Contact`, не удалённые; стандартная «Контакты»
-    /// (`contacts`) первой.
+    /// Папки контактов для синхронизации: класс ровно `IPF.Contact` и папка контактов Skype, не
+    /// удалённые; стандартная «Контакты» (`contacts`) первой, Skype — последней.
     pub fn contact_folders(&self, account: AccountId) -> Result<Vec<SyncFolder>> {
         self.with_conn(|c| {
-            let mut st = c.prepare_cached(
+            let mut st = c.prepare_cached(&format!(
                 "SELECT folder_pk, server_id, display_name, distinguished, total_count FROM folders
-                  WHERE account_id = ?1 AND deleted = 0 AND folder_class = 'IPF.Contact'
-                  ORDER BY CASE WHEN distinguished = 'contacts' THEN 0 ELSE 1 END, folder_pk",
-            )?;
+                  WHERE account_id = ?1 AND deleted = 0 AND {CONTACT_FOLDER}
+                  ORDER BY CASE distinguished WHEN 'contacts' THEN 0 WHEN 'quickcontacts' THEN 2 ELSE 1 END, folder_pk"
+            ))?;
             let rows = st
                 .query_map(params![account.0], |r| Ok(SyncFolder { folder_pk: r.get(0)?, server_id: r.get(1)?, name: r.get(2)?, distinguished: r.get(3)?, total_count: r.get(4)? }))?
                 .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -128,14 +213,23 @@ impl Store {
 
     /// Применяет пачку изменений папки контактов и записывает её состояние синхронизации
     /// (`complete` — сервер сообщил, что изменений больше нет; тогда же удаляются контакты папки,
-    /// которых полная выгрузка не подтвердила). Заметки в разметке сводятся к тексту.
+    /// которых полная выгрузка не подтвердила). Заметки в разметке сводятся к тексту; у контактов
+    /// Skype заметок нет — в теле там служебный журнал Skype (когда и какой версией изменён).
     pub fn apply_contact_batch(&self, account: AccountId, folder_pk: i64, changes: &[ContactChange], state: &SyncState, complete: bool) -> Result<ContactApplyStats> {
         let now = now_ms();
         let stats = self.with_tx(|tx| {
+            let skype = tx.query_row("SELECT distinguished = 'quickcontacts' FROM folders WHERE folder_pk = ?1", params![folder_pk], |r| r.get::<_, Option<bool>>(0)).optional()?.flatten().unwrap_or(false);
             let mut stats = ContactApplyStats::default();
             for ch in changes {
                 match ch {
                     ContactChange::Create(c) | ContactChange::Update(c) => {
+                        let stripped;
+                        let c = if skype {
+                            stripped = ContactItem { notes: None, notes_is_html: false, ..c.clone() };
+                            &stripped
+                        } else {
+                            c
+                        };
                         if write_contact(tx, account, folder_pk, c, now)?.1 {
                             stats.updated += 1;
                         } else {
@@ -181,22 +275,31 @@ impl Store {
 
     /// Контакты и группы ящика: группы после контактов, по имени списка; `query` — слова, каждое
     /// должно начинать слово имени, адреса, компании, должности или цифр телефона. `limit` — предел
-    /// на каждый вид отдельно: группы не вытесняются контактами.
+    /// на каждый вид отдельно: группы не вытесняются контактами. Контакты Skype — вперемешку со
+    /// своими, без повторов, с телефонами из другой копии (`skype_view`).
     pub fn contacts_list(&self, account: AccountId, query: &str, limit: usize) -> Result<Vec<ContactRow>> {
         let words: Vec<String> = text::norm_lower(query).split_whitespace().map(String::from).collect();
         self.with_conn(|c| {
-            let mut st = c.prepare_cached(&format!("SELECT contact_pk, folder_pk, json, search_text, is_group FROM contacts WHERE account_id = ?1 AND {LIVE_FOLDER} ORDER BY is_group, sort_key, contact_pk"))?;
-            let rows = st.query_map(params![account.0], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, String>(2)?, r.get::<_, String>(3)?, r.get::<_, i64>(4)? != 0)))?;
+            let view = skype_view(c, account)?;
+            let mut st = c.prepare_cached(&format!("SELECT contact_pk, folder_pk, json, search_text, is_group, {SKYPE_ROW} FROM contacts WHERE account_id = ?1 AND {LIVE_FOLDER} ORDER BY is_group, sort_key, contact_pk"))?;
+            let rows = st.query_map(params![account.0], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, String>(2)?, r.get::<_, String>(3)?, r.get::<_, i64>(4)? != 0, r.get::<_, bool>(5)?)))?;
             let mut out = Vec::new();
             let (mut people, mut groups) = (0usize, 0usize);
             for r in rows {
-                let (contact_pk, folder_pk, json, search, is_group) = r?;
+                let (contact_pk, folder_pk, json, mut search, is_group, skype) = r?;
                 let taken = if is_group { &mut groups } else { &mut people };
-                if *taken >= limit || !words.iter().all(|w| word_prefix_match(&search, w)) {
+                if *taken >= limit || view.hidden.contains(&contact_pk) {
                     continue;
                 }
-                let Some(item) = row_item(&json) else { continue };
-                out.push(ContactRow { contact_pk, folder_pk, item });
+                if let Some(p) = view.phones.get(&contact_pk) {
+                    search = format!("{search} | {}", phones_text(p));
+                }
+                if !words.iter().all(|w| word_prefix_match(&search, w)) {
+                    continue;
+                }
+                let Some(mut item) = row_item(&json) else { continue };
+                view.fill(contact_pk, &mut item);
+                out.push(ContactRow { contact_pk, folder_pk, skype, item });
                 *taken += 1;
                 if groups >= limit {
                     break;
@@ -209,13 +312,19 @@ impl Store {
     /// Контакт по ключу базы.
     pub fn contact(&self, account: AccountId, contact_pk: i64) -> Result<Option<ContactRow>> {
         self.with_conn(|c| {
-            let mut st = c.prepare_cached(&format!("{CONTACT_SELECT} WHERE account_id = ?1 AND contact_pk = ?2"))?;
-            let row = st.query_row(params![account.0, contact_pk], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, String>(2)?))).optional()?;
-            Ok(row.and_then(|(contact_pk, folder_pk, json)| row_item(&json).map(|item| ContactRow { contact_pk, folder_pk, item })))
+            let mut st = c.prepare_cached(&format!("{} WHERE account_id = ?1 AND contact_pk = ?2", contact_select()))?;
+            let row = st.query_row(params![account.0, contact_pk], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, String>(2)?, r.get::<_, bool>(3)?))).optional()?;
+            let Some((contact_pk, folder_pk, json, skype)) = row else { return Ok(None) };
+            let Some(mut item) = row_item(&json) else { return Ok(None) };
+            if skype {
+                skype_view(c, account)?.fill(contact_pk, &mut item);
+            }
+            Ok(Some(ContactRow { contact_pk, folder_pk, skype, item }))
         })
     }
 
-    /// Личный контакт с таким адресом (любым из его адресов, без учёта регистра); группы — нет.
+    /// Личный контакт с таким адресом (любым из его адресов, без учёта регистра); группы — нет. Свой
+    /// контакт важнее контакта Skype, из копий Skype — та, что в списке.
     pub fn contact_by_email(&self, account: AccountId, email: &str) -> Result<Option<ContactRow>> {
         let key = email.trim().to_lowercase();
         if key.is_empty() {
@@ -223,15 +332,28 @@ impl Store {
         }
         self.with_conn(|c| {
             let mut st = c.prepare_cached(&format!(
-                "{CONTACT_SELECT} WHERE account_id = ?1 AND is_group = 0 AND {LIVE_FOLDER} AND (email = ?2 OR instr(search_text, ?2) > 0)
-                  ORDER BY CASE WHEN email = ?2 THEN 0 ELSE 1 END, contact_pk"
+                "{} WHERE account_id = ?1 AND is_group = 0 AND {LIVE_FOLDER} AND (email = ?2 OR instr(search_text, ?2) > 0)
+                  ORDER BY {SKYPE_ROW}, CASE WHEN email = ?2 THEN 0 ELSE 1 END, contact_pk",
+                contact_select()
             ))?;
-            let rows = st.query_map(params![account.0, key], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, String>(2)?)))?;
+            let rows = st.query_map(params![account.0, key], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, String>(2)?, r.get::<_, bool>(3)?)))?;
+            let mut view: Option<SkypeView> = None;
             for r in rows {
-                let (contact_pk, folder_pk, json) = r?;
-                let Some(item) = row_item(&json) else { continue };
+                let (contact_pk, folder_pk, json, skype) = r?;
+                if skype {
+                    if view.is_none() {
+                        view = Some(skype_view(c, account)?);
+                    }
+                    if view.as_ref().is_some_and(|v| v.hidden.contains(&contact_pk)) {
+                        continue;
+                    }
+                }
+                let Some(mut item) = row_item(&json) else { continue };
                 if item.emails.iter().any(|e| e.email.trim().eq_ignore_ascii_case(&key)) {
-                    return Ok(Some(ContactRow { contact_pk, folder_pk, item }));
+                    if let Some(v) = &view {
+                        v.fill(contact_pk, &mut item);
+                    }
+                    return Ok(Some(ContactRow { contact_pk, folder_pk, skype, item }));
                 }
             }
             Ok(None)
@@ -245,8 +367,8 @@ impl Store {
                 "SELECT f.folder_pk, f.display_name, f.distinguished, f.total_count, f.last_synced_at, f.sync_complete,
                         (SELECT count(*) FROM contacts c WHERE c.folder_pk = f.folder_pk)
                    FROM folders f
-                  WHERE f.account_id = ?1 AND f.deleted = 0 AND f.folder_class = 'IPF.Contact'
-                  ORDER BY CASE WHEN f.distinguished = 'contacts' THEN 0 ELSE 1 END, f.folder_pk",
+                  WHERE f.account_id = ?1 AND f.deleted = 0 AND (f.folder_class = 'IPF.Contact' OR f.distinguished = 'quickcontacts')
+                  ORDER BY CASE f.distinguished WHEN 'contacts' THEN 0 WHEN 'quickcontacts' THEN 2 ELSE 1 END, f.folder_pk",
             )?;
             let rows = st
                 .query_map(params![account.0], |r| {
@@ -265,19 +387,28 @@ impl Store {
         })
     }
 
-    /// Сколько контактов и групп в базе (в живых папках).
+    /// Сколько контактов и групп в списке (в живых папках, без повторов контактов Skype).
     pub fn contacts_count(&self, account: AccountId) -> Result<i64> {
-        self.with_conn(|c| Ok(c.query_row(&format!("SELECT count(*) FROM contacts WHERE account_id = ?1 AND {LIVE_FOLDER}"), params![account.0], |r| r.get(0))?))
+        self.with_conn(|c| {
+            let all: i64 = c.query_row(&format!("SELECT count(*) FROM contacts WHERE account_id = ?1 AND {LIVE_FOLDER}"), params![account.0], |r| r.get(0))?;
+            Ok(all - skype_view(c, account)?.hidden.len() as i64)
+        })
     }
 
-    /// Адреса личных контактов (без групп) для подсказок адресатов, по имени списка.
+    /// Адреса личных контактов (без групп, с контактами Skype без повторов) для подсказок
+    /// адресатов, по имени списка.
     pub fn contact_recipients(&self, account: AccountId) -> Result<Vec<ContactRecipient>> {
         self.with_conn(|c| {
-            let mut st = c.prepare_cached(&format!("SELECT json FROM contacts WHERE account_id = ?1 AND is_group = 0 AND {LIVE_FOLDER} ORDER BY sort_key, contact_pk"))?;
-            let rows = st.query_map(params![account.0], |r| r.get::<_, String>(0))?;
+            let hidden = skype_view(c, account)?.hidden;
+            let mut st = c.prepare_cached(&format!("SELECT contact_pk, json FROM contacts WHERE account_id = ?1 AND is_group = 0 AND {LIVE_FOLDER} ORDER BY sort_key, contact_pk"))?;
+            let rows = st.query_map(params![account.0], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
             let mut out = Vec::new();
             for r in rows {
-                let Some(item) = row_item(&r?) else { continue };
+                let (pk, json) = r?;
+                if hidden.contains(&pk) {
+                    continue;
+                }
+                let Some(item) = row_item(&json) else { continue };
                 let name = item.list_name();
                 for e in &item.emails {
                     let email = e.email.trim().to_lowercase();
@@ -305,8 +436,8 @@ fn sort_key(c: &ContactItem) -> String {
     text::norm_lower(&c.list_name().unwrap_or_default())
 }
 
-/// Текст для поиска: имя, адреса, компания, должность, отдел, прозвище, телефоны (как есть и
-/// только цифры), участники группы — через ` | `, в нижнем регистре.
+/// Текст для поиска: имя, адреса, компания, должность, отдел, прозвище, адреса Skype, телефоны (как
+/// есть и только цифры), участники группы — через ` | `, в нижнем регистре.
 fn search_text(c: &ContactItem) -> String {
     let mut parts: Vec<String> = Vec::new();
     let mut push = |s: &Option<String>| {
@@ -332,6 +463,9 @@ fn search_text(c: &ContactItem) -> String {
         if let Some(n) = &e.name {
             parts.push(n.clone());
         }
+    }
+    for im in &c.im_addresses {
+        parts.push(im.clone());
     }
     for p in &c.phones {
         parts.push(p.number.clone());
@@ -544,5 +678,88 @@ mod tests {
         let got = store.contacts_list(account, "", 2).unwrap();
         assert_eq!(got.iter().map(|r| r.item.item_id.id.as_str()).collect::<Vec<_>>(), ["C1", "C2", "G1"]);
         assert_eq!(store.contacts_list(account, "", 100).unwrap().len(), 4);
+    }
+
+    /// Контакты Skype для бизнеса (п. 25): папка синхронизируется последней, контакты — только для
+    /// просмотра, без служебных заметок, по одному на человека (самая свежая копия), и человек из
+    /// своих контактов не повторяется копией Skype.
+    #[test]
+    fn skype_contacts_are_read_only_and_without_repeats() {
+        let (store, account, folder_pk) = store_with_contacts_folder("skype");
+        let quick = Folder {
+            id: FolderId { id: "F-Q".into(), change_key: None },
+            parent_id: None,
+            display_name: "Контакты Skype для бизнеса".into(),
+            distinguished: Some(SKYPE_CONTACTS_FOLDER.into()),
+            folder_class: Some("IPF.Contact.MOC.QuickContacts".into()),
+            total_count: 5,
+            unread_count: 0,
+            child_folder_count: 0,
+        };
+        let groups = Folder { id: FolderId { id: "F-L".into(), change_key: None }, display_name: "{guid}".into(), distinguished: Some("imcontactlist".into()), folder_class: Some("IPF.Contact.MOC.ImContactList".into()), ..quick.clone() };
+        store.upsert_folders(account, &[quick, groups]).unwrap();
+        let folders = store.contact_folders(account).unwrap();
+        assert_eq!(folders.iter().map(|f| f.distinguished.as_deref()).collect::<Vec<_>>(), [Some("contacts"), Some(SKYPE_CONTACTS_FOLDER)], "группы Skype не синхронизируются, Skype — последней");
+        let skype_pk = folders[1].folder_pk;
+
+        store.apply_contact_batch(account, folder_pk, &[ContactChange::Create(contact("C1", "Анна Своя", "anna@example.com"))], &SyncState("s1".into()), true).unwrap();
+        let skype = |id: &str, name: &str, email: Option<&str>, sip: &str, modified: i64| {
+            let mut c = contact(id, name, email.unwrap_or(""));
+            if email.is_none() {
+                c.emails.clear();
+            }
+            c.im_addresses = vec![sip.into()];
+            c.notes = Some("01.02.2020 Контакт изменён Skype for Business 2016".into());
+            c.modified_at = Some(jiff::Timestamp::from_millisecond(modified).unwrap());
+            c
+        };
+        // Телефоны Бориса — только в старых копиях: показанная (самая свежая) берёт их из самой
+        // свежей копии, где они есть.
+        let with_phone = |mut c: ContactItem, number: &str| {
+            c.phones = if number.is_empty() { vec![] } else { vec![ContactPhone { key: Some("MobilePhone".into()), number: number.into() }] };
+            c
+        };
+        store
+            .apply_contact_batch(
+                account,
+                skype_pk,
+                &[
+                    ContactChange::Create(with_phone(skype("Q1", "Борис Старый", Some("boris@example.com"), "boris@corp.local", 1_000), "+7 (499) 000-00-01")),
+                    ContactChange::Create(with_phone(skype("Q2", "Борис Новый", Some("boris@example.com"), "Boris@Corp.Local", 2_000), "")),
+                    ContactChange::Create(with_phone(skype("Q3", "Борис Новый", Some("boris@example.com"), "boris@corp.local", 1_500), "+7 (495) 555-01-02")),
+                    ContactChange::Create(skype("Q4", "Анна из Skype", Some("Anna@Example.com"), "anna@corp.local", 3_000)),
+                    ContactChange::Create(skype("Q5", "Вера Только Skype", None, "sip:vera@partner.local", 1_000)),
+                ],
+                &SyncState("q1".into()),
+                true,
+            )
+            .unwrap();
+
+        let all = store.contacts_list(account, "", 100).unwrap();
+        assert_eq!(all.iter().map(|r| (r.item.item_id.id.as_str(), r.skype)).collect::<Vec<_>>(), [("C1", false), ("Q2", true), ("Q5", true)], "свой контакт, самая свежая копия Бориса, человек без почты");
+        assert!(all.iter().all(|r| r.item.notes.is_none()), "служебный журнал Skype — не заметки");
+        assert_eq!(store.contacts_count(account).unwrap(), 3);
+        assert_eq!(store.contacts_list(account, "vera@partner", 10).unwrap().len(), 1, "поиск по адресу Skype");
+        assert_eq!(store.contacts_list(account, "старый", 10).unwrap().len(), 0, "старая копия не ищется");
+        let phones = |r: &ContactRow| r.item.phones.iter().map(|p| p.number.clone()).collect::<Vec<_>>();
+        assert_eq!(phones(&all[1]), ["+7 (495) 555-01-02"], "телефон из самой свежей копии, где он есть");
+        let by_phone = store.contacts_list(account, "74955550102", 10).unwrap();
+        assert_eq!(by_phone.iter().map(|r| r.item.item_id.id.as_str()).collect::<Vec<_>>(), ["Q2"], "поиск и по взятому телефону");
+        assert!(store.contacts_list(account, "74990000001", 10).unwrap().is_empty(), "телефон старой копии не берётся");
+
+        let anna = store.contact_by_email(account, "anna@example.com").unwrap().unwrap();
+        assert_eq!((anna.item.item_id.id.as_str(), anna.skype), ("C1", false), "свой контакт важнее Skype");
+        let boris = store.contact_by_email(account, "boris@example.com").unwrap().unwrap();
+        assert_eq!((boris.item.item_id.id.as_str(), boris.skype), ("Q2", true), "из копий Skype — та, что в списке");
+        assert_eq!(phones(&boris), ["+7 (495) 555-01-02"]);
+        let by_pk = store.contact(account, boris.contact_pk).unwrap().unwrap();
+        assert!(by_pk.skype);
+        assert_eq!(phones(&by_pk), ["+7 (495) 555-01-02"]);
+
+        let recipients = store.contact_recipients(account).unwrap();
+        assert_eq!(recipients.iter().map(|r| (r.email.as_str(), r.name.as_deref())).collect::<Vec<_>>(), [("anna@example.com", Some("Анна Своя")), ("boris@example.com", Some("Борис Новый"))]);
+
+        let infos = store.contact_folder_infos(account).unwrap();
+        assert_eq!(infos.iter().map(|f| (f.distinguished.as_deref(), f.contacts)).collect::<Vec<_>>(), [(Some("contacts"), 1), (Some(SKYPE_CONTACTS_FOLDER), 5)]);
     }
 }

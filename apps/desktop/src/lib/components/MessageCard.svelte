@@ -586,9 +586,9 @@
       <div class="who">
         <div class="from">
           {#if expanded && openContact && message.from_email}
-            <button type="button" class="name person" onclick={(e) => showContact(e, message.from_name, message.from_email)} aria-haspopup="dialog" title="Карточка контакта">{personLabel(message.from_name, message.from_email)}</button>
+            <button type="button" class="name person" onclick={(e) => showContact(e, message.from_name, message.from_email)} aria-haspopup="dialog" title="{personLabel(message.from_name, message.from_email)} — карточка контакта">{personLabel(message.from_name, message.from_email)}</button>
           {:else}
-            <span class="name">{personLabel(message.from_name, message.from_email) || "(без отправителя)"}</span>
+            <span class="name" title={personLabel(message.from_name, message.from_email) || undefined}>{personLabel(message.from_name, message.from_email) || "(без отправителя)"}</span>
           {/if}
           {#if message.from_name && message.from_email}<span class="email caption">{message.from_email}</span>{/if}
           {#if message.importance === "High"}<span class="badge high">важное</span>{/if}
@@ -884,14 +884,17 @@
       inset 3px 0 0 var(--unread),
       var(--shadow-2);
   }
+  /* Панель действий не сжимает отправителя: если рядом с ней заголовку остаётся меньше
+     420 px (узкая колонка чтения), она переносится строкой ниже, к правому краю (п. 26). */
   .head {
     display: flex;
+    flex-wrap: wrap;
     align-items: flex-start;
     gap: var(--space-2);
     padding: var(--space-3) var(--space-3) var(--space-3) var(--space-4);
   }
   .head-main {
-    flex: 1;
+    flex: 1 1 420px;
     min-width: 0;
     display: grid;
     grid-template-columns: 36px 1fr auto;
@@ -927,9 +930,16 @@
     min-width: 0;
     flex-wrap: wrap;
   }
+  /* Имя — одной строкой: длинное режется многоточием (полностью — в подсказке), адрес и метки
+     переносятся следующей строкой. */
   .name {
     font: var(--text-body-strong);
     user-select: text;
+    min-width: 0;
+    max-width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
   .email {
     user-select: text;
@@ -1098,6 +1108,7 @@
     align-items: center;
     gap: 2px;
     margin-top: -2px;
+    margin-left: auto;
   }
   .act {
     width: 28px;

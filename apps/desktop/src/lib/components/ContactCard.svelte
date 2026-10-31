@@ -275,7 +275,7 @@
     <div class="who">
       <h2 class="name" id="{uid}-name">{name}</h2>
       {#if subtitle}<div class="sub" id="{uid}-sub">{subtitle}</div>{/if}
-      {#if personal}<span class="badge">В моих контактах</span>{/if}
+      {#if personal}<span class="badge">{personal.skype ? "В контактах Skype" : "В моих контактах"}</span>{/if}
       {#if kindLabel}<span class="badge">{kindLabel}</span>{/if}
     </div>
     <div class="head-actions">
@@ -410,7 +410,7 @@
       Найти письма
     </button>
     <button class="btn" onclick={copyAddress}>Копировать адрес</button>
-    {#if onaddcontact && !personal && !isList && !loading && email.includes("@")}
+    {#if onaddcontact && (!personal || personal.skype) && !isList && !loading && email.includes("@")}
       <button class="btn" onclick={addContact} disabled={actionsBlocked !== null} title={actionsBlocked ?? "Новый личный контакт с этим адресом в «Контактах»"}>Добавить в контакты</button>
     {/if}
   </div>

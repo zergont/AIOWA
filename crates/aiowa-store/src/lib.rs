@@ -32,7 +32,7 @@ use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
 pub use calendar::{reminder_state_key, CachedTimeZone, CalendarRow, ReminderMark, ReminderRow, ReminderState, OWA_TIME_ZONE_KEY, OWA_TIME_ZONE_TTL_MS};
-pub use contacts::{ContactApplyStats, ContactFolderInfo, ContactRecipient, ContactRow};
+pub use contacts::{ContactApplyStats, ContactFolderInfo, ContactRecipient, ContactRow, SKYPE_CONTACTS_FOLDER};
 pub use directory::ContactLocalStats;
 pub use drafts::LocalDraft;
 pub use identity::{login_key, read_summary, DbAccount, DbSummary, MailboxIdentity};

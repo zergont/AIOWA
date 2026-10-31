@@ -541,6 +541,8 @@ export interface PersonalContact {
   name: string;
   email: string | null;
   is_group: boolean;
+  /** Контакт Skype для бизнеса (п. 25): только для просмотра. */
+  skype?: boolean;
   birthday_ms?: number | null;
   modified_ms?: number | null;
   item: ContactItem;
