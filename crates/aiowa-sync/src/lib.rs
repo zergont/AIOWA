@@ -436,6 +436,23 @@ impl Engine {
         Ok(n)
     }
 
+    /// Папки нет на сервере, а синхронизация иерархии об этом не сообщила (docs/protocol-owa-json.md
+    /// § 5u): папка снимается из базы вместе с подпапками и письмами, остальные синхронизируются
+    /// дальше. Служебная папка так не снимается — ошибка уходит наверх, как раньше.
+    fn folder_gone(&self, folder: &SyncFolder, e: TransportError) -> Result<()> {
+        match self.store.delete_folder_local(folder.folder_pk, None) {
+            Ok(stats) => {
+                warn!(folder = folder.name.as_str(), folders = stats.folders, items = stats.items, "папки нет на сервере: снята из базы вместе с подпапками");
+                self.emit(SyncEvent::FoldersApplied { upserts: 0, deletes: stats.folders });
+                if stats.items > 0 {
+                    self.emit(SyncEvent::ItemsApplied { folder_pk: folder.folder_pk, folder: folder.name.clone(), changed: stats.items, recent: false });
+                }
+                Ok(())
+            }
+            Err(_) => Err(SyncError::Transport(e)),
+        }
+    }
+
     async fn sync_items(&self, folder: &SyncFolder, opts: &SyncOptions, report: &mut SyncReport) -> Result<()> {
         let folder_pk = folder.folder_pk;
         let name = folder.name.as_str();
@@ -478,6 +495,7 @@ impl Engine {
                     self.store.set_folder_sync_state(folder_pk, None, false)?;
                     continue;
                 }
+                Err(SyncError::Transport(e)) if e.folder_missing() => return self.folder_gone(folder, e),
                 Err(e) => return Err(e),
             };
             pages += 1;

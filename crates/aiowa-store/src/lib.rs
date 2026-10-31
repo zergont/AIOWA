@@ -1277,7 +1277,9 @@ impl Store {
     pub fn conversation_item_pks(&self, account: AccountId, conversation_pk: i64, folder_pk: Option<i64>) -> Result<Vec<i64>> {
         self.with_conn(|c| {
             let mut st = c.prepare_cached(
-                "SELECT item_pk FROM items WHERE conversation_pk = ?1 AND account_id = ?2 AND deleted = 0 AND (?3 IS NULL OR folder_pk = ?3)
+                // `+account_id`: без статистики планировщик брал индекс `items_from_lower` (по `account_id`)
+                // и перебирал все письма ящика — 1–7 с на беседу на 155 тыс. писем; нужен `items_conv_folder`.
+                "SELECT item_pk FROM items WHERE conversation_pk = ?1 AND +account_id = ?2 AND deleted = 0 AND (?3 IS NULL OR folder_pk = ?3)
                  ORDER BY COALESCE(received_at, sent_at) DESC, item_pk DESC",
             )?;
             Ok(st.query_map(params![conversation_pk, account.0, folder_pk], |r| r.get::<_, i64>(0))?.collect::<std::result::Result<Vec<_>, _>>()?)

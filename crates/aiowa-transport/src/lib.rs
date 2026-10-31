@@ -93,6 +93,11 @@ impl TransportError {
     pub fn invalidates_sync_state(&self) -> bool {
         matches!(self, Self::Server { code, .. } if code == "ErrorInvalidSyncStateData" || code == "ErrorSyncFolderNotFound")
     }
+
+    /// Папки нет на сервере: синхронизировать в ней нечего (после сброса состояния — она удалена).
+    pub fn folder_missing(&self) -> bool {
+        matches!(self, Self::Server { code, .. } if code == "ErrorSyncFolderNotFound" || code == "ErrorFolderNotFound")
+    }
 }
 
 pub type Result<T> = std::result::Result<T, TransportError>;

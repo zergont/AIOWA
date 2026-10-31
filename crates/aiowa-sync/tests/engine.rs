@@ -89,6 +89,8 @@ struct Fake {
     gate: Mutex<Option<Arc<Gate>>>,
     /// Изменения дерева для следующего инкрементального `SyncFolderHierarchy` (один раз).
     hierarchy_next: Mutex<Option<Vec<FolderChange>>>,
+    /// Папки, которых на сервере уже нет: `SyncFolderItems` отвечает `ErrorSyncFolderNotFound`.
+    missing: Mutex<Vec<String>>,
 }
 
 impl Fake {
@@ -104,6 +106,7 @@ impl Fake {
             recent_calls: Mutex::new(vec![]),
             gate: Mutex::new(None),
             hierarchy_next: Mutex::new(None),
+            missing: Mutex::new(vec![]),
         })
     }
 
@@ -144,6 +147,9 @@ impl MailTransport for Fake {
         self.seen_states.lock().unwrap().push(state.map(|s| s.0.clone()));
         let FolderRef::Id(fid) = folder else { panic!("ожидается FolderId") };
         self.seen_folders.lock().unwrap().push(fid.id.clone());
+        if self.missing.lock().unwrap().contains(&fid.id) {
+            return Err(TransportError::Server { code: "ErrorSyncFolderNotFound".into(), message: "The folder to be synchronized could not be found.".into() });
+        }
         if fid.id != "F-INBOX" {
             return Ok(ItemChanges { state: SyncState(format!("{}-done", fid.id)), changes: vec![], includes_last: true });
         }
@@ -573,6 +579,26 @@ async fn invalid_state_triggers_resync() {
     assert_eq!(report.items_created, 0);
     assert_eq!(report.items_updated, 3);
     assert_eq!(store.folder_sync_state(inbox_pk).unwrap().unwrap().0, "I2");
+}
+
+/// Папки нет на сервере, а иерархия об этом не сообщила (§ 5u): после сброса состояния снова
+/// `ErrorSyncFolderNotFound` — папка снимается из базы, остальные синхронизируются, прогон не падает.
+#[tokio::test]
+async fn missing_folder_is_dropped_and_sync_continues() {
+    let store = test_store("missing-folder");
+    let account = store.account("fake", "u").unwrap();
+    let fake = Fake::new();
+    fake.missing.lock().unwrap().push("F-PROJ".into());
+    let engine = Engine::new(fake.clone(), store.clone(), account, Arc::new(AtomicBool::new(false)));
+    let opts = SyncOptions { folders: FolderSelection::AllMail, fetch_bodies: false, fetch_attachments: false, ..SyncOptions::default() };
+    engine.run(&opts).await.unwrap();
+    assert!(store.resolve_folder(account, "Проекты").unwrap().is_none(), "папка снята из базы");
+    let seen = fake.seen_folders.lock().unwrap().clone();
+    assert_eq!(seen.iter().filter(|f| *f == "F-PROJ").count(), 2, "один сброс состояния, затем папка снята: {seen:?}");
+    assert!(seen.contains(&"F-INBOX".to_string()) && seen.contains(&"F-SENT".to_string()), "остальные папки синхронизированы: {seen:?}");
+    // Следующий прогон её уже не трогает.
+    engine.run(&opts).await.unwrap();
+    assert_eq!(fake.seen_folders.lock().unwrap().iter().filter(|f| *f == "F-PROJ").count(), 2);
 }
 
 // --- свежие письма первыми и события по ходу прогона -------------------------------------------
