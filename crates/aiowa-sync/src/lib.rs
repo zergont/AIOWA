@@ -312,7 +312,97 @@ impl Engine {
         if total > 0 || deletes > 0 {
             self.emit(SyncEvent::FoldersApplied { upserts: total, deletes });
         }
+        self.drop_orphan_items()?;
         Ok(total)
+    }
+
+    /// Живые письма папок, уже помеченных удалёнными (docs/obkatka.md п. 28), — удалёнными; окну —
+    /// какие папки перечитать. Запрос дешёвый (папок с `deleted = 1` мало), поэтому — каждый раз
+    /// после иерархии.
+    fn drop_orphan_items(&self) -> Result<()> {
+        let (folders, stats) = self.store.drop_items_of_deleted_folders(self.account)?;
+        if stats.items > 0 {
+            warn!(folders = folders.len(), items = stats.items, "письма уже удалённых папок сняты из базы");
+            for folder_pk in folders {
+                self.emit(SyncEvent::ItemsApplied { folder_pk, folder: String::new(), changed: 0, recent: false });
+            }
+        }
+        Ok(())
+    }
+
+    /// Сверка дерева папок с сервером (docs/obkatka.md п. 28): полная выгрузка иерархии без
+    /// состояния ложится поверх базы (имена, родители, счётчики — как на сервере; состояние иерархии
+    /// — новое), а папки, которых в ней нет, снимаются из базы вместе с письмами
+    /// (`Store::drop_folders_not_on_server`). Так уходят «призраки»: папки, удалённые на сервере
+    /// так, что синхронизация иерархии об этом не сообщила (§ 5u протокола), — их не удалить из
+    /// окна (сервер отвечает «папки нет»), и инкрементальная синхронизация их не увидит.
+    ///
+    /// Осторожность: выгрузка оборвалась на полпути, в ней нет «Входящих» из базы (другой формат
+    /// идентификаторов) или снимать пришлось бы больше трёх папок и больше четверти своих —
+    /// ничего не снимается, причина в журнале. Возвращает число снятых папок.
+    pub async fn reconcile_hierarchy(&self) -> Result<usize> {
+        const MAX_ROUNDS: u32 = 50;
+        self.emit(SyncEvent::Stage { stage: SyncStage::Hierarchy, folder: None });
+        let mut state: Option<SyncState> = None;
+        let mut all: Vec<FolderChange> = Vec::new();
+        let mut complete = false;
+        for _ in 0..MAX_ROUNDS {
+            self.check_cancel()?;
+            let transport = self.transport.clone();
+            let st = state.clone();
+            let changes = with_retry("SyncFolderHierarchy", || {
+                let t = transport.clone();
+                let st = st.clone();
+                async move { t.sync_folder_hierarchy(st.as_ref()).await }
+            })
+            .await?;
+            let done = changes.includes_last || changes.changes.is_empty();
+            all.extend(changes.changes);
+            state = Some(changes.state);
+            if done {
+                complete = true;
+                break;
+            }
+        }
+        let Some(state) = state.filter(|_| complete) else {
+            warn!(rounds = MAX_ROUNDS, "сверка дерева: выгрузка иерархии не закончилась, папки не сверены");
+            return Ok(0);
+        };
+        let server_ids: HashSet<String> = all
+            .iter()
+            .filter_map(|c| match c {
+                FolderChange::Create(f) | FolderChange::Update(f) => Some(f.id.id.clone()),
+                FolderChange::Delete(_) => None,
+            })
+            .collect();
+        let inbox_known = match self.store.folder_by_distinguished(self.account, "inbox")? {
+            Some((_, sid)) => server_ids.contains(&sid),
+            None => false,
+        };
+        if !inbox_known {
+            warn!(server = server_ids.len(), "сверка дерева: «Входящих» из базы нет в выгрузке иерархии, папки не сверены");
+            return Ok(0);
+        }
+        let own = self.store.list_folders(self.account)?.into_iter().filter(|(_, f)| f.distinguished.is_none()).collect::<Vec<_>>();
+        let missing = own.iter().filter(|(_, f)| !server_ids.contains(&f.id.id)).count();
+        if missing > 3 && missing * 4 > own.len() {
+            warn!(missing, own = own.len(), "сверка дерева: на сервере нет слишком многих папок базы, папки не сверены");
+            return Ok(0);
+        }
+        let upserts = self.store.apply_hierarchy_batch(self.account, &all, &state)?;
+        let (dropped, stats) = self.store.drop_folders_not_on_server(self.account, &server_ids)?;
+        info!(server = server_ids.len(), upserts, dropped = dropped.len(), items = stats.items, "дерево папок сверено с сервером");
+        if upserts > 0 || !dropped.is_empty() {
+            self.emit(SyncEvent::FoldersApplied { upserts, deletes: dropped.len() });
+        }
+        // Открытый в окне список снятой папки перечитывается, как у `folder_gone`.
+        if stats.items > 0 {
+            for &folder_pk in &dropped {
+                self.emit(SyncEvent::ItemsApplied { folder_pk, folder: String::new(), changed: 0, recent: false });
+            }
+        }
+        self.drop_orphan_items()?;
+        Ok(dropped.len())
     }
 
     /// Последняя страница писем папки, которую ещё ни разу не синхронизировали (нет состояния

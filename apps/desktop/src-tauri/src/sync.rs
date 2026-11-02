@@ -207,7 +207,15 @@ pub struct SyncState {
     identity: crate::mailbox::IdentityGuard,
     /// Живое окно: события о записи в базу по ходу прогона (`live.rs`).
     live: Arc<crate::live::LiveEvents>,
+    /// Сверить дерево папок с сервером при следующем прогоне, не дожидаясь суточного срока
+    /// (`request_reconcile`: сервер ответил «папки нет»).
+    reconcile_requested: AtomicBool,
 }
+
+/// Когда дерево папок последний раз сверялось с сервером (`sync_state`, мс эпохи).
+const RECONCILED_KEY: &str = "hierarchy_reconciled_at";
+/// Сверка дерева с сервером — не чаще раза в сутки, если её не попросили раньше.
+const RECONCILE_EVERY_MS: i64 = 24 * 60 * 60 * 1000;
 
 const MAX_WARNINGS: usize = 5;
 
@@ -251,7 +259,7 @@ impl SyncState {
     pub fn new(store: Arc<Store>, account: AccountId, host: String, user: String) -> Self {
         let last_ok_ms = store.get_state(account, LAST_OK_KEY).ok().flatten().and_then(|v| v.parse::<i64>().ok());
         let status = SyncStatusDto { last_ok_ms, ..SyncStatusDto::default() };
-        Self { inner: Mutex::new(Inner { status, ..Inner::default() }), connect_lock: tokio::sync::Mutex::new(()), closing: AtomicBool::new(false), store, account, host, user, identity: Default::default(), live: Arc::default() }
+        Self { inner: Mutex::new(Inner { status, ..Inner::default() }), connect_lock: tokio::sync::Mutex::new(()), closing: AtomicBool::new(false), store, account, host, user, identity: Default::default(), live: Arc::default(), reconcile_requested: AtomicBool::new(false) }
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
@@ -293,6 +301,39 @@ impl SyncState {
     /// `folders-changed`.
     pub fn request_hierarchy(self: &Arc<Self>, app: AppHandle) {
         self.launch(app, None, Scope::HierarchyOnly, true);
+    }
+
+    /// Сервер ответил, что папки нет, а в базе она есть (docs/obkatka.md п. 28): дерево
+    /// сверяется с полным списком папок сервера (`Engine::reconcile_hierarchy`) сразу, прогоном
+    /// дерева, а не в суточный срок. Призраки уходят из базы и из окна.
+    pub fn request_reconcile(self: &Arc<Self>, app: AppHandle) {
+        self.reconcile_requested.store(true, Ordering::SeqCst);
+        self.request_hierarchy(app);
+    }
+
+    /// Пора сверять дерево: попросили (флаг снимается) или с прошлой сверки прошли сутки.
+    fn reconcile_due(&self) -> bool {
+        if self.reconcile_requested.swap(false, Ordering::SeqCst) {
+            return true;
+        }
+        let last = self.store.get_state(self.account, RECONCILED_KEY).ok().flatten().and_then(|v| v.parse::<i64>().ok());
+        last.is_none_or(|t| now_ms() - t >= RECONCILE_EVERY_MS)
+    }
+
+    /// Сверка дерева с сервером (п. 28). Удача — отметка времени; отказ (сеть, остановка) — в
+    /// журнал, сверка повторится следующим прогоном. Ошибка прогон не валит: почта уже готова.
+    async fn reconcile_folders(&self, engine: &Engine) {
+        match engine.reconcile_hierarchy().await {
+            Ok(_) => {
+                if let Err(e) = self.store.set_state(self.account, RECONCILED_KEY, Some(&now_ms().to_string())) {
+                    warn!(error = %e, "время сверки дерева папок не записано");
+                }
+            }
+            Err(e) => {
+                warn!(error = %e, "сверка дерева папок с сервером не выполнена, повтор следующим прогоном");
+                self.reconcile_requested.store(true, Ordering::SeqCst);
+            }
+        }
     }
 
     fn launch(self: &Arc<Self>, app: AppHandle, days: Option<u32>, scope: Scope, queue_if_busy: bool) -> SyncStatusDto {
@@ -534,7 +575,11 @@ impl SyncState {
             Scope::Folders(pks) => FolderSelection::Ids(pks),
             Scope::HierarchyOnly => {
                 let started = std::time::Instant::now();
-                return match engine.sync_hierarchy().await {
+                let result = engine.sync_hierarchy().await;
+                if result.is_ok() && self.reconcile_requested.load(Ordering::SeqCst) && self.reconcile_due() {
+                    self.reconcile_folders(&engine).await;
+                }
+                return match result {
                     Ok(n) => Ok(SyncReport { folders_in_hierarchy: n, elapsed: started.elapsed(), ..SyncReport::default() }),
                     Err(e) => Err(Self::failed(e)),
                 };
@@ -555,6 +600,10 @@ impl SyncState {
         };
         let body_days = opts.body_days;
         let report = engine.run(&opts).await.map_err(Self::failed)?;
+        // Призраки в дереве (п. 28): раз в сутки или по просьбе — сверка с полным списком папок.
+        if self.reconcile_due() {
+            self.reconcile_folders(&engine).await;
+        }
         self.repair_change_keys(&transport, &cancel).await;
         self.backfill_verbs(&transport, body_days, &cancel).await;
         self.sync_contacts(app, &transport, &cancel).await;

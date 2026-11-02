@@ -175,12 +175,21 @@ pub(crate) fn subtree_pks(list: &[(i64, Folder)], folder_pk: i64) -> Vec<i64> {
     out
 }
 
+/// Папки (или папки назначения) нет на сервере: окно сверяет дерево с сервером
+/// (`SyncState::request_reconcile`, docs/obkatka.md п. 28), и папки, которых там нет, уходят из списка.
+const FOLDER_GONE: &str = "Папки уже нет на сервере: сверяю список папок, лишние из него уйдут";
+
+/// Отказ сервера «папки нет».
+fn folder_not_found(e: &TransportError) -> bool {
+    matches!(e, TransportError::Server { code, .. } if code == "ErrorFolderNotFound" || code == "ErrorItemNotFound")
+}
+
 /// Текст отказа сервера по папке: частые коды словами, остальные как у `describe_transport`.
 pub(crate) fn describe_folder_error(e: &TransportError) -> String {
     let TransportError::Server { code, .. } = e else { return describe_transport(e) };
     match code.as_str() {
         "ErrorFolderExists" => "Папка с таким именем уже есть".into(),
-        "ErrorFolderNotFound" | "ErrorItemNotFound" => "Папки уже нет на сервере: обновите папки".into(),
+        "ErrorFolderNotFound" | "ErrorItemNotFound" => FOLDER_GONE.into(),
         "ErrorDeleteDistinguishedFolder" => "Служебную папку нельзя удалить".into(),
         "ErrorCannotDeleteObject" => "Сервер не разрешил удалить папку".into(),
         "ErrorMoveCopyFailed" => "Сервер не смог перенести папку".into(),
@@ -193,13 +202,16 @@ pub(crate) fn describe_folder_error(e: &TransportError) -> String {
 // --- сервер и база -----------------------------------------------------------------------------
 
 /// Один сетевой шаг под таймаутом: ошибка транспорта сбрасывает мёртвую сессию и превращается в
-/// текст для пользователя.
-async fn server_step<T>(sync: &SyncState, what: &'static str, fut: impl Future<Output = aiowa_transport::Result<T>>) -> CmdResult<T> {
+/// текст для пользователя. «Папки нет» — ещё и сверка дерева с сервером (призраки уходят из базы).
+async fn server_step<T>(app: &AppHandle, sync: &Arc<SyncState>, what: &'static str, fut: impl Future<Output = aiowa_transport::Result<T>>) -> CmdResult<T> {
     match tokio::time::timeout(FOLDER_TIMEOUT, fut).await {
         Ok(Ok(v)) => Ok(v),
         Ok(Err(e)) => {
             warn!(step = what, error = %e, "операция с папкой отклонена");
             sync.invalidate_on(&e).await;
+            if folder_not_found(&e) {
+                sync.request_reconcile(app.clone());
+            }
             Err(describe_folder_error(&e))
         }
         Err(_) => {
@@ -245,7 +257,7 @@ pub(crate) async fn folder_create(parent_pk: Option<i64>, name: String, app: App
         return Err("Папка с таким именем уже есть".into());
     }
     let transport = sync.transport().await.map_err(|e| e.to_string())?;
-    let id = server_step(&sync, "CreateFolder", transport.create_folder(&parent_ref, &name)).await?;
+    let id = server_step(&app, &sync, "CreateFolder", transport.create_folder(&parent_ref, &name)).await?;
     let folder = Folder {
         id,
         parent_id: parent_server_id.map(|p| FolderId { id: p, change_key: None }),
@@ -278,7 +290,7 @@ pub(crate) async fn folder_rename(folder_pk: i64, name: String, app: AppHandle, 
         return Err("Папка с таким именем уже есть".into());
     }
     let transport = sync.transport().await.map_err(|e| e.to_string())?;
-    let new_id = server_step(&sync, "UpdateFolder", transport.rename_folder(&f.id, &name)).await?;
+    let new_id = server_step(&app, &sync, "UpdateFolder", transport.rename_folder(&f.id, &name)).await?;
     state.store.rename_folder_local(folder_pk, &name, Some(&new_id)).map_err(err)?;
     info!(folder_pk, name_len = name.chars().count(), same_id = new_id.id == f.id.id, "папка переименована");
     after_change(&app, &sync);
@@ -301,7 +313,7 @@ pub(crate) async fn folder_move(folder_pk: i64, target_pk: Option<i64>, app: App
         None => (FolderRef::Distinguished(DistinguishedFolder::MsgFolderRoot), root),
     };
     let transport = sync.transport().await.map_err(|e| e.to_string())?;
-    let new_id = server_step(&sync, "MoveFolder", transport.move_folder(&f.id, &target_ref)).await?;
+    let new_id = server_step(&app, &sync, "MoveFolder", transport.move_folder(&f.id, &target_ref)).await?;
     state.store.move_folder_local(folder_pk, parent_server_id.as_deref(), Some(&new_id)).map_err(err)?;
     info!(folder_pk, target_pk, same_id = new_id.id == f.id.id, "папка перенесена");
     after_change(&app, &sync);
@@ -328,7 +340,7 @@ pub(crate) async fn folder_delete(folder_pk: i64, permanent: bool, app: AppHandl
     };
     let affected = subtree_pks(&list, folder_pk);
     let transport = sync.transport().await.map_err(|e| e.to_string())?;
-    server_step(&sync, "DeleteFolder", transport.delete_folder(&f.id, permanent)).await?;
+    server_step(&app, &sync, "DeleteFolder", transport.delete_folder(&f.id, permanent)).await?;
     let stats = state.store.delete_folder_local(folder_pk, to_deleted).map_err(err)?;
     info!(folder_pk, permanent, folders = stats.folders, items = stats.items, "папка удалена");
     after_change(&app, &sync);
@@ -359,7 +371,7 @@ pub(crate) async fn folder_empty(folder_pk: i64, subfolders: bool, app: AppHandl
     let delete_type = if mode == EmptyMode::Permanent { "SoftDelete" } else { "MoveToDeletedItems" };
     let affected = subtree_pks(&list, folder_pk);
     let transport = sync.transport().await.map_err(|e| e.to_string())?;
-    server_step(&sync, "EmptyFolder", transport.empty_folder(&f.id, delete_type, subfolders)).await?;
+    server_step(&app, &sync, "EmptyFolder", transport.empty_folder(&f.id, delete_type, subfolders)).await?;
     let stats = state.store.empty_folder_local(folder_pk, local).map_err(err)?;
     info!(folder_pk, permanent = mode == EmptyMode::Permanent, subfolders, folders = stats.folders, items = stats.items, "папка очищена");
     after_change(&app, &sync);
@@ -490,7 +502,7 @@ mod tests {
     fn folder_error_texts_are_russian() {
         let server = |code: &str| TransportError::Server { code: code.into(), message: "<details>".into() };
         assert_eq!(describe_folder_error(&server("ErrorFolderExists")), "Папка с таким именем уже есть");
-        assert_eq!(describe_folder_error(&server("ErrorFolderNotFound")), "Папки уже нет на сервере: обновите папки");
+        assert_eq!(describe_folder_error(&server("ErrorFolderNotFound")), FOLDER_GONE);
         assert_eq!(describe_folder_error(&server("ErrorDeleteDistinguishedFolder")), "Служебную папку нельзя удалить");
         assert_eq!(describe_folder_error(&server("ErrorIrresolvableConflict")), "Папка изменена на сервере, обновите папки и повторите");
         let other = describe_folder_error(&server("ErrorInternalServerError"));

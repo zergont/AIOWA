@@ -601,6 +601,34 @@ async fn missing_folder_is_dropped_and_sync_continues() {
     assert_eq!(fake.seen_folders.lock().unwrap().iter().filter(|f| *f == "F-PROJ").count(), 2);
 }
 
+/// Сверка дерева (п. 28): папка, которой нет в полной выгрузке иерархии, снимается из базы
+/// вместе с письмами, папки сервера остаются, окно получает `FoldersApplied`; повтор ничего не снимает.
+#[tokio::test]
+async fn reconcile_drops_folders_missing_on_server() {
+    let store = test_store("reconcile");
+    let account = store.account("fake", "u").unwrap();
+    let fake = Fake::new();
+    let events = Arc::new(Mutex::new(Vec::<SyncEvent>::new()));
+    let sink = events.clone();
+    let progress: aiowa_sync::ProgressFn = Arc::new(move |e: &SyncEvent| sink.lock().unwrap().push(e.clone()));
+    let engine = Engine::new(fake.clone(), store.clone(), account, Arc::new(AtomicBool::new(false))).on_progress(progress);
+    engine.sync_hierarchy().await.unwrap();
+    // Призрак: папка в базе, которой сервер уже не знает (и подпапка в нём), с письмом.
+    store
+        .upsert_folders(account, &[folder("F-GHOST", "[AIOWA] Перенос", None, 1), Folder { parent_id: Some(FolderId { id: "F-GHOST".into(), change_key: None }), ..folder("F-GHOST-SUB", "Цель", None, 0) }])
+        .unwrap();
+    let ghost = store.resolve_folder(account, "[AIOWA] Перенос").unwrap().unwrap().folder_pk;
+    store.apply_item_changes(account, ghost, &[ItemChange::Create(meta("I-GHOST", "[AIOWA] проверка", 1))]).unwrap();
+    events.lock().unwrap().clear();
+
+    assert_eq!(engine.reconcile_hierarchy().await.unwrap(), 2);
+    assert!(store.resolve_folder(account, "[AIOWA] Перенос").unwrap().is_none(), "призрак снят");
+    assert!(store.resolve_folder(account, "Цель").unwrap().is_none(), "его подпапка тоже");
+    assert!(store.resolve_folder(account, "Проекты").unwrap().is_some(), "папка сервера осталась");
+    assert!(events.lock().unwrap().iter().any(|e| matches!(e, SyncEvent::FoldersApplied { deletes: 2, .. })));
+    assert_eq!(engine.reconcile_hierarchy().await.unwrap(), 0, "повтор ничего не снимает");
+}
+
 // --- свежие письма первыми и события по ходу прогона -------------------------------------------
 
 /// Дерево, в котором только удалили папку (upsert-ов нет), — тоже изменение: окно получает

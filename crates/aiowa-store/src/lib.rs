@@ -24,7 +24,7 @@ use jiff::Timestamp;
 use rusqlite::types::Value as SqlValue;
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension, Transaction};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
@@ -829,6 +829,58 @@ impl Store {
                     Ok(FolderDeleteStats { folders: subtree.len(), items, conversation_pks })
                 }
             }
+        })
+    }
+
+    /// Сверка дерева с полным списком папок сервера (`server_ids` — все папки, которые вернула
+    /// выгрузка иерархии без состояния, docs/obkatka.md п. 28): папки, которых там нет, —
+    /// «призраки» (удалены на сервере, а синхронизация иерархии об этом не сообщила, § 5u
+    /// протокола) — помечаются удалёнными вместе с письмами. Служебные папки не трогаются: корень и
+    /// папки по известным именам выгрузка может не вернуть. Папка, которая на сервере есть, не
+    /// снимается, даже если её родитель в базе — призрак. Возвращает снятые папки (`folder_pk`).
+    pub fn drop_folders_not_on_server(&self, account: AccountId, server_ids: &HashSet<String>) -> Result<(Vec<i64>, FolderDeleteStats)> {
+        self.write_generation.fetch_add(1, Ordering::Relaxed);
+        self.with_tx(|tx| {
+            let ghosts: Vec<i64> = tx
+                .prepare_cached("SELECT folder_pk, server_id FROM folders WHERE account_id = ?1 AND deleted = 0 AND distinguished IS NULL")?
+                .query_map(params![account.0], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?
+                .filter_map(|row| match row {
+                    Ok((pk, sid)) if !server_ids.contains(&sid) => Some(Ok(pk)),
+                    Ok(_) => None,
+                    Err(e) => Some(Err(e)),
+                })
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            if ghosts.is_empty() {
+                return Ok((ghosts, FolderDeleteStats { folders: 0, items: 0, conversation_pks: Vec::new() }));
+            }
+            let mut touched = Touched::default();
+            let items = delete_subtree_rows(tx, &ghosts, now_ms(), &mut touched)?;
+            let conversation_pks = touched.recompute(tx)?;
+            let stats = FolderDeleteStats { folders: ghosts.len(), items, conversation_pks };
+            Ok((ghosts, stats))
+        })
+    }
+
+    /// Живые письма папок, которые уже помечены удалёнными (docs/obkatka.md п. 28): так их оставляла
+    /// папка, удалённая на сервере, пока `Delete` иерархии снимал только строку папки (до 0.2.3).
+    /// В дереве окна такой папки нет, а поиск находит её письма — с именем удалённой папки. Письма
+    /// помечаются удалёнными, как у удалённой папки (уходят из индекса, агрегаты бесед
+    /// пересчитываются). Возвращает такие папки и итог.
+    pub fn drop_items_of_deleted_folders(&self, account: AccountId) -> Result<(Vec<i64>, FolderDeleteStats)> {
+        self.with_tx(|tx| {
+            let folders: Vec<i64> = tx
+                .prepare_cached("SELECT folder_pk FROM folders f WHERE account_id = ?1 AND deleted = 1 AND EXISTS (SELECT 1 FROM items i WHERE i.folder_pk = f.folder_pk AND i.deleted = 0)")?
+                .query_map(params![account.0], |r| r.get::<_, i64>(0))?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            if folders.is_empty() {
+                return Ok((folders, FolderDeleteStats { folders: 0, items: 0, conversation_pks: Vec::new() }));
+            }
+            self.write_generation.fetch_add(1, Ordering::Relaxed);
+            let mut touched = Touched::default();
+            let items = delete_subtree_rows(tx, &folders, now_ms(), &mut touched)?;
+            let conversation_pks = touched.recompute(tx)?;
+            let stats = FolderDeleteStats { folders: folders.len(), items, conversation_pks };
+            Ok((folders, stats))
         })
     }
 
@@ -2456,6 +2508,68 @@ mod tests {
         assert_eq!(conv.item_count, 1, "письмо удалённой подпапки ушло из беседы");
         // Повтор того же Delete и Delete неизвестной папки — без ошибок.
         s.apply_hierarchy_batch(acc, &[FolderChange::Delete(FolderId { id: "F-Проекты-2".into(), change_key: None }), FolderChange::Delete(FolderId { id: "нет".into(), change_key: None })], &SyncState("s2".into())).unwrap();
+    }
+
+    /// Сверка с сервером (п. 28): снимаются только призраки с письмами; служебная папка и папка,
+    /// которая на сервере есть (даже под призраком), остаются.
+    #[test]
+    fn folders_not_on_server_are_dropped() {
+        let s = tmp_store("ghosts");
+        let acc = s.account("h", "u").unwrap();
+        s.upsert_folders(
+            acc,
+            &[
+                folder_with("Входящие", Some("inbox"), Some("IPF.Note"), Some("ROOT"), 1),
+                folder_with("Корень", Some("msgfolderroot"), None, None, 0),
+                folder_with("Проекты", None, Some("IPF.Note"), Some("ROOT"), 1),
+                folder_with("Призрак", None, Some("IPF.Note"), Some("ROOT"), 1),
+                folder_with("Подпризрак", None, Some("IPF.Note"), Some("Призрак"), 0),
+                folder_with("Живая", None, Some("IPF.Note"), Some("Призрак"), 0),
+            ],
+        )
+        .unwrap();
+        let pk = |name: &str| s.resolve_folder(acc, name).unwrap().unwrap().folder_pk;
+        let (inbox, ghost, sub, alive) = (pk("Входящие"), pk("Призрак"), pk("Подпризрак"), pk("Живая"));
+        s.apply_item_changes(acc, ghost, &[ItemChange::Create(meta_at("G", "Тест", "2026-10-02T10:00:00Z", Some("c1")))]).unwrap();
+        s.apply_item_changes(acc, inbox, &[ItemChange::Create(meta_at("I", "RE: Тест", "2026-10-04T10:00:00Z", Some("c1")))]).unwrap();
+        let on_server: HashSet<String> = ["F-Входящие", "F-Проекты", "F-Живая"].into_iter().map(String::from).collect();
+
+        let (dropped, stats) = s.drop_folders_not_on_server(acc, &on_server).unwrap();
+        assert_eq!(dropped.len(), 2);
+        assert!(dropped.contains(&ghost) && dropped.contains(&sub));
+        assert_eq!((stats.folders, stats.items), (2, 1));
+        assert!(s.folder_by_pk(acc, ghost).unwrap().is_none());
+        assert!(s.folder_by_pk(acc, sub).unwrap().is_none());
+        assert!(s.folder_by_pk(acc, alive).unwrap().is_some(), "папка с сервера остаётся");
+        assert!(s.folder_by_distinguished(acc, "msgfolderroot").unwrap().is_some(), "служебная не снимается");
+        let conv = s.list_conversations(acc, inbox, 10).unwrap().into_iter().find(|c| c.topic.as_deref() == Some("Тест")).unwrap();
+        assert_eq!(conv.item_count, 1, "письмо призрака ушло из беседы");
+        // Повтор — ничего не снимает.
+        let (again, _) = s.drop_folders_not_on_server(acc, &on_server).unwrap();
+        assert!(again.is_empty());
+    }
+
+    /// Живые письма папки, которая уже удалена (строку снял старый `Delete` иерархии), уходят из
+    /// базы и поиска (п. 28); письма живых папок не трогаются.
+    #[test]
+    fn items_of_deleted_folders_are_dropped() {
+        let s = tmp_store("orphans");
+        let acc = s.account("h", "u").unwrap();
+        s.upsert_folders(acc, &[folder_with("Входящие", Some("inbox"), Some("IPF.Note"), Some("ROOT"), 1), folder_with("[AIOWA] Перенос", None, Some("IPF.Note"), Some("ROOT"), 1)]).unwrap();
+        let pk = |name: &str| s.resolve_folder(acc, name).unwrap().unwrap().folder_pk;
+        let (inbox, test) = (pk("Входящие"), pk("[AIOWA] Перенос"));
+        s.apply_item_changes(acc, test, &[ItemChange::Create(meta_at("T", "[AIOWA] проверка очистки", "2026-10-30T10:00:00Z", Some("c1")))]).unwrap();
+        s.apply_item_changes(acc, inbox, &[ItemChange::Create(meta_at("I", "Обычное письмо", "2026-10-31T10:00:00Z", Some("c2")))]).unwrap();
+        s.mark_folder_deleted(acc, &FolderId { id: "F-[AIOWA] Перенос".into(), change_key: None }).unwrap();
+        let live = |id: &str| s.item_pk_by_server_id(acc, id).unwrap().is_some_and(|(_, deleted)| !deleted);
+        assert!(live("T"), "до сверки письмо удалённой папки живое");
+
+        let (folders, stats) = s.drop_items_of_deleted_folders(acc).unwrap();
+        assert_eq!((folders, stats.items), (vec![test], 1));
+        assert!(!live("T"));
+        assert!(live("I"), "письмо живой папки остаётся");
+        let (again, _) = s.drop_items_of_deleted_folders(acc).unwrap();
+        assert!(again.is_empty(), "повтор ничего не находит");
     }
 
     #[test]
