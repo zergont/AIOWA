@@ -87,6 +87,7 @@ mod staged;
 mod storage;
 mod sync;
 mod updates;
+mod window_chrome;
 mod write;
 
 /// Лимит одной инлайновой картинки: больше не скачиваем и не подставляем.
@@ -863,6 +864,7 @@ pub fn run() {
             notify::notify_set_toasts,
             window_close_guard,
             window_close_confirmed,
+            window_chrome::window_snap_layouts,
             setup::app_mode,
             setup::setup_normalize_host,
             setup::setup_test_login,

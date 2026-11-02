@@ -4,6 +4,7 @@
   import { bytesText, syncedText } from "../data";
   import { BODY_DAYS_CHOICES, loginHint, owaUrl, parseHost } from "../setup";
   import Logo from "./Logo.svelte";
+  import WindowControls from "./WindowControls.svelte";
 
   /**
    * Мастер первого запуска: приложение поднялось без учётной записи (режим "setup"), почты ещё нет.
@@ -197,6 +198,10 @@
   const busy = $derived(testing || saving || saved);
 </script>
 
+<!-- Окно без системного заголовка (п. 14): полоса сверху перетаскивает окно, справа — кнопки окна. -->
+<div class="titlebar" data-tauri-drag-region>
+  <WindowControls />
+</div>
 <main class="setup" aria-labelledby="{uid}-title">
   <div class="card" aria-busy={busy}>
     <header class="head">
@@ -384,12 +389,22 @@
 </main>
 
 <style>
+  .titlebar {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    height: 40px;
+    display: flex;
+    justify-content: flex-end;
+    z-index: 10;
+  }
   .setup {
     height: 100%;
     overflow: auto;
     display: grid;
     place-items: center;
-    padding: var(--space-6);
+    padding: calc(40px + var(--space-2)) var(--space-6) var(--space-6);
     background: var(--bg-base);
   }
   .card {

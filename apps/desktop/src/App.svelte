@@ -19,6 +19,7 @@
   import SearchSuggest from "./lib/components/SearchSuggest.svelte";
   import StatusBar from "./lib/components/StatusBar.svelte";
   import Logo from "./lib/components/Logo.svelte";
+  import WindowControls from "./lib/components/WindowControls.svelte";
   import Composer, { type CloseReason } from "./lib/components/Composer.svelte";
   import type { LocalDraft } from "./lib/api";
   import ConfirmPopover from "./lib/components/ConfirmPopover.svelte";
@@ -1974,20 +1975,18 @@
 {/snippet}
 
 <div class="shell" class:dragging style="--list-width: {listWidth}px">
-  <header class="topbar">
-    <div class="brand">
+  <!-- Своя шапка вместо системного заголовка окна (п. 14, замечание 7): одна полоса со знаком,
+       разделами, поиском и кнопками окна. Пустые места полосы, знак и имя учётной записи
+       перетаскивают окно, двойной щелчок по ним разворачивает. -->
+  <header class="topbar" data-tauri-drag-region>
+    <div class="brand" data-tauri-drag-region title="AIOWA">
       <Logo size={20} />
-      <span class="brand-name">AIOWA</span>
     </div>
     <div class="segmented sections" role="tablist" aria-label="Разделы">
       <button role="tab" aria-selected={section === "mail"} class:on={section === "mail"} onclick={() => (section = "mail")} title={hint("Почта", "section-mail")}>Почта</button>
       <button role="tab" aria-selected={section === "calendar"} class:on={section === "calendar"} onclick={showCalendar} title={hint("Календарь", "section-calendar")}>Календарь</button>
       <button role="tab" aria-selected={section === "people"} class:on={section === "people"} onclick={() => (section = "people")} title={hint("Люди", "section-people")}>Люди</button>
     </div>
-    <button class="new-mail" onclick={() => openCompose("new", null, null)} title={hint("Новое письмо", "new-mail")}>
-      <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path d={ICON.compose} fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" /></svg>
-      Новое письмо
-    </button>
     <div class="search" class:active={query.length > 0} class:off={section !== "mail"}>
       <svg class="search-icon" width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><circle cx="7" cy="7" r="4.5" fill="none" stroke="currentColor" stroke-width="1.4" /><path d="M10.5 10.5 14 14" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" /></svg>
       <input id="search-input" type="search" placeholder="Поиск в почте: тема, текст, от:имя, вложение:" bind:value={query} oninput={onQueryInput} onkeydown={onSearchKey} onfocus={onSearchFocus} onblur={() => (suggestOpen = false)} autocomplete="off" spellcheck="false" />
@@ -2001,22 +2000,32 @@
       {/if}
     </div>
     <div class="top-right">
-      <div class="account caption">
+      <div class="account caption" data-tauri-drag-region>
         {#if account}{account.user}{/if}
       </div>
       <button class="settings-btn" bind:this={settingsBtn} onclick={openSettings} aria-label="Настройки" aria-haspopup="dialog" aria-expanded={settingsOpen} title={hint("Настройки", "settings")}>
         <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path d={ICON.settings} fill="none" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round" /></svg>
       </button>
     </div>
+    <div class="window-controls">
+      <WindowControls />
+    </div>
   </header>
 
   <nav class="nav" aria-label={section === "mail" ? "Папки" : section === "calendar" ? "Мини-календарь" : "Люди"}>
-    <div class="folders" class:off={section !== "mail"}>
-      <FolderTree {folders} selected={selectedFolder} onselect={openFolder} onsync={startFolderSync} syncing={syncStatus?.running ?? false} oncreate={createFolder} onrename={renameFolder} ondelete={deleteFolder} ondrop={dropConversations} onempty={emptyFolder} onmove={moveFolder} />
+    <!-- «Новое письмо» — над папками, а не в шапке (п. 14): не прокручивается вместе с деревом. -->
+    <button class="new-mail" onclick={() => openCompose("new", null, null)} title={hint("Новое письмо", "new-mail")}>
+      <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path d={ICON.compose} fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" /></svg>
+      Новое письмо
+    </button>
+    <div class="nav-scroll">
+      <div class="folders" class:off={section !== "mail"}>
+        <FolderTree {folders} selected={selectedFolder} onselect={openFolder} onsync={startFolderSync} syncing={syncStatus?.running ?? false} oncreate={createFolder} onrename={renameFolder} ondelete={deleteFolder} ondrop={dropConversations} onempty={emptyFolder} onmove={moveFolder} />
+      </div>
+      {#if section === "calendar"}
+        <MiniMonth selected={calendarAnchor} range={calendarKind === "month" ? null : calendarRange} eventDays={calendarEventDays} onselect={pickCalendarDay} />
+      {/if}
     </div>
-    {#if section === "calendar"}
-      <MiniMonth selected={calendarAnchor} range={calendarKind === "month" ? null : calendarRange} eventDays={calendarEventDays} onselect={pickCalendarDay} />
-    {/if}
   </nav>
 
   <section class="list" class:off={section !== "mail"} aria-label="Список бесед">
@@ -2092,7 +2101,7 @@
   .shell {
     display: grid;
     grid-template-columns: var(--nav-width) var(--list-width) 1px minmax(var(--read-min), 1fr);
-    grid-template-rows: 48px 1fr 28px;
+    grid-template-rows: 40px 1fr 28px;
     grid-template-areas:
       "top top top top"
       "nav list split reader"
@@ -2110,22 +2119,32 @@
   .topbar {
     grid-area: top;
     display: grid;
-    grid-template-columns: calc(var(--nav-width) - var(--space-4)) auto auto 1fr auto;
+    grid-template-columns: auto auto minmax(0, 1fr) auto auto;
     align-items: center;
     gap: var(--space-4);
-    padding: 0 var(--space-3) 0 var(--space-3);
+    padding-left: var(--space-3);
   }
   .sections {
     justify-self: start;
   }
-  /* Учётная запись и шестерёнка — всегда в последней колонке (поиск в календаре спрятан, и без
-     явной колонки блок съехал бы влево). */
+  /* Учётная запись, шестерёнка и кнопки окна — в своих колонках (поиск в календаре спрятан, и
+     без явной колонки блоки съехали бы влево). */
   .top-right {
-    grid-column: 5;
+    grid-column: 4;
     display: flex;
     align-items: center;
     gap: var(--space-2);
     min-width: 0;
+  }
+  /* Кнопки окна — над подложкой диалогов (z-index 90): свернуть и закрыть окно можно и при
+     открытом диалоге, как с системным заголовком. Перетаскивать окно диалог не даёт. */
+  .window-controls {
+    grid-column: 5;
+    align-self: stretch;
+    display: flex;
+    position: relative;
+    z-index: 100;
+    margin-left: calc(var(--space-2) - var(--space-4));
   }
   .account {
     white-space: nowrap;
@@ -2157,8 +2176,11 @@
     color: var(--fg-1);
   }
   .new-mail {
-    display: inline-flex;
+    flex: none;
+    display: flex;
     align-items: center;
+    justify-content: center;
+    margin: var(--space-2) var(--space-2) var(--space-1);
     gap: 6px;
     height: var(--control-height);
     padding: 0 12px;
@@ -2178,11 +2200,10 @@
   .brand {
     display: flex;
     align-items: center;
-    gap: var(--space-2);
   }
-  .brand-name {
-    font: var(--text-body-strong);
-    letter-spacing: 0.02em;
+  /* Перетаскивает окно сам блок со знаком: Tauri берёт только элемент с атрибутом, не его детей. */
+  .brand :global(.logo) {
+    pointer-events: none;
   }
 
   .search {
@@ -2258,8 +2279,15 @@
 
   .nav {
     grid-area: nav;
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+  }
+  .nav-scroll {
+    flex: 1;
+    min-height: 0;
     overflow: auto;
-    padding: var(--space-2) var(--space-2) var(--space-4);
+    padding: var(--space-1) var(--space-2) var(--space-4);
   }
   .list {
     grid-area: list;

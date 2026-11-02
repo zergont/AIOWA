@@ -1082,6 +1082,8 @@ export const api = {
   windowCloseGuard: (enabled: boolean) => invoke<void>("window_close_guard", { enabled }),
   /** Пользователь подтвердил закрытие окна. */
   windowCloseConfirmed: () => invoke<void>("window_close_confirmed"),
+  /** Раскладки Snap у своей кнопки «Развернуть» (Win+Z); false — выключены в Windows или окно не в фокусе. */
+  windowSnapLayouts: () => invoke<boolean>("window_snap_layouts"),
 
   // --- календарь ---------------------------------------------------------------------------
   /**

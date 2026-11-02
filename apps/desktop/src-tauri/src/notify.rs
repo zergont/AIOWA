@@ -840,9 +840,14 @@ pub(crate) fn summary_text(n: usize) -> String {
 
 // --- чистая логика: заголовок окна и значок ---------------------------------------------------
 
-/// Заголовок окна: «AIOWA» или «AIOWA (N)».
+/// Заголовок окна: «AIOWA» или «AIOWA — N непрочитанных». В окне его не видно (своя шапка, п. 14),
+/// он виден на панели задач и в Alt+Tab, поэтому число с подписью, а не голое «(N)» (замечание 7).
 pub(crate) fn title_text(unread: i64) -> String {
-    if unread > 0 { format!("{APP_TITLE} ({unread})") } else { APP_TITLE.to_string() }
+    if unread <= 0 {
+        return APP_TITLE.to_string();
+    }
+    let word = if unread % 10 == 1 && unread % 100 != 11 { "непрочитанное" } else { "непрочитанных" };
+    format!("{APP_TITLE} — {unread} {word}")
 }
 
 /// Текст на значке: до двух цифр, дальше «99+».
@@ -1038,8 +1043,11 @@ mod tests {
     fn window_title_and_badge() {
         assert_eq!(title_text(0), "AIOWA");
         assert_eq!(title_text(-3), "AIOWA");
-        assert_eq!(title_text(7), "AIOWA (7)");
-        assert_eq!(title_text(1234), "AIOWA (1234)");
+        assert_eq!(title_text(7), "AIOWA — 7 непрочитанных");
+        assert_eq!(title_text(1), "AIOWA — 1 непрочитанное");
+        assert_eq!(title_text(21), "AIOWA — 21 непрочитанное");
+        assert_eq!(title_text(11), "AIOWA — 11 непрочитанных");
+        assert_eq!(title_text(3690), "AIOWA — 3690 непрочитанных");
         assert_eq!(badge_text(7), "7");
         assert_eq!(badge_text(99), "99");
         assert_eq!(badge_text(100), "99+");

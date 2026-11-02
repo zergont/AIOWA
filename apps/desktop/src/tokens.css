@@ -76,6 +76,10 @@
   --cal-weekend: rgba(0, 0, 0, 0.025);
   --cal-today: rgba(0, 95, 184, 0.05);
   --cal-now: #c42b1c;
+
+  /* «Закрыть» в своей шапке окна при наведении — как у Windows 11, одинаково в обеих темах */
+  --caption-close-bg: #c42b1c;
+  --caption-close-fg: #ffffff;
 }
 
 @media (prefers-color-scheme: dark) {
