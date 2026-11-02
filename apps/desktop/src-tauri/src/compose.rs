@@ -23,6 +23,10 @@
 //! ответа или пересылки цитата собирается заново (`quote_html`) из полного тела оригинала,
 //! прочитанного с сервера: в базе только `UniqueBody`, без истории переписки.
 //!
+//! Цитата в ответе и пересылке свёрнута под редактором; «Развернуть» (`compose_expand_quote`)
+//! сохраняет письмо черновиком и кладёт его тело вместе с цитатой сервера в редактор — дальше
+//! письмо живёт как открытый черновик, и цитату можно править и удалять (п. 27 обкатки).
+//!
 //! Тело письма перед отправкой проходит ту же очистку ammonia, что и показ писем: во вставленном
 //! из буфера HTML не должно уйти скриптов и обработчиков. Ссылки `cid:` на инлайновые вложения
 //! при этом остаются как есть (`sanitize_keep_cid`): подмена на `data:` сломала бы картинки у
@@ -267,6 +271,22 @@ pub(crate) struct DraftInfoDto {
     inline_images: HashMap<String, String>,
 }
 
+/// Итог «Развернуть» в ответе или пересылке (`compose_expand_quote`): черновик на сервере и его
+/// тело вместе с цитатой.
+#[derive(Debug, Serialize)]
+pub(crate) struct ExpandedQuoteDto {
+    draft: DraftRef,
+    /// Тело черновика с цитатой (очищенный HTML, `cid:` как есть); `None` — черновик сохранён, а
+    /// тело не получено, причина в `message`.
+    body_html: Option<String>,
+    /// Файловые вложения черновика (при пересылке — вложения исходного письма, их приложил сервер).
+    attachments: Vec<DraftAttachmentDto>,
+    /// Инлайновые картинки цитаты для показа в редакторе, как у `DraftInfoDto::inline_images`: из
+    /// кэша исходного письма (сервер копирует их в черновик с теми же `cid`).
+    inline_images: HashMap<String, String>,
+    message: Option<String>,
+}
+
 /// Ссылка на черновик на сервере после автосохранения; `item_pk` — локальная запись, если
 /// синхронизация её уже принесла.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -276,8 +296,8 @@ pub(crate) struct DraftRef {
     item_pk: Option<i64>,
 }
 
-/// Заготовка композера: получатели и тема подобраны по виду письма, оригинал — для показа
-/// под редактором (только чтение), собственные адреса — чтобы окно не предлагало их в «ответить всем».
+/// Заготовка композера: получатели и тема подобраны по виду письма, оригинал — для свёрнутой
+/// цитаты под редактором, собственные адреса — чтобы окно не предлагало их в «ответить всем».
 /// У открытого черновика (`compose_open_draft`) есть ещё скрытые получатели, тело и `draft`.
 #[derive(Serialize)]
 pub(crate) struct ComposeContext {
@@ -1481,6 +1501,63 @@ pub(crate) async fn compose_autosave(req: ComposeRequest, draft_server_id: Optio
     cs.remember(&id);
     info!(kind = ?req.kind, updated = existing.is_some(), to = msg.to.len(), cc = msg.cc.len(), bcc = msg.bcc.len(), ms = started.elapsed().as_millis() as u64, "черновик автосохранён");
     Ok(draft_ref(&state, &id))
+}
+
+/// «Развернуть» исходное письмо в ответе или пересылке (п. 27 обкатки): письмо сохраняется
+/// черновиком на сервере — цитату (а при пересылке и вложения исходного письма) ставит сервер, как
+/// в OWA, — и тело черновика целиком возвращается в редактор. Дальше окно работает с ним как с
+/// черновиком из «Черновиков» (вид `New` и `draft_server_id`): цитата правится и удаляется как
+/// обычный текст, сохраняется и уходит то, что в окне, — `append_quote` такому письму не нужен.
+/// Черновик уже есть (автосохранение) — сначала в него пишется текущий текст с цитатой. Тело не
+/// получено или обрезано сервером — черновик всё равно возвращается (`body_html: None`, причина в
+/// `message`): окно продолжает с ним, а цитата остаётся свёрнутой.
+#[tauri::command]
+pub(crate) async fn compose_expand_quote(req: ComposeRequest, state: State<'_, AppState>, sync: State<'_, Arc<SyncState>>, cs: State<'_, ComposeState>) -> Result<ExpandedQuoteDto, ComposeFail> {
+    let Some(reference_pk) = req.reference_item_pk.filter(|_| req.kind.needs_reference()) else {
+        return Err(ComposeFail::fixed("Цитата есть только у ответа и пересылки"));
+    };
+    let _busy = cs.sending.try_lock().map_err(|_| ComposeFail::fixed("Отправка уже идёт"))?;
+    let existing = draft_id_of(&req);
+    let mut msg = outgoing(&req, false)?;
+    let started = Instant::now();
+    let transport = sync.transport().await.map_err(|e| ComposeFail::connect(&e))?;
+    let target = match existing.as_deref() {
+        None => {
+            let kind = compose_kind(&state.store, req.kind, Some(reference_pk), false)?;
+            create_draft_fresh(&state, &sync, &transport, &cs, kind, &msg, &req).await?
+        }
+        Some(sid) => DraftTarget::Existing(cs.item_id(sid)),
+    };
+    let id = match target {
+        DraftTarget::Created(id) => id,
+        DraftTarget::Existing(item) => rewrite_draft(&state, &sync, &transport, &cs, &req, &mut msg, &item).await?,
+    };
+    cs.remember(&id);
+    let draft = match step(&sync, "GetItem", CREATE_TIMEOUT, transport.get_draft(&id)).await {
+        Ok(d) => d,
+        Err(why) => {
+            warn!(why = %why.message, "развернуть цитату: черновик сохранён, тело не прочитано");
+            return Ok(ExpandedQuoteDto { draft: draft_ref(&state, &id), body_html: None, attachments: Vec::new(), inline_images: HashMap::new(), message: Some(format!("Черновик сохранён, но цитата не загружена: {}. Нажмите «Развернуть» ещё раз", why.message)) });
+        }
+    };
+    let id = draft.id.clone();
+    cs.remember(&id);
+    let attachments = draft.file_attachments().map(|a| DraftAttachmentDto::of(a, None)).collect();
+    if draft.is_truncated {
+        warn!(body_chars = draft.body_html.chars().count(), "развернуть цитату: сервер отдал тело черновика обрезанным");
+        let message = "Письмо с цитатой слишком большое для правки в AIOWA: сервер отдаёт его обрезанным. Цитата останется свёрнутой и уйдёт целиком; править её можно в OWA".to_string();
+        return Ok(ExpandedQuoteDto { draft: draft_ref(&state, &id), body_html: None, attachments, inline_images: HashMap::new(), message: Some(message) });
+    }
+    let store = state.store.clone();
+    let inline_images = tauri::async_runtime::spawn_blocking(move || prepare_attachments(&store, reference_pk, None).map(|(atts, _)| inline_preview_urls(&atts)))
+        .await
+        .map_err(err)?
+        .unwrap_or_else(|e| {
+            warn!(error = %e, "развернуть цитату: картинки исходного письма не найдены в кэше");
+            HashMap::new()
+        });
+    info!(kind = ?req.kind, updated = existing.is_some(), attachments = draft.attachments.len(), inline = inline_images.len(), ms = started.elapsed().as_millis() as u64, "цитата развёрнута в редактор");
+    Ok(ExpandedQuoteDto { draft: draft_ref(&state, &id), body_html: Some(crate::sanitize_keep_cid(&draft.body_html)), attachments, inline_images, message: None })
 }
 
 /// Локальный черновик композера: записывается окном раз в одну-две секунды после правок, чтобы

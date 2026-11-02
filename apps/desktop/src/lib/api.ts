@@ -316,6 +316,20 @@ export interface DraftRef {
   item_pk: number | null;
 }
 
+/**
+ * Итог «Развернуть» в ответе или пересылке (compose_expand_quote): черновик на сервере и его тело
+ * вместе с цитатой сервера. body_html null — черновик сохранён, а тело не получено (причина в message).
+ */
+export interface ExpandedQuote {
+  draft: DraftRef;
+  body_html: string | null;
+  /** Файловые вложения черновика: при пересылке — вложения исходного письма. */
+  attachments: DraftAttachment[];
+  /** Картинки цитаты для показа в редакторе: нормализованный cid → адрес из кэша. */
+  inline_images: Record<string, string>;
+  message: string | null;
+}
+
 /** Заготовка композера от бэкенда: получатели и тема уже подобраны по виду письма. */
 export interface ComposeContext {
   kind: ComposeKind;
@@ -1034,6 +1048,8 @@ export const api = {
   composeOpenDraft: (itemPk: number) => invoke<ComposeContext>("compose_open_draft", { itemPk }),
   /** Автосохранение: без draftServerId — create_draft, с ним — update_draft; вложения не трогает. */
   composeAutosave: (req: ComposeRequest, draftServerId: string | null) => invoke<DraftRef>("compose_autosave", { req, draftServerId }),
+  /** «Развернуть» цитату ответа или пересылки: письмо сохраняется черновиком, его тело с цитатой — в редактор. */
+  composeExpandQuote: (req: ComposeRequest) => invoke<ExpandedQuote>("compose_expand_quote", { req }),
   /** Удалить черновик: на сервере — в «Удалённые», локально — сразу из «Черновиков». */
   composeDiscardDraft: (draftServerId: string) => invoke<void>("compose_discard_draft", { draftServerId }),
   /** Локальный черновик композера в базе (переживает падение и закрытие окна). */

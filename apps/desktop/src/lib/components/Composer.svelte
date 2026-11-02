@@ -8,8 +8,6 @@
   import { hint, layerOpen } from "../hotkeys";
   import RecipientsInput from "./RecipientsInput.svelte";
   import Editor from "./Editor.svelte";
-  import BodyFrame from "./BodyFrame.svelte";
-  import { darkMailByDefault, windowIsDark } from "../darkmail.svelte";
   import ChoicePopover from "./ChoicePopover.svelte";
   import SignatureDialog from "./SignatureDialog.svelte";
 
@@ -111,6 +109,16 @@
   let attachments = $state<PickedFile[]>(untrack(() => ctx.restore?.attachments ?? []));
   let signature = $state<SignatureDto>(untrack(() => ctx.signature));
   let original = $state<Message | null>(untrack(() => ctx.original));
+  /**
+   * Вид письма и исходное письмо для запросов. После «Развернуть» (expandQuote) письмо — черновик на
+   * сервере с цитатой в тексте: дальше оно сохраняется и уходит как открытый черновик (вид «новое»),
+   * и бэкенд не дописывает цитату к тексту окна.
+   */
+  let kind = $state(untrack(() => ctx.kind));
+  let referencePk = $state(untrack(() => ctx.reference_item_pk));
+  /** Цитата развёрнута в редактор: свёрнутая строка «Исходное письмо» больше не нужна. */
+  let quoteInText = $state(false);
+  let expanding = $state(false);
 
   // --- черновик на сервере -----------------------------------------------------------------
   // Открытый черновик приходит с серверным id и вложениями; новое письмо получает id после первого
@@ -159,7 +167,6 @@
   let withoutQuote = $state(false);
   let cancelAsk = $state(false);
   let sigOpen = $state(false);
-  let showOriginal = $state(true);
   let origLoading = $state(false);
   let origError = $state<string | null>(null);
 
@@ -207,7 +214,8 @@
 
   /** Файлы исходного письма при пересылке: их добавит сервер, здесь только показываем (пока список с сервера не известен — там они уже есть). */
   const originalFiles = $derived(ctx.kind === "forward" && original && !serverListed ? original.attachments.filter((a) => !isInlinePicture(a)) : []);
-  const originalTo = $derived(original ? original.recipients.filter((r) => r.kind === 1).map((r) => personLabel(r.name, r.email)) : []);
+  /** Подпись свёрнутой цитаты: от кого и когда. */
+  const originalSummary = $derived(original ? [personLabel(original.from_name, original.from_email), fullDate(original.received_ms ?? original.sent_ms)].filter(Boolean).join(", ") : "");
   /**
    * «Ответить всем», а получатели исходного письма в базе неизвестны: они приходят только вместе с
    * телом, и пока оно не загружено (или сервер его не отдал), в заготовке один отправитель.
@@ -291,8 +299,8 @@
 
   function request(): ComposeRequest {
     return {
-      kind: ctx.kind,
-      reference_item_pk: ctx.reference_item_pk,
+      kind,
+      reference_item_pk: referencePk,
       to: clean(to),
       cc: clean(cc),
       bcc: clean(bcc),
@@ -391,8 +399,8 @@
     try {
       await api.composeLocalSave({
         draft_id: localId,
-        kind: ctx.kind,
-        reference_item_pk: ctx.reference_item_pk,
+        kind,
+        reference_item_pk: referencePk,
         draft_server_id: draftRef?.server_id ?? null,
         subject: subject.trim(),
         to: clean(to),
@@ -569,6 +577,51 @@
     if (what === "send") void send();
     else if (what === "draft") void saveDraft();
     else autosave();
+  }
+
+  /**
+   * «Развернуть» свёрнутую цитату (п. 27 обкатки): письмо сохраняется черновиком на сервере —
+   * цитату (а при пересылке и вложения исходного письма) ставит сервер, как в OWA, — и тело
+   * черновика целиком встаёт в редактор. Дальше это открытый черновик: цитата правится и удаляется
+   * как обычный текст, а сохраняется и уходит то, что в окне. Тело не пришло — черновик всё равно
+   * запомнен, цитата остаётся свёрнутой, причина — в строке ошибки.
+   */
+  async function expandQuote() {
+    if (busy || quoteInText || referencePk == null) return;
+    busy = "draft";
+    expanding = true;
+    error = null;
+    lastAction = null;
+    try {
+      // Идущее автосохранение должно закончиться: разворачивается его черновик, а не новый.
+      await autosavePromise;
+      const key = snapshot;
+      const rep = await api.composeExpandQuote(draftRequest());
+      if (!alive) return;
+      draftRef = rep.draft;
+      if (rep.body_html == null) {
+        lastSavedKey = key;
+        error = rep.message ?? "Цитата не загружена";
+        return;
+      }
+      applyServerFiles(rep.attachments);
+      body = cleanDraftHtml(rep.body_html, rep.inline_images) || "<div><br></div>";
+      kind = "new";
+      referencePk = null;
+      quoteInText = true;
+      // Черновик на сервере — ровно то, что теперь в окне.
+      lastSavedKey = snapshot;
+      failedKey = null;
+      savedAt = Date.now();
+    } catch (e) {
+      if (!alive) return;
+      error = errorMessage(e);
+    } finally {
+      if (alive) {
+        busy = null;
+        expanding = false;
+      }
+    }
   }
 
   function requestCancel() {
@@ -832,30 +885,22 @@
     {/if}
   </div>
 
-  {#if original}
+  {#if original && !quoteInText}
+    <!-- Цитата свёрнута: так она и уйдёт (её добавит сервер). «Развернуть» кладёт её в редактор,
+         где её можно править и удалять (п. 27). -->
     <section class="original" aria-label="Исходное письмо">
-      <button class="orig-toggle" onclick={() => (showOriginal = !showOriginal)} aria-expanded={showOriginal}>
-        <svg class="chev" class:open={showOriginal} width="12" height="12" viewBox="0 0 12 12" aria-hidden="true"><path d="M4 2.5 7.5 6 4 9.5" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" /></svg>
-        Исходное письмо
-        <span class="caption orig-hint">цитату добавит сервер</span>
-      </button>
-      {#if showOriginal}
-        <div class="orig-meta caption">
-          <div><span class="orig-key">От:</span> {personLabel(original.from_name, original.from_email) || "—"}</div>
-          <div><span class="orig-key">Кому:</span> {originalTo.length ? originalTo.join(", ") : original.display_to || "—"}</div>
-          <div><span class="orig-key">Дата:</span> {fullDate(original.received_ms ?? original.sent_ms) || "—"}</div>
-          <div><span class="orig-key">Тема:</span> {original.subject || "(без темы)"}</div>
-        </div>
-        {#if original.body_html != null}
-          <!-- Исходное письмо — как в карточке по настройке «Вид»: тёмные тона только для показа, в цитату на сервер идёт тело с сервера. -->
-          <BodyFrame html={original.body_html} title="Исходное письмо" dark={windowIsDark() && darkMailByDefault()} darkColors={original.dark_colors} darkTag={original.dark_tag} />
-        {:else if origLoading}
-          <div class="orig-note caption"><span class="spinner" aria-hidden="true"></span> Загружаю исходное письмо…</div>
-        {:else if origError}
-          <div class="orig-note failed">{origError}</div>
+      <button class="orig-toggle" onclick={() => void expandQuote()} disabled={busy != null} title="Вставить исходное письмо в текст: цитату можно будет править и удалять">
+        {#if expanding}
+          <span class="spinner small" aria-hidden="true"></span>
         {:else}
-          <div class="orig-note caption">Текст письма не загружен.</div>
+          <svg class="chev" width="12" height="12" viewBox="0 0 12 12" aria-hidden="true"><path d="M4 2.5 7.5 6 4 9.5" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" /></svg>
         {/if}
+        <span class="orig-title">Исходное письмо</span>
+        <span class="caption orig-hint">{originalSummary}</span>
+        <span class="orig-action">{expanding ? "Разворачиваю…" : "Развернуть"}</span>
+      </button>
+      {#if origError}
+        <div class="orig-note failed">{origError}</div>
       {/if}
     </section>
   {/if}
@@ -1114,30 +1159,29 @@
   .orig-toggle:focus-visible {
     outline-offset: -2px;
   }
+  .orig-toggle:disabled {
+    background: none;
+  }
   .chev {
     flex: none;
-    transition: transform var(--dur-fast) var(--ease-in);
   }
-  .chev.open {
-    transform: rotate(90deg);
+  .orig-title {
+    flex: none;
   }
   .orig-hint {
+    flex: 1;
+    min-width: 0;
     margin-left: var(--space-2);
-  }
-  .orig-meta {
-    padding: 0 var(--space-3) var(--space-2);
-    display: flex;
-    flex-direction: column;
-    gap: 2px;
-    user-select: text;
-  }
-  .orig-meta div {
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
   }
-  .orig-key {
-    color: var(--fg-4);
+  .orig-action {
+    flex: none;
+    color: var(--accent);
+  }
+  .orig-toggle:disabled .orig-action {
+    color: var(--fg-3);
   }
   .orig-note {
     display: flex;

@@ -828,6 +828,7 @@ pub fn run() {
             compose::compose_save_draft,
             compose::compose_open_draft,
             compose::compose_autosave,
+            compose::compose_expand_quote,
             compose::compose_discard_draft,
             compose::compose_local_save,
             compose::compose_local_drop,
