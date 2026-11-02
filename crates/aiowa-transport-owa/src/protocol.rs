@@ -673,6 +673,15 @@ pub fn text_to_html(text: &str) -> String {
 /// Черновик из элемента ответа `GetItem` (`parse_message_full` плюс сведение тела к HTML): тело —
 /// `Body`, иначе `NormalizedBody`, иначе `UniqueBody`; тело типа `Text` переводится в HTML; без
 /// тела — пустая строка. Без `ItemId` черновика нет.
+/// Тип вложенного письма (`ItemAttachment`).
+pub const MESSAGE_RFC822: &str = "message/rfc822";
+
+/// Имя файла вложенного письма: его имя (обычно тема) с `.eml`; без имени — «письмо.eml».
+fn eml_name(name: Option<&str>) -> String {
+    let base = name.map(str::trim).filter(|n| !n.is_empty()).unwrap_or("письмо");
+    if base.to_ascii_lowercase().ends_with(".eml") { base.to_string() } else { format!("{base}.eml") }
+}
+
 pub fn parse_draft_content(item: &Value) -> Option<DraftContent> {
     let full = parse_message_full(item)?;
     let body_html = match &full.body {
@@ -1932,6 +1941,19 @@ pub fn parse_message_full(v: &Value) -> Option<MessageFull> {
             a.iter()
                 .filter_map(|att| {
                     let id = att.get("AttachmentId").and_then(|i| str_of(i, "Id"))?;
+                    // Вложенное письмо (пересланное «как вложение», docs/obkatka.md п. 30) — не файл:
+                    // `ItemAttachment` без `ContentType`. `GetFileAttachment` отдаёт его целиком в
+                    // MIME, поэтому дальше оно живёт как файл `.eml` типа `message/rfc822`.
+                    if str_of(att, "__type").is_some_and(|t| t.starts_with("ItemAttachment")) {
+                        return Some(AttachmentMeta {
+                            id: id.to_string(),
+                            name: Some(eml_name(str_of(att, "Name"))),
+                            content_type: Some(MESSAGE_RFC822.to_string()),
+                            size: i64_of(att, "Size"),
+                            is_inline: false,
+                            content_id: None,
+                        });
+                    }
                     Some(AttachmentMeta {
                         id: id.to_string(),
                         name: str_of(att, "Name").map(String::from),
@@ -2490,6 +2512,16 @@ mod tests {
         assert!(m.reply_to.is_empty(), "без ключа ReplyTo список пуст");
         assert_eq!(m.attachments[0].name.as_deref(), Some("a.pdf"));
         assert_eq!(m.body.unwrap().unique_body.as_deref(), Some("<p>x</p>"));
+        // Вложенное письмо (п. 30): `ItemAttachment` без типа — файл `.eml` типа message/rfc822.
+        let v: Value = serde_json::from_str(r#"{"ItemId":{"Id":"A"},"Attachments":[
+          {"__type":"ItemAttachment:#Exchange","AttachmentId":{"Id":"att2"},"Name":"Счёт за октябрь","Size":2035,"IsInline":false},
+          {"__type":"ItemAttachment:#Exchange","AttachmentId":{"Id":"att3"},"Name":"","Size":10},
+          {"__type":"ItemAttachment:#Exchange","AttachmentId":{"Id":"att4"},"Name":"письмо.EML"}]}"#).unwrap();
+        let m = parse_message_full(&v).unwrap();
+        let names: Vec<_> = m.attachments.iter().map(|a| a.name.as_deref().unwrap_or("")).collect();
+        assert_eq!(names, ["Счёт за октябрь.eml", "письмо.eml", "письмо.EML"]);
+        assert!(m.attachments.iter().all(|a| a.content_type.as_deref() == Some(MESSAGE_RFC822) && !a.is_inline));
+        assert_eq!(m.attachments[0].size, Some(2035));
         // ReplyTo — массив адресов той же формы, что получатели (с MailboxType, как отдаёт OWA JSON).
         let v: Value = serde_json::from_str(r#"{"ItemId":{"Id":"A"},"From":{"Mailbox":{"Name":"Список","EmailAddress":"list@x.ru","RoutingType":"SMTP"}},
           "ReplyTo":[{"Name":"Владелец","EmailAddress":"owner@x.ru","RoutingType":"SMTP","MailboxType":"OneOff"}],

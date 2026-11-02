@@ -1,9 +1,12 @@
 //! Извлечение текста из вложений для поискового индекса. Чистые функции над байтами,
-//! без ввода-вывода и без OCR: PDF с текстовым слоем, DOCX, XLSX/XLS, TXT/CSV.
+//! без ввода-вывода и без OCR: PDF с текстовым слоем, DOCX, XLSX/XLS, TXT/CSV, вложенные письма .eml.
 //! Остальные типы (картинки, архивы, сканы) считаются неподдерживаемыми и пропускаются.
 
 use std::io::{Cursor, Read};
 use std::panic::{catch_unwind, AssertUnwindSafe};
+
+mod message;
+pub use message::{looks_like_message, parse_message, MessageAttachment, MessagePerson, ParsedMessage};
 
 /// Тип вложения по имени файла и MIME-типу.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -14,6 +17,8 @@ pub enum Kind {
     Spreadsheet,
     /// TXT, CSV, MD, LOG и прочий простой текст.
     PlainText,
+    /// Вложенное письмо `.eml` (`message/rfc822`, docs/obkatka.md п. 30).
+    Message,
     Unsupported,
 }
 
@@ -42,6 +47,7 @@ pub fn kind_of(name: Option<&str>, content_type: Option<&str>) -> Kind {
         "docx" | "docm" | "dotx" => return Kind::Docx,
         "xlsx" | "xlsm" | "xls" | "xlsb" | "ods" => return Kind::Spreadsheet,
         "txt" | "csv" | "tsv" | "md" | "log" | "json" | "xml" | "ini" | "cfg" => return Kind::PlainText,
+        "eml" => return Kind::Message,
         _ => {}
     }
     match ct.as_str() {
@@ -49,6 +55,7 @@ pub fn kind_of(name: Option<&str>, content_type: Option<&str>) -> Kind {
         "application/vnd.openxmlformats-officedocument.wordprocessingml.document" => Kind::Docx,
         "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" | "application/vnd.ms-excel" | "application/vnd.oasis.opendocument.spreadsheet" => Kind::Spreadsheet,
         "text/plain" | "text/csv" | "text/markdown" => Kind::PlainText,
+        "message/rfc822" => Kind::Message,
         _ => Kind::Unsupported,
     }
 }
@@ -60,6 +67,7 @@ pub fn extract(kind: Kind, bytes: &[u8], max_chars: usize) -> Extraction {
         Kind::Docx => docx(bytes),
         Kind::Spreadsheet => spreadsheet(bytes),
         Kind::PlainText => Ok(plain_text(bytes)),
+        Kind::Message => message::message_text(bytes),
         Kind::Unsupported => return Extraction::Unsupported,
     }
     .map(|t| Extraction::Text(limit_chars(normalize_ws(&t), max_chars)))
@@ -70,9 +78,16 @@ pub fn extract(kind: Kind, bytes: &[u8], max_chars: usize) -> Extraction {
     }
 }
 
-/// Удобная обёртка: тип определяется по имени и MIME.
+/// Удобная обёртка: тип определяется по имени и MIME, а неизвестный тип без точного MIME — ещё и
+/// по содержимому: так узнаётся вложенное письмо, скачанное до п. 30 с именем-темой (в теме бывают
+/// точки) и типом `application/octet-stream` (`looks_like_message`).
 pub fn extract_text(name: Option<&str>, content_type: Option<&str>, bytes: &[u8], max_chars: usize) -> Extraction {
-    extract(kind_of(name, content_type), bytes, max_chars)
+    let generic = content_type.is_none_or(|c| c.trim().is_empty() || c.trim().eq_ignore_ascii_case("application/octet-stream"));
+    let kind = match kind_of(name, content_type) {
+        Kind::Unsupported if generic && looks_like_message(bytes) => Kind::Message,
+        k => k,
+    };
+    extract(kind, bytes, max_chars)
 }
 
 fn limit_chars(s: String, max: usize) -> String {

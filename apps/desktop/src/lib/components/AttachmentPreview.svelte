@@ -1,6 +1,8 @@
 <script lang="ts">
-  import { api, errorMessage, formatSize, type Attachment, type PreviewDto } from "../api";
+  import { api, errorMessage, formatSize, fullDate, personLabel, type Attachment, type EmbeddedMessage, type EmbeddedPerson, type PreviewDto } from "../api";
   import { hint, isTopLayer, keysOf, layer } from "../hotkeys";
+  import BodyFrame from "./BodyFrame.svelte";
+  import { darkMailByDefault, windowIsDark } from "../darkmail.svelte";
 
   /**
    * Предпросмотр вложений письма поверх области чтения: картинка, PDF, текст (в том числе HTML — как
@@ -39,23 +41,50 @@
   const hasNext = $derived(index < files.length - 1);
 
   let dto = $state<PreviewDto | null>(null);
-  /** «Открыть» системным приложением: для исполняемых типов бэкенд его не разрешает — только «Сохранить как…». */
-  const canOpen = $derived(dto?.openable !== false);
   let text = $state<string | null>(null);
+  /** Вложенное письмо .eml (п. 30): шапка, текст и его вложения. */
+  let message = $state<EmbeddedMessage | null>(null);
+  /** Вложение вложенного письма, с которым идёт действие, и итог действия. */
+  let partBusy = $state<number | null>(null);
+  let partNote = $state<{ text: string; failed: boolean } | null>(null);
   let loading = $state(false);
   let error = $state<string | null>(null);
   let dialogEl = $state<HTMLDivElement | null>(null);
   let closeBtn = $state<HTMLButtonElement | null>(null);
 
   /** Вид показа по типу от бэкенда. */
-  const mode = $derived.by((): "image" | "pdf" | "text" | "none" => {
+  const mode = $derived.by((): "image" | "pdf" | "text" | "message" | "none" => {
     if (!dto || !dto.previewable) return "none";
     const ct = (dto.content_type ?? "").toLowerCase().split(";")[0].trim();
     if (ct.startsWith("image/")) return "image";
     if (ct === "application/pdf") return "pdf";
     if (ct.startsWith("text/")) return "text";
+    if (ct === "message/rfc822") return "message";
     return "none";
   });
+  /**
+   * «Открыть» системным приложением: для исполняемых типов бэкенд его не разрешает — только
+   * «Сохранить как…»; вложенное письмо уже показано здесь, системе оно не отдаётся.
+   */
+  const canOpen = $derived(dto?.openable !== false && mode !== "message");
+
+  const people = (ps: EmbeddedPerson[]) => ps.map((p) => personLabel(p.name, p.email)).filter(Boolean).join(", ");
+
+  /** Вложение вложенного письма: открыть системным приложением или «Сохранить как…». */
+  async function partAction(index: number, save: boolean) {
+    const p = pk;
+    if (p == null || partBusy != null) return;
+    partBusy = index;
+    partNote = null;
+    try {
+      const path = await api.attachmentMessagePart(p, index, save);
+      if (p === pk && path) partNote = { text: `Сохранено: ${path}`, failed: false };
+    } catch (e) {
+      if (p === pk) partNote = { text: errorMessage(e), failed: true };
+    } finally {
+      partBusy = null;
+    }
+  }
 
   /**
    * Текст файла: UTF-16 по метке порядка байт (Блокнот «Юникод», Excel «Текст в Юникоде»), иначе
@@ -80,6 +109,8 @@
     const p = pk;
     dto = null;
     text = null;
+    message = null;
+    partNote = null;
     error = null;
     if (p == null) return;
     const req = ++request;
@@ -99,6 +130,10 @@
           if (req !== request) return;
           const body = decodeText(buf);
           text = body.length > TEXT_MAX ? body.slice(0, TEXT_MAX) : body;
+        } else if (d.previewable && ct.startsWith("message/rfc822")) {
+          const m = await api.attachmentMessage(p);
+          if (req !== request) return;
+          message = m;
         }
       } catch (e) {
         if (req === request) error = errorMessage(e);
@@ -203,7 +238,7 @@
       <div class="action-note" role="status"><span class="note-text">Сохранено: {status.saved}</span></div>
     {/if}
 
-    <div class="stage" class:paper={mode === "text" || mode === "pdf"} class:navs={files.length > 1}>
+    <div class="stage" class:paper={mode === "text" || mode === "pdf" || mode === "message"} class:navs={files.length > 1}>
       {#if files.length > 1}
         <button class="nav prev" onclick={() => go(-1)} disabled={!hasPrev} aria-label={hint("Предыдущее вложение", "preview-prev")} title={hint("Предыдущее", "preview-prev")}>
           <svg width="20" height="20" viewBox="0 0 16 16" aria-hidden="true"><path d="M10 3 5 8l5 5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" /></svg>
@@ -235,6 +270,46 @@
         <iframe class="pdf" title={name} src={dto.url}></iframe>
       {:else if dto && mode === "text"}
         <pre class="text">{text ?? ""}</pre>
+      {:else if dto && mode === "message" && message}
+        <!-- Вложенное письмо (п. 30): как письмо в OWA — шапка, текст в той же рамке, его вложения. -->
+        <article class="eml" aria-label="Вложенное письмо">
+          <header class="eml-head">
+            <h3 class="eml-subject">{message.subject || "(без темы)"}</h3>
+            <dl class="eml-meta caption">
+              {#if message.from.length}<dt>От:</dt><dd>{people(message.from)}</dd>{/if}
+              {#if message.to.length}<dt>Кому:</dt><dd>{people(message.to)}</dd>{/if}
+              {#if message.cc.length}<dt>Копия:</dt><dd>{people(message.cc)}</dd>{/if}
+              {#if message.date_ms != null}<dt>Дата:</dt><dd>{fullDate(message.date_ms)}</dd>{/if}
+            </dl>
+            {#if message.attachments.length}
+              <div class="eml-files" aria-label="Вложения письма">
+                {#each message.attachments as part (part.index)}
+                  {@const partName = part.name ?? "вложение"}
+                  <span class="eml-file">
+                    <button class="eml-open" onclick={() => partAction(part.index, false)} disabled={partBusy != null} title="Открыть в системном приложении">
+                      {#if partBusy === part.index}<span class="spinner" aria-hidden="true"></span>{/if}
+                      <span class="eml-file-name">{partName}</span>
+                      <span class="caption">{formatSize(part.size)}</span>
+                    </button>
+                    <button class="eml-save" onclick={() => partAction(part.index, true)} disabled={partBusy != null} aria-label="Сохранить как… {partName}" title="Сохранить как…">
+                      <svg width="14" height="14" viewBox="0 0 16 16" aria-hidden="true"><path d="M8 2.5v8m0 0 3-3m-3 3-3-3M3 12.5h10" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" /></svg>
+                    </button>
+                  </span>
+                {/each}
+              </div>
+            {/if}
+            {#if partNote}
+              <div class="eml-note caption" class:failed={partNote.failed} role={partNote.failed ? "alert" : "status"}>{partNote.text}</div>
+            {/if}
+          </header>
+          <div class="eml-body">
+            {#if message.body_html != null}
+              <BodyFrame html={message.body_html} title="Текст вложенного письма" dark={windowIsDark() && darkMailByDefault()} darkColors={message.dark_colors} darkTag={message.dark_tag} />
+            {:else}
+              <p class="caption eml-empty">В письме нет текста.</p>
+            {/if}
+          </div>
+        </article>
       {:else if dto}
         <div class="note">
           <span class="note-text">
@@ -370,6 +445,93 @@
     max-height: 100%;
     object-fit: contain;
     user-select: none;
+  }
+  .eml {
+    flex: 1;
+    min-width: 0;
+    overflow: auto;
+    display: flex;
+    flex-direction: column;
+    background: var(--bg-card);
+  }
+  .eml-head {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+    padding: var(--space-4) var(--space-5) var(--space-3);
+    border-bottom: 1px solid var(--stroke-1);
+  }
+  .eml-subject {
+    margin: 0;
+    font: var(--text-subtitle);
+    color: var(--fg-1);
+    user-select: text;
+  }
+  .eml-meta {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr);
+    gap: 2px var(--space-2);
+    margin: 0;
+    color: var(--fg-2);
+    user-select: text;
+  }
+  .eml-meta dt {
+    color: var(--fg-3);
+  }
+  .eml-meta dd {
+    margin: 0;
+    overflow-wrap: anywhere;
+  }
+  .eml-files {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-2);
+  }
+  .eml-file {
+    display: inline-flex;
+    align-items: stretch;
+    border: 1px solid var(--stroke-2);
+    border-radius: var(--radius-control);
+    background: var(--bg-layer-alt);
+    max-width: 100%;
+  }
+  .eml-open,
+  .eml-save {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-2);
+    padding: 4px 10px;
+    color: var(--fg-1);
+  }
+  .eml-open {
+    min-width: 0;
+  }
+  .eml-save {
+    border-left: 1px solid var(--stroke-1);
+    color: var(--fg-2);
+  }
+  .eml-open:hover:not(:disabled),
+  .eml-save:hover:not(:disabled) {
+    background: var(--bg-hover);
+  }
+  .eml-file-name {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .eml-note {
+    color: var(--fg-2);
+    user-select: text;
+  }
+  .eml-note.failed {
+    color: var(--danger);
+  }
+  .eml-body {
+    padding: var(--space-3) var(--space-5) var(--space-5);
+  }
+  .eml-empty {
+    margin: 0;
   }
   .pdf {
     width: 100%;

@@ -191,6 +191,8 @@ export interface SearchHit {
   attachment_name: string | null;
   /** Начало текста письма: показывается, когда фрагмента с совпадениями нет. */
   preview?: string | null;
+  /** У письма есть вложения: строка рисует скрепку. */
+  has_attachments: boolean;
 }
 
 /** Этап синхронизации; совпадает с `StageDto` в src-tauri/src/sync.rs. */
@@ -314,6 +316,27 @@ export interface DraftRef {
   server_id: string;
   change_key: string | null;
   item_pk: number | null;
+}
+
+/** Человек из шапки вложенного письма. */
+export interface EmbeddedPerson {
+  name: string | null;
+  email: string | null;
+}
+
+/** Вложенное письмо .eml для показа в окне (attachment_message, п. 30). */
+export interface EmbeddedMessage {
+  subject: string | null;
+  from: EmbeddedPerson[];
+  to: EmbeddedPerson[];
+  cc: EmbeddedPerson[];
+  date_ms: number | null;
+  /** Очищенный HTML с тёмными тонами, как у писем; картинки текста — data:. */
+  body_html: string | null;
+  dark_colors: string[] | null;
+  dark_tag: string | null;
+  /** Вложения письма; index — номер для attachmentMessagePart. */
+  attachments: { index: number; name: string | null; content_type: string | null; size: number }[];
 }
 
 /**
@@ -988,7 +1011,12 @@ export const api = {
   /** Догрузить тело письма и инлайновые картинки с сервера (если их ещё нет) и вернуть свежий DTO. */
   messageFetch: (itemPk: number) => invoke<Message>("message_fetch", { itemPk }),
   /** Скачать вложение при необходимости и открыть системным приложением. */
-  attachmentOpen: (attachmentPk: number) => invoke<void>("attachment_open", { attachmentPk }),
+  /** Открыть системным приложением; true — это вложенное письмо, окно показывает его само (п. 30). */
+  attachmentOpen: (attachmentPk: number) => invoke<boolean>("attachment_open", { attachmentPk }),
+  /** Вложенное письмо .eml, разобранное для показа (шапка, текст, вложения). */
+  attachmentMessage: (attachmentPk: number) => invoke<EmbeddedMessage>("attachment_message", { attachmentPk }),
+  /** Вложение вложенного письма: открыть (save = false) или «Сохранить как…» (путь, null — отмена). */
+  attachmentMessagePart: (attachmentPk: number, index: number, save: boolean) => invoke<string | null>("attachment_message_part", { attachmentPk, index, save }),
   /** Скачать при необходимости и показать диалог «Сохранить как»; null — пользователь отменил. */
   attachmentSaveAs: (attachmentPk: number) => invoke<string | null>("attachment_save_as", { attachmentPk }),
   /** Скачать при необходимости и вернуть адрес файла в кэше по протоколу aiowa-att для предпросмотра. */
@@ -1276,7 +1304,7 @@ export function isInlinePicture(a: Attachment): boolean {
   return a.is_inline && isImageType(a.content_type);
 }
 
-const PREVIEW_EXT = /\.(png|jpe?g|gif|webp|bmp|svg|ico|avif|pdf|txt|csv|log|md|html?)$/i;
+const PREVIEW_EXT = /\.(png|jpe?g|gif|webp|bmp|svg|ico|avif|pdf|txt|csv|log|md|html?|eml)$/i;
 /** Те же типы, что у бэкенда (`preview::is_previewable`): картинки, которые рисует WebView, PDF и текст. */
 const PREVIEW_TYPES = new Set([
   "image/png",
@@ -1294,6 +1322,7 @@ const PREVIEW_TYPES = new Set([
   "text/plain",
   "text/csv",
   "text/html",
+  "message/rfc822",
 ]);
 
 /**

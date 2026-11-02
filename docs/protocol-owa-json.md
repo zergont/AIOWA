@@ -189,6 +189,8 @@ X-OWA-CANARY: <канарейка>          — дублируется заго�
 
 с ответом `Body.ResponseMessages.Items[0].Attachments[0]` типа `FileAttachment:#Exchange` и содержимым в `Content` (base64). Для вложений-писем (`ItemAttachment`) поля `Content` нет.
 
+**Вложенные письма (`ItemAttachment`, docs/obkatka.md п. 30; проба `aiowa item-attachment-check`, 02.11.2026).** В `Attachments` письма такое вложение — `__type: ItemAttachment:#Exchange` с `Name` (обычно тема), `Size` и `AttachmentId`, **без `ContentType`**. `GET service.svc/s/GetFileAttachment` по его `AttachmentId` отдаёт письмо целиком в MIME (RFC 822, `application/octet-stream`) — это готовый `.eml`; `GetAttachment` с `AttachmentShape.IncludeMimeContent: true` (форма EWS) этот сервер отвергает: HTTP 500 «Cannot deserialize object of type GetAttachmentJsonRequest». `CreateAttachment` с `ItemAttachment` и `Item: Message` (тема, тело, получатель) принимается (`NoError`) — так проба создаёт тестовое вложенное письмо. Клиент помечает `ItemAttachment` при разборе как `message/rfc822` с именем `<имя>.eml` (`protocol::parse_message_full`) и качает обычным путём.
+
 Следствия для клиента: скачивать по одному, с ограничением размера по `Content-Length` и по счётчику прочитанных байт; инлайновые картинки (`IsInline: true`, есть `ContentId`) нужны только рендеру и не качаются индексом; текст извлекается локально (PDF с текстовым слоем, DOCX, XLSX/XLS, TXT/CSV), сканы дают пустой текст, OCR отложен.
 
 ## 5a. TLS сервера

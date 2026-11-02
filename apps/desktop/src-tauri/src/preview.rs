@@ -201,6 +201,23 @@ pub(crate) async fn attachment_preview_url(attachment_pk: i64, state: State<'_, 
     let ct = resolved_type(row.name.as_deref(), row.content_type.as_deref());
     let openable = !crate::ondemand::is_unsafe_to_open(row.name.as_deref());
     let mut dto = PreviewDto { url: String::new(), content_type: Some(ct.clone()), previewable: false, reason: None, openable, name: row.name.clone(), size: row.size };
+    if row.size.is_some_and(|s| s > PREVIEW_MAX_BYTES as i64) {
+        dto.reason = Some(if is_previewable(&ct) || ct == crate::embedded::MESSAGE_RFC822 { REASON_SIZE } else { REASON_TYPE });
+        return Ok(dto);
+    }
+    // Вложенное письмо (п. 30): окно показывает его само (`attachment_message`), протокол его не
+    // отдаёт. Вложение общего типа скачивается, чтобы узнать письмо по содержимому (так лежат
+    // вложенные письма, скачанные до п. 30).
+    if ct == crate::embedded::MESSAGE_RFC822 || ct == "application/octet-stream" {
+        let path = ensure_cached(&state, &sync, &od, attachment_pk).await?;
+        let (name, declared) = (row.name.clone(), row.content_type.clone());
+        let message = tauri::async_runtime::spawn_blocking(move || crate::embedded::is_message_file(name.as_deref(), declared.as_deref(), &path)).await.map_err(err)?;
+        if message {
+            dto.content_type = Some(crate::embedded::MESSAGE_RFC822.to_string());
+            dto.previewable = true;
+            return Ok(dto);
+        }
+    }
     if !is_previewable(&ct) {
         dto.reason = Some(REASON_TYPE);
         return Ok(dto);

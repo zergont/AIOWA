@@ -144,6 +144,8 @@ pub struct SearchHit {
     /// Начало текста письма (серверный `Preview`): строка результата показывает его, когда
     /// фрагмента нет (тело ещё не загружено, совпадение только в теме или отправителе).
     pub preview: Option<String>,
+    /// У письма есть вложения (`items.has_attachments`): строка результата рисует скрепку (п. 29).
+    pub has_attachments: bool,
 }
 
 /// Сводка по папке для `stats`.
@@ -1212,6 +1214,46 @@ impl Store {
 
     /// Кладёт скачанный файл в кэш и записывает текст; индекс письма пересобирается в той же
     /// транзакции. Возвращает путь к файлу.
+    /// Скачанные вложения общего типа без извлечённого текста (`TEXT_UNSUPPORTED`, тип пуст или
+    /// `application/octet-stream`): среди них вложенные письма, скачанные до docs/obkatka.md п. 30.
+    /// Возвращает ключ вложения, имя и путь файла в кэше.
+    pub fn generic_attachments_without_text(&self, account: AccountId) -> Result<Vec<(i64, Option<String>, PathBuf)>> {
+        self.with_conn(|c| {
+            let mut st = c.prepare(
+                "SELECT a.attachment_pk, a.name, a.local_path FROM attachments a JOIN items i ON i.item_pk = a.item_pk
+                 WHERE i.account_id = ?1 AND i.deleted = 0 AND a.is_inline = 0 AND a.local_path IS NOT NULL AND a.text_state = ?2
+                   AND (a.content_type IS NULL OR lower(trim(a.content_type)) IN ('', 'application/octet-stream'))",
+            )?;
+            let rows = st.query_map(params![account.0, TEXT_UNSUPPORTED], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?, PathBuf::from(r.get::<_, String>(2)?))))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+        })
+    }
+
+    /// Вложение оказалось письмом (п. 30): тип `message/rfc822`, имя с `.eml`, текст письма — в
+    /// запись и в поисковый индекс письма-родителя.
+    pub fn mark_message_attachment(&self, attachment_pk: i64, text: AttachmentText) -> Result<()> {
+        let (text_value, text_state, err) = match text {
+            AttachmentText::Extracted(t) => (Some(t), TEXT_OK, None),
+            AttachmentText::Unsupported => (None, TEXT_UNSUPPORTED, None),
+            AttachmentText::Failed(e) => (None, TEXT_FAILED, Some(e)),
+        };
+        if let Some(e) = err {
+            debug!(attachment_pk, error = %e, "текст вложенного письма не извлечён");
+        }
+        self.with_tx(|tx| {
+            let item_pk: i64 = tx.query_row("SELECT item_pk FROM attachments WHERE attachment_pk = ?1", params![attachment_pk], |r| r.get(0))?;
+            fts_delete(tx, item_pk)?;
+            tx.execute(
+                "UPDATE attachments SET content_type = 'message/rfc822', text = ?2, text_state = ?3,
+                   name = CASE WHEN lower(COALESCE(name, '')) LIKE '%.eml' THEN name ELSE COALESCE(NULLIF(trim(name), ''), 'письмо') || '.eml' END
+                 WHERE attachment_pk = ?1",
+                params![attachment_pk, text_value, text_state],
+            )?;
+            fts_insert(tx, item_pk)?;
+            Ok(())
+        })
+    }
+
     pub fn save_attachment(&self, todo: &AttachmentTodo, bytes: &[u8], content_type: Option<&str>, text: AttachmentText) -> Result<PathBuf> {
         std::fs::create_dir_all(&self.attachments_dir)?;
         let name = safe_file_name(todo.name.as_deref().unwrap_or("attachment"));
@@ -1621,7 +1663,7 @@ impl Store {
             sql.push_str(
                 "SELECT i.item_pk, bm25(items_fts, 8.0, 4.0, 2.0, 1.0, 1.0, 0.5) AS rank,
                         i.subject, i.from_name, i.from_email, i.received_at, f.display_name,
-                        snippet(items_fts, 4, ?1, ?2, '…', 14), snippet(items_fts, 5, ?1, ?2, '…', 14), i.conversation_pk, i.preview
+                        snippet(items_fts, 4, ?1, ?2, '…', 14), snippet(items_fts, 5, ?1, ?2, '…', 14), i.conversation_pk, i.preview, i.has_attachments
                  FROM items_fts JOIN items i ON i.item_pk = items_fts.rowid
                  LEFT JOIN folders f ON f.folder_pk = i.folder_pk
                  WHERE items_fts MATCH ?3 AND i.account_id = ?4 AND i.deleted = 0",
@@ -1633,7 +1675,7 @@ impl Store {
         } else {
             sql.push_str(
                 "SELECT i.item_pk, 0.0 AS rank, i.subject, i.from_name, i.from_email, i.received_at, f.display_name,
-                        COALESCE(i.preview, ''), '', i.conversation_pk, i.preview
+                        COALESCE(i.preview, ''), '', i.conversation_pk, i.preview, i.has_attachments
                  FROM items i LEFT JOIN folders f ON f.folder_pk = i.folder_pk
                  WHERE i.account_id = ?1 AND i.deleted = 0",
             );
@@ -1689,11 +1731,12 @@ impl Store {
                     r.get::<_, String>(8)?,
                     r.get::<_, Option<i64>>(9)?,
                     r.get::<_, Option<String>>(10)?,
+                    r.get::<_, bool>(11)?,
                 ))
             })?;
             let raw = rows.collect::<std::result::Result<Vec<_>, _>>()?;
             let mut hits = Vec::with_capacity(raw.len());
-            for (item_pk, rank, subject, from_name, from_email, received_at, folder_name, body_snip, att_snip, conversation_pk, preview) in raw {
+            for (item_pk, rank, subject, from_name, from_email, received_at, folder_name, body_snip, att_snip, conversation_pk, preview, has_attachments) in raw {
                 let body_hit = body_snip.contains(MARK_OPEN);
                 let att_hit = att_snip.contains(MARK_OPEN);
                 let (snippet, attachment_name) = if att_hit && !body_hit {
@@ -1704,7 +1747,7 @@ impl Store {
                 };
                 let snippet = snippet.replace(MARK_OPEN, "[").replace(MARK_CLOSE, "]");
                 let preview = preview.filter(|p| !p.trim().is_empty());
-                hits.push(SearchHit { item_pk, rank, subject, from_name, from_email, received_at: ms_ts(received_at), folder_name, snippet, attachment_name, conversation_pk, preview });
+                hits.push(SearchHit { item_pk, rank, subject, from_name, from_email, received_at: ms_ts(received_at), folder_name, snippet, attachment_name, conversation_pk, preview, has_attachments });
             }
             Ok(hits)
         })
@@ -2862,6 +2905,39 @@ mod tests {
         let only = s.search(acc, "после:2026-10-01", 10).unwrap();
         assert_eq!(ids(only).len(), 2);
         assert!(s.search(acc, "", 10).unwrap().is_empty());
+    }
+
+    /// Вложенное письмо, скачанное до п. 30 (тема без `.eml`, `application/octet-stream`, текста
+    /// нет): кандидат на проверку; после пометки — `.eml`, `message/rfc822`, текст в поиске, а
+    /// письмо со скрепкой (п. 29).
+    #[test]
+    fn old_message_attachment_is_marked_and_searchable() {
+        let s = tmp_store("eml");
+        let acc = s.account("h", "u").unwrap();
+        s.upsert_folders(acc, &[folder("Входящие", Some("inbox"))]).unwrap();
+        let (fpk, _) = s.folder_by_distinguished(acc, "inbox").unwrap().unwrap();
+        let att = AttachmentMeta { id: "eml1".into(), name: Some("Счёт 10.2026".into()), content_type: None, size: Some(900), is_inline: false, content_id: None };
+        let mut msg = full(meta("A", "Пересылаю"), "<p>см. вложение</p>", vec![att]);
+        msg.meta.has_attachments = true;
+        s.store_full_messages(acc, fpk, std::slice::from_ref(&msg)).unwrap();
+        let todo = s.attachments_to_fetch(acc, fpk, None, i64::MAX, 10).unwrap();
+        s.save_attachment(&todo[0], b"From: a@x\r\nSubject: s\r\n\r\nbody", Some("application/octet-stream"), AttachmentText::Unsupported).unwrap();
+
+        let candidates = s.generic_attachments_without_text(acc).unwrap();
+        assert_eq!(candidates.len(), 1);
+        let (pk, name, path) = &candidates[0];
+        assert_eq!(name.as_deref(), Some("Счёт 10.2026"));
+        assert!(path.exists());
+        s.mark_message_attachment(*pk, AttachmentText::Extracted("Тема: s\n\nтекст вложенного счёта".into())).unwrap();
+
+        let row = s.attachment(*pk).unwrap().unwrap();
+        assert_eq!(row.name.as_deref(), Some("Счёт 10.2026.eml"));
+        assert_eq!(row.content_type.as_deref(), Some("message/rfc822"));
+        assert!(s.generic_attachments_without_text(acc).unwrap().is_empty(), "больше не кандидат");
+        let hits = s.search(acc, "вложенного счёта", 10).unwrap();
+        assert_eq!(hits.len(), 1, "текст вложенного письма в поиске");
+        assert_eq!(hits[0].attachment_name.as_deref(), Some("Счёт 10.2026.eml"));
+        assert!(hits[0].has_attachments, "скрепка в результате поиска");
     }
 
     #[test]

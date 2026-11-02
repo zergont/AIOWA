@@ -67,6 +67,7 @@ mod calendar_write;
 mod compose;
 mod config;
 mod data;
+mod embedded;
 mod directory;
 mod external_images;
 mod folders;
@@ -295,6 +296,8 @@ struct SearchHitDto {
     attachment_name: Option<String>,
     /// Начало текста письма: строка результата показывает его, когда фрагмента нет.
     preview: Option<String>,
+    /// У письма есть вложения: строка результата рисует скрепку (п. 29).
+    has_attachments: bool,
 }
 
 /// Ключ сопоставления `src="cid:…"` с `Content-ID` вложения: без схемы `cid:`, URL-декодирован,
@@ -395,7 +398,7 @@ pub(crate) fn prepare_attachments(store: &Store, item_pk: i64, wanted: Option<&H
 /// Очистка HTML письма. Инлайновые стили разрешены: без них деловая почта нечитаема,
 /// а внешние ресурсы из CSS всё равно блокирует CSP фрейма. `src="cid:…"` у картинок
 /// заменяется на `data:` из карты; несопоставленные `cid:` теряют атрибут `src`.
-fn sanitize_html(html: &str, inline: &Arc<InlineMap>) -> String {
+pub(crate) fn sanitize_html(html: &str, inline: &Arc<InlineMap>) -> String {
     clean_html(html, Some(inline.clone()))
 }
 
@@ -582,6 +585,7 @@ fn search(state: State<'_, AppState>, query: String, limit: Option<usize>) -> Cm
             snippet: h.snippet,
             attachment_name: h.attachment_name,
             preview: h.preview,
+            has_attachments: h.has_attachments,
         });
     }
     Ok(out)
@@ -808,6 +812,8 @@ pub fn run() {
             ondemand::attachment_open,
             ondemand::attachment_save_as,
             preview::attachment_preview_url,
+            embedded::attachment_message,
+            embedded::attachment_message_part,
             ondemand::open_external,
             write::items_mark_read,
             write::items_set_flag,

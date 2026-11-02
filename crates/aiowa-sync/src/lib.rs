@@ -254,6 +254,7 @@ impl Engine {
                 self.check_cancel()?;
                 self.fetch_attachments(f, since, opts, &mut report).await?;
             }
+            self.recognize_message_attachments(opts.attachment_text_chars).await?;
             let evicted = self.store.evict_attachment_cache(opts.attachment_cache_bytes)?;
             report.cache_files_evicted = evicted.files_removed;
             report.cache_bytes_evicted = evicted.bytes_freed;
@@ -314,6 +315,48 @@ impl Engine {
         }
         self.drop_orphan_items()?;
         Ok(total)
+    }
+
+    /// Вложенные письма, скачанные до docs/obkatka.md п. 30 (имя-тема без `.eml`, тип
+    /// `application/octet-stream`, текста нет): один раз после обновления файлы кэша общего типа
+    /// без текста проверяются по содержимому, и письма получают тип, имя `.eml` и текст в поиске.
+    /// Дальше вложенные письма приходят уже с типом (`ItemAttachment`), и проход не нужен.
+    async fn recognize_message_attachments(&self, max_chars: usize) -> Result<()> {
+        const DONE_KEY: &str = "eml_recognized.v1";
+        if self.store.get_state(self.account, DONE_KEY)?.is_some() {
+            return Ok(());
+        }
+        let candidates = self.store.generic_attachments_without_text(self.account)?;
+        let checked = candidates.len();
+        let found = tokio::task::spawn_blocking(move || {
+            candidates
+                .into_iter()
+                .filter_map(|(pk, name, path)| {
+                    use std::io::Read as _;
+                    let mut head = Vec::with_capacity(16 * 1024);
+                    std::fs::File::open(&path).and_then(|f| f.take(16 * 1024).read_to_end(&mut head)).ok()?;
+                    if !aiowa_extract::looks_like_message(&head) {
+                        return None;
+                    }
+                    let bytes = std::fs::read(&path).ok()?;
+                    let text = match aiowa_extract::extract_text(name.as_deref(), Some("message/rfc822"), &bytes, max_chars) {
+                        Extraction::Text(t) => AttachmentText::Extracted(t),
+                        Extraction::Unsupported => AttachmentText::Unsupported,
+                        Extraction::Failed(e) => AttachmentText::Failed(e),
+                    };
+                    Some((pk, text))
+                })
+                .collect::<Vec<_>>()
+        })
+        .await
+        .map_err(|e| SyncError::Store(StoreError::Other(format!("проверка скачанных вложений прервана: {e}"))))?;
+        let messages = found.len();
+        for (pk, text) in found {
+            self.store.mark_message_attachment(pk, text)?;
+        }
+        info!(checked, messages, "вложенные письма среди скачанных раньше вложений");
+        self.store.set_state(self.account, DONE_KEY, Some("1"))?;
+        Ok(())
     }
 
     /// Живые письма папок, уже помеченных удалёнными (docs/obkatka.md п. 28), — удалёнными; окну —
@@ -842,7 +885,7 @@ impl Engine {
             async move { t.get_attachment(&id, max_bytes).await }
         })
         .await?;
-        let content_type = content.content_type.clone().or_else(|| todo.content_type.clone());
+        let content_type = downloaded_type(content.content_type.as_deref(), todo.content_type.as_deref());
         let name = todo.name.clone().or(content.file_name.clone());
         let bytes = content.bytes;
         let (bytes, extraction) = tokio::task::spawn_blocking(move || {
@@ -859,9 +902,19 @@ impl Engine {
             Extraction::Unsupported => (AttachmentText::Unsupported, aiowa_store::TEXT_UNSUPPORTED, 0),
             Extraction::Failed(e) => (AttachmentText::Failed(e), aiowa_store::TEXT_FAILED, 0),
         };
-        let content_type = content.content_type.clone().or_else(|| todo.content_type.clone());
+        let content_type = downloaded_type(content.content_type.as_deref(), todo.content_type.as_deref());
         let path = self.store.save_attachment(todo, &bytes, content_type.as_deref(), text)?;
         Ok(FetchedAttachment { path, bytes: bytes.len(), text_chars, text_state })
+    }
+}
+
+/// Тип скачанного вложения: из ответа сервера, но общий `application/octet-stream` не затирает
+/// точный тип записи — так `GetFileAttachment` отдаёт и вложенное письмо, у которого в записи
+/// `message/rfc822` (docs/obkatka.md п. 30).
+fn downloaded_type(got: Option<&str>, known: Option<&str>) -> Option<String> {
+    match (got, known) {
+        (Some(g), Some(k)) if g.trim().eq_ignore_ascii_case("application/octet-stream") && !k.trim().is_empty() => Some(k.to_string()),
+        (g, k) => g.or(k).map(String::from),
     }
 }
 

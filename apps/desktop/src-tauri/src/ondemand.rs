@@ -254,18 +254,24 @@ pub(crate) async fn message_fetch(item_pk: i64, state: State<'_, AppState>, sync
 }
 
 /// Скачать вложение при необходимости и открыть системным приложением (ShellExecute, глагол
-/// по умолчанию). Исполняемые типы не открываются — только «Сохранить как».
+/// по умолчанию). Исполняемые типы не открываются — только «Сохранить как». Вложенное письмо
+/// (п. 30, в том числе узнанное по содержимому) системе не отдаётся: `true` — окно покажет его само.
 #[tauri::command]
-pub(crate) async fn attachment_open(attachment_pk: i64, state: State<'_, AppState>, sync: State<'_, Arc<SyncState>>, od: State<'_, OnDemand>) -> CmdResult<()> {
+pub(crate) async fn attachment_open(attachment_pk: i64, state: State<'_, AppState>, sync: State<'_, Arc<SyncState>>, od: State<'_, OnDemand>) -> CmdResult<bool> {
     let row = state.store.attachment(attachment_pk).map_err(err)?.ok_or_else(|| "Вложение не найдено".to_string())?;
     if is_unsafe_to_open(row.name.as_deref()) {
         return Err("Файлы такого типа открывать небезопасно — используйте «Сохранить как…»".into());
     }
     let path = ensure_cached(&state, &sync, &od, attachment_pk).await?;
+    let (name, declared, file) = (row.name.clone(), row.content_type.clone(), path.clone());
+    if tauri::async_runtime::spawn_blocking(move || crate::embedded::is_message_file(name.as_deref(), declared.as_deref(), &file)).await.map_err(err)? {
+        return Ok(true);
+    }
     tauri::async_runtime::spawn_blocking(move || open::that_detached(&path)).await.map_err(err)?.map_err(|e| {
         warn!(attachment_pk, error = %e, "системное приложение не открыло файл");
         "Не удалось открыть файл системным приложением".to_string()
-    })
+    })?;
+    Ok(false)
 }
 
 /// Скачать при необходимости и сохранить копию туда, куда укажет пользователь. `None` — отмена.
@@ -274,7 +280,12 @@ pub(crate) async fn attachment_open(attachment_pk: i64, state: State<'_, AppStat
 pub(crate) async fn attachment_save_as(attachment_pk: i64, app: AppHandle, state: State<'_, AppState>, sync: State<'_, Arc<SyncState>>, od: State<'_, OnDemand>) -> CmdResult<Option<String>> {
     let row = state.store.attachment(attachment_pk).map_err(err)?.ok_or_else(|| "Вложение не найдено".to_string())?;
     let cached = ensure_cached(&state, &sync, &od, attachment_pk).await?;
-    let suggested = aiowa_store::safe_file_name(row.name.as_deref().unwrap_or("вложение"));
+    let mut suggested = aiowa_store::safe_file_name(row.name.as_deref().unwrap_or("вложение"));
+    // Вложенное письмо, скачанное до п. 30 (имя-тема без `.eml`), сохраняется файлом `.eml`.
+    let (name, declared, file) = (row.name.clone(), row.content_type.clone(), cached.clone());
+    if !suggested.to_ascii_lowercase().ends_with(".eml") && tauri::async_runtime::spawn_blocking(move || crate::embedded::is_message_file(name.as_deref(), declared.as_deref(), &file)).await.map_err(err)? {
+        suggested.push_str(".eml");
+    }
     let mut dialog = rfd::AsyncFileDialog::new().set_title("Сохранить вложение").set_file_name(&suggested);
     if let Some(dir) = dirs::download_dir() {
         dialog = dialog.set_directory(dir);

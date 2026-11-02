@@ -268,6 +268,18 @@ enum Cmd {
         #[arg(long)]
         yes_i_know: bool,
     },
+    /// Живая проверка вложенного письма (docs/obkatka.md п. 30) одной сессией: CreateItem «[AIOWA]
+    /// проверка п. 30» → CreateAttachment `ItemAttachment` (вложенное письмо с маркером) → GetItem
+    /// черновика (что в `Attachments`) → GetAttachment с `IncludeMimeContent` (форма ответа, MIME) →
+    /// загрузка обычным путём (`get_attachment`). С --send черновик уходит на свой адрес (письмо с
+    /// вложенным письмом для проверки окна), без него — в «Удалённые». Без --yes-i-know только план
+    ItemAttachmentCheck {
+        #[arg(long)]
+        send: bool,
+        /// Подтверждение: это запись в настоящий ящик (тестовый черновик или письмо себе)
+        #[arg(long)]
+        yes_i_know: bool,
+    },
     /// Показать подпись пользователя из настроек OWA (GetUserConfiguration), ничего не сохраняя
     Signature,
     /// Подсказки получателей из локальной базы по началу адреса или слова имени
@@ -2312,6 +2324,104 @@ fn check_local_draft(store: &Store, account: AccountId, server_id: &str, expect_
 /// Живая проверка черновиков: CreateItem → CreateAttachment → GetItem → UpdateItem → GetItem →
 /// DeleteAttachment → GetItem → DeleteItem HardDelete. Сбой после создания всё равно заканчивается
 /// удалением черновика навсегда. `owner` — свой адрес (единственный получатель после обновления).
+const ITEM_ATT_SUBJECT: &str = "[AIOWA] проверка п. 30";
+const ITEM_ATT_INNER: &str = "[AIOWA] вложенное письмо п. 30";
+const ITEM_ATT_MARK: &str = "VLOZHENO30";
+
+/// Проба `item-attachment-check`: печатает только коды, типы, ключи и размеры.
+async fn item_attachment_check(t: &OwaTransport, owner: &str, send: bool) -> Result<()> {
+    use aiowa_transport_owa::protocol;
+    use base64::Engine as _;
+    use serde_json::{json, Value};
+    let me = Participant { name: None, email: Some(owner.to_string()), routing_type: None };
+    let msg = OutgoingMessage { to: if send { vec![me] } else { vec![] }, subject: ITEM_ATT_SUBJECT.into(), body_html: text_to_html("Тестовое письмо AIOWA: внутри вложенное письмо (п. 30)."), ..OutgoingMessage::default() };
+    let draft = t.create_draft(&ComposeKind::New, &msg).await.map_err(|e| anyhow!("CreateItem: {e}"))?;
+    println!("CreateItem: Ok");
+    let outcome = async {
+        let body = json!({
+            "__type": "CreateAttachmentRequest:#Exchange",
+            "ParentItemId": { "__type": "ItemId:#Exchange", "Id": draft.id, "ChangeKey": draft.change_key },
+            "Attachments": [ {
+                "__type": "ItemAttachment:#Exchange",
+                "Name": ITEM_ATT_INNER,
+                "Item": {
+                    "__type": "Message:#Exchange",
+                    "Subject": ITEM_ATT_INNER,
+                    "Body": { "__type": "BodyContentType:#Exchange", "BodyType": "HTML", "Value": format!("<div>Текст вложенного письма, маркер {ITEM_ATT_MARK}.</div>") },
+                    "ToRecipients": [ { "__type": "EmailAddress:#Exchange", "EmailAddress": owner } ],
+                },
+            } ],
+        });
+        let v = t.call("CreateAttachment", protocol::V_2017, body).await.map_err(|e| anyhow!("CreateAttachment ItemAttachment: {e}"))?;
+        let m = protocol::response_messages(&v).into_iter().next().cloned().unwrap_or(Value::Null);
+        println!("CreateAttachment ItemAttachment: {}; ответ {}", protocol::str_of(&m, "ResponseCode").unwrap_or("?"), protocol::json_shape(&m, 3));
+        let current = protocol::parse_attachment_root(&m).unwrap_or_else(|| draft.clone());
+
+        let d = t.get_draft(&current).await.map_err(|e| anyhow!("GetItem черновика: {e}"))?;
+        for a in &d.attachments {
+            println!("GetItem: вложение content_type {:?}, size {:?}, inline {}, имя {} символов, AttachmentId {} символов", a.content_type, a.size, a.is_inline, a.name.as_deref().map(|n| n.chars().count()).unwrap_or(0), a.id.len());
+        }
+        let att = d.attachments.first().ok_or_else(|| anyhow!("в черновике нет вложений"))?.id.clone();
+
+        let body = json!({
+            "__type": "GetAttachmentRequest:#Exchange",
+            "AttachmentIds": [ { "__type": "AttachmentId:#Exchange", "Id": att } ],
+            "AttachmentShape": { "__type": "AttachmentResponseShape:#Exchange", "IncludeMimeContent": true, "BodyType": "Best" },
+        });
+        match t.call("GetAttachment", protocol::V_2013, body).await {
+            Ok(v) => {
+                let m = protocol::response_messages(&v).into_iter().next().cloned().unwrap_or(Value::Null);
+                let a = m.pointer("/Attachments/0").cloned().unwrap_or(Value::Null);
+                println!("GetAttachment IncludeMimeContent: {}; вложение {}", protocol::str_of(&m, "ResponseCode").unwrap_or("?"), protocol::json_shape(&a, 2));
+                match a.pointer("/Item/MimeContent/Value").and_then(Value::as_str) {
+                    Some(b64) => match base64::engine::general_purpose::STANDARD.decode(b64) {
+                        Ok(bytes) => {
+                            let text = String::from_utf8_lossy(&bytes);
+                            println!(
+                                "  MimeContent: {} байт; CharacterSet {:?}; Subject: {}, MIME-Version: {}, Content-Type: {}, маркер в тексте: {}",
+                                bytes.len(),
+                                a.pointer("/Item/MimeContent/CharacterSet").and_then(Value::as_str),
+                                text.contains("Subject:"),
+                                text.contains("MIME-Version:"),
+                                text.contains("Content-Type:"),
+                                text.contains(ITEM_ATT_MARK)
+                            );
+                        }
+                        Err(e) => println!("  MimeContent: не base64 ({e})"),
+                    },
+                    None => println!("  MimeContent нет в ответе"),
+                }
+            }
+            Err(e) => println!("GetAttachment IncludeMimeContent: {e}"),
+        }
+        match t.get_attachment(&att, 10 * 1024 * 1024).await {
+            Ok(c) => {
+                let head = String::from_utf8_lossy(&c.bytes[..c.bytes.len().min(400)]).to_string();
+                println!("Обычная загрузка (get_attachment): Ok, {} байт, content_type {:?}; похоже на письмо: {}", c.bytes.len(), c.content_type, head.contains("Subject:") || head.contains("MIME-Version:"));
+            }
+            Err(e) => println!("Обычная загрузка (get_attachment): {e}"),
+        }
+        Ok::<_, anyhow::Error>(d.id)
+    }
+    .await;
+    let current = match &outcome {
+        Ok(id) => id.clone(),
+        Err(_) => draft.clone(),
+    };
+    if send && outcome.is_ok() {
+        match t.send_draft(&current).await {
+            Ok(()) => println!("SendItem на свой адрес: Ok"),
+            Err(e) => println!("SendItem: {e} — черновик остался в «Черновиках»"),
+        }
+    } else {
+        match t.delete_items(std::slice::from_ref(&current), DeleteMode::ToDeletedItems).await {
+            Ok(_) => println!("DeleteItem черновика (в «Удалённые»): Ok"),
+            Err(e) => println!("DeleteItem черновика: {e} — черновик остался в «Черновиках»!"),
+        }
+    }
+    outcome.map(|_| ())
+}
+
 async fn draft_check_flow(t: &OwaTransport, store: &Arc<Store>, account: AccountId, owner: &str, sync_drafts: bool) -> Result<()> {
     let msg1 = OutgoingMessage { subject: DRAFT_CHECK_SUBJECT.into(), body_html: text_to_html(&format!("{DRAFT_CHECK_MARK_1}\n\nПервая версия тела.")), ..OutgoingMessage::default() };
     let file = OutgoingAttachment { name: DRAFT_CHECK_ATTACHMENT.into(), content_type: Some("text/plain".into()), bytes: format!("AIOWA draft-check {}\n", jiff::Timestamp::now()).into_bytes() };
@@ -3720,6 +3830,23 @@ async fn real_main() -> Result<()> {
             }
             let t = connect(&cli).await?;
             let result = draft_check_flow(&t, &store, account, &owner, *sync_drafts).await;
+            t.logoff().await.ok();
+            result?;
+        }
+        Cmd::ItemAttachmentCheck { send, yes_i_know } => {
+            let store = Store::open(&db_path)?;
+            let account = store.account(&cli.host, &cli.user)?;
+            let owner = store.own_addresses(account)?.into_iter().next().ok_or_else(|| anyhow!("в локальной базе нет писем в «Отправленных»: собственный адрес неизвестен"))?;
+            println!(
+                "План одной сессией: CreateItem «{ITEM_ATT_SUBJECT}» → CreateAttachment ItemAttachment «{ITEM_ATT_INNER}» → GetItem → GetAttachment IncludeMimeContent → загрузка обычным путём → {}.",
+                if *send { "SendItem на свой адрес" } else { "DeleteItem в «Удалённые»" }
+            );
+            if !yes_i_know {
+                println!("Это запись в настоящий ящик. Повторите с --yes-i-know, чтобы выполнить.");
+                return Ok(());
+            }
+            let t = connect(&cli).await?;
+            let result = item_attachment_check(&t, &owner, *send).await;
             t.logoff().await.ok();
             result?;
         }

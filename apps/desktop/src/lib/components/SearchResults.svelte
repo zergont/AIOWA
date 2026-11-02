@@ -1,5 +1,6 @@
 <script lang="ts">
   import { listDate, personLabel, type SearchHit } from "../api";
+  import { ICON } from "../actions";
 
   interface Props {
     hits: SearchHit[];
@@ -42,6 +43,10 @@
     <div class="row" class:selected={h.conversation_pk != null && h.conversation_pk === selectedPk} role="option" aria-selected={h.conversation_pk === selectedPk} tabindex="-1" onclick={() => h.conversation_pk != null && onopen(h.conversation_pk)} onkeydown={(e) => e.key === "Enter" && h.conversation_pk != null && onopen(h.conversation_pk)}>
       <div class="line1">
         <span class="people">{personLabel(h.from_name, h.from_email)}</span>
+        <!-- Скрепка — как в списке бесед (п. 29). -->
+        {#if h.has_attachments}
+          <svg class="clip" width="14" height="14" viewBox="0 0 16 16" aria-label="Есть вложения"><path d={ICON.attach} fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" /></svg>
+        {/if}
         <span class="date">{listDate(h.received_ms)}</span>
       </div>
       <div class="topic">{h.subject || "(без темы)"}</div>
@@ -121,6 +126,11 @@
     font: var(--text-caption);
     color: var(--fg-3);
     white-space: nowrap;
+  }
+  .clip {
+    flex: none;
+    align-self: center;
+    color: var(--fg-3);
   }
   .topic {
     color: var(--fg-1);

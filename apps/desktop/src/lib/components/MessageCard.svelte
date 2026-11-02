@@ -331,8 +331,16 @@
     if (status(pk).busy) return;
     setStatus(pk, { busy: "open", error: null, saved: null });
     try {
-      await api.attachmentOpen(pk);
+      const isMessage = await api.attachmentOpen(pk);
       markCached(pk);
+      // Вложенное письмо, узнанное по содержимому (скачано до п. 30 без .eml): показ в окне.
+      if (isMessage && !previewOpen) {
+        const i = files.findIndex((f) => f.attachment_pk === pk);
+        if (i >= 0) {
+          previewIndex = i;
+          previewOpen = true;
+        }
+      }
     } catch (e) {
       setStatus(pk, { error: errorMessage(e) });
     } finally {
@@ -784,6 +792,9 @@
             <button class="file-open" onclick={(e) => clickAttachment(e, a)} disabled={st.busy != null} aria-label={previewable ? `Предпросмотр вложения ${name}` : `Открыть вложение ${name}`} aria-haspopup={previewable ? "dialog" : undefined} aria-busy={st.busy === "open"}>
               {#if st.busy === "open"}
                 <span class="spinner" aria-hidden="true"></span>
+              {:else if a.content_type === "message/rfc822" || /\.eml$/i.test(name)}
+                <!-- Вложенное письмо (п. 30) — конверт. -->
+                <svg width="14" height="14" viewBox="0 0 16 16" aria-hidden="true"><rect x="2" y="3.5" width="12" height="9" rx="1" fill="none" stroke="currentColor" stroke-width="1.2" /><path d="m2.5 4.5 5.5 4 5.5-4" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round" /></svg>
               {:else}
                 <svg width="14" height="14" viewBox="0 0 16 16" aria-hidden="true"><path d="M3 2.5h7l3 3v8H3v-11Zm7 0v3h3" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round" /></svg>
               {/if}
