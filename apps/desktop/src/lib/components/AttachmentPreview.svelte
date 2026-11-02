@@ -2,6 +2,7 @@
   import { api, errorMessage, formatSize, fullDate, personLabel, type Attachment, type EmbeddedMessage, type EmbeddedPerson, type PreviewDto } from "../api";
   import { hint, isTopLayer, keysOf, layer } from "../hotkeys";
   import BodyFrame from "./BodyFrame.svelte";
+  import WindowControls from "./WindowControls.svelte";
   import { darkMailByDefault, windowIsDark } from "../darkmail.svelte";
 
   /**
@@ -22,8 +23,15 @@
     /** Скрыть ошибку действия. */
     onclearerror?: (a: Attachment) => void;
     onclose: () => void;
+    /**
+     * Своё окно Windows (п. 31, `AttachmentWindow`): без подложки, на всё окно, шапка — заголовок
+     * окна (перетаскивание, кнопки окна вместо «Закрыть»).
+     */
+    standalone?: boolean;
   }
-  let { files, index = $bindable(0), onopen, onsave, status, onclearerror, onclose }: Props = $props();
+  let { files, index = $bindable(0), onopen, onsave, status, onclearerror, onclose, standalone = false }: Props = $props();
+  /** Атрибут перетаскивания окна для шапки окна просмотра (у слоя поверх окна его нет). */
+  const drag = $derived(standalone ? "" : undefined);
 
   const uid = $props.id();
   /** Текст больше этого в окно не грузится: предлагается открыть файл. */
@@ -206,16 +214,16 @@
 <svelte:window onkeydown={onKey} />
 
 <!-- Подложка только для мыши: закрытие с клавиатуры — Esc (обработчик окна выше), поэтому для читалок она «презентационная». -->
-<div class="overlay" role="presentation" onclick={onBackdrop}>
-  <div class="dialog" role="dialog" aria-modal="true" aria-labelledby="{uid}-title" aria-busy={loading} bind:this={dialogEl} {@attach layer}>
-    <header class="head">
+<div class="overlay" class:standalone role="presentation" onclick={standalone ? undefined : onBackdrop}>
+  <div class="dialog" role="dialog" aria-modal={!standalone} aria-labelledby="{uid}-title" aria-busy={loading} bind:this={dialogEl} {@attach layer}>
+    <header class="head" data-tauri-drag-region={drag}>
       <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path d="M3 2.5h7l3 3v8H3v-11Zm7 0v3h3" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round" /></svg>
-      <h2 class="title" id="{uid}-title" title={name}>{name}</h2>
+      <h2 class="title" id="{uid}-title" title={name} data-tauri-drag-region={drag}>{name}</h2>
       <span class="caption size">{formatSize(file?.size ?? dto?.size ?? null)}</span>
       {#if files.length > 1}
         <span class="caption pos" aria-live="polite">{index + 1} из {files.length}</span>
       {/if}
-      <span class="spacer"></span>
+      <span class="spacer" data-tauri-drag-region={drag}></span>
       {#if canOpen}
         <button class="btn" onclick={() => file && onopen(file)} disabled={!file || actionBusy != null} aria-busy={actionBusy === "open"} title="Открыть в системном приложении">
           {#if actionBusy === "open"}<span class="spinner" aria-hidden="true"></span>{/if}
@@ -226,7 +234,14 @@
         {#if actionBusy === "save"}<span class="spinner" aria-hidden="true"></span>{/if}
         Сохранить как…
       </button>
-      <button class="btn" bind:this={closeBtn} onclick={onclose} title={`Закрыть (${keysOf("preview-close")}; пока фокус внутри PDF — кнопкой)`}>Закрыть</button>
+      {#if standalone}
+        <!-- Окно просмотра: кнопки окна, как у главного; Esc закрывает его так же. -->
+        <div class="window-controls">
+          <WindowControls />
+        </div>
+      {:else}
+        <button class="btn" bind:this={closeBtn} onclick={onclose} title={`Закрыть (${keysOf("preview-close")}; пока фокус внутри PDF — кнопкой)`}>Закрыть</button>
+      {/if}
     </header>
 
     {#if status?.error}
@@ -341,6 +356,30 @@
     align-items: center;
     justify-content: center;
     padding: var(--space-6);
+  }
+  /* Своё окно просмотра (п. 31): без подложки и рамки диалога, на всё окно. */
+  .overlay.standalone {
+    position: static;
+    height: 100%;
+    padding: 0;
+    background: var(--bg-card);
+  }
+  .standalone .dialog {
+    width: 100%;
+    height: 100%;
+    border: 0;
+    border-radius: 0;
+    box-shadow: none;
+  }
+  .standalone .head {
+    min-height: 40px;
+    padding-block: 0;
+    padding-right: 0;
+  }
+  .window-controls {
+    align-self: stretch;
+    display: flex;
+    margin-left: var(--space-1);
   }
   .dialog {
     display: flex;

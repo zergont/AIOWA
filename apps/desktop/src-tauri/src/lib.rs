@@ -62,6 +62,7 @@ use std::sync::Arc;
 use tauri::{Emitter, Manager, State};
 use tracing::{error, info, warn};
 
+mod attachment_window;
 mod calendar;
 mod calendar_write;
 mod compose;
@@ -789,13 +790,27 @@ pub fn run() {
             }
         })
         .on_window_event(|w, ev| {
-            if let tauri::WindowEvent::CloseRequested { api, .. } = ev
-                && w.state::<CloseState>().guarded.load(Ordering::Relaxed)
-            {
-                api.prevent_close();
-                if let Err(e) = w.emit("close-requested", ()) {
-                    warn!(error = %e, "не удалось отправить событие close-requested");
+            let main = w.label() == "main";
+            match ev {
+                // Несохранённое письмо держит только главное окно; окна просмотра вложений
+                // (п. 31) закрываются всегда.
+                tauri::WindowEvent::CloseRequested { api, .. } if main && w.state::<CloseState>().guarded.load(Ordering::Relaxed) => {
+                    api.prevent_close();
+                    if let Err(e) = w.emit("close-requested", ()) {
+                        warn!(error = %e, "не удалось отправить событие close-requested");
+                    }
                 }
+                tauri::WindowEvent::CloseRequested { .. } if w.label().starts_with(attachment_window::LABEL_PREFIX) => attachment_window::remember_geometry(w),
+                // Без главного окна приложение не нужно: окна просмотра закрываются с ним, и
+                // последний закрытый даёт обычный выход (`RunEvent::Exit`, logoff).
+                tauri::WindowEvent::Destroyed if main => {
+                    for (label, other) in w.app_handle().webview_windows() {
+                        if label != "main" {
+                            let _ = other.destroy();
+                        }
+                    }
+                }
+                _ => {}
             }
         })
         .invoke_handler(tauri::generate_handler![
@@ -814,6 +829,8 @@ pub fn run() {
             preview::attachment_preview_url,
             embedded::attachment_message,
             embedded::attachment_message_part,
+            attachment_window::attachment_window,
+            attachment_window::item_attachments,
             ondemand::open_external,
             write::items_mark_read,
             write::items_set_flag,

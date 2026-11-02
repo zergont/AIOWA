@@ -1013,6 +1013,10 @@ export const api = {
   /** Скачать вложение при необходимости и открыть системным приложением. */
   /** Открыть системным приложением; true — это вложенное письмо, окно показывает его само (п. 30). */
   attachmentOpen: (attachmentPk: number) => invoke<boolean>("attachment_open", { attachmentPk }),
+  /** Открыть (или поднять открытое) окно просмотра вложений письма на этом вложении (п. 31). */
+  attachmentWindow: (itemPk: number, attachmentPk: number) => invoke<void>("attachment_window", { itemPk, attachmentPk }),
+  /** Вложения письма для окна просмотра (вместе с картинками текста — их окно отбрасывает само). */
+  itemAttachments: (itemPk: number) => invoke<Attachment[]>("item_attachments", { itemPk }),
   /** Вложенное письмо .eml, разобранное для показа (шапка, текст, вложения). */
   attachmentMessage: (attachmentPk: number) => invoke<EmbeddedMessage>("attachment_message", { attachmentPk }),
   /** Вложение вложенного письма: открыть (save = false) или «Сохранить как…» (путь, null — отмена). */

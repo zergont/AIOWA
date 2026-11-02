@@ -20,7 +20,6 @@
   import ConfirmPopover from "./ConfirmPopover.svelte";
   import ChoicePopover from "./ChoicePopover.svelte";
   import BodyFrame from "./BodyFrame.svelte";
-  import AttachmentPreview from "./AttachmentPreview.svelte";
 
   interface Props {
     message: Message;
@@ -333,14 +332,8 @@
     try {
       const isMessage = await api.attachmentOpen(pk);
       markCached(pk);
-      // Вложенное письмо, узнанное по содержимому (скачано до п. 30 без .eml): показ в окне.
-      if (isMessage && !previewOpen) {
-        const i = files.findIndex((f) => f.attachment_pk === pk);
-        if (i >= 0) {
-          previewIndex = i;
-          previewOpen = true;
-        }
-      }
+      // Вложенное письмо, узнанное по содержимому (скачано до п. 30 без .eml): окно просмотра.
+      if (isMessage) await api.attachmentWindow(message.item_pk, pk);
     } catch (e) {
       setStatus(pk, { error: errorMessage(e) });
     } finally {
@@ -375,36 +368,22 @@
   });
 
   // --- предпросмотр вложений ----------------------------------------------------
-  // Картинки, PDF и текст открываются поверх области чтения; остальные типы — системным приложением.
-  // Листаются все файлы письма: для непредпросматриваемого окно предложит «Открыть».
+  // Картинки, PDF, текст и вложенные письма открываются своим окном просмотра (п. 31: его можно
+  // двигать, растягивать и уносить на другой монитор), остальные типы — системным приложением. В
+  // окне листаются все файлы письма: для непредпросматриваемого оно предложит «Открыть».
 
-  let previewOpen = $state(false);
-  let previewIndex = $state(0);
-  let previewReturnTo: HTMLElement | null = null;
-
-  function clickAttachment(e: MouseEvent, a: Attachment) {
+  async function clickAttachment(a: Attachment) {
     if (!isPreviewable(a)) {
       void openAttachment(a);
       return;
     }
-    const i = files.findIndex((f) => f.attachment_pk === a.attachment_pk);
-    if (i < 0) return;
-    previewReturnTo = e.currentTarget instanceof HTMLElement ? e.currentTarget : null;
-    previewIndex = i;
-    previewOpen = true;
-  }
-  function closePreview() {
-    previewOpen = false;
-    focusBack(previewReturnTo);
-    previewReturnTo = null;
-  }
-  $effect(() => {
-    // Письмо перечитано и вложений стало меньше: индекс не должен указывать в пустоту.
-    if (previewOpen && previewIndex >= files.length) {
-      if (files.length) previewIndex = files.length - 1;
-      else previewOpen = false;
+    const pk = a.attachment_pk;
+    try {
+      await api.attachmentWindow(message.item_pk, pk);
+    } catch (e) {
+      setStatus(pk, { error: errorMessage(e) });
     }
-  });
+  }
 
   // --- тёмные тона -------------------------------------------------------------
   // В тёмной теме окна письмо по настройке «Вид» перекрашено в тёмные тона или на светлом листе;
@@ -788,8 +767,8 @@
           {@const cached = a.cached || cachedHere.has(a.attachment_pk)}
           {@const name = a.name ?? "вложение"}
           {@const previewable = isPreviewable(a)}
-          <div class="file" class:cached class:busy={st.busy != null} class:failed={st.error != null} title={[a.content_type ?? "", previewable ? "Клик — предпросмотр" : "Клик — открыть в приложении", cached ? "Файл в кэше" : "Файл будет скачан при открытии"].filter(Boolean).join("\n")}>
-            <button class="file-open" onclick={(e) => clickAttachment(e, a)} disabled={st.busy != null} aria-label={previewable ? `Предпросмотр вложения ${name}` : `Открыть вложение ${name}`} aria-haspopup={previewable ? "dialog" : undefined} aria-busy={st.busy === "open"}>
+          <div class="file" class:cached class:busy={st.busy != null} class:failed={st.error != null} title={[a.content_type ?? "", previewable ? "Клик — открыть в окне просмотра" : "Клик — открыть в приложении", cached ? "Файл в кэше" : "Файл будет скачан при открытии"].filter(Boolean).join("\n")}>
+            <button class="file-open" onclick={() => void clickAttachment(a)} disabled={st.busy != null} aria-label={previewable ? `Предпросмотр вложения ${name}` : `Открыть вложение ${name}`} aria-busy={st.busy === "open"}>
               {#if st.busy === "open"}
                 <span class="spinner" aria-hidden="true"></span>
               {:else if a.content_type === "message/rfc822" || /\.eml$/i.test(name)}
@@ -866,18 +845,6 @@
     </div>
   {/if}
 </article>
-
-{#if previewOpen && files.length}
-  <AttachmentPreview
-    {files}
-    bind:index={previewIndex}
-    status={status(files[previewIndex]?.attachment_pk ?? -1)}
-    onopen={(a) => void openAttachment(a)}
-    onsave={(a) => void saveAttachment(a)}
-    onclearerror={(a) => setStatus(a.attachment_pk, { error: null })}
-    onclose={closePreview}
-  />
-{/if}
 
 <style>
   .card {
