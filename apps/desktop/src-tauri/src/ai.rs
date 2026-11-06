@@ -35,8 +35,10 @@ const KEY_MAX: usize = 512;
 
 /// Шлюз моделей и идущие проверки подключений (по профилю: новая проверка отменяет прежнюю).
 pub(crate) struct AiState {
-    gateway: Gateway,
+    pub(crate) gateway: Gateway,
     tests: Mutex<HashMap<String, Cancel>>,
+    /// Идущие «Советы» по номеру просьбы окна: отмена из панели и при закрытии композера.
+    advice: Mutex<HashMap<String, Cancel>>,
 }
 
 impl AiState {
@@ -61,10 +63,29 @@ impl AiState {
             }
         });
         let gateway = Gateway::new(&format!("AIOWA/{}", env!("CARGO_PKG_VERSION")), journal).map_err(|e| e.to_string())?;
-        Ok(Self { gateway, tests: Mutex::new(HashMap::new()) })
+        Ok(Self { gateway, tests: Mutex::new(HashMap::new()), advice: Mutex::new(HashMap::new()) })
     }
 
     /// Отменить идущую проверку профиля (и забыть её).
+    /// Новый «Совет»: запомнить его отмену (прежний с тем же номером — отменить).
+    pub(crate) fn start_advice(&self, request_id: &str) -> Cancel {
+        let c = Cancel::new();
+        if let Some(old) = self.advice.lock().unwrap_or_else(|p| p.into_inner()).insert(request_id.to_string(), c.clone()) {
+            old.cancel();
+        }
+        c
+    }
+
+    pub(crate) fn finish_advice(&self, request_id: &str) {
+        self.advice.lock().unwrap_or_else(|p| p.into_inner()).remove(request_id);
+    }
+
+    pub(crate) fn cancel_advice(&self, request_id: &str) {
+        if let Some(c) = self.advice.lock().unwrap_or_else(|p| p.into_inner()).remove(request_id) {
+            c.cancel();
+        }
+    }
+
     fn cancel_test(&self, id: &str) {
         if let Some(c) = self.tests.lock().unwrap_or_else(|p| p.into_inner()).remove(id) {
             c.cancel();
@@ -84,11 +105,11 @@ fn place_code(p: Place) -> &'static str {
 
 /// Настройки ИИ в значениях.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct AiConfig {
-    enabled: bool,
-    mode: PrivacyMode,
-    profiles: Vec<Profile>,
-    advice: Option<String>,
+pub(crate) struct AiConfig {
+    pub(crate) enabled: bool,
+    pub(crate) mode: PrivacyMode,
+    pub(crate) profiles: Vec<Profile>,
+    pub(crate) advice: Option<String>,
     parse: Option<String>,
 }
 
@@ -108,7 +129,7 @@ impl AiConfig {
         }
     }
 
-    fn load(store: &Store, account: AccountId) -> Self {
+    pub(crate) fn load(store: &Store, account: AccountId) -> Self {
         Self::from_lookup(|key| match store.get_state(account, key) {
             Ok(v) => v,
             Err(e) => {
@@ -132,7 +153,7 @@ impl AiConfig {
         Ok(())
     }
 
-    fn profile(&self, id: &str) -> CmdResult<&Profile> {
+    pub(crate) fn profile(&self, id: &str) -> CmdResult<&Profile> {
         self.profiles.iter().find(|p| p.id == id).ok_or_else(|| "Подключение не найдено".to_string())
     }
 }
@@ -143,7 +164,7 @@ fn key_entry(id: &str) -> Result<keyring::Entry, String> {
     keyring::Entry::new(KEYRING_SERVICE, &format!("ai:{id}")).map_err(|e| format!("Диспетчер учётных данных Windows недоступен: {e}"))
 }
 
-fn key_get(id: &str) -> Option<SecretString> {
+pub(crate) fn key_get(id: &str) -> Option<SecretString> {
     key_entry(id).ok()?.get_password().ok().map(SecretString::from)
 }
 

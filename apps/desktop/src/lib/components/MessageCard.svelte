@@ -565,7 +565,7 @@
   {/if}
 {/snippet}
 
-<article class="card" class:expanded class:unread={!message.is_read} class:flagged={message.is_flagged} bind:this={cardEl}>
+<article class="card" class:expanded class:unread={!message.is_read} class:flagged={message.is_flagged} data-item-pk={message.item_pk} bind:this={cardEl}>
   <div class="head">
     <!-- Клавиши имён (Enter, пробел) не должны сворачивать письмо: реагируем только на сам заголовок. -->
     <div class="head-main" onclick={ontoggle} role="button" tabindex="0" onkeydown={(e) => e.target === e.currentTarget && (e.key === "Enter" || e.key === " ") && ontoggle()} aria-expanded={expanded}>

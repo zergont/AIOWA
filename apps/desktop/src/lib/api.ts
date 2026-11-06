@@ -1,4 +1,4 @@
-import { invoke } from "@tauri-apps/api/core";
+import { Channel, invoke } from "@tauri-apps/api/core";
 import { emitTo, listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 
@@ -1220,6 +1220,17 @@ export const api = {
   /** «Проверить»: список моделей и короткий ответ выбранной модели. */
   aiProfileTest: (id: string) => invoke<AiTest>("ai_profile_test", { id }),
   aiJournal: () => invoke<AiJournal>("ai_journal"),
+  /** Доступен ли «Совет» (ИИ включён, модель назначена) и какая модель его даёт. */
+  aiAdviceStatus: () => invoke<AiAdviceStatus>("ai_advice_status"),
+  /** «Что уйдёт в модель»: собранный промпт без отправки. */
+  aiAdvicePreview: (req: AdviceRequest) => invoke<AdvicePreview>("ai_advice_preview", { req }),
+  /** «Посоветовать»: события (контекст, куски ответа, итог) — в `onEvent`; промис — конец или отказ. */
+  aiAdvice: (req: AdviceRequest, onEvent: (e: AdviceEvent) => void) => {
+    const channel = new Channel<AdviceEvent>();
+    channel.onmessage = onEvent;
+    return invoke<void>("ai_advice", { req, onEvent: channel });
+  },
+  aiAdviceCancel: (requestId: string) => invoke<void>("ai_advice_cancel", { requestId }),
 };
 
 // --- ИИ ----------------------------------------------------------------------------------------
@@ -1315,6 +1326,45 @@ export interface AiUsage {
   input_tokens: number;
   output_tokens: number;
 }
+
+/** Доступность «Совета» (docs/ai-layer-design.md § 4). */
+export interface AiAdviceStatus {
+  available: boolean;
+  reason: string | null;
+  profile_name: string | null;
+  model: string | null;
+  place: AiPlace | null;
+}
+
+export type AdviceKind = "reply" | "reply_all" | "forward";
+export type AdviceTone = "shorter" | "longer" | "softer" | "formal";
+
+export interface AdviceRequest {
+  request_id: string;
+  kind: AdviceKind;
+  reference_item_pk: number;
+  direction: string;
+  tones: AdviceTone[];
+  typed_text: string;
+}
+
+export interface AdvicePreview {
+  system: string;
+  user: string;
+  chars: number;
+  truncated: boolean;
+}
+
+/** Письмо, на которое модель может сослаться: номер и подпись чипа. */
+export interface AdviceRef {
+  id: number;
+  label: string;
+}
+
+export type AdviceEvent =
+  | { type: "context"; messages: AdviceRef[]; truncated: boolean; chars: number }
+  | { type: "text"; text: string }
+  | { type: "done"; stop: string; cited: number[]; unverified: string[]; input_tokens: number | null; output_tokens: number | null; ms: number };
 
 export interface AiJournal {
   recent: AiCall[];

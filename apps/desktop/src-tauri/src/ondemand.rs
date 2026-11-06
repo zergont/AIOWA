@@ -196,6 +196,27 @@ pub(crate) async fn ensure_cached(state: &AppState, sync: &SyncState, od: &OnDem
 
 // --- команды Tauri -----------------------------------------------------------
 
+/// Тело письма — с сервера, если его ещё не загружали (для «Совета»: беседа целиком, без картинок).
+/// `Ok(false)` — тела не будет: сервер его уже не отдавал раньше, письмо удалено или сервер отказал;
+/// тогда у письма остаётся начало текста из списка.
+pub(crate) async fn ensure_body(state: &AppState, sync: &SyncState, od: &OnDemand, item_pk: i64) -> CmdResult<bool> {
+    let lock = od.items.get(item_pk);
+    let _busy = lock.lock().await;
+    let Some(item) = state.store.item_ref(item_pk).map_err(err)? else { return Ok(false) };
+    match item.body_state {
+        1 => return Ok(true),
+        2 => return Ok(false),
+        _ => {}
+    }
+    let eng = engine_for(state, sync).await?;
+    match tokio::time::timeout(BODY_TIMEOUT, eng.fetch_body(&item.id, item.folder_pk)).await {
+        Err(_) => Err(timed_out(BODY_TIMEOUT)),
+        Ok(Err(e)) => Err(fail(sync, e).await),
+        Ok(Ok(BodyFetchOutcome::Stored)) => Ok(true),
+        Ok(Ok(_)) => Ok(false),
+    }
+}
+
 /// Тело письма и его инлайновые картинки: догружаются с сервера, если их нет локально, затем
 /// возвращается свежий DTO с `data:` вместо `cid:`. Если всё уже есть — сети нет.
 #[tauri::command]

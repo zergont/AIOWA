@@ -1968,6 +1968,21 @@ impl Store {
         })
     }
 
+    /// Мои письма адресату из «Отправленных» с загруженным телом, свежие первыми (примеры стиля
+    /// для «Совета», `docs/ai-layer-design.md` § 4.2). `email` — без учёта регистра, среди «Кому».
+    pub fn sent_to(&self, account: AccountId, email: &str, limit: usize) -> Result<Vec<i64>> {
+        let Some((sent_pk, _)) = self.folder_by_distinguished(account, "sentitems")? else { return Ok(vec![]) };
+        self.with_conn(|c| {
+            let mut st = c.prepare_cached(
+                "SELECT i.item_pk FROM items i
+                  WHERE i.folder_pk = ?1 AND i.deleted = 0 AND i.body_state = 1
+                    AND EXISTS (SELECT 1 FROM recipients r WHERE r.item_pk = i.item_pk AND r.kind = 1 AND lower(r.email) = lower(?2))
+                  ORDER BY COALESCE(i.sent_at, i.received_at) DESC LIMIT ?3",
+            )?;
+            Ok(st.query_map(params![sent_pk, email.trim(), limit as i64], |r| r.get::<_, i64>(0))?.collect::<std::result::Result<Vec<_>, _>>()?)
+        })
+    }
+
     /// Отладка: выполняет запрос только на чтение и возвращает строки как текст (значения через табуляцию).
     pub fn debug_query(&self, sql: &str) -> Result<Vec<String>> {
         let head = sql.trim_start().to_ascii_lowercase();

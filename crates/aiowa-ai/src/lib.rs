@@ -5,7 +5,9 @@
 //! ([`CallRecord`], без содержимого). Функции ИИ («Совет», разбор запроса) не знают, куда уходит
 //! запрос. Ключи сюда передаются на время вызова и нигде не сохраняются.
 
+pub mod advice;
 pub mod anthropic;
+pub mod mailtext;
 pub mod openai;
 pub mod profile;
 pub mod sse;

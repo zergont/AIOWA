@@ -758,7 +758,7 @@ pub(crate) fn quote_html(from: &str, sent: Option<&str>, to: &str, cc: &str, sub
 
 /// Собственные адреса: самые частые отправители в «Отправленных» плюс логин, если он адрес;
 /// в нижнем регистре, без повторов.
-fn own_addresses_of(store: &Store, account: AccountId, user: &str) -> CmdResult<Vec<String>> {
+pub(crate) fn own_addresses_of(store: &Store, account: AccountId, user: &str) -> CmdResult<Vec<String>> {
     let mut out = store.own_addresses(account).map_err(err)?;
     let login = user.trim().to_lowercase();
     if login.contains('@') && !out.contains(&login) {

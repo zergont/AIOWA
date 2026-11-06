@@ -61,6 +61,7 @@ use std::sync::Arc;
 use tauri::{Emitter, Manager, State};
 use tracing::{error, info, warn};
 
+mod advice;
 mod ai;
 mod child_windows;
 mod calendar;
@@ -909,6 +910,10 @@ pub fn run() {
             ai::ai_profile_models,
             ai::ai_profile_test,
             ai::ai_journal,
+            advice::ai_advice_status,
+            advice::ai_advice_preview,
+            advice::ai_advice,
+            advice::ai_advice_cancel,
             compose::compose_draft_attachments,
             compose::recipients_suggest,
             compose::own_addresses,

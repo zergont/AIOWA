@@ -10,6 +10,8 @@
   import Editor from "./Editor.svelte";
   import ChoicePopover from "./ChoicePopover.svelte";
   import SignatureDialog from "./SignatureDialog.svelte";
+  import AdvicePanel from "./AdvicePanel.svelte";
+  import type { AdviceKind, AiAdviceStatus } from "../api";
 
   /**
    * Почему композер закрылся: отправлено, сохранён черновик, черновик удалён, просто отменено;
@@ -250,6 +252,55 @@
    * телом, и пока оно не загружено (или сервер его не отдал), в заготовке один отправитель.
    */
   const recipientsUnknown = $derived(ctx.kind === "reply_all" && original != null && original.body_state !== 1 && original.recipients.length === 0 && !origLoading);
+
+  // --- «Совет» (docs/ai-layer-design.md § 4) -------------------------------------------------
+  // Для ответа, ответа всем и пересылки, если ИИ включён и модель назначена. Вид и исходное
+  // письмо — из заготовки: после «Развернуть» письмо становится «новым», а совет по беседе нужен тот же.
+
+  const adviceKind: AdviceKind | null = untrack(() => (ctx.reference_item_pk != null && (ctx.kind === "reply" || ctx.kind === "reply_all" || ctx.kind === "forward") ? ctx.kind : null));
+  const adviceRef = untrack(() => ctx.reference_item_pk);
+  let adviceStatus = $state<AiAdviceStatus | null>(null);
+  let adviceOpen = $state(false);
+
+  onMount(() => {
+    if (!adviceKind) return;
+    api
+      .aiAdviceStatus()
+      .then((s) => {
+        if (alive) adviceStatus = s;
+      })
+      .catch(() => {});
+  });
+
+  /** Текст черновика «Совета» в разметку редактора: строки — абзацами, пустые — пустыми строками. */
+  function adviceHtml(text: string): string {
+    const esc = (s: string) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    return text
+      .trim()
+      .split("\n")
+      .map((l) => (l.trim() ? `<div>${esc(l)}</div>` : "<div><br></div>"))
+      .join("");
+  }
+
+  /**
+   * «Вставить в письмо» — черновик в начало письма (над тем, что уже есть: подписью, цитатой);
+   * «Заменить мой текст» — письмо заново: черновик и подпись, если она добавляется сама.
+   */
+  function insertAdvice(text: string, mode: "insert" | "replace") {
+    const html = adviceHtml(text);
+    if (!html) return;
+    if (mode === "replace") {
+      const s = signature.auto_add ? signature.html.trim() : "";
+      body = s ? `${html}<div><br></div><div><br></div>${s}` : html;
+    } else {
+      // Пустые строки под каретку в начале письма (их две над подписью) заменяются черновиком:
+      // между ним и подписью остаётся одна.
+      const rest = body.replace(/^(?:<div><br><\/div>){1,2}/, "");
+      body = `${html}<div><br></div>${rest}`;
+    }
+    adviceOpen = false;
+    editor?.focus();
+  }
 
   onMount(() => {
     root?.scrollIntoView({ block: "start" });
@@ -854,6 +905,8 @@
   // Ctrl+Enter в меню чипа не отправляет письмо.
 
   function onWindowKey(e: KeyboardEvent) {
+    // Клавишу уже обработала панель «Совета» (Ctrl+Enter там — «Посоветовать», а не «Отправить»).
+    if (e.defaultPrevented) return;
     if (!root || !(e.target instanceof Node) || !root.contains(e.target)) return;
     if (sigOpen || cancelAsk || layerOpen()) return;
     const ctrl = e.ctrlKey || e.metaKey;
@@ -893,6 +946,9 @@
       Вложить файл
     </button>
     <button class="btn" bind:this={sigBtn} onclick={() => (sigOpen = true)} disabled={busy != null} title="Подпись: текст и автодобавление" aria-haspopup="dialog">Подпись…</button>
+    {#if adviceKind && adviceStatus?.available}
+      <button class="btn" class:on={adviceOpen} onclick={() => (adviceOpen = !adviceOpen)} disabled={busy != null} aria-expanded={adviceOpen} title="Совет: суть переписки и черновик ответа">Совет</button>
+    {/if}
     {#if !standalone}
       <button class="btn icon" onclick={() => void popOut()} disabled={busy != null || poppingOut} title="Редактировать в отдельном окне" aria-label="Редактировать в отдельном окне">
         <svg width="14" height="14" viewBox="0 0 16 16" aria-hidden="true"><path d={ICON.popout} fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round" /></svg>
@@ -962,6 +1018,10 @@
         </span>
       {/each}
     </div>
+  {/if}
+
+  {#if adviceOpen && adviceKind && adviceRef != null && adviceStatus}
+    <AdvicePanel kind={adviceKind} referencePk={adviceRef} status={adviceStatus} typed={() => (isDirty ? htmlToText(body) : "")} canReplace={!quoteInText} oninsert={insertAdvice} onclose={() => (adviceOpen = false)} />
   {/if}
 
   <div class="editor-wrap">
@@ -1081,6 +1141,10 @@
   }
   .btn:disabled {
     color: var(--fg-disabled);
+  }
+  .btn.on {
+    border-color: var(--accent);
+    color: var(--accent);
   }
   .btn.primary {
     background: var(--accent);
