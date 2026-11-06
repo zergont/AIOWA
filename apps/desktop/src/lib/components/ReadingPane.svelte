@@ -1,7 +1,7 @@
 <script lang="ts">
   import { untrack, type Snippet } from "svelte";
-  import { conversationsText, type ComposeKind, type Conversation, type Folder, type Message } from "../api";
-  import type { ItemAction } from "../actions";
+  import { conversationsText, plural, type ComposeKind, type Conversation, type Folder, type Message } from "../api";
+  import { ICON, type ItemAction } from "../actions";
   import MessageCard from "./MessageCard.svelte";
 
   interface Props {
@@ -37,8 +37,10 @@
     topExpandedPk?: number | null;
     /** С карточки дан ответ на приглашение (или отмена убрана из календаря): беседу стоит перечитать. */
     onmeeting?: () => void;
+    /** Кнопка «Открыть в отдельном окне» в шапке беседы (п. 32); без неё кнопки нет (само окно беседы). */
+    onpopout?: () => void;
   }
-  let { conversation, messages, loading, onfetch, folders, deletedFolderPk, archiveFolderPk = null, draftsFolderPk = null, multiCount = 0, onaction, oncompose, onopendraft, draftOpening = false, composer, composerAlone = false, topExpandedPk = $bindable(null), onmeeting, onfindsent }: Props = $props();
+  let { conversation, messages, loading, onfetch, folders, deletedFolderPk, archiveFolderPk = null, draftsFolderPk = null, multiCount = 0, onaction, oncompose, onopendraft, draftOpening = false, composer, composerAlone = false, topExpandedPk = $bindable(null), onmeeting, onfindsent, onpopout }: Props = $props();
 
   // Письма идут от новых к старым; самое свежее развёрнуто, остальные свёрнуты до заголовка.
   // Раскрытие пересчитывается только при смене беседы: точечная замена письма (догрузка тела)
@@ -108,15 +110,22 @@
   <div class="pane">
     {#if conversation && !composerAlone}
       <header class="head">
-        <h1 class="topic">{conversation.topic || messages[0]?.subject || "(без темы)"}</h1>
-        <div class="meta caption">
-          {#if messages.length > 1}
-            {messages.length} писем в беседе
-            <button class="link" onclick={toggleAll}>{allExpanded ? "свернуть все" : "развернуть все"}</button>
-          {:else if messages.length === 1}
-            одно письмо
-          {/if}
+        <div class="head-text">
+          <h1 class="topic">{conversation.topic || messages[0]?.subject || "(без темы)"}</h1>
+          <div class="meta caption">
+            {#if messages.length > 1}
+              {messages.length} {plural(messages.length, "письмо", "письма", "писем")} в беседе
+              <button class="link" onclick={toggleAll}>{allExpanded ? "свернуть все" : "развернуть все"}</button>
+            {:else if messages.length === 1}
+              одно письмо
+            {/if}
+          </div>
         </div>
+        {#if onpopout}
+          <button class="popout" onclick={onpopout} title="Открыть в отдельном окне" aria-label="Открыть в отдельном окне">
+            <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path d={ICON.popout} fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round" /></svg>
+          </button>
+        {/if}
       </header>
     {/if}
     <div class="messages">
@@ -156,8 +165,35 @@
     flex-direction: column;
   }
   .head {
+    display: flex;
+    align-items: flex-start;
+    gap: var(--space-3);
     padding: var(--space-4) var(--space-6) var(--space-3);
     border-bottom: 1px solid var(--stroke-1);
+  }
+  .head-text {
+    flex: 1;
+    min-width: 0;
+  }
+  .popout {
+    flex: none;
+    width: var(--control-height);
+    height: var(--control-height);
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: var(--radius-control);
+    color: var(--fg-2);
+    transition:
+      background var(--dur-fast) var(--ease-in),
+      color var(--dur-fast) var(--ease-in);
+  }
+  .popout:hover {
+    background: var(--bg-hover);
+    color: var(--fg-1);
+  }
+  .popout:active {
+    background: var(--bg-pressed);
   }
   .topic {
     margin: 0;

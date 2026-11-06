@@ -52,10 +52,12 @@
     onaction: (targets: Conversation[], action: ItemAction, anchor: Anchor) => Promise<void>;
     /** Ответ, ответ всем или пересылка самого свежего письма беседы в текущей папке. */
     oncompose: (c: Conversation, kind: ComposeKind) => void;
-    /** В «Черновиках»: двойной клик или Enter по беседе открывает её черновик в композере. */
+    /** В «Черновиках»: Enter по беседе (и двойной клик, если нет onopenwindow) открывает её черновик в композере. */
     onopendraft?: (c: Conversation) => void;
+    /** Двойной клик по беседе (п. 32): отдельное окно — беседы, а в «Черновиках» — окно черновика (`drafts`). */
+    onopenwindow?: (c: Conversation, drafts: boolean) => void;
   }
-  let { folder, conversations, selected, selectedPks, loading, hasMore, onselect, onselection, onmore, folders, archiveFolderPk, onaction, oncompose, onopendraft }: Props = $props();
+  let { folder, conversations, selected, selectedPks, loading, hasMore, onselect, onselection, onmore, folders, archiveFolderPk, onaction, oncompose, onopendraft, onopenwindow }: Props = $props();
 
   const inDrafts = $derived(folder?.distinguished === "drafts");
 
@@ -65,7 +67,8 @@
     else selectOne(c);
   }
   function onRowDblClick(c: Conversation) {
-    if (inDrafts && onopendraft) onopendraft(c);
+    if (onopenwindow) onopenwindow(c, inDrafts);
+    else if (inDrafts && onopendraft) onopendraft(c);
   }
 
   // Простая виртуализация: рисуем только строки в окне прокрутки плюс запас. Высота строки одна на

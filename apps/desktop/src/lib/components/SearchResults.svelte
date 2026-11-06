@@ -8,9 +8,11 @@
     query: string;
     selectedPk: number | null;
     onopen: (conversationPk: number) => void;
+    /** Двойной щелчок по найденному письму: его беседа отдельным окном (п. 32). */
+    onopenwindow?: (conversationPk: number, subject: string | null) => void;
     onclear: () => void;
   }
-  let { hits, searching, query, selectedPk, onopen, onclear }: Props = $props();
+  let { hits, searching, query, selectedPk, onopen, onopenwindow, onclear }: Props = $props();
 
   /** Сниппет приходит с совпадениями в квадратных скобках; подсвечиваем их. */
   function parts(snippet: string): { text: string; hit: boolean }[] {
@@ -40,7 +42,7 @@
     </div>
   {/if}
   {#each hits as h (h.item_pk)}
-    <div class="row" class:selected={h.conversation_pk != null && h.conversation_pk === selectedPk} role="option" aria-selected={h.conversation_pk === selectedPk} tabindex="-1" onclick={() => h.conversation_pk != null && onopen(h.conversation_pk)} onkeydown={(e) => e.key === "Enter" && h.conversation_pk != null && onopen(h.conversation_pk)}>
+    <div class="row" class:selected={h.conversation_pk != null && h.conversation_pk === selectedPk} role="option" aria-selected={h.conversation_pk === selectedPk} tabindex="-1" onclick={() => h.conversation_pk != null && onopen(h.conversation_pk)} ondblclick={() => h.conversation_pk != null && onopenwindow?.(h.conversation_pk, h.subject)} onkeydown={(e) => e.key === "Enter" && h.conversation_pk != null && onopen(h.conversation_pk)}>
       <div class="line1">
         <span class="people">{personLabel(h.from_name, h.from_email)}</span>
         <!-- Скрепка — как в списке бесед (п. 29). -->

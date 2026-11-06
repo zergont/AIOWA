@@ -57,12 +57,11 @@ use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tauri::{Emitter, Manager, State};
 use tracing::{error, info, warn};
 
-mod attachment_window;
+mod child_windows;
 mod calendar;
 mod calendar_write;
 mod compose;
@@ -113,25 +112,38 @@ fn err<E: std::fmt::Display>(e: E) -> String {
     e.to_string()
 }
 
-/// Закрытие окна при несохранённом письме. Пока окно держит флаг (`window_close_guard`: в
-/// композере есть правки или идёт отправка), крестик и Alt+F4 окно не закрывают, а шлют событие
+/// Закрытие окна при несохранённом письме. Пока окно держит флаг (`window_close_guard`: в его
+/// композере есть правки или идёт отправка), крестик и Alt+F4 окно не закрывают, а шлют ему событие
 /// `close-requested`; окно спрашивает пользователя и закрывает через `window_close_confirmed`.
-/// Без флага окно закрывается как обычно — если фронтенд не поднялся, окно не «залипает».
+/// Без флага окно закрывается как обычно — если фронтенд не поднялся, окно не «залипает». Флаг у
+/// каждого окна свой (главное, окно письма и окно черновика, п. 32): главное окно, закрываясь,
+/// сначала отправляет вопрос окну с несохранённым письмом (`on_window_event`).
 #[derive(Default)]
 struct CloseState {
-    guarded: AtomicBool,
+    guarded: std::sync::Mutex<HashSet<String>>,
+}
+
+impl CloseState {
+    fn guarded(&self) -> std::sync::MutexGuard<'_, HashSet<String>> {
+        self.guarded.lock().unwrap_or_else(|p| p.into_inner())
+    }
 }
 
 #[tauri::command]
-fn window_close_guard(enabled: bool, st: State<'_, CloseState>) {
-    st.guarded.store(enabled, Ordering::Relaxed);
+fn window_close_guard(enabled: bool, window: tauri::WebviewWindow, st: State<'_, CloseState>) {
+    let label = window.label().to_string();
+    if enabled {
+        st.guarded().insert(label);
+    } else {
+        st.guarded().remove(&label);
+    }
 }
 
 /// Пользователь подтвердил закрытие: снять флаг и закрыть окно (через обычный `CloseRequested`,
-/// чтобы сработал `RunEvent::Exit` с logoff).
+/// чтобы у главного окна сработал `RunEvent::Exit` с logoff).
 #[tauri::command]
 fn window_close_confirmed(window: tauri::WebviewWindow, st: State<'_, CloseState>) -> CmdResult<()> {
-    st.guarded.store(false, Ordering::Relaxed);
+    st.guarded().remove(window.label());
     window.close().map_err(err)
 }
 
@@ -790,24 +802,52 @@ pub fn run() {
             }
         })
         .on_window_event(|w, ev| {
-            let main = w.label() == "main";
+            let label = w.label().to_string();
+            let main = label == "main";
             match ev {
-                // Несохранённое письмо держит только главное окно; окна просмотра вложений
-                // (п. 31) закрываются всегда.
-                tauri::WindowEvent::CloseRequested { api, .. } if main && w.state::<CloseState>().guarded.load(Ordering::Relaxed) => {
-                    api.prevent_close();
-                    if let Err(e) = w.emit("close-requested", ()) {
-                        warn!(error = %e, "не удалось отправить событие close-requested");
+                tauri::WindowEvent::CloseRequested { api, .. } => {
+                    let guarded: Vec<String> = w.state::<CloseState>().guarded().iter().cloned().collect();
+                    // Несохранённое письмо в этом окне: окно спрашивает само.
+                    let ask = if guarded.contains(&label) {
+                        Some(label.clone())
+                    } else if main {
+                        // Главное окно закрывает и остальные: сначала вопрос окну черновика или
+                        // письма с несохранённым письмом (оно выходит вперёд); AIOWA закроется
+                        // следующим нажатием, когда там решат.
+                        guarded.into_iter().find(|l| l != "main")
+                    } else {
+                        None
+                    };
+                    match ask {
+                        Some(target) => {
+                            api.prevent_close();
+                            if let Some(other) = w.app_handle().get_webview_window(&target) {
+                                let _ = other.unminimize();
+                                let _ = other.set_focus();
+                            }
+                            if let Err(e) = w.app_handle().emit_to(target.as_str(), "close-requested", ()) {
+                                warn!(error = %e, "не удалось отправить событие close-requested");
+                            }
+                        }
+                        None => child_windows::remember_geometry(w),
                     }
                 }
-                tauri::WindowEvent::CloseRequested { .. } if w.label().starts_with(attachment_window::LABEL_PREFIX) => attachment_window::remember_geometry(w),
-                // Без главного окна приложение не нужно: окна просмотра закрываются с ним, и
-                // последний закрытый даёт обычный выход (`RunEvent::Exit`, logoff).
-                tauri::WindowEvent::Destroyed if main => {
-                    for (label, other) in w.app_handle().webview_windows() {
-                        if label != "main" {
-                            let _ = other.destroy();
+                tauri::WindowEvent::Destroyed => {
+                    w.state::<CloseState>().guarded().remove(&label);
+                    // Без главного окна приложение не нужно: остальные окна закрываются с ним, и
+                    // последний закрытый даёт обычный выход (`RunEvent::Exit`, logoff). Их размер
+                    // и место запоминаются, как при обычном закрытии.
+                    if main {
+                        for (other_label, other) in w.app_handle().webview_windows() {
+                            if other_label != "main" {
+                                child_windows::remember_geometry(&other.as_ref().window());
+                                let _ = other.destroy();
+                            }
                         }
+                    } else if child_windows::is_compose_window(&label) {
+                        // Окно черновика закрылось: его письмо (если осталось локальным черновиком)
+                        // главное окно снова предлагает открыть.
+                        let _ = w.app_handle().emit_to("main", "local-drafts-changed", ());
                     }
                 }
                 _ => {}
@@ -829,8 +869,10 @@ pub fn run() {
             preview::attachment_preview_url,
             embedded::attachment_message,
             embedded::attachment_message_part,
-            attachment_window::attachment_window,
-            attachment_window::item_attachments,
+            child_windows::attachment_window,
+            child_windows::message_window,
+            child_windows::compose_window,
+            child_windows::item_attachments,
             ondemand::open_external,
             write::items_mark_read,
             write::items_set_flag,
@@ -856,6 +898,8 @@ pub fn run() {
             compose::compose_local_save,
             compose::compose_local_drop,
             compose::compose_local_list,
+            compose::compose_local_get,
+            compose::compose_draft_attachments,
             compose::recipients_suggest,
             compose::own_addresses,
             compose::signature_get,

@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount, tick, untrack } from "svelte";
-  import { api, conversationKeyOf, conversationsText, errorMessage, itemKindOf, messageNeedsFetch, messagesKey, newMailSender, onCalendarChanged, onCloseRequested, onFoldersChanged, onItemsChanged, onNewMail, onNotifyStatus, onReminder, onSyncProgress, onWriteFailed, type AccountInfo, type ComposeContext, type ComposeKind, type ComposeRecipient, type ContactForm, type Conversation, type Folder, type ItemsChanged, type Message, type NewMail, type NotifyStatus, type ReminderDto, type SearchHit, type StageAction, type StagedDto, type SyncStatus, type WriteReport } from "./lib/api";
+  import { api, contextFromLocal, conversationKeyOf, conversationsText, errorMessage, itemKindOf, messageNeedsFetch, messagesKey, newMailSender, onCalendarChanged, onCloseRequested, onComposeFinished, onFoldersChanged, onItemsChanged, onLocalDraftsChanged, onNewMail, onNotifyStatus, onReminder, onSyncProgress, onWriteFailed, type AccountInfo, type ComposeContext, type ComposeKind, type ComposeRecipient, type ContactForm, type Conversation, type Folder, type ItemsChanged, type Message, type NewMail, type NotifyStatus, type ReminderDto, type SearchHit, type StageAction, type StagedDto, type SyncStatus, type WriteReport } from "./lib/api";
   import { onSyncLive, type SyncLive } from "./lib/api";
   import { ICON, failureText, findArchiveFolder, type DragPayload, type ItemAction } from "./lib/actions";
   import { focusBack, type Anchor } from "./lib/popover";
@@ -282,6 +282,33 @@
     }
   }
 
+  // --- отдельные окна (п. 32) --------------------------------------------------------------
+
+  /** Беседа отдельным окном: кнопка в шапке области чтения, двойной щелчок в списке и в поиске. */
+  async function openMessageWindow(conversationPk: number, title: string | null) {
+    try {
+      await api.messageWindow(conversationPk, title);
+    } catch (e) {
+      error = errorMessage(e);
+    }
+  }
+
+  /** Двойной щелчок по беседе: в «Черновиках» — окно её черновика, иначе — окно беседы. */
+  async function openConversationWindow(c: Conversation, drafts: boolean) {
+    if (!drafts) return openMessageWindow(c.conversation_pk, c.topic);
+    if (!selectedFolder) return;
+    try {
+      const pks = await api.conversationItemPks(c.conversation_pk, selectedFolder.folder_pk);
+      if (!pks.length) {
+        error = "В этой папке нет черновиков беседы";
+        return;
+      }
+      await api.composeWindow(null, pks[0]);
+    } catch (e) {
+      error = errorMessage(e);
+    }
+  }
+
   /** Плашка «Вы ответили / переслали»: та же беседа в «Отправленных», где лежит ответ или пересылка. */
   async function findSentOfSelected() {
     const pk = selected?.conversation_pk;
@@ -326,17 +353,7 @@
     }
     composeLoading = "compose";
     try {
-      let ctx: ComposeContext;
-      try {
-        ctx = await api.composeContext(d.kind, d.reference_item_pk);
-      } catch (e) {
-        console.warn("compose_context для локального черновика:", errorMessage(e));
-        ctx = await api.composeContext("new", null);
-        // Ответ или пересылка уже на сервере: вид и оригинал остаются, чтобы сохранение не заменило
-        // тело с цитатой одним новым текстом, а сказало, что цитату не собрать.
-        if (d.draft_server_id && d.kind !== "new") ctx = { ...ctx, kind: d.kind, reference_item_pk: d.reference_item_pk };
-      }
-      compose = { ...ctx, to: d.to, cc: d.cc, bcc: d.bcc, subject: d.subject, body_html: d.body_html, restore: d };
+      compose = await contextFromLocal(d);
       composeConversationPk = null;
       composerDirty = true;
       unsavedDrafts = unsavedDrafts.filter((x) => x.draft_id !== d.draft_id);
@@ -405,6 +422,15 @@
     composeConversationPk = null;
     composerDirty = false;
     composerBusy = null;
+    if (reason === "window") showNotice("Письмо открыто в отдельном окне");
+    else afterCompose(reason);
+  }
+
+  /**
+   * Итог композера — этого окна или отдельного (окна черновика и окна письма, п. 32, присылают его
+   * событием compose-finished): строка уведомления и синхронизация «Отправленных» и «Черновиков».
+   */
+  function afterCompose(reason: string) {
     if (reason === "sent") showNotice("Отправлено");
     else if (reason === "draft") showNotice("Черновик сохранён в «Черновиках» на сервере");
     else if (reason === "discard") showNotice("Черновик удалён");
@@ -417,7 +443,7 @@
     if (reason === "sent") syncComposeFolders([sentFolderPk, draftsFolderPk]);
     // Удалённый черновик уходит в «Удалённые»: там он должен появиться.
     else if (reason === "discard") syncComposeFolders([draftsFolderPk, deletedFolderPk]);
-    else if (reason !== "cancel") syncComposeFolders([draftsFolderPk]);
+    else if (reason === "draft" || reason === "local") syncComposeFolders([draftsFolderPk]);
   }
 
   /** Синхронизировать папки после композера. Идущую синхронизацию бэкенд не прерывает и запрос не
@@ -1860,6 +1886,8 @@
     let unlistenFolders: (() => void) | undefined;
     let unlistenWriteFailed: (() => void) | undefined;
     let unlistenLive: (() => void) | undefined;
+    let unlistenComposeFinished: (() => void) | undefined;
+    let unlistenLocalDrafts: (() => void) | undefined;
     let wasRunning = false;
     // Настройки окна (тема, задержка автопометки, интервал таймера, тосты) — первым делом:
     // тема прошлого запуска уже стоит из localStorage, здесь она сверяется с базой.
@@ -1906,6 +1934,10 @@
         // список перечитает items-changed, пользователю нужен только текст.
         unlistenWriteFailed = await onWriteFailed((ev) => (error = ev.message));
         unlistenClose = await onCloseRequested(onCloseRequest);
+        // Отдельные окна писем и черновиков (п. 32): итог их композеров и закрытие окна черновика.
+        unlistenComposeFinished = await onComposeFinished(afterCompose);
+        // Чуть позже: закрытое окно ещё может числиться среди открытых, и его письмо не попало бы в полосу.
+        unlistenLocalDrafts = await onLocalDraftsChanged(() => setTimeout(() => void refreshLocalDrafts(), 300));
         account = await api.accountInfo();
         loadRecentQueries(account);
         void loadDirectoryCaps();
@@ -1937,6 +1969,8 @@
       unlistenFolders?.();
       unlistenWriteFailed?.();
       unlistenClose?.();
+      unlistenComposeFinished?.();
+      unlistenLocalDrafts?.();
       unlistenNotify?.();
       unlistenNewMail?.();
       unlistenReminder?.();
@@ -2030,16 +2064,16 @@
 
   <section class="list" class:off={section !== "mail"} aria-label="Список бесед">
     {#if searchHits !== null}
-      <SearchResults hits={searchHits} {searching} {query} onopen={openConversationByPk} onclear={clearSearch} selectedPk={selected?.conversation_pk ?? null} />
+      <SearchResults hits={searchHits} {searching} {query} onopen={openConversationByPk} onopenwindow={(pk, subject) => void openMessageWindow(pk, subject)} onclear={clearSearch} selectedPk={selected?.conversation_pk ?? null} />
     {:else}
-      <ConversationList folder={selectedFolder} {conversations} {selected} {selectedPks} loading={loadingList} {hasMore} onselect={openConversation} onselection={onMultiSelection} onmore={loadMore} {folders} archiveFolderPk={archiveFolder?.folder_pk ?? null} onaction={onListAction} oncompose={composeFromConversation} onopendraft={openDraftFromConversation} />
+      <ConversationList folder={selectedFolder} {conversations} {selected} {selectedPks} loading={loadingList} {hasMore} onselect={openConversation} onselection={onMultiSelection} onmore={loadMore} {folders} archiveFolderPk={archiveFolder?.folder_pk ?? null} onaction={onListAction} oncompose={composeFromConversation} onopendraft={openDraftFromConversation} onopenwindow={(c, drafts) => void openConversationWindow(c, drafts)} />
     {/if}
   </section>
 
   <div class="splitter" class:off={section !== "mail"} role="separator" aria-orientation="vertical" aria-label="Ширина списка" onpointerdown={startDrag}></div>
 
   <section class="reader" class:off={section !== "mail"} aria-label="Чтение" bind:this={readerEl}>
-    <ReadingPane conversation={multiCount ? null : selected} messages={multiCount ? [] : messages} loading={loadingMessages} onfetch={fetchMessage} {folders} {deletedFolderPk} archiveFolderPk={archiveFolder?.folder_pk ?? null} {draftsFolderPk} {multiCount} onaction={onMessageAction} oncompose={composeFromMessage} onopendraft={(itemPk) => openDraft(itemPk, selected?.conversation_pk ?? null)} onfindsent={findSentOfSelected} draftOpening={composeLoading === "draft"} composer={compose ? composerSnippet : undefined} {composerAlone} bind:topExpandedPk onmeeting={() => void rereadConversation()} />
+    <ReadingPane conversation={multiCount ? null : selected} messages={multiCount ? [] : messages} loading={loadingMessages} onfetch={fetchMessage} {folders} {deletedFolderPk} archiveFolderPk={archiveFolder?.folder_pk ?? null} {draftsFolderPk} {multiCount} onaction={onMessageAction} oncompose={composeFromMessage} onopendraft={(itemPk) => openDraft(itemPk, selected?.conversation_pk ?? null)} onfindsent={findSentOfSelected} draftOpening={composeLoading === "draft"} composer={compose ? composerSnippet : undefined} {composerAlone} bind:topExpandedPk onmeeting={() => void rereadConversation()} onpopout={selected ? () => void openMessageWindow(selected!.conversation_pk, selected!.topic ?? messages[0]?.subject ?? null) : undefined} />
   </section>
 
   {#if calendarMounted}

@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
-import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { emitTo, listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 
 export interface AccountInfo {
   host: string;
@@ -372,6 +373,11 @@ export interface ComposeContext {
   draft?: DraftInfo | null;
   /** Восстановленный локальный черновик (окно собрало заготовку из него): его id, файлы и черновик на сервере. */
   restore?: LocalDraft | null;
+  /**
+   * Вложения черновика на сервере у восстановленного письма, если окно их перечитало
+   * (compose_draft_attachments): письмо, перенесённое в отдельное окно, показывает и уже приложенные файлы.
+   */
+  restore_files?: DraftAttachment[] | null;
 }
 
 export interface ComposeRequest {
@@ -1017,6 +1023,13 @@ export const api = {
   attachmentWindow: (itemPk: number, attachmentPk: number) => invoke<void>("attachment_window", { itemPk, attachmentPk }),
   /** Вложения письма для окна просмотра (вместе с картинками текста — их окно отбрасывает само). */
   itemAttachments: (itemPk: number) => invoke<Attachment[]>("item_attachments", { itemPk }),
+  /** Открыть беседу отдельным окном (п. 32) или поднять уже открытое; title — заголовок окна до загрузки. */
+  messageWindow: (conversationPk: number, title: string | null) => invoke<void>("message_window", { conversationPk, title }),
+  /**
+   * Письмо в работе отдельным окном (п. 32): localId — локальный черновик, который окно поднимет
+   * (перенос из композера), draftItemPk — черновик из «Черновиков». Окно с тем же письмом поднимается.
+   */
+  composeWindow: (localId: string | null, draftItemPk: number | null) => invoke<void>("compose_window", { localId, draftItemPk }),
   /** Вложенное письмо .eml, разобранное для показа (шапка, текст, вложения). */
   attachmentMessage: (attachmentPk: number) => invoke<EmbeddedMessage>("attachment_message", { attachmentPk }),
   /** Вложение вложенного письма: открыть (save = false) или «Сохранить как…» (путь, null — отмена). */
@@ -1087,8 +1100,12 @@ export const api = {
   /** Локальный черновик композера в базе (переживает падение и закрытие окна). */
   composeLocalSave: (draft: LocalDraft) => invoke<void>("compose_local_save", { draft }),
   composeLocalDrop: (draftId: string) => invoke<void>("compose_local_drop", { draftId }),
-  /** Локальные черновики, оставшиеся с прошлого запуска, свежие первыми. */
+  /** Локальные черновики, оставшиеся с прошлого запуска, свежие первыми (кроме открытых в окнах черновиков). */
   composeLocalList: () => invoke<LocalDraft[]>("compose_local_list"),
+  /** Один локальный черновик; null — его уже нет. */
+  composeLocalGet: (draftId: string) => invoke<LocalDraft | null>("compose_local_get", { draftId }),
+  /** Файловые вложения черновика на сервере (окно черновика показывает уже приложенные файлы). */
+  composeDraftAttachments: (draftServerId: string) => invoke<DraftAttachment[]>("compose_draft_attachments", { draftServerId }),
   /** Подсказки адресатов по началу адреса или слову имени. */
   recipientsSuggest: (prefix: string, limit?: number) => invoke<RecipientSuggestion[]>("recipients_suggest", { prefix, limit: limit ?? null }),
   /**
@@ -1194,9 +1211,49 @@ export const api = {
   settingsOpenDataDir: () => invoke<void>("settings_open_data_dir"),
 };
 
-/** Подписка на запрос закрытия окна (крестик, Alt+F4) при поднятом windowCloseGuard. Возвращает функцию отписки. */
+/**
+ * Подписка на запрос закрытия окна (крестик, Alt+F4) при поднятом windowCloseGuard. Только своего
+ * окна: бэкенд шлёт вопрос окну с несохранённым письмом (`emit_to`), а общая подписка ловила бы и
+ * вопросы окнам писем и черновиков (п. 32). Возвращает функцию отписки.
+ */
 export function onCloseRequested(cb: () => void): Promise<UnlistenFn> {
-  return listen<void>("close-requested", () => cb());
+  return getCurrentWebviewWindow().listen<void>("close-requested", () => cb());
+}
+
+/**
+ * Композер отдельного окна (п. 32) закрылся с причиной `reason` («sent», «draft», «discard», «local»):
+ * главное окно синхронизирует «Отправленные» и «Черновики» и показывает итог, как после своего композера.
+ */
+export function composeFinished(reason: string): Promise<void> {
+  return emitTo("main", "compose-finished", reason);
+}
+
+/** Подписка главного окна на итог композера отдельного окна. Возвращает функцию отписки. */
+export function onComposeFinished(cb: (reason: string) => void): Promise<UnlistenFn> {
+  return getCurrentWebviewWindow().listen<string>("compose-finished", (e) => cb(e.payload));
+}
+
+/** Окно черновика закрылось (п. 32): локальные черновики главного окна стоит перечитать. Возвращает функцию отписки. */
+export function onLocalDraftsChanged(cb: () => void): Promise<UnlistenFn> {
+  return getCurrentWebviewWindow().listen<void>("local-drafts-changed", () => cb());
+}
+
+/**
+ * Заготовка композера из локального черновика: по виду письма (оригинал удалён — как новое письмо),
+ * поверх — сохранённые текст, тема и получатели.
+ */
+export async function contextFromLocal(d: LocalDraft): Promise<ComposeContext> {
+  let ctx: ComposeContext;
+  try {
+    ctx = await api.composeContext(d.kind, d.reference_item_pk);
+  } catch (e) {
+    console.warn("compose_context для локального черновика:", errorMessage(e));
+    ctx = await api.composeContext("new", null);
+    // Ответ или пересылка уже на сервере: вид и оригинал остаются, чтобы сохранение не заменило
+    // тело с цитатой одним новым текстом, а сказало, что цитату не собрать.
+    if (d.draft_server_id && d.kind !== "new") ctx = { ...ctx, kind: d.kind, reference_item_pk: d.reference_item_pk };
+  }
+  return { ...ctx, to: d.to, cc: d.cc, bcc: d.bcc, subject: d.subject, body_html: d.body_html, restore: d };
 }
 
 /** Подписка на ход синхронизации. Возвращает функцию отписки. */

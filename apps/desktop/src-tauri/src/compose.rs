@@ -1580,8 +1580,25 @@ pub(crate) fn compose_local_drop(draft_id: String, state: State<'_, AppState>) -
 
 /// Локальные черновики, оставшиеся с прошлого запуска, свежие первыми: окно предлагает открыть их.
 #[tauri::command]
-pub(crate) fn compose_local_list(state: State<'_, AppState>) -> CmdResult<Vec<LocalDraftDto>> {
-    Ok(state.store.local_drafts(state.account).map_err(err)?.into_iter().map(LocalDraftDto::from_row).collect())
+pub(crate) fn compose_local_list(app: AppHandle, state: State<'_, AppState>) -> CmdResult<Vec<LocalDraftDto>> {
+    // Письма, открытые сейчас в окнах черновиков (п. 32), живут там: предлагать их не нужно.
+    let open = crate::child_windows::local_drafts_in_windows(&app);
+    Ok(state.store.local_drafts(state.account).map_err(err)?.into_iter().filter(|d| !open.contains(&d.draft_id)).map(LocalDraftDto::from_row).collect())
+}
+
+/// Один локальный черновик по ключу (окно черновика, п. 32, поднимает перенесённое в него письмо);
+/// `None` — его уже нет.
+#[tauri::command]
+pub(crate) fn compose_local_get(draft_id: String, state: State<'_, AppState>) -> CmdResult<Option<LocalDraftDto>> {
+    Ok(state.store.local_draft(draft_id.trim()).map_err(err)?.map(LocalDraftDto::from_row))
+}
+
+/// Файловые вложения черновика на сервере (окно черновика, п. 32: письмо, перенесённое в окно,
+/// показывает и уже приложенные файлы — например, вложения пересылаемого письма).
+#[tauri::command]
+pub(crate) async fn compose_draft_attachments(draft_server_id: String, sync: State<'_, Arc<SyncState>>, cs: State<'_, ComposeState>) -> CmdResult<Vec<DraftAttachmentDto>> {
+    let transport = sync.transport().await.map_err(|e| e.to_string())?;
+    server_files(&sync, &transport, &cs.item_id(draft_server_id.trim())).await.ok_or_else(|| "Вложения черновика не прочитаны с сервера".to_string())
 }
 
 fn forget_local_draft(store: &Store, draft_id: Option<&str>) {

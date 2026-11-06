@@ -3,6 +3,8 @@ import "./app.css";
 import App from "./App.svelte";
 import SetupWizard from "./lib/components/SetupWizard.svelte";
 import AttachmentWindow from "./lib/components/AttachmentWindow.svelte";
+import MessageWindow from "./lib/components/MessageWindow.svelte";
+import ComposeWindow from "./lib/components/ComposeWindow.svelte";
 import { api, errorMessage, type AppMode } from "./lib/api";
 import { restoreTheme } from "./lib/settings.svelte";
 
@@ -11,11 +13,28 @@ restoreTheme();
 
 const target = document.getElementById("app")!;
 
-// Окно просмотра вложений (п. 31): та же страница с `?view=attachments` — своё окно, без почты.
+// Отдельные окна — та же страница с `?view=…` (src-tauri/src/child_windows.rs), без почты главного
+// окна: просмотр вложений (п. 31), беседа и письмо в работе (п. 32).
 const query = new URLSearchParams(location.search);
-const attachmentView = query.get("view") === "attachments" ? { itemPk: Number(query.get("item")), attachmentPk: Number(query.get("att")) } : null;
-if (attachmentView && Number.isFinite(attachmentView.itemPk) && Number.isFinite(attachmentView.attachmentPk)) {
-  mount(AttachmentWindow, { target, props: attachmentView });
+const view = query.get("view");
+const num = (name: string): number | null => {
+  const v = query.get(name);
+  const n = v == null || v === "" ? NaN : Number(v);
+  return Number.isSafeInteger(n) ? n : null;
+};
+const itemPk = num("item");
+const attachmentPk = num("att");
+const conversationPk = num("conv");
+const localId = query.get("local");
+if (view === "attachments" && itemPk != null && attachmentPk != null) {
+  mount(AttachmentWindow, { target, props: { itemPk, attachmentPk } });
+} else if (view === "message" && conversationPk != null) {
+  mount(MessageWindow, { target, props: { conversationPk } });
+} else if (view === "compose" && localId) {
+  mount(ComposeWindow, { target, props: { localId, draftPk: num("draft") } });
+} else if (view) {
+  // Отдельное окно с неверным адресом: почту главного окна (синхронизацию, таймеры) в нём не поднимать.
+  target.textContent = "Окно не открылось: неверный адрес";
 } else {
   mountMain();
 }

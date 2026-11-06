@@ -13,9 +13,10 @@
 
   /**
    * Почему композер закрылся: отправлено, сохранён черновик, черновик удалён, просто отменено;
-   * `local` — связи нет, текст остался локальным черновиком (его предложат открыть).
+   * `local` — связи нет, текст остался локальным черновиком (его предложат открыть); `window` —
+   * письмо перенесено в отдельное окно (п. 32), его локальный черновик теперь у того окна.
    */
-  export type CloseReason = "sent" | "draft" | "discard" | "cancel" | "local";
+  export type CloseReason = "sent" | "draft" | "discard" | "cancel" | "local" | "window";
 
   interface Props {
     /** Заготовка от бэкенда; новая заготовка — новый экземпляр композера (родитель оборачивает в {#key}). */
@@ -25,8 +26,19 @@
     /** Идёт отправка или сохранение черновика: родитель не заменяет композер и не даёт закрыть окно. */
     busy?: "send" | "draft" | null;
     onclose: (reason: CloseReason) => void;
+    /**
+     * Композер — всё окно черновика (п. 32): без рамки карточки и без кнопки «Редактировать в
+     * отдельном окне». Иначе эта кнопка переносит письмо в своё окно.
+     */
+    standalone?: boolean;
+    /** Ключ локального черновика, если его выбрал родитель (окно черновика знает его по имени окна). */
+    localDraftId?: string;
+    /** Высота поля текста; окно черновика растягивает его на окно. */
+    editorMinHeight?: number;
+    /** Тема письма — для заголовка окна черновика. */
+    heading?: string;
   }
-  let { ctx, dirty = $bindable(false), busy = $bindable(null), onclose }: Props = $props();
+  let { ctx, dirty = $bindable(false), busy = $bindable(null), onclose, standalone = false, localDraftId, editorMinHeight = 240, heading = $bindable("") }: Props = $props();
 
   // Экземпляр мог быть уничтожен, пока шёл запрос: его итог тогда никому не нужен, и уж точно
   // нельзя звать onclose — родитель закрыл бы уже другой композер.
@@ -49,9 +61,9 @@
     w?.(reason);
   }
 
-  /** Закрыть композер с причиной и сообщить её тому, кто ждёт askClose. Локальный черновик нужен только при `local`. */
+  /** Закрыть композер с причиной и сообщить её тому, кто ждёт askClose. Локальный черновик нужен только при `local` и `window`. */
   function finish(reason: CloseReason) {
-    if (reason !== "local") dropLocal();
+    if (reason !== "local" && reason !== "window") dropLocal();
     onclose(reason);
     settleClose(reason);
   }
@@ -132,13 +144,13 @@
       return null;
     }),
   );
-  /** Вложения черновика, уже лежащие на сервере. */
-  let serverFiles = $state<DraftAttachment[]>(untrack(() => ctx.draft?.attachments ?? []));
+  /** Вложения черновика, уже лежащие на сервере (у перенесённого в окно письма — перечитанные окном). */
+  let serverFiles = $state<DraftAttachment[]>(untrack(() => ctx.draft?.attachments ?? ctx.restore_files ?? []));
   /** Серверные вложения, убранные крестиком: уйдут в removed_attachment_ids при сохранении или отправке. */
   let removedServerIds = $state<string[]>(untrack(() => ctx.restore?.removed_attachment_ids ?? []));
   const keptServerFiles = $derived(serverFiles.filter((f) => !removedServerIds.includes(f.server_id)));
   /** Список вложений черновика известен с сервера (открытый черновик или после сохранения с файлами). */
-  let serverListed = $state(untrack(() => ctx.draft != null));
+  let serverListed = $state(untrack(() => ctx.draft != null || ctx.restore_files != null));
   /** Есть изменения вложений, которых ещё нет на сервере (автосохранение их не пишет). */
   const pendingFiles = $derived(attachments.length > 0 || removedServerIds.length > 0);
   /**
@@ -210,6 +222,9 @@
   const isDirty = $derived(subject !== init.subject || keyOf(to) !== init.to || keyOf(cc) !== init.cc || keyOf(bcc) !== init.bcc || attachments.length > 0 || removedServerIds.length > 0 || htmlToText(body) !== init.bodyText || (body !== startBody && normHtml(body) !== init.bodyHtml));
   $effect(() => {
     dirty = isDirty;
+  });
+  $effect(() => {
+    heading = subject.trim();
   });
 
   /** Файлы исходного письма при пересылке: их добавит сервер, здесь только показываем (пока список с сервера не известен — там они уже есть). */
@@ -382,7 +397,7 @@
   // закрытия «связи нет, письмо осталось локально» (его предложат открыть).
 
   const LOCAL_SAVE_DELAY_MS = 1500;
-  const localId = untrack(() => ctx.restore?.draft_id ?? crypto.randomUUID());
+  const localId = untrack(() => ctx.restore?.draft_id ?? localDraftId ?? crypto.randomUUID());
   const localSnapshot = $derived(JSON.stringify([snapshot, attachments.map((a) => a.path), removedServerIds, draftRef?.server_id ?? null]));
   let lastLocalKey = $state<string | null>(untrack(() => (ctx.restore ? JSON.stringify([snapshot, (ctx.restore.attachments ?? []).map((a) => a.path), ctx.restore.removed_attachment_ids ?? [], ctx.restore.draft_server_id ?? null]) : null)));
 
@@ -731,6 +746,43 @@
     }
   }
 
+  // --- отдельное окно (п. 32) ---------------------------------------------------------------
+
+  let poppingOut = $state(false);
+
+  /**
+   * «Редактировать в отдельном окне»: письмо целиком (текст, получатели, файлы, черновик на сервере)
+   * записывается локальным черновиком, окно черновика поднимает его, этот композер закрывается.
+   * Идущее автосохранение сначала заканчивается: окно продолжит тот же черновик на сервере.
+   */
+  async function popOut() {
+    if (busy || poppingOut) return;
+    poppingOut = true;
+    error = null;
+    try {
+      await autosavePromise;
+      if (!alive) return;
+      // Недонабранный адрес становится чипом: в локальный черновик идут только чипы.
+      toField?.commit();
+      ccField?.commit();
+      bccField?.commit();
+      const failed = await saveLocal(localSnapshot);
+      if (failed) {
+        error = `Письмо не перенесено в отдельное окно: ${failed}`;
+        lastAction = null;
+        return;
+      }
+      await api.composeWindow(localId, draftRef?.item_pk ?? null);
+      if (alive) finish("window");
+    } catch (e) {
+      if (!alive) return;
+      error = errorMessage(e);
+      lastAction = null;
+    } finally {
+      if (alive) poppingOut = false;
+    }
+  }
+
   // --- вложения ---------------------------------------------------------------------------
 
   async function pickFiles() {
@@ -776,7 +828,7 @@
 
 <svelte:window onkeydown={onWindowKey} />
 
-<section class="composer" bind:this={root} tabindex="-1" aria-label={title} aria-busy={busy != null}>
+<section class="composer" class:standalone bind:this={root} tabindex="-1" aria-label={title} aria-busy={busy != null}>
   <div class="bar">
     <span class="kind">{title}</span>
     <button class="btn primary" onclick={send} disabled={busy != null} title={hint("Отправить", "composer-send")}>
@@ -797,6 +849,11 @@
       Вложить файл
     </button>
     <button class="btn" bind:this={sigBtn} onclick={() => (sigOpen = true)} disabled={busy != null} title="Подпись: текст и автодобавление" aria-haspopup="dialog">Подпись…</button>
+    {#if !standalone}
+      <button class="btn icon" onclick={() => void popOut()} disabled={busy != null || poppingOut} title="Редактировать в отдельном окне" aria-label="Редактировать в отдельном окне">
+        <svg width="14" height="14" viewBox="0 0 16 16" aria-hidden="true"><path d={ICON.popout} fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round" /></svg>
+      </button>
+    {/if}
   </div>
 
   {#if error}
@@ -864,7 +921,7 @@
   {/if}
 
   <div class="editor-wrap">
-    <Editor bind:this={editor} bind:value={body} disabled={busy != null} minHeight={240} />
+    <Editor bind:this={editor} bind:value={body} disabled={busy != null} minHeight={editorMinHeight} />
   </div>
 
   <div class="foot caption" aria-live="polite">
@@ -936,6 +993,12 @@
     box-shadow: var(--shadow-2);
     min-width: 0;
   }
+  /* Окно черновика (п. 32): композер — всё окно, без рамки карточки. */
+  .composer.standalone {
+    border: 0;
+    border-radius: 0;
+    box-shadow: none;
+  }
 
   /* --- верхняя панель --- */
   .bar {
@@ -990,6 +1053,11 @@
   .btn.primary:disabled {
     opacity: 0.6;
     color: var(--fg-on-accent);
+  }
+  .btn.icon {
+    width: var(--control-height);
+    padding: 0;
+    justify-content: center;
   }
   .btn.small {
     height: 24px;
