@@ -72,6 +72,7 @@
   export function askClose(): Promise<CloseReason | null> {
     if (busy) return Promise.resolve(null);
     if (!isDirty) {
+      if (strayDraft) return dropStrayDraft();
       finish("cancel");
       return Promise.resolve("cancel");
     }
@@ -144,6 +145,13 @@
       return null;
     }),
   );
+  /**
+   * Черновик на сервере появится в этом композере сам (автосохранение, «Развернуть»), а не придёт
+   * открытым из «Черновиков» или с перенесённым письмом.
+   */
+  const draftMadeHere = untrack(() => draftRef == null);
+  /** Автор сохранял письмо сам: «Сохранить черновик» или неудачная отправка, оставившая черновик. */
+  let savedByAuthor = $state(false);
   /** Вложения черновика, уже лежащие на сервере (у перенесённого в окно письма — перечитанные окном). */
   let serverFiles = $state<DraftAttachment[]>(untrack(() => ctx.draft?.attachments ?? ctx.restore_files ?? []));
   /** Серверные вложения, убранные крестиком: уйдут в removed_attachment_ids при сохранении или отправке. */
@@ -220,8 +228,14 @@
   // Восстановленный локальный черновик на сервере не сохранён: отсчёт правок — от пустого письма.
   const init = untrack(() => (ctx.restore ? { subject: "", bodyText: "", bodyHtml: normHtml("<div><br></div>"), to: "", cc: "", bcc: "" } : { subject: ctx.subject, bodyText: htmlToText(startBody), bodyHtml: normHtml(startBody), to: keyOf(to), cc: keyOf(cc), bcc: keyOf(bcc) }));
   const isDirty = $derived(subject !== init.subject || keyOf(to) !== init.to || keyOf(cc) !== init.cc || keyOf(bcc) !== init.bcc || attachments.length > 0 || removedServerIds.length > 0 || htmlToText(body) !== init.bodyText || (body !== startBody && normHtml(body) !== init.bodyHtml));
+  /**
+   * Черновик, который создал сам композер и автор не сохранял (п. 33): при нетронутом письме он
+   * лишний и при закрытии убирается. Для родителя письмо с ним — «с правками»: закрытие окна,
+   * замена композера и установка обновления идут через askClose, а не мимо.
+   */
+  const strayDraft = $derived(draftMadeHere && draftRef != null && !savedByAuthor);
   $effect(() => {
-    dirty = isDirty;
+    dirty = isDirty || strayDraft;
   });
   $effect(() => {
     heading = subject.trim();
@@ -526,6 +540,7 @@
       if (rep.draft) {
         draftRef = rep.draft;
         lastSavedKey = key;
+        savedByAuthor = true;
       }
       if (rep.attachments) applyServerFiles(rep.attachments);
       // Исход SendItem неизвестен: письмо могло уйти, автосохранение до следующей правки не пишет в черновик.
@@ -559,6 +574,7 @@
     try {
       await autosavePromise;
       const warn = await saveNow(true);
+      if (alive) savedByAuthor = true;
       if (warn && alive) error = warn;
     } catch (e) {
       if (!alive) return;
@@ -642,7 +658,34 @@
   function requestCancel() {
     if (busy) return;
     if (isDirty) cancelAsk = true;
+    else if (strayDraft) void dropStrayDraft();
     else finish("cancel");
+  }
+
+  let droppingStray = $state(false);
+
+  /**
+   * Письмо вернулось к заготовке, а черновик на сервере остался от автосохранения (п. 33): убрать
+   * его в «Удалённые» молча и закрыть композер. Не вышло (нет связи) — композер всё равно
+   * закрывается: автор отменял письмо, о черновике он не знает.
+   */
+  async function dropStrayDraft(): Promise<CloseReason> {
+    busy = "draft";
+    droppingStray = true;
+    try {
+      await autosavePromise;
+      const id = draftRef?.server_id;
+      if (id) await api.composeDiscardDraft(id);
+    } catch (e) {
+      console.warn("compose_discard_draft (лишний черновик):", errorMessage(e));
+    } finally {
+      if (alive) {
+        busy = null;
+        droppingStray = false;
+      }
+    }
+    if (alive) finish("cancel");
+    return "cancel";
   }
   function keepWriting() {
     cancelAsk = false;
@@ -694,6 +737,7 @@
       await autosavePromise;
       const warn = await saveNow(true);
       if (!alive) return;
+      savedByAuthor = true;
       // Текст сохранён, а вложения нет: не закрывать молча — пользователь решит, что делать.
       if (warn) {
         error = warn;
@@ -840,7 +884,7 @@
     {#if busy}
       <span class="progress caption" aria-live="polite">
         <span class="spinner" aria-hidden="true"></span>
-        {busy === "send" ? "Отправляю…" : "Сохраняю черновик…"}
+        {busy === "send" ? "Отправляю…" : droppingStray ? "Закрываю…" : "Сохраняю черновик…"}
       </span>
     {/if}
     <span class="spacer"></span>
