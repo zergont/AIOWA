@@ -1209,7 +1209,118 @@ export const api = {
   settingsForgetAccount: () => invoke<void>("settings_forget_account"),
   /** Открыть каталог базы в Проводнике. */
   settingsOpenDataDir: () => invoke<void>("settings_open_data_dir"),
+
+  // --- ИИ: подключения к моделям (docs/ai-layer-design.md § 3) --------------------------------
+  aiSettings: () => invoke<AiSettings>("ai_settings"),
+  aiSettingsSet: (patch: AiSettingsPatch) => invoke<AiSettings>("ai_settings_set", { patch }),
+  /** Сохранить подключение; `key` — новый ключ (пустой — не менять), `clearKey` — убрать сохранённый. Ключ обратно не возвращается. */
+  aiProfileSave: (profile: AiProfileInput, key: string | null, clearKey: boolean) => invoke<AiSettings>("ai_profile_save", { profile, key, clearKey }),
+  aiProfileDelete: (id: string) => invoke<AiSettings>("ai_profile_delete", { id }),
+  aiProfileModels: (id: string) => invoke<AiModel[]>("ai_profile_models", { id }),
+  /** «Проверить»: список моделей и короткий ответ выбранной модели. */
+  aiProfileTest: (id: string) => invoke<AiTest>("ai_profile_test", { id }),
+  aiJournal: () => invoke<AiJournal>("ai_journal"),
 };
+
+// --- ИИ ----------------------------------------------------------------------------------------
+
+/** Протокол подключения: Messages API Anthropic или OpenAI-совместимый (OpenAI, vLLM, Ollama, LM Studio). */
+export type AiProviderKind = "anthropic" | "openai";
+/** Где модель: этот компьютер, свой сервер в сети, облако. */
+export type AiPlace = "local" | "own_server" | "cloud";
+/** Режим приватности: любые модели или только свои (без облака). */
+export type AiMode = "any" | "own_only";
+
+export interface AiProfile {
+  id: string;
+  name: string;
+  kind: AiProviderKind;
+  base_url: string;
+  model: string;
+  timeout_s: number;
+  own_server: boolean;
+  /** Дополнительные поля запроса (JSON-объект текстом) — у OpenAI-совместимых. */
+  extra: string;
+  has_key: boolean;
+  place: AiPlace;
+  /** Адрес API, куда пойдёт шлюз (с `/v1` у OpenAI-совместимых). */
+  api_base: string;
+}
+
+export interface AiSettings {
+  enabled: boolean;
+  mode: AiMode;
+  profiles: AiProfile[];
+  advice_profile: string | null;
+  parse_profile: string | null;
+}
+
+/** `null` у назначения — снять его; отсутствие поля — не менять. */
+export interface AiSettingsPatch {
+  enabled?: boolean;
+  mode?: AiMode;
+  advice_profile?: string | null;
+  parse_profile?: string | null;
+}
+
+export interface AiProfileInput {
+  id: string | null;
+  name: string;
+  kind: AiProviderKind;
+  base_url: string;
+  model: string;
+  timeout_s: number;
+  own_server: boolean;
+  extra: string;
+}
+
+export interface AiModel {
+  id: string;
+  name: string | null;
+  context: number | null;
+}
+
+export interface AiTest {
+  models: AiModel[];
+  models_error: string | null;
+  model_listed: boolean | null;
+  reply: string | null;
+  reply_error: string | null;
+  first_ms: number | null;
+  total_ms: number | null;
+  stop: string | null;
+  input_tokens: number | null;
+  output_tokens: number | null;
+  served_model: string | null;
+}
+
+export interface AiCall {
+  at_ms: number;
+  feature: string;
+  profile_id: string;
+  host: string;
+  place: AiPlace;
+  model: string;
+  input_tokens: number | null;
+  output_tokens: number | null;
+  duration_ms: number;
+  outcome: string;
+}
+
+export interface AiUsage {
+  profile_id: string;
+  model: string;
+  place: AiPlace;
+  calls: number;
+  input_tokens: number;
+  output_tokens: number;
+}
+
+export interface AiJournal {
+  recent: AiCall[];
+  /** Итоги за 30 дней по подключению и модели. */
+  month: AiUsage[];
+}
 
 /**
  * Подписка на запрос закрытия окна (крестик, Alt+F4) при поднятом windowCloseGuard. Только своего

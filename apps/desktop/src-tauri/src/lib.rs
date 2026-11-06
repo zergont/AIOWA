@@ -61,6 +61,7 @@ use std::sync::Arc;
 use tauri::{Emitter, Manager, State};
 use tracing::{error, info, warn};
 
+mod ai;
 mod child_windows;
 mod calendar;
 mod calendar_write;
@@ -610,6 +611,7 @@ struct MailParts {
     sync: Arc<sync::SyncState>,
     notify: Arc<notify::NotifyState>,
     reminders: Arc<reminders::RemindersState>,
+    ai: ai::AiState,
 }
 
 /// Фоновые службы почты для запуска в `setup` и остановки при выходе.
@@ -652,7 +654,8 @@ fn open_mail(boot: &config::MailBoot, config_dir: &Path) -> Result<MailParts, St
     let sync = Arc::new(sync::SyncState::new(store.clone(), account, boot.host.clone(), boot.user.clone()));
     let notify = Arc::new(notify::NotifyState::new(store.clone(), account, sync.clone()));
     let reminders = Arc::new(reminders::RemindersState::new(store.clone(), account));
-    Ok(MailParts { state: AppState { store, account, host: boot.host.clone(), user: boot.user.clone() }, sync, notify, reminders })
+    let ai = ai::AiState::new(store.clone(), account)?;
+    Ok(MailParts { state: AppState { store, account, host: boot.host.clone(), user: boot.user.clone() }, sync, notify, reminders, ai })
 }
 
 /// Выключает браузерные клавиши WebView2 в главном окне (`AreBrowserAcceleratorKeysEnabled`):
@@ -774,7 +777,7 @@ pub fn run() {
     let services = match mail {
         Some(parts) => {
             let services = MailServices { sync: parts.sync.clone(), notify: parts.notify.clone(), reminders: parts.reminders.clone() };
-            builder = builder.manage(parts.state).manage(parts.sync).manage(parts.notify).manage(parts.reminders);
+            builder = builder.manage(parts.state).manage(parts.sync).manage(parts.notify).manage(parts.reminders).manage(parts.ai);
             // Шаги выхода перед установщиком обновления (`updates.rs`) берут службы отсюда.
             builder = builder.manage(services.clone());
             Some(services)
@@ -899,6 +902,13 @@ pub fn run() {
             compose::compose_local_drop,
             compose::compose_local_list,
             compose::compose_local_get,
+            ai::ai_settings,
+            ai::ai_settings_set,
+            ai::ai_profile_save,
+            ai::ai_profile_delete,
+            ai::ai_profile_models,
+            ai::ai_profile_test,
+            ai::ai_journal,
             compose::compose_draft_attachments,
             compose::recipients_suggest,
             compose::own_addresses,

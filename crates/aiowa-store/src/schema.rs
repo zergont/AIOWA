@@ -12,7 +12,7 @@ use rusqlite::types::ValueRef;
 use rusqlite::Connection;
 use tracing::info;
 
-pub const CURRENT_VERSION: i64 = 11;
+pub const CURRENT_VERSION: i64 = 12;
 
 /// Состояния текста вложения (`attachments.text_state`).
 pub const TEXT_PENDING: i64 = 0;
@@ -576,8 +576,45 @@ pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
         }
         info!("схема базы обновлена до версии 11: своё состояние синхронизации контактов");
     }
+    if version < 12 {
+        conn.execute_batch("BEGIN IMMEDIATE;")?;
+        let result = (|| -> rusqlite::Result<()> {
+            conn.execute_batch(V12_TABLES)?;
+            conn.pragma_update(None, "user_version", 12)?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => conn.execute_batch("COMMIT;")?,
+            Err(e) => {
+                let _ = conn.execute_batch("ROLLBACK;");
+                return Err(e);
+            }
+        }
+        info!("схема базы обновлена до версии 12: журнал обращений к моделям");
+    }
     Ok(())
 }
+
+/// Версия 12: журнал обращений к языковым моделям (`docs/ai-layer-design.md` § 3.3) — что, куда
+/// и сколько, без содержимого запросов и ответов; SHA-256 тела запроса вместо текста.
+const V12_TABLES: &str = r#"
+CREATE TABLE IF NOT EXISTS ai_calls (
+  call_pk        INTEGER PRIMARY KEY,
+  account_id     INTEGER NOT NULL REFERENCES accounts(account_id),
+  at             INTEGER NOT NULL,
+  feature        TEXT NOT NULL,
+  profile_id     TEXT NOT NULL,
+  host           TEXT NOT NULL,
+  place          TEXT NOT NULL,
+  model          TEXT NOT NULL,
+  input_tokens   INTEGER,
+  output_tokens  INTEGER,
+  duration_ms    INTEGER NOT NULL,
+  outcome        TEXT NOT NULL,
+  request_sha256 TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ai_calls_at ON ai_calls(account_id, at);
+"#;
 
 /// Версия 10: личные контакты ящика (docs/obkatka.md п. 8) — разобранный контакт как JSON и
 /// колонки для списка, поиска и подсказок адресатов. Состояние синхронизации папки контактов —

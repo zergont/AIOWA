@@ -17,6 +17,7 @@ aiowa-transport-owa = { path = "crates/aiowa-transport-owa" }
 aiowa-store = { path = "crates/aiowa-store" }
 aiowa-sync = { path = "crates/aiowa-sync" }
 aiowa-extract = { path = "crates/aiowa-extract" }
+aiowa-ai = { path = "crates/aiowa-ai" }
 
 # общие
 anyhow = "1"
