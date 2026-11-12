@@ -293,6 +293,41 @@
     }
   }
 
+  /** Черновик уехал в своё окно (п. 36): главное окно снимает выбор и показывает «Входящие». */
+  async function leaveDrafts() {
+    const inbox = folders.find((f) => f.distinguished === "inbox") ?? null;
+    if (!inbox || selectedFolder?.folder_pk === inbox.folder_pk) return;
+    try {
+      await openFolder(inbox);
+    } catch (e) {
+      error = errorMessage(e);
+    }
+  }
+
+  /**
+   * Кнопка в шапке области чтения. В «Черновиках» (п. 36) — сразу окно свежего черновика беседы,
+   * главное окно после этого показывает «Входящие»; в остальных папках — окно беседы (п. 32).
+   * Черновик, открытый в композере, переносит кнопка самого композера (шапки тогда нет): см.
+   * closeCompose.
+   */
+  async function popOutSelected() {
+    const c = selected;
+    if (!c) return;
+    const folder = selectedFolder;
+    if (folder?.distinguished !== "drafts") return openMessageWindow(c.conversation_pk, c.topic ?? messages[0]?.subject ?? null);
+    try {
+      const pks = await api.conversationItemPks(c.conversation_pk, folder.folder_pk);
+      if (!pks.length) {
+        error = "В этой папке нет черновиков беседы";
+        return;
+      }
+      await api.composeWindow(null, pks[0]);
+      await leaveDrafts();
+    } catch (e) {
+      error = errorMessage(e);
+    }
+  }
+
   /** Двойной щелчок по беседе: в «Черновиках» — окно её черновика, иначе — окно беседы. */
   async function openConversationWindow(c: Conversation, drafts: boolean) {
     if (!drafts) return openMessageWindow(c.conversation_pk, c.topic);
@@ -418,12 +453,16 @@
   }
 
   function closeCompose(reason: CloseReason) {
+    const wasDraft = compose?.draft != null;
     compose = null;
     composeConversationPk = null;
     composerDirty = false;
     composerBusy = null;
-    if (reason === "window") showNotice("Письмо открыто в отдельном окне");
-    else afterCompose(reason);
+    if (reason === "window") {
+      showNotice("Письмо открыто в отдельном окне");
+      // Черновик из «Черновиков» уехал в своё окно (п. 36): здесь от него осталась бы одна карточка.
+      if (wasDraft && selectedFolder?.distinguished === "drafts") void leaveDrafts();
+    } else afterCompose(reason);
   }
 
   /**
@@ -2078,7 +2117,7 @@
   <div class="splitter" class:off={section !== "mail"} role="separator" aria-orientation="vertical" aria-label="Ширина списка" onpointerdown={startDrag}></div>
 
   <section class="reader" class:off={section !== "mail"} aria-label="Чтение" bind:this={readerEl}>
-    <ReadingPane conversation={multiCount ? null : selected} messages={multiCount ? [] : messages} loading={loadingMessages} onfetch={fetchMessage} {folders} {deletedFolderPk} archiveFolderPk={archiveFolder?.folder_pk ?? null} {draftsFolderPk} {multiCount} onaction={onMessageAction} oncompose={composeFromMessage} onopendraft={(itemPk) => openDraft(itemPk, selected?.conversation_pk ?? null)} onfindsent={findSentOfSelected} draftOpening={composeLoading === "draft"} composer={compose ? composerSnippet : undefined} {composerAlone} bind:topExpandedPk onmeeting={() => void rereadConversation()} onpopout={selected ? () => void openMessageWindow(selected!.conversation_pk, selected!.topic ?? messages[0]?.subject ?? null) : undefined} />
+    <ReadingPane conversation={multiCount ? null : selected} messages={multiCount ? [] : messages} loading={loadingMessages} onfetch={fetchMessage} {folders} {deletedFolderPk} archiveFolderPk={archiveFolder?.folder_pk ?? null} {draftsFolderPk} {multiCount} onaction={onMessageAction} oncompose={composeFromMessage} onopendraft={(itemPk) => openDraft(itemPk, selected?.conversation_pk ?? null)} onfindsent={findSentOfSelected} draftOpening={composeLoading === "draft"} composer={compose ? composerSnippet : undefined} {composerAlone} bind:topExpandedPk onmeeting={() => void rereadConversation()} onpopout={selected ? () => void popOutSelected() : undefined} popoutTitle={selectedFolder?.distinguished === "drafts" ? "Редактировать в отдельном окне" : undefined} />
   </section>
 
   {#if calendarMounted}

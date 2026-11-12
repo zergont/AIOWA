@@ -486,8 +486,8 @@ pub fn body_content_json(html: &str) -> Value {
 /// пересылки. У нового письма пустые списки получателей не передаются (так снято на сервере);
 /// у ответов и пересылки все три списка передаются всегда, пустой — как `[]`: непереданный
 /// список сервер заполняет из оригинала сам, и письмо ушло бы тем, кого пользователь убрал.
-/// У нового письма всегда есть `Importance` и `IsRead: true`, у ответов `Importance` только
-/// отличная от обычной.
+/// У нового письма всегда есть `Importance` и `IsRead: true`; у ответов и пересылки важность в
+/// `CreateItem` не передаётся — её пишет отдельный `UpdateItem` (`update_importance_body`).
 pub fn outgoing_item_json(kind: &ComposeKind, msg: &OutgoingMessage) -> Value {
     let mut item = match kind {
         ComposeKind::New => json!({ "__type": "Message:#Exchange", "Subject": msg.subject, "Body": body_content_json(&msg.body_html) }),
@@ -509,8 +509,6 @@ pub fn outgoing_item_json(kind: &ComposeKind, msg: &OutgoingMessage) -> Value {
     if matches!(kind, ComposeKind::New) {
         item["Importance"] = json!(msg.importance.as_str());
         item["IsRead"] = json!(true);
-    } else if msg.importance != Importance::Normal {
-        item["Importance"] = json!(msg.importance.as_str());
     }
     item
 }
@@ -551,19 +549,22 @@ pub fn send_item_body(item: &ItemId) -> Value {
     })
 }
 
-/// `UpdateItem` черновика целиком: тема, тело, списки получателей и важность. Пустой список
-/// снимается `DeleteItemField`, иначе сервер оставил бы старых получателей. Важность пишется,
-/// только если она не обычная (как у ответов в `outgoing_item_json`): у композера выбора важности
-/// нет, и `Normal` значит «не трогать» — иначе важность, заданная черновику в OWA, сбросилась бы.
+/// Запись важности письма в `UpdateItem`.
+fn importance_update(importance: Importance) -> Value {
+    json!({ "__type": "SetItemField:#Exchange", "Path": property_uri("item:Importance"), "Item": { "__type": "Message:#Exchange", "Importance": importance.as_str() } })
+}
+
+/// `UpdateItem` черновика целиком: тема, тело, важность и списки получателей. Пустой список
+/// снимается `DeleteItemField`, иначе сервер оставил бы старых получателей. Важность пишется
+/// всегда (п. 35 обкатки): композер показывает важность черновика и отдаёт выбранную, в том числе
+/// возврат к обычной.
 pub fn update_draft_body(item: &ItemId, msg: &OutgoingMessage) -> Value {
     let set = |field: &str, value: Value| json!({ "__type": "SetItemField:#Exchange", "Path": property_uri(field), "Item": value });
     let mut updates = vec![
         set("item:Subject", json!({ "__type": "Message:#Exchange", "Subject": msg.subject })),
         set("item:Body", json!({ "__type": "Message:#Exchange", "Body": body_content_json(&msg.body_html) })),
+        importance_update(msg.importance),
     ];
-    if msg.importance != Importance::Normal {
-        updates.push(set("item:Importance", json!({ "__type": "Message:#Exchange", "Importance": msg.importance.as_str() })));
-    }
     for (field, key, list) in [("message:ToRecipients", "ToRecipients", &msg.to), ("message:CcRecipients", "CcRecipients", &msg.cc), ("message:BccRecipients", "BccRecipients", &msg.bcc)] {
         if list.is_empty() {
             updates.push(json!({ "__type": "DeleteItemField:#Exchange", "Path": property_uri(field) }));
@@ -579,6 +580,18 @@ pub fn update_draft_body(item: &ItemId, msg: &OutgoingMessage) -> Value {
         "MessageDisposition": "SaveOnly",
         "SuppressReadReceipts": true,
         "ItemChanges": [ { "__type": "ItemChange:#Exchange", "ItemId": item_id_json(item), "Updates": updates } ],
+    })
+}
+
+/// `UpdateItem` черновика с одной записью — важностью: у ответа и пересылки `CreateItem` её не
+/// принимает, а `update_draft_body` заменил бы тело с цитатой, которую сервер только что дописал.
+pub fn update_importance_body(item: &ItemId, importance: Importance) -> Value {
+    json!({
+        "__type": "UpdateItemRequest:#Exchange",
+        "ConflictResolution": "AlwaysOverwrite",
+        "MessageDisposition": "SaveOnly",
+        "SuppressReadReceipts": true,
+        "ItemChanges": [ { "__type": "ItemChange:#Exchange", "ItemId": item_id_json(item), "Updates": [ importance_update(importance) ] } ],
     })
 }
 
@@ -2876,7 +2889,7 @@ mod tests {
         msg.importance = Importance::High;
         let s = serde_json::to_string(&outgoing_item_json(&ComposeKind::Forward { reference }, &msg)).unwrap();
         assert!(s.starts_with(r#"{"__type":"ForwardItem:#Exchange","ReferenceItemId":{"#), "{s}");
-        assert!(s.ends_with(r#","Importance":"High"}"#), "важность только отличная от обычной: {s}");
+        assert!(!s.contains("Importance"), "у ответа и пересылки важность пишет отдельный UpdateItem: {s}");
         let s = serde_json::to_string(&create_item_body(&ComposeKind::Reply { reference: ItemId { id: "R".into(), change_key: None } }, &msg)).unwrap();
         assert!(s.contains(r#""Items":[{"__type":"ReplyToItem:#Exchange","ReferenceItemId":{"__type":"ItemId:#Exchange","Id":"R"}"#), "{s}");
     }
@@ -2907,7 +2920,7 @@ mod tests {
         let s = serde_json::to_string(&update_draft_body(&ItemId { id: "D".into(), change_key: Some("dk".into()) }, &outgoing())).unwrap();
         assert_eq!(
             s,
-            r#"{"__type":"UpdateItemRequest:#Exchange","ConflictResolution":"AlwaysOverwrite","MessageDisposition":"SaveOnly","SuppressReadReceipts":true,"ItemChanges":[{"__type":"ItemChange:#Exchange","ItemId":{"__type":"ItemId:#Exchange","Id":"D","ChangeKey":"dk"},"Updates":[{"__type":"SetItemField:#Exchange","Path":{"__type":"PropertyUri:#Exchange","FieldURI":"item:Subject"},"Item":{"__type":"Message:#Exchange","Subject":"Тема"}},{"__type":"SetItemField:#Exchange","Path":{"__type":"PropertyUri:#Exchange","FieldURI":"item:Body"},"Item":{"__type":"Message:#Exchange","Body":{"__type":"BodyContentType:#Exchange","BodyType":"HTML","Value":"<p>Привет</p>"}}},{"__type":"SetItemField:#Exchange","Path":{"__type":"PropertyUri:#Exchange","FieldURI":"message:ToRecipients"},"Item":{"__type":"Message:#Exchange","ToRecipients":[{"__type":"EmailAddress:#Exchange","Name":"Иван","EmailAddress":"i@x.ru","RoutingType":"SMTP"}]}},{"__type":"DeleteItemField:#Exchange","Path":{"__type":"PropertyUri:#Exchange","FieldURI":"message:CcRecipients"}},{"__type":"SetItemField:#Exchange","Path":{"__type":"PropertyUri:#Exchange","FieldURI":"message:BccRecipients"},"Item":{"__type":"Message:#Exchange","BccRecipients":[{"__type":"EmailAddress:#Exchange","EmailAddress":"b@x.ru","RoutingType":"SMTP"}]}}]}]}"#
+            r#"{"__type":"UpdateItemRequest:#Exchange","ConflictResolution":"AlwaysOverwrite","MessageDisposition":"SaveOnly","SuppressReadReceipts":true,"ItemChanges":[{"__type":"ItemChange:#Exchange","ItemId":{"__type":"ItemId:#Exchange","Id":"D","ChangeKey":"dk"},"Updates":[{"__type":"SetItemField:#Exchange","Path":{"__type":"PropertyUri:#Exchange","FieldURI":"item:Subject"},"Item":{"__type":"Message:#Exchange","Subject":"Тема"}},{"__type":"SetItemField:#Exchange","Path":{"__type":"PropertyUri:#Exchange","FieldURI":"item:Body"},"Item":{"__type":"Message:#Exchange","Body":{"__type":"BodyContentType:#Exchange","BodyType":"HTML","Value":"<p>Привет</p>"}}},{"__type":"SetItemField:#Exchange","Path":{"__type":"PropertyUri:#Exchange","FieldURI":"item:Importance"},"Item":{"__type":"Message:#Exchange","Importance":"Normal"}},{"__type":"SetItemField:#Exchange","Path":{"__type":"PropertyUri:#Exchange","FieldURI":"message:ToRecipients"},"Item":{"__type":"Message:#Exchange","ToRecipients":[{"__type":"EmailAddress:#Exchange","Name":"Иван","EmailAddress":"i@x.ru","RoutingType":"SMTP"}]}},{"__type":"DeleteItemField:#Exchange","Path":{"__type":"PropertyUri:#Exchange","FieldURI":"message:CcRecipients"}},{"__type":"SetItemField:#Exchange","Path":{"__type":"PropertyUri:#Exchange","FieldURI":"message:BccRecipients"},"Item":{"__type":"Message:#Exchange","BccRecipients":[{"__type":"EmailAddress:#Exchange","EmailAddress":"b@x.ru","RoutingType":"SMTP"}]}}]}]}"#
         );
     }
 
@@ -2916,13 +2929,22 @@ mod tests {
         let msg = OutgoingMessage { subject: "Т".into(), body_html: "<div>х</div>".into(), ..OutgoingMessage::default() };
         let s = serde_json::to_string(&update_draft_body(&ItemId { id: "D".into(), change_key: None }, &msg)).unwrap();
         assert_eq!(s.matches(r#""__type":"DeleteItemField:#Exchange""#).count(), 3, "три пустых списка — три DeleteItemField: {s}");
-        assert_eq!(s.matches(r#""__type":"SetItemField:#Exchange""#).count(), 2, "тема и тело; обычная важность не пишется: {s}");
-        assert!(!s.contains("item:Importance"), "{s}");
+        assert_eq!(s.matches(r#""__type":"SetItemField:#Exchange""#).count(), 3, "тема, тело и важность: {s}");
+        assert!(s.contains(r#""FieldURI":"item:Importance"},"Item":{"__type":"Message:#Exchange","Importance":"Normal"}"#), "обычная важность пишется тоже — так она возвращается с высокой: {s}");
         assert!(s.contains(r#""ItemId":{"__type":"ItemId:#Exchange","Id":"D"},"Updates""#), "без ChangeKey ключ не передаётся: {s}");
     }
 
     #[test]
-    fn update_draft_body_writes_importance_only_when_not_normal() {
+    fn update_importance_body_exact() {
+        let s = serde_json::to_string(&update_importance_body(&ItemId { id: "D".into(), change_key: Some("dk".into()) }, Importance::Low)).unwrap();
+        assert_eq!(
+            s,
+            r#"{"__type":"UpdateItemRequest:#Exchange","ConflictResolution":"AlwaysOverwrite","MessageDisposition":"SaveOnly","SuppressReadReceipts":true,"ItemChanges":[{"__type":"ItemChange:#Exchange","ItemId":{"__type":"ItemId:#Exchange","Id":"D","ChangeKey":"dk"},"Updates":[{"__type":"SetItemField:#Exchange","Path":{"__type":"PropertyUri:#Exchange","FieldURI":"item:Importance"},"Item":{"__type":"Message:#Exchange","Importance":"Low"}}]}]}"#
+        );
+    }
+
+    #[test]
+    fn update_draft_body_writes_chosen_importance() {
         let msg = OutgoingMessage { subject: "Т".into(), body_html: "<div>х</div>".into(), importance: Importance::High, ..OutgoingMessage::default() };
         let s = serde_json::to_string(&update_draft_body(&ItemId { id: "D".into(), change_key: None }, &msg)).unwrap();
         assert!(s.contains(r#"{"__type":"SetItemField:#Exchange","Path":{"__type":"PropertyUri:#Exchange","FieldURI":"item:Importance"},"Item":{"__type":"Message:#Exchange","Importance":"High"}}"#), "{s}");

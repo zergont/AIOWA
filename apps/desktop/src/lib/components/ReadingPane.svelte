@@ -39,8 +39,10 @@
     onmeeting?: () => void;
     /** Кнопка «Открыть в отдельном окне» в шапке беседы (п. 32); без неё кнопки нет (само окно беседы). */
     onpopout?: () => void;
+    /** Подпись этой кнопки; в «Черновиках» она сразу открывает окно черновика (п. 36). */
+    popoutTitle?: string;
   }
-  let { conversation, messages, loading, onfetch, folders, deletedFolderPk, archiveFolderPk = null, draftsFolderPk = null, multiCount = 0, onaction, oncompose, onopendraft, draftOpening = false, composer, composerAlone = false, topExpandedPk = $bindable(null), onmeeting, onfindsent, onpopout }: Props = $props();
+  let { conversation, messages, loading, onfetch, folders, deletedFolderPk, archiveFolderPk = null, draftsFolderPk = null, multiCount = 0, onaction, oncompose, onopendraft, draftOpening = false, composer, composerAlone = false, topExpandedPk = $bindable(null), onmeeting, onfindsent, onpopout, popoutTitle = "Открыть в отдельном окне" }: Props = $props();
 
   // Письма идут от новых к старым; самое свежее развёрнуто, остальные свёрнуты до заголовка.
   // Раскрытие пересчитывается только при смене беседы: точечная замена письма (догрузка тела)
@@ -122,7 +124,7 @@
           </div>
         </div>
         {#if onpopout}
-          <button class="popout" onclick={onpopout} title="Открыть в отдельном окне" aria-label="Открыть в отдельном окне">
+          <button class="popout" onclick={onpopout} title={popoutTitle} aria-label={popoutTitle}>
             <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path d={ICON.popout} fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round" /></svg>
           </button>
         {/if}

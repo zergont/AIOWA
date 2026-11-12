@@ -10,7 +10,7 @@ pub mod notify;
 pub mod protocol;
 
 use aiowa_core::{
-    CalendarEvent, CalendarEventDetails, CalendarItemChanges, ComposeKind, ContactChange, ContactChanges, ContactItem, DirectoryPerson, DraftContent, FolderChanges, FolderId, FolderRef, ItemChanges, ItemId, MeetingRequestInfo, MeetingResponse, MessageMeta,
+    CalendarEvent, CalendarEventDetails, CalendarItemChanges, ComposeKind, ContactChange, ContactChanges, ContactItem, DirectoryPerson, DraftContent, FolderChanges, FolderId, FolderRef, Importance, ItemChanges, ItemId, MeetingRequestInfo, MeetingResponse, MessageMeta,
     NewCalendarItem, OutgoingAttachment, OutgoingMessage, Signature, SyncState,
 };
 use aiowa_transport::{
@@ -1833,6 +1833,15 @@ impl MailTransport for OwaTransport {
             ck_len = new_id.as_ref().and_then(|n| n.change_key.as_deref()).map(str::len),
             "черновик обновлён"
         );
+        Ok(new_id.unwrap_or_else(|| item.clone()))
+    }
+
+    async fn set_draft_importance(&self, item: &ItemId, importance: Importance) -> Result<ItemId> {
+        let v = self.call("UpdateItem", protocol::V_2017, protocol::update_importance_body(item, importance)).await?;
+        let m = Self::first_message("UpdateItem", &v)?;
+        Self::log_shape("UpdateItem", m);
+        let new_id = protocol::written_item_id(m);
+        debug!(importance = importance.as_str(), id_in_response = new_id.is_some(), "важность черновика записана");
         Ok(new_id.unwrap_or_else(|| item.clone()))
     }
 

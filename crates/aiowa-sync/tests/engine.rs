@@ -281,6 +281,10 @@ impl MailTransport for Fake {
         Ok(item.clone())
     }
 
+    async fn set_draft_importance(&self, item: &ItemId, _importance: Importance) -> TResult<ItemId> {
+        Ok(item.clone())
+    }
+
     async fn delete_attachments(&self, _ids: &[String]) -> TResult<ItemId> {
         Ok(ItemId { id: "draft".into(), change_key: Some("d3".into()) })
     }

@@ -1,9 +1,10 @@
 <script lang="ts">
-  import { onDestroy, onMount, untrack } from "svelte";
-  import { api, errorMessage, failNetwork, failOriginalGone, failRetryable, formatSize, fullDate, isInlinePicture, messageNeedsFetch, onSyncProgress, personLabel, type ComposeContext, type ComposeRecipient, type ComposeRequest, type DraftAttachment, type DraftRef, type LocalDraft, type Message, type PickedFile, type SignatureDto } from "../api";
+  import { onDestroy, onMount, tick, untrack } from "svelte";
+  import { api, errorMessage, failNetwork, failOriginalGone, failRetryable, formatSize, fullDate, isInlinePicture, messageNeedsFetch, onSyncProgress, personLabel, type ComposeContext, type ComposeRecipient, type ComposeRequest, type DraftAttachment, type DraftRef, type Importance, type LocalDraft, type Message, type PickedFile, type SignatureDto } from "../api";
   import { COMPOSE_TITLE, ICON } from "../actions";
   import { isValidEmail, mergeRecipients } from "../addresses";
   import { cleanDraftHtml, htmlToText, restoreDraftHtml } from "../html";
+  import { recipientDrag } from "../recipientDrag.svelte";
   import { focusBack } from "../popover";
   import { hint, layerOpen } from "../hotkeys";
   import RecipientsInput from "./RecipientsInput.svelte";
@@ -118,7 +119,44 @@
   let cc = $state<ComposeRecipient[]>(untrack(() => mergeRecipients([], ctx.cc)));
   let bcc = $state<ComposeRecipient[]>(untrack(() => mergeRecipients([], ctx.bcc ?? ctx.draft?.bcc ?? [])));
   let showBcc = $state(untrack(() => bcc.length > 0));
+
+  // Перенос адресата между «Кому», «Копией» и «Скрытой» (п. 34 обкатки): мышью — чип тянется в
+  // другое поле (с Ctrl копируется), с клавиатуры — пункты «Переместить в…» в меню чипа.
+  type Field = "to" | "cc" | "bcc";
+  const MOVE_LABEL: Record<Field, string> = { to: "Переместить в «Кому»", cc: "Переместить в «Копию»", bcc: "Переместить в «Скрытую»" };
+  const moveTargets = (own: Field) => (["to", "cc", "bcc"] as Field[]).filter((f) => f !== own).map((f) => ({ field: f, label: MOVE_LABEL[f] }));
+  const MOVE_TARGETS: Record<Field, { field: string; label: string }[]> = { to: moveTargets("to"), cc: moveTargets("cc"), bcc: moveTargets("bcc") };
+  /** Тянут чип этого письма: спрятанная «Скрытая» показывается, чтобы в неё тоже можно было бросить. */
+  const draggingRecipient = $derived(recipientDrag.group === uid);
+
+  function transferRecipient(from: Field, r: ComposeRecipient, target: string, index: number | null, copy: boolean) {
+    if (target !== "to" && target !== "cc" && target !== "bcc") return;
+    const key = r.email.trim().toLowerCase();
+    const same = (x: ComposeRecipient) => x.email.trim().toLowerCase() === key;
+    const get = (f: Field) => (f === "to" ? to : f === "cc" ? cc : bcc);
+    const set = (f: Field, v: ComposeRecipient[]) => {
+      if (f === "to") to = v;
+      else if (f === "cc") cc = v;
+      else bcc = v;
+    };
+    // Адресат, который в поле уже есть, второй раз не добавляется.
+    const dst = get(target);
+    if (!dst.some(same)) {
+      const at = index == null ? dst.length : Math.max(0, Math.min(index, dst.length));
+      set(target, [...dst.slice(0, at), r, ...dst.slice(at)]);
+    }
+    if (!copy && from !== target) set(from, get(from).filter((x) => !same(x)));
+    if (target === "bcc") showBcc = true;
+    // Чип, с которого начали, из прежнего поля убран: фокус — в поле, куда он переехал, иначе он
+    // ушёл бы из композера, и клавиши окна сработали бы на беседу под ним.
+    void tick().then(() => (target === "to" ? toField : target === "cc" ? ccField : bccField)?.focus());
+  }
   let subject = $state(untrack(() => ctx.subject));
+  /** Важность письма (п. 35 обкатки): уходит с письмом, пишется в черновик на сервере и в локальный. */
+  let importance = $state<Importance>(untrack(() => ctx.importance ?? "Normal"));
+  function toggleImportance(v: "High" | "Low") {
+    importance = importance === v ? "Normal" : v;
+  }
   const startBody = untrack(() => initialBody(ctx));
   let body = $state(startBody);
   let attachments = $state<PickedFile[]>(untrack(() => ctx.restore?.attachments ?? []));
@@ -228,10 +266,10 @@
   /** Разметка в том виде, как её сериализует браузер: правка одного форматирования (жирный, список) тоже правка. */
   const normHtml = (h: string) => new DOMParser().parseFromString(h, "text/html").body.innerHTML;
   // Восстановленный локальный черновик на сервере не сохранён: отсчёт правок — от пустого письма.
-  const init = untrack(() => (ctx.restore ? { subject: "", bodyText: "", bodyHtml: normHtml("<div><br></div>"), to: "", cc: "", bcc: "" } : { subject: ctx.subject, bodyText: htmlToText(startBody), bodyHtml: normHtml(startBody), to: keyOf(to), cc: keyOf(cc), bcc: keyOf(bcc) }));
+  const init = untrack(() => (ctx.restore ? { subject: "", bodyText: "", bodyHtml: normHtml("<div><br></div>"), to: "", cc: "", bcc: "", importance: "Normal" } : { subject: ctx.subject, bodyText: htmlToText(startBody), bodyHtml: normHtml(startBody), to: keyOf(to), cc: keyOf(cc), bcc: keyOf(bcc), importance }));
   /** Текст тела без разметки: считается раз на правку, нужен и «есть правки», и «письмо непустое». */
   const bodyText = $derived(htmlToText(body));
-  const isDirty = $derived(subject !== init.subject || keyOf(to) !== init.to || keyOf(cc) !== init.cc || keyOf(bcc) !== init.bcc || attachments.length > 0 || removedServerIds.length > 0 || bodyText !== init.bodyText || (body !== startBody && normHtml(body) !== init.bodyHtml));
+  const isDirty = $derived(subject !== init.subject || keyOf(to) !== init.to || keyOf(cc) !== init.cc || keyOf(bcc) !== init.bcc || importance !== init.importance || attachments.length > 0 || removedServerIds.length > 0 || bodyText !== init.bodyText || (body !== startBody && normHtml(body) !== init.bodyHtml));
   /**
    * Черновик, который создал сам композер и автор не сохранял (п. 33): при нетронутом письме он
    * лишний и при закрытии убирается. Для родителя письмо с ним — «с правками»: закрытие окна,
@@ -394,6 +432,7 @@
       removed_attachment_ids: removedServerIds,
       local_draft_id: localId,
       without_quote: withoutQuote,
+      importance,
     };
   }
 
@@ -423,8 +462,8 @@
   const AUTOSAVE_GAP_MS = 60_000;
   const timeOnly = new Intl.DateTimeFormat("ru-RU", { hour: "2-digit", minute: "2-digit" });
 
-  /** Что именно сохраняется: тема, получатели и разметка тела (форматирование тоже правка). */
-  const snapshot = $derived(JSON.stringify([subject.trim(), keyOf(to), keyOf(cc), keyOf(bcc), body]));
+  /** Что именно сохраняется: тема, получатели, важность и разметка тела (форматирование тоже правка). */
+  const snapshot = $derived(JSON.stringify([subject.trim(), keyOf(to), keyOf(cc), keyOf(bcc), body, importance]));
   const nonEmpty = $derived(subject.trim() !== "" || to.length + cc.length + bcc.length > 0 || bodyText !== "");
   /** Снимок, который лежит на сервере; у открытого черновика — его начальное состояние. */
   let lastSavedKey = $state<string | null>(untrack(() => (ctx.draft ? snapshot : null)));
@@ -520,6 +559,7 @@
       body_html: restoreDraftHtml(body),
       attachments: $state.snapshot(attachments),
       removed_attachment_ids: $state.snapshot(removedServerIds),
+      importance,
       updated_ms: Date.now(),
     };
     try {
@@ -975,11 +1015,19 @@
       </span>
     {/if}
     <span class="spacer"></span>
-    <button class="btn" onclick={pickFiles} disabled={busy != null} title="Вложить файл…">
-      <svg width="14" height="14" viewBox="0 0 16 16" aria-hidden="true"><path d={ICON.attach} fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" /></svg>
-      Вложить файл
+    <!-- Важность (п. 35): нажата одна из двух или ни одной; значками, как и вложение с подписью, — строка помещается в области чтения. -->
+    <button class="btn icon" class:on={importance === "High"} class:high={importance === "High"} onclick={() => toggleImportance("High")} disabled={busy != null} aria-pressed={importance === "High"} title="Высокая важность" aria-label="Высокая важность">
+      <svg width="14" height="14" viewBox="0 0 16 16" aria-hidden="true"><path d={ICON.important} fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" /></svg>
     </button>
-    <button class="btn" bind:this={sigBtn} onclick={() => (sigOpen = true)} disabled={busy != null} title="Подпись: текст и автодобавление" aria-haspopup="dialog">Подпись…</button>
+    <button class="btn icon" class:on={importance === "Low"} onclick={() => toggleImportance("Low")} disabled={busy != null} aria-pressed={importance === "Low"} title="Низкая важность" aria-label="Низкая важность">
+      <svg width="14" height="14" viewBox="0 0 16 16" aria-hidden="true"><path d={ICON.lowImportance} fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" /></svg>
+    </button>
+    <button class="btn icon" onclick={pickFiles} disabled={busy != null} title="Вложить файл…" aria-label="Вложить файл">
+      <svg width="14" height="14" viewBox="0 0 16 16" aria-hidden="true"><path d={ICON.attach} fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" /></svg>
+    </button>
+    <button class="btn icon" bind:this={sigBtn} onclick={() => (sigOpen = true)} disabled={busy != null} title="Подпись: текст и автодобавление" aria-label="Подпись" aria-haspopup="dialog">
+      <svg width="14" height="14" viewBox="0 0 16 16" aria-hidden="true"><path d={ICON.signature} fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round" /></svg>
+    </button>
     {#if adviceKind && adviceStatus?.available}
       <button class="btn" class:on={adviceOpen} onclick={() => (adviceOpen = !adviceOpen)} disabled={busy != null} aria-expanded={adviceOpen} title="Совет: суть переписки и черновик ответа">Совет</button>
     {/if}
@@ -1002,7 +1050,7 @@
   <div class="fields">
     <div class="row">
       <label class="lbl" for="{uid}-to">Кому</label>
-      <RecipientsInput bind:this={toField} id="{uid}-to" bind:recipients={to} disabled={busy != null} placeholder="Адрес или имя" />
+      <RecipientsInput bind:this={toField} id="{uid}-to" bind:recipients={to} disabled={busy != null} placeholder="Адрес или имя" field="to" dragGroup={uid} moveTargets={MOVE_TARGETS.to} ontransfer={(r, t, i, c) => transferRecipient("to", r, t, i, c)} />
       {#if !showBcc}
         <button class="link-btn" onclick={() => (showBcc = true)} disabled={busy != null}>Скрытая</button>
       {/if}
@@ -1012,12 +1060,12 @@
     {/if}
     <div class="row">
       <label class="lbl" for="{uid}-cc">Копия</label>
-      <RecipientsInput bind:this={ccField} id="{uid}-cc" bind:recipients={cc} disabled={busy != null} />
+      <RecipientsInput bind:this={ccField} id="{uid}-cc" bind:recipients={cc} disabled={busy != null} field="cc" dragGroup={uid} moveTargets={MOVE_TARGETS.cc} ontransfer={(r, t, i, c) => transferRecipient("cc", r, t, i, c)} />
     </div>
-    {#if showBcc}
+    {#if showBcc || draggingRecipient}
       <div class="row">
         <label class="lbl" for="{uid}-bcc">Скрытая</label>
-        <RecipientsInput bind:this={bccField} id="{uid}-bcc" bind:recipients={bcc} disabled={busy != null} />
+        <RecipientsInput bind:this={bccField} id="{uid}-bcc" bind:recipients={bcc} disabled={busy != null} field="bcc" dragGroup={uid} moveTargets={MOVE_TARGETS.bcc} ontransfer={(r, t, i, c) => transferRecipient("bcc", r, t, i, c)} />
       </div>
     {/if}
     <div class="row">
@@ -1179,6 +1227,10 @@
   .btn.on {
     border-color: var(--accent);
     color: var(--accent);
+  }
+  .btn.on.high {
+    border-color: var(--danger);
+    color: var(--danger);
   }
   .btn.primary {
     background: var(--accent);

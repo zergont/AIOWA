@@ -355,6 +355,9 @@ export interface ExpandedQuote {
 }
 
 /** Заготовка композера от бэкенда: получатели и тема уже подобраны по виду письма. */
+/** Важность письма, как её называет Exchange. */
+export type Importance = "Low" | "Normal" | "High";
+
 export interface ComposeContext {
   kind: ComposeKind;
   reference_item_pk: number | null;
@@ -378,6 +381,8 @@ export interface ComposeContext {
    * (compose_draft_attachments): письмо, перенесённое в отдельное окно, показывает и уже приложенные файлы.
    */
   restore_files?: DraftAttachment[] | null;
+  /** Важность письма (п. 35 обкатки): у открытого черновика — его собственная. Нет у старого бэкенда — обычная. */
+  importance?: Importance;
 }
 
 export interface ComposeRequest {
@@ -401,6 +406,8 @@ export interface ComposeRequest {
   local_draft_id?: string | null;
   /** Продолжить без цитаты: оригинала больше нет (ошибка с `original_gone`). */
   without_quote?: boolean;
+  /** Важность, выбранная в композере: уходит с письмом и пишется в черновик. */
+  importance?: Importance;
 }
 
 /**
@@ -419,6 +426,8 @@ export interface LocalDraft {
   body_html: string;
   attachments: PickedFile[];
   removed_attachment_ids: string[];
+  /** Важность письма; у черновика, записанного до 0.2.11, поля нет — обычная. */
+  importance?: Importance;
   updated_ms: number;
 }
 
@@ -1412,7 +1421,7 @@ export async function contextFromLocal(d: LocalDraft): Promise<ComposeContext> {
     // тело с цитатой одним новым текстом, а сказало, что цитату не собрать.
     if (d.draft_server_id && d.kind !== "new") ctx = { ...ctx, kind: d.kind, reference_item_pk: d.reference_item_pk };
   }
-  return { ...ctx, to: d.to, cc: d.cc, bcc: d.bcc, subject: d.subject, body_html: d.body_html, restore: d };
+  return { ...ctx, to: d.to, cc: d.cc, bcc: d.bcc, subject: d.subject, body_html: d.body_html, importance: d.importance ?? "Normal", restore: d };
 }
 
 /** Подписка на ход синхронизации. Возвращает функцию отписки. */

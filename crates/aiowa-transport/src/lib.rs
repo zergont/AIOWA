@@ -4,7 +4,7 @@
 //! Уровень абстракции: операции схемы EWS, а не HTTP. Транспорт сам отвечает за
 //! сессию, повторный вход и ограничение параллелизма.
 
-use aiowa_core::{ContactChanges, FolderChanges, FolderId, FolderRef, ItemChanges, ItemId, MessageFull, MessageMeta, Participant, SyncState};
+use aiowa_core::{ContactChanges, FolderChanges, FolderId, FolderRef, Importance, ItemChanges, ItemId, MessageFull, MessageMeta, Participant, SyncState};
 pub use aiowa_core::{
     Attendee, CalendarEvent, CalendarEventDetails, CalendarItemChanges, CalendarItemType, ComposeKind, DirectoryPerson, DraftContent, FreeBusy, MeetingMessageKind, MeetingRequestInfo, MeetingResponse,
     NewCalendarItem, OutgoingAttachment, OutgoingMessage, PersonKind, ResponseType, Signature,
@@ -450,13 +450,18 @@ pub trait MailTransport: Send + Sync {
     /// Отправить черновик (`SendItem` с копией в «Отправленных»).
     async fn send_draft(&self, item: &ItemId) -> Result<()>;
 
-    /// Перезаписать тему, тело, получателей и (если она не обычная) важность черновика
-    /// (`UpdateItem` с `SaveOnly` и `AlwaysOverwrite`: `SetItemField` по `item:Subject`,
-    /// `item:Body`, `message:To/Cc/BccRecipients`, `item:Importance` только при `Importance` не
-    /// `Normal`; опустевший список — `DeleteItemField`). Вложения не трогает.
+    /// Перезаписать тему, тело, важность и получателей черновика (`UpdateItem` с `SaveOnly` и
+    /// `AlwaysOverwrite`: `SetItemField` по `item:Subject`, `item:Body`, `item:Importance`,
+    /// `message:To/Cc/BccRecipients`; опустевший список — `DeleteItemField`). Вложения не трогает.
     /// Возвращает идентификатор с новым `ChangeKey`; отказ сервера по черновику (например,
     /// `ErrorItemNotFound`, если он удалён в OWA) — `Server`.
     async fn update_draft(&self, item: &ItemId, msg: &OutgoingMessage) -> Result<ItemId>;
+
+    /// Записать только важность черновика (`UpdateItem` с одним `SetItemField` по
+    /// `item:Importance`). У ответа и пересылки `CreateItem` важность не принимает, а полная
+    /// перезапись (`update_draft`) стёрла бы цитату, которую сервер только что дописал.
+    /// Возвращает идентификатор с новым `ChangeKey`.
+    async fn set_draft_importance(&self, item: &ItemId, importance: Importance) -> Result<ItemId>;
 
     /// Удалить вложения черновика по их `AttachmentId` (`DeleteAttachment`, одним запросом).
     /// Возвращает идентификатор письма-родителя с новым `ChangeKey` (`RootItemId`/`RootItemChangeKey`

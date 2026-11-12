@@ -5,6 +5,7 @@
   import { isValidEmail, mergeRecipients, parseAddresses, recipientLabel } from "../addresses";
   import { CONTACT_ICON, contactCardOpener, copyText, directoryLine, emailKey, expandSupported, isKnownList, noteExpandError, personMatches, rememberKinds } from "../contact";
   import { focusBack } from "../popover";
+  import { recipientDrag, registerZone, zoneAt } from "../recipientDrag.svelte";
   import ContextMenu, { type MenuItem } from "./ContextMenu.svelte";
 
   interface Props {
@@ -14,8 +15,21 @@
     recipients: ComposeRecipient[];
     disabled?: boolean;
     placeholder?: string;
+    /**
+     * Перенос адресатов между полями одного письма (п. 34 обкатки): имя этого поля и группа — письмо,
+     * которому оно принадлежит. Без них чипы не тянутся (поля участников встречи).
+     */
+    field?: string;
+    dragGroup?: string;
+    /** Другие поля письма для меню чипа: имя поля и подпись пункта («Переместить в «Копию»»). */
+    moveTargets?: { field: string; label: string }[];
+    /**
+     * Адресата переносят в другое поле письма: мышью (тогда `index` — перед каким чипом, с Ctrl —
+     * `copy`) или из меню чипа (`index` — null, в конец). Массивы полей меняет композер.
+     */
+    ontransfer?: (r: ComposeRecipient, to: string, index: number | null, copy: boolean) => void;
   }
-  let { id, recipients = $bindable([]), disabled = false, placeholder = "" }: Props = $props();
+  let { id, recipients = $bindable([]), disabled = false, placeholder = "", field, dragGroup, moveTargets = [], ontransfer }: Props = $props();
 
   /** Карточка контакта (её держит App); вне App чипы её не открывают. */
   const openContact = contactCardOpener();
@@ -241,6 +255,11 @@
     close();
   }
 
+  /** Фокус в поле ввода: композер ставит его в поле, куда перенесён адресат. */
+  export function focus() {
+    input?.focus();
+  }
+
   /** Превратить недонабранный адрес в чип: композер зовёт перед отправкой (Ctrl+Enter не ждёт Enter в поле). */
   export function commit() {
     if (text.trim()) commitText();
@@ -440,6 +459,122 @@
     }
   }
 
+  // --- перетаскивание чипов между полями письма (п. 34 обкатки) -------------------------------
+  // Чип тянется мышью в другое поле этого же письма и переносится туда (с Ctrl — копируется, как
+  // в Проводнике), внутри своего поля — меняет место. Esc отменяет. Работает, когда композер дал
+  // полю имя и группу; место вставки и поле под указателем считает lib/recipientDrag.svelte.ts.
+
+  const DRAG_START_PX = 5;
+  const dropHere = $derived(box !== null && recipientDrag.over === box);
+  /** Чип, который сейчас тянут из этого поля: он приглушён. */
+  let draggedKey = $state<string | null>(null);
+  let drag: { r: ComposeRecipient; x0: number; y0: number; started: boolean; ghost: HTMLElement | null } | null = null;
+
+  $effect(() => {
+    const el = box;
+    if (!el || !dragGroup || !field) return;
+    return registerZone(el, { group: dragGroup, field });
+  });
+
+  function onChipPointerDown(e: PointerEvent, r: ComposeRecipient) {
+    if (disabled || !dragGroup || !field || e.button !== 0) return;
+    endDrag();
+    drag = { r, x0: e.clientX, y0: e.clientY, started: false, ghost: null };
+    window.addEventListener("pointermove", onDragMove);
+    window.addEventListener("pointerup", onDragUp);
+    window.addEventListener("pointercancel", endDrag);
+    window.addEventListener("keydown", onDragKey, true);
+    window.addEventListener("keyup", onDragKey, true);
+  }
+
+  function ghostText(r: ComposeRecipient, copy: boolean): string {
+    return (copy ? "+ " : "") + recipientLabel(r);
+  }
+
+  function onDragMove(e: PointerEvent) {
+    const d = drag;
+    if (!d || !dragGroup) return;
+    if (!d.started) {
+      if (Math.hypot(e.clientX - d.x0, e.clientY - d.y0) < DRAG_START_PX) return;
+      d.started = true;
+      draggedKey = emailKey(d.r.email);
+      menu = null;
+      close();
+      // Подпись под указателем — прямо в body: её не обрежут ни рамка поля, ни прокрутка письма.
+      const g = document.createElement("div");
+      g.setAttribute("aria-hidden", "true");
+      g.style.cssText =
+        "position:fixed;z-index:2000;pointer-events:none;max-width:320px;padding:0 10px;border-radius:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font:var(--text-body);line-height:24px;height:24px;box-sizing:content-box;background:var(--bg-card);color:var(--fg-1);border:1px solid var(--accent);box-shadow:var(--shadow-8)";
+      document.body.append(g);
+      d.ghost = g;
+      document.documentElement.style.userSelect = "none";
+      recipientDrag.group = dragGroup;
+    }
+    if (d.ghost) {
+      d.ghost.textContent = ghostText(d.r, e.ctrlKey);
+      d.ghost.style.left = `${e.clientX + 12}px`;
+      d.ghost.style.top = `${e.clientY + 14}px`;
+    }
+    const z = zoneAt(dragGroup, e.clientX, e.clientY);
+    recipientDrag.over = z?.el ?? null;
+    if (z) {
+      recipientDrag.index = z.index;
+      recipientDrag.markLeft = z.markLeft;
+      recipientDrag.markTop = z.markTop;
+    }
+  }
+
+  function onDragUp(e: PointerEvent) {
+    const d = drag;
+    const z = d?.started && dragGroup ? zoneAt(dragGroup, e.clientX, e.clientY) : null;
+    endDrag();
+    if (!d || !z) return;
+    const key = emailKey(d.r.email);
+    const from = recipients.findIndex((x) => emailKey(x.email) === key);
+    if (from < 0) return;
+    if (z.el === box) {
+      // В своём поле чип меняет место; копировать в то же поле нечего.
+      const to = z.index > from ? z.index - 1 : z.index;
+      if (to === from) return;
+      const moved = recipients[from];
+      const rest = recipients.filter((_, k) => k !== from);
+      recipients = [...rest.slice(0, to), moved, ...rest.slice(to)];
+      void tick().then(() => focusChip(to));
+      return;
+    }
+    if (!e.ctrlKey) forgetPending(d.r);
+    ontransfer?.(d.r, z.field, z.index, e.ctrlKey);
+  }
+
+  function endDrag() {
+    window.removeEventListener("pointermove", onDragMove);
+    window.removeEventListener("pointerup", onDragUp);
+    window.removeEventListener("pointercancel", endDrag);
+    window.removeEventListener("keydown", onDragKey, true);
+    window.removeEventListener("keyup", onDragKey, true);
+    if (drag?.started) {
+      drag.ghost?.remove();
+      document.documentElement.style.userSelect = "";
+      recipientDrag.group = null;
+      recipientDrag.over = null;
+    }
+    drag = null;
+    draggedKey = null;
+  }
+
+  /** Пока чип тянут: Esc отменяет (и не доходит до «Отменить» композера), Ctrl меняет перенос на копию. */
+  function onDragKey(e: KeyboardEvent) {
+    const d = drag;
+    if (!d?.started) return;
+    if (e.key === "Escape") {
+      e.preventDefault();
+      e.stopPropagation();
+      endDrag();
+    } else if (e.key === "Control" && d.ghost) {
+      d.ghost.textContent = ghostText(d.r, e.type === "keydown");
+    }
+  }
+
   let menu = $state<{ index: number; anchor: HTMLElement } | null>(null);
 
   function openMenu(e: MouseEvent, i: number) {
@@ -457,6 +592,7 @@
     if (isKnownList(r.email) && expandSupported()) items.push({ id: "expand", label: "Развернуть список", icon: CONTACT_ICON.people, disabled: expanding !== null });
     items.push({ id: "copy", label: "Копировать адрес", icon: CONTACT_ICON.copy });
     items.push({ id: "edit", label: "Изменить", icon: ICON.rename });
+    moveTargets.forEach((t, k) => items.push({ id: `move:${t.field}`, label: t.label, icon: ICON.move, separator: k === 0 }));
     items.push({ id: "remove", label: "Убрать", icon: ICON.close, separator: true });
     return items;
   });
@@ -467,6 +603,11 @@
     const r = m ? recipients[m.index] : undefined;
     if (!m || !r) {
       input?.focus();
+      return;
+    }
+    if (action.startsWith("move:")) {
+      forgetPending(r);
+      ontransfer?.(r, action.slice(5), null, false);
       return;
     }
     switch (action) {
@@ -630,16 +771,20 @@
     clearTimeout(localTimer);
     clearTimeout(dirTimer);
     clearTimeout(noteTimer);
+    endDrag();
   });
 </script>
 
 <div class="wrap">
-  <div class="box" class:disabled role="presentation" bind:this={box} onpointerdown={onBoxPointerDown}>
+  <div class="box" class:disabled class:drop={dropHere} role="presentation" bind:this={box} onpointerdown={onBoxPointerDown}>
+    {#if dropHere}
+      <span class="drop-mark" style="left: {recipientDrag.markLeft}px; top: {recipientDrag.markTop}px" aria-hidden="true"></span>
+    {/if}
     {#each recipients as r, i (emailKey(r.email))}
       {@const ok = isValidEmail(r.email)}
       {@const list = ok && isKnownList(r.email)}
       {@const busy = expanding?.key === emailKey(r.email)}
-      <span class="chip" class:invalid={!ok} class:list title={chipTitle(r, ok, list)}>
+      <span class="chip" class:invalid={!ok} class:list class:dragged={draggedKey === emailKey(r.email)} data-chip title={chipTitle(r, ok, list)}>
         {#if busy}
           <span class="spinner" aria-hidden="true"></span>
         {:else if list}
@@ -653,6 +798,7 @@
           aria-label="{recipientLabel(r)}{r.name ? `, ${r.email}` : ''}{list ? ', список рассылки' : ''}{ok ? '' : ', неверный адрес'}"
           aria-haspopup="menu"
           aria-busy={busy}
+          onpointerdown={(e) => onChipPointerDown(e, r)}
           ondblclick={(e) => showCard(r, e.currentTarget)}
           oncontextmenu={(e) => openMenu(e, i)}
           onkeydown={(e) => onChipKey(e, i, r)}>{recipientLabel(r)}</button
@@ -791,6 +937,24 @@
     background: var(--bg-layer-alt);
     cursor: text;
     transition: border-color var(--dur-fast) var(--ease-in);
+    /* Метка вставки при перетаскивании чипа стоит внутри рамки. */
+    position: relative;
+  }
+  /* Поле под перетаскиваемым чипом (п. 34). */
+  .box.drop {
+    border-color: var(--accent);
+    box-shadow: inset 0 0 0 1px var(--accent);
+  }
+  .drop-mark {
+    position: absolute;
+    width: 2px;
+    height: 24px;
+    border-radius: 1px;
+    background: var(--accent);
+    pointer-events: none;
+  }
+  .chip.dragged {
+    opacity: 0.45;
   }
   .box:focus-within {
     border-bottom: 2px solid var(--accent);

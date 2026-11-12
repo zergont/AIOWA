@@ -313,6 +313,8 @@ pub(crate) struct ComposeContext {
     /// Тело открытого черновика (очищенный HTML); у новой заготовки `None` — тело строится из подписи.
     body_html: Option<String>,
     draft: Option<DraftInfoDto>,
+    /// Важность письма (п. 35 обкатки): у заготовки обычная, у открытого черновика — его собственная.
+    importance: Importance,
 }
 
 /// Письмо из окна: получатели, тема, HTML редактора, пути файлов-вложений.
@@ -345,6 +347,9 @@ pub(crate) struct ComposeRequest {
     /// заменяется одним текстом из окна.
     #[serde(default)]
     without_quote: bool,
+    /// Важность, выбранная в композере: уходит с письмом и пишется в черновик.
+    #[serde(default)]
+    importance: Importance,
 }
 
 /// Локальный черновик композера для окна (`local_drafts` в базе): всё, что нужно, чтобы открыть
@@ -370,6 +375,8 @@ pub(crate) struct LocalDraftDto {
     #[serde(default)]
     removed_attachment_ids: Vec<String>,
     #[serde(default)]
+    importance: Importance,
+    #[serde(default)]
     updated_ms: i64,
 }
 
@@ -394,6 +401,7 @@ impl LocalDraftDto {
             body_html: self.body_html.clone(),
             attachments_json: json(&self.attachments)?,
             removed_json: json(&self.removed_attachment_ids)?,
+            importance: self.importance.as_str().to_string(),
             created_at: 0,
             updated_at: 0,
         })
@@ -420,6 +428,7 @@ impl LocalDraftDto {
             body_html: d.body_html,
             attachments: list(&d.attachments_json),
             removed_attachment_ids: list(&d.removed_json),
+            importance: Importance::parse(&d.importance),
             updated_ms: d.updated_at,
         }
     }
@@ -441,6 +450,7 @@ impl LocalDraftDto {
             body_html: req.body_html.clone(),
             attachments,
             removed_attachment_ids: req.removed_attachment_ids.clone(),
+            importance: req.importance,
             updated_ms: 0,
         }
     }
@@ -680,7 +690,7 @@ pub(crate) fn outgoing(req: &ComposeRequest, require_recipient: bool) -> CmdResu
         return Err("Укажите хотя бы одного получателя".into());
     }
     let body_html = crate::sanitize_keep_cid(&req.body_html);
-    Ok(OutgoingMessage { to, cc, bcc, subject: req.subject.trim().to_string(), body_html, importance: Importance::Normal })
+    Ok(OutgoingMessage { to, cc, bcc, subject: req.subject.trim().to_string(), body_html, importance: req.importance })
 }
 
 /// Идентификатор черновика из запроса; пустая строка — «черновика на сервере нет».
@@ -847,6 +857,7 @@ struct LocalDraft {
     files: Vec<AttachmentRow>,
     /// Инлайновые картинки из кэша для показа в редакторе (`DraftInfoDto::inline_images`).
     inline_images: HashMap<String, String>,
+    importance: Importance,
 }
 
 /// Получатели одного вида из строк базы (1 — Кому, 2 — Копия, 3 — Скрытая); без адреса SMTP не берутся.
@@ -878,6 +889,7 @@ fn local_draft(store: &Store, item_pk: i64) -> CmdResult<LocalDraft> {
     });
     let inline_images = inline_preview_urls(&atts);
     Ok(LocalDraft {
+        importance: head.importance.as_deref().map(Importance::parse).unwrap_or_default(),
         id: item.id,
         subject: head.subject.unwrap_or_default(),
         to: recipients_of(&rows, 1),
@@ -1187,6 +1199,21 @@ async fn create_draft_fresh(state: &AppState, sync: &SyncState, transport: &impl
         let fail = match tokio::time::timeout(CREATE_TIMEOUT, transport.create_draft(&kind, msg)).await {
             Ok(Ok(id)) => {
                 cs.clear_lost(local);
+                // У ответа и пересылки `CreateItem` важность не принимает: её пишет отдельный
+                // `UpdateItem`, не трогая тело с цитатой, которую сервер только что дописал.
+                if kind.reference().is_some() && msg.importance != Importance::Normal {
+                    return Ok(match step(sync, "UpdateItem", CREATE_TIMEOUT, transport.set_draft_importance(&id, msg.importance)).await {
+                        Ok(with_importance) => DraftTarget::Created(with_importance),
+                        Err(fail) => {
+                            // Черновик создан, важность не записана: вызывающий перепишет его целиком
+                            // (`Existing`). Попытка остаётся среди «потерянных»: не выйдет и это — повтор
+                            // найдёт тот же черновик, а не создаст второй.
+                            warn!(?reference_pk, why = %fail.message, "важность черновика не записана, черновик будет переписан целиком");
+                            cs.remember_lost(local, LostCreate::of(msg, started));
+                            DraftTarget::Existing(id)
+                        }
+                    });
+                }
                 return Ok(DraftTarget::Created(id));
             }
             Ok(Err(e)) if is_stale_object(&e) && !stale_retried && reference_pk.is_some() => {
@@ -1334,7 +1361,7 @@ pub(crate) async fn compose_context(kind: ComposeKindDto, item_pk: Option<i64>, 
     let own_addresses = own_addresses_of(&store, account, &state.user)?;
     let signature = signature_of(&store, account)?;
     if !kind.needs_reference() {
-        return Ok(ComposeContext { kind, reference_item_pk: None, to: vec![], cc: vec![], bcc: vec![], subject: String::new(), original: None, own_addresses, signature, body_html: None, draft: None });
+        return Ok(ComposeContext { kind, reference_item_pk: None, to: vec![], cc: vec![], bcc: vec![], subject: String::new(), original: None, own_addresses, signature, body_html: None, draft: None, importance: Importance::Normal });
     }
     let pk = item_pk.ok_or_else(|| "Не указано исходное письмо".to_string())?;
     // DTO читает файлы кэша (инлайновые картинки) — в блокирующем потоке.
@@ -1346,7 +1373,7 @@ pub(crate) async fn compose_context(kind: ComposeKindDto, item_pk: Option<i64>, 
     .map_err(err)??;
     let (to, cc) = reply_recipients(kind, original.from_name.as_deref(), original.from_email.as_deref(), &original.reply_to, &original.recipients, &own_addresses);
     let subject = subject_with_prefix(kind, original.subject.as_deref());
-    Ok(ComposeContext { kind, reference_item_pk: Some(pk), to, cc, bcc: vec![], subject, original: Some(original), own_addresses, signature, body_html: None, draft: None })
+    Ok(ComposeContext { kind, reference_item_pk: Some(pk), to, cc, bcc: vec![], subject, original: Some(original), own_addresses, signature, body_html: None, draft: None, importance: Importance::Normal })
 }
 
 /// Сверка с черновиком на сервере перед загрузкой и удалением вложений (`reconcile_with`): повтор
@@ -1446,14 +1473,14 @@ pub(crate) async fn compose_open_draft(item_pk: i64, state: State<'_, AppState>,
     let signature = signature_of(&store, account)?;
     let local = tauri::async_runtime::spawn_blocking(move || local_draft(&store, item_pk)).await.map_err(err)??;
     let inline_images = local.inline_images;
-    let (id, subject, to, cc, bcc, body_html, attachments) = match local.body_html {
+    let (id, subject, to, cc, bcc, body_html, attachments, importance) = match local.body_html {
         Some(body_html) => {
             let attachments: Vec<DraftAttachmentDto> = local
                 .files
                 .iter()
                 .map(|a| DraftAttachmentDto { attachment_pk: Some(a.attachment_pk), server_id: a.server_id.clone(), name: a.name.clone(), size: a.size, content_type: a.content_type.clone() })
                 .collect();
-            (local.id, local.subject, local.to, local.cc, local.bcc, body_html, attachments)
+            (local.id, local.subject, local.to, local.cc, local.bcc, body_html, attachments, local.importance)
         }
         None => {
             let transport = sync.transport().await.map_err(|e| e.to_string())?;
@@ -1466,7 +1493,7 @@ pub(crate) async fn compose_open_draft(item_pk: i64, state: State<'_, AppState>,
             let body_html = crate::sanitize_keep_cid(&draft.body_html);
             let attachments = draft.file_attachments().map(|a| DraftAttachmentDto::of(a, local.files.iter().find(|r| r.server_id == a.id).map(|r| r.attachment_pk))).collect();
             let (to, cc, bcc) = (people(&draft.to), people(&draft.cc), people(&draft.bcc));
-            (draft.id, draft.subject, to, cc, bcc, body_html, attachments)
+            (draft.id, draft.subject, to, cc, bcc, body_html, attachments, draft.importance)
         }
     };
     cs.remember(&id);
@@ -1483,6 +1510,7 @@ pub(crate) async fn compose_open_draft(item_pk: i64, state: State<'_, AppState>,
         signature,
         body_html: Some(body_html),
         draft: Some(DraftInfoDto { item_pk: Some(item_pk), server_id: id.id, change_key: id.change_key, attachments, inline_images }),
+        importance,
     })
 }
 
@@ -1888,8 +1916,10 @@ mod tests {
             removed_attachment_ids: vec![],
             local_draft_id: None,
             without_quote: false,
+            importance: Importance::High,
         };
         let msg = outgoing(&req, true).unwrap();
+        assert_eq!(msg.importance, Importance::High, "важность из окна уходит в письмо");
         assert_eq!(msg.subject, "Тема");
         assert_eq!(msg.to[0].email.as_deref(), Some("a@y.ru"));
         assert_eq!(msg.to[0].name.as_deref(), Some("Анна"));
