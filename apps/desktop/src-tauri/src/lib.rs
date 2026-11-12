@@ -923,6 +923,7 @@ pub fn run() {
             compose::signature_set,
             compose::signature_import_owa,
             compose::attachments_pick,
+            compose::attachment_drop,
             directory::directory_search,
             directory::contact_card,
             directory::contact_photos,

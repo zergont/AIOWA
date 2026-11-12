@@ -308,7 +308,8 @@
    * Кнопка в шапке области чтения. В «Черновиках» (п. 36) — сразу окно свежего черновика беседы,
    * главное окно после этого показывает «Входящие»; в остальных папках — окно беседы (п. 32).
    * Черновик, открытый в композере, переносит кнопка самого композера (шапки тогда нет): см.
-   * closeCompose.
+   * closeCompose. Пока в области чтения открыто письмо в работе, этой кнопки нет вовсе (п. 38):
+   * кнопка отдельного окна на экране одна — у композера, и уносит она письмо.
    */
   async function popOutSelected() {
     const c = selected;
@@ -2117,7 +2118,7 @@
   <div class="splitter" class:off={section !== "mail"} role="separator" aria-orientation="vertical" aria-label="Ширина списка" onpointerdown={startDrag}></div>
 
   <section class="reader" class:off={section !== "mail"} aria-label="Чтение" bind:this={readerEl}>
-    <ReadingPane conversation={multiCount ? null : selected} messages={multiCount ? [] : messages} loading={loadingMessages} onfetch={fetchMessage} {folders} {deletedFolderPk} archiveFolderPk={archiveFolder?.folder_pk ?? null} {draftsFolderPk} {multiCount} onaction={onMessageAction} oncompose={composeFromMessage} onopendraft={(itemPk) => openDraft(itemPk, selected?.conversation_pk ?? null)} onfindsent={findSentOfSelected} draftOpening={composeLoading === "draft"} composer={compose ? composerSnippet : undefined} {composerAlone} bind:topExpandedPk onmeeting={() => void rereadConversation()} onpopout={selected ? () => void popOutSelected() : undefined} popoutTitle={selectedFolder?.distinguished === "drafts" ? "Редактировать в отдельном окне" : undefined} />
+    <ReadingPane conversation={multiCount ? null : selected} messages={multiCount ? [] : messages} loading={loadingMessages} onfetch={fetchMessage} {folders} {deletedFolderPk} archiveFolderPk={archiveFolder?.folder_pk ?? null} {draftsFolderPk} {multiCount} onaction={onMessageAction} oncompose={composeFromMessage} onopendraft={(itemPk) => openDraft(itemPk, selected?.conversation_pk ?? null)} onfindsent={findSentOfSelected} draftOpening={composeLoading === "draft"} composer={compose ? composerSnippet : undefined} {composerAlone} bind:topExpandedPk onmeeting={() => void rereadConversation()} onpopout={selected && !compose ? () => void popOutSelected() : undefined} popoutTitle={selectedFolder?.distinguished === "drafts" ? "Редактировать в отдельном окне" : undefined} />
   </section>
 
   {#if calendarMounted}

@@ -347,6 +347,9 @@ pub fn new_guid() -> String {
 
 /// Транспорт почты. Все методы потокобезопасны и могут вызываться параллельно;
 /// реализация сама ограничивает число одновременных запросов.
+/// Отчёт о ходе загрузки вложений: `(отправлено, всего)` в байтах файлов.
+pub type UploadProgress = std::sync::Arc<dyn Fn(u64, u64) + Send + Sync>;
+
 #[async_trait]
 pub trait MailTransport: Send + Sync {
     /// Иерархия почтовых папок. `state` = `None` — полная выгрузка.
@@ -444,8 +447,9 @@ pub trait MailTransport: Send + Sync {
 
     /// Приложить файлы к черновику (`CreateAttachment`, по одному запросу на файл). Возвращает
     /// идентификатор черновика с актуальным `ChangeKey` (`RootItemChangeKey` последнего ответа):
-    /// именно его нужно передавать в `send_draft`.
-    async fn add_attachments(&self, item: &ItemId, files: &[OutgoingAttachment]) -> Result<ItemId>;
+    /// именно его нужно передавать в `send_draft`. `progress` — отчёт о ходе: сколько байт файлов
+    /// уже отдано на отправку и сколько их всего (вызывается много раз, в конце — с равными числами).
+    async fn add_attachments(&self, item: &ItemId, files: &[OutgoingAttachment], progress: Option<UploadProgress>) -> Result<ItemId>;
 
     /// Отправить черновик (`SendItem` с копией в «Отправленных»).
     async fn send_draft(&self, item: &ItemId) -> Result<()>;

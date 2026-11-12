@@ -269,7 +269,7 @@ impl MailTransport for Fake {
         Ok(ItemId { id: "draft".into(), change_key: Some("d1".into()) })
     }
 
-    async fn add_attachments(&self, item: &ItemId, _files: &[OutgoingAttachment]) -> TResult<ItemId> {
+    async fn add_attachments(&self, item: &ItemId, _files: &[OutgoingAttachment], _progress: Option<aiowa_transport::UploadProgress>) -> TResult<ItemId> {
         Ok(ItemId { id: item.id.clone(), change_key: Some("d2".into()) })
     }
 

@@ -2172,7 +2172,7 @@ async fn send_flow(t: &OwaTransport, msg: &OutgoingMessage, files: &[OutgoingAtt
         let mut current = draft.clone();
         if !files.is_empty() {
             let started = std::time::Instant::now();
-            current = t.add_attachments(&draft, files).await.map_err(|e| anyhow!("CreateAttachment: {e}"))?;
+            current = t.add_attachments(&draft, files, None).await.map_err(|e| anyhow!("CreateAttachment: {e}"))?;
             println!(
                 "CreateAttachment: Ok, файлов {} за {} мс; RootItemId {}, RootItemChangeKey {}",
                 files.len(),
@@ -2431,7 +2431,7 @@ async fn draft_check_flow(t: &OwaTransport, store: &Arc<Store>, account: Account
     let mut all_ok = true;
     let outcome = async {
         let started = std::time::Instant::now();
-        let current = t.add_attachments(&draft, std::slice::from_ref(&file)).await.map_err(|e| anyhow!("CreateAttachment: {e}"))?;
+        let current = t.add_attachments(&draft, std::slice::from_ref(&file), None).await.map_err(|e| anyhow!("CreateAttachment: {e}"))?;
         println!("CreateAttachment ({} байт): Ok за {} мс; RootItemId {}, RootItemChangeKey {}", file.bytes.len(), started.elapsed().as_millis(), if current.id == draft.id { "тот же" } else { "ДРУГОЙ" }, describe_change_key(&draft, &current));
 
         let started = std::time::Instant::now();

@@ -125,6 +125,7 @@ dependencies = [
  "tracing-appender",
  "tracing-subscriber",
  "url",
+ "uuid",
  "webview2-com",
  "windows",
 ]
@@ -192,6 +193,8 @@ dependencies = [
  "aiowa-transport",
  "async-trait",
  "base64 0.23.1",
+ "bytes",
+ "http-body",
  "jiff",
  "percent-encoding",
  "reqwest",

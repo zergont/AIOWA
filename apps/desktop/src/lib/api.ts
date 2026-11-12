@@ -355,6 +355,19 @@ export interface ExpandedQuote {
 }
 
 /** Заготовка композера от бэкенда: получатели и тема уже подобраны по виду письма. */
+/** Ход загрузки вложений на сервер (п. 39 обкатки): байты файлов, отданные на отправку, и их сумма. */
+export interface UploadProgress {
+  sent: number;
+  total: number;
+}
+
+/** Канал, по которому бэкенд сообщает о ходе загрузки вложений во время отправки и сохранения. */
+function uploadChannel(cb?: (p: UploadProgress) => void): Channel<UploadProgress> {
+  const ch = new Channel<UploadProgress>();
+  if (cb) ch.onmessage = cb;
+  return ch;
+}
+
 /** Важность письма, как её называет Exchange. */
 export type Importance = "Low" | "Normal" | "High";
 
@@ -1095,9 +1108,9 @@ export const api = {
   /** Заготовка композера: для ответа/пересылки itemPk — исходное письмо. */
   composeContext: (kind: ComposeKind, itemPk: number | null) => invoke<ComposeContext>("compose_context", { kind, itemPk }),
   /** Черновик → вложения → отправка; отказ после создания черновика приходит в SendReport (draft_saved). */
-  composeSend: (req: ComposeRequest) => invoke<SendReport>("compose_send", { req }),
+  composeSend: (req: ComposeRequest, onUpload?: (p: UploadProgress) => void) => invoke<SendReport>("compose_send", { req, onProgress: uploadChannel(onUpload) }),
   /** Сохранить черновик вместе с файлами (create или update по draft_server_id → новые файлы → удаление убранных), без отправки. */
-  composeSaveDraft: (req: ComposeRequest) => invoke<SendReport>("compose_save_draft", { req }),
+  composeSaveDraft: (req: ComposeRequest, onUpload?: (p: UploadProgress) => void) => invoke<SendReport>("compose_save_draft", { req, onProgress: uploadChannel(onUpload) }),
   /** Заготовка композера из черновика в базе (текст с сервера, если локального тела нет). */
   composeOpenDraft: (itemPk: number) => invoke<ComposeContext>("compose_open_draft", { itemPk }),
   /** Автосохранение: без draftServerId — create_draft, с ним — update_draft; вложения не трогает. */
@@ -1149,6 +1162,15 @@ export const api = {
   signatureImportOwa: () => invoke<SignatureDto>("signature_import_owa"),
   /** Системный диалог выбора файлов; отмена — пустой список. */
   attachmentsPick: () => invoke<PickedFile[]>("attachments_pick"),
+  /**
+   * Файл, брошенный в письмо (п. 37 обкатки): пути к нему у страницы нет, поэтому содержимое уходит
+   * телом вызова, а имя — заголовком (UTF-8 в base64: в заголовке допустим только ASCII). Бэкенд
+   * кладёт копию в данные приложения и возвращает её как выбранный файл.
+   */
+  attachmentDrop: async (file: File) => {
+    const name = btoa(String.fromCharCode(...new TextEncoder().encode(file.name)));
+    return invoke<PickedFile>("attachment_drop", new Uint8Array(await file.arrayBuffer()), { headers: { "x-file-name": name } });
+  },
 
   // --- окно --------------------------------------------------------------------------------
   /** Пока в композере несохранённое письмо: крестик и Alt+F4 не закрывают окно, а шлют событие close-requested. */

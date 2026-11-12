@@ -457,9 +457,19 @@ async fn send_message_with_attachments() {
         OutgoingAttachment { name: "data.bin".into(), content_type: None, bytes: vec![0, 1, 2, 3, 255] },
     ];
     let stale = draft.clone();
-    let draft = t.add_attachments(&draft, &files).await.unwrap();
+    // Ход загрузки: тело запроса уходит с отчётом (и с Content-Length — иначе сервер его не прочёл бы),
+    // числа — в байтах файлов, не убывают и кончаются полной суммой.
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<(u64, u64)>::new()));
+    let sink = seen.clone();
+    let progress: aiowa_transport::UploadProgress = std::sync::Arc::new(move |sent, total| sink.lock().unwrap().push((sent, total)));
+    let draft = t.add_attachments(&draft, &files, Some(progress)).await.unwrap();
     assert_eq!(draft.id, stale.id);
     assert_ne!(draft.change_key, stale.change_key);
+    let seen = seen.lock().unwrap().clone();
+    let total = files.iter().map(|f| f.bytes.len() as u64).sum::<u64>();
+    assert!(seen.len() >= files.len() * 2, "отчёт и по ходу тела, и по концу каждого файла: {seen:?}");
+    assert!(seen.iter().all(|(_, t)| *t == total) && seen.windows(2).all(|w| w[0].0 <= w[1].0), "{seen:?}");
+    assert_eq!(seen.last().copied(), Some((total, total)));
     {
         let st = server.state();
         let calls = st.calls_of("CreateAttachment");

@@ -30,6 +30,7 @@ keyring.workspace = true
 secrecy.workspace = true
 tokio.workspace = true
 base64.workspace = true
+uuid.workspace = true
 percent-encoding.workspace = true
 url.workspace = true
 # Внешние картинки писем по кнопке (`external_images.rs`): отдельный клиент без cookies и Referer.

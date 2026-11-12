@@ -15,7 +15,7 @@ use aiowa_core::{
 };
 use aiowa_transport::{
     async_trait, AttachmentContent, Credentials, DeleteMode, FolderCounts, ItemFetchShape, ItemResult, MailTransport, NotificationEvent, NotificationKind, Result, ServerInfo, StreamEnd, SubscriptionRequest,
-    SubscriptionResult, TransportError, WriteResult,
+    SubscriptionResult, TransportError, UploadProgress, WriteResult,
  ResolvedPerson,};
 use base64::prelude::*;
 use jiff::Timestamp;
@@ -296,6 +296,44 @@ fn truncate(s: &str, n: usize) -> String {
     out
 }
 
+/// Отчёт тела запроса о ходе отправки: `(отдано, всего)` в байтах тела.
+type SentFn = Arc<dyn Fn(u64, u64) + Send + Sync>;
+
+/// Сколько байт тела отдаётся сети за раз: мельче — чаще отчёт, но больше возни.
+const UPLOAD_CHUNK: usize = 64 * 1024;
+
+/// Тело запроса, которое сообщает, сколько байт уже отдано на отправку (п. 39 обкатки: ход
+/// загрузки вложения). Длина известна заранее, поэтому запрос уходит с `Content-Length`.
+struct ProgressBody {
+    data: bytes::Bytes,
+    pos: usize,
+    on_sent: SentFn,
+}
+
+impl http_body::Body for ProgressBody {
+    type Data = bytes::Bytes;
+    type Error = std::convert::Infallible;
+
+    fn poll_frame(mut self: std::pin::Pin<&mut Self>, _cx: &mut std::task::Context<'_>) -> std::task::Poll<Option<std::result::Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        if self.pos >= self.data.len() {
+            return std::task::Poll::Ready(None);
+        }
+        let end = (self.pos + UPLOAD_CHUNK).min(self.data.len());
+        let chunk = self.data.slice(self.pos..end);
+        self.pos = end;
+        (self.on_sent)(end as u64, self.data.len() as u64);
+        std::task::Poll::Ready(Some(Ok(http_body::Frame::data(chunk))))
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.pos >= self.data.len()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        http_body::SizeHint::with_exact((self.data.len() - self.pos) as u64)
+    }
+}
+
 /// Ответ пробного GET `service.svc/s/<op>` (`OwaTransport::service_get_probe`).
 #[derive(Debug, Clone)]
 pub struct ServiceGetReply {
@@ -555,10 +593,24 @@ impl OwaTransport {
 
     /// Готовое тело запроса под разрешением семафора с одной попыткой повторного входа.
     async fn call_payload(&self, op: &str, payload: Vec<u8>, timeout: Option<Duration>, idempotent: bool) -> Result<Value> {
+        self.call_bytes(op, payload.into(), timeout, idempotent, None).await
+    }
+
+    /// Вызов с телом, которое сообщает о ходе отправки (`on_sent(отправлено, всего)` в байтах
+    /// тела): загрузка вложения идёт минутами, и окно показывает её ход.
+    async fn call_upload(&self, op: &str, version: &str, body: Value, timeout: Option<Duration>, on_sent: SentFn) -> Result<Value> {
+        let env = protocol::envelope(op, version, &self.inner.config.time_zone, body);
+        let payload = serde_json::to_vec(&env).map_err(|e| TransportError::Protocol { op: op.into(), status: 0, raw: e.to_string() })?;
+        self.call_bytes(op, payload.into(), timeout, is_idempotent(op), Some(on_sent)).await
+    }
+
+    /// Запрос с одной попыткой повторного входа. Тело — `Bytes`: повтор не копирует его заново
+    /// (вложение в base64 — до ~33 МБ).
+    async fn call_bytes(&self, op: &str, payload: bytes::Bytes, timeout: Option<Duration>, idempotent: bool, on_sent: Option<SentFn>) -> Result<Value> {
         let _permit = self.inner.permits.acquire().await.map_err(|_| TransportError::Cancelled)?;
         for attempt in 0..2 {
             let generation = self.inner.generation.load(Ordering::SeqCst);
-            match self.call_once(op, payload.clone(), timeout, idempotent).await {
+            match self.call_once_with(op, payload.clone(), timeout, idempotent, on_sent.clone()).await {
                 Err(e) if e.needs_reauth() && attempt == 0 => {
                     self.relogin_once(generation).await?;
                 }
@@ -569,6 +621,10 @@ impl OwaTransport {
     }
 
     async fn call_once(&self, op: &str, payload: Vec<u8>, timeout: Option<Duration>, idempotent: bool) -> Result<Value> {
+        self.call_once_with(op, payload.into(), timeout, idempotent, None).await
+    }
+
+    async fn call_once_with(&self, op: &str, payload: bytes::Bytes, timeout: Option<Duration>, idempotent: bool, on_sent: Option<SentFn>) -> Result<Value> {
         let inner = &self.inner;
         let id = inner.action_id.fetch_sub(1, Ordering::SeqCst);
         let mut url = inner.base.join("owa/service.svc").expect("url");
@@ -585,7 +641,13 @@ impl OwaTransport {
             headers.insert("X-OWA-ClientBuildVersion", v);
         }
         let started = std::time::Instant::now();
-        let mut req = inner.client.post(url).headers(headers).body(payload);
+        // Тело с отчётом о ходе отдаёт себя частями и знает свою длину: запрос уходит с
+        // `Content-Length`, как обычный. Повторить его при сетевом сбое нельзя (`send_retrying`).
+        let body = match on_sent {
+            Some(on_sent) => reqwest::Body::wrap(ProgressBody { data: payload, pos: 0, on_sent }),
+            None => reqwest::Body::from(payload),
+        };
+        let mut req = inner.client.post(url).headers(headers).body(body);
         if let Some(t) = timeout {
             req = req.timeout(t);
         }
@@ -1790,11 +1852,27 @@ impl MailTransport for OwaTransport {
         protocol::parse_created_item_id(m).ok_or_else(|| TransportError::Protocol { op: "CreateItem".into(), status: 200, raw: format!("нет Items[0].ItemId: {}", protocol::json_shape(m, 2)) })
     }
 
-    async fn add_attachments(&self, item: &ItemId, files: &[OutgoingAttachment]) -> Result<ItemId> {
+    async fn add_attachments(&self, item: &ItemId, files: &[OutgoingAttachment], progress: Option<UploadProgress>) -> Result<ItemId> {
         let mut current = item.clone();
+        let total: u64 = files.iter().map(|f| f.bytes.len() as u64).sum();
+        let mut done: u64 = 0;
         for (i, f) in files.iter().enumerate() {
             let body = protocol::create_attachment_body(&current, f);
-            let v = self.call_with_timeout("CreateAttachment", protocol::V_2017, body, Some(self.inner.config.upload_timeout)).await?;
+            let size = f.bytes.len() as u64;
+            let timeout = Some(self.inner.config.upload_timeout);
+            let v = match &progress {
+                Some(report) => {
+                    // Тело запроса — JSON с base64: его отправленная доля переводится в байты файла.
+                    let (report, base) = (report.clone(), done);
+                    let on_sent: SentFn = Arc::new(move |sent, of| report(base + (size as u128 * sent as u128 / of.max(1) as u128) as u64, total));
+                    self.call_upload("CreateAttachment", protocol::V_2017, body, timeout, on_sent).await?
+                }
+                None => self.call_with_timeout("CreateAttachment", protocol::V_2017, body, timeout).await?,
+            };
+            done += size;
+            if let Some(report) = &progress {
+                report(done, total);
+            }
             let m = Self::first_message("CreateAttachment", &v)?;
             Self::log_shape("CreateAttachment", m);
             match protocol::parse_attachment_root(m) {

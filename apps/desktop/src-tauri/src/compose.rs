@@ -39,7 +39,7 @@ use crate::{build_message, err, prepare_attachments, AppState, CmdResult, Compos
 use aiowa_core::{AccountId, AttachmentMeta, BodyType, ComposeKind, DistinguishedFolder, DraftContent, FolderRef, Importance, ItemId, MessageFull, MessageMeta, OutgoingAttachment, OutgoingMessage, Participant};
 use aiowa_store::ui::RecipientRow;
 use aiowa_store::{AttachmentRow, LocalDraft as StoredDraft, Store};
-use aiowa_transport::{DeleteMode, ItemFetchShape, ItemResult, MailTransport, TransportError, WriteResult};
+use aiowa_transport::{DeleteMode, ItemFetchShape, ItemResult, MailTransport, TransportError, UploadProgress, WriteResult};
 use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -47,6 +47,7 @@ use std::future::Future;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tauri::ipc::Channel;
 use tauri::{AppHandle, Manager, State};
 use tracing::{debug, info, warn};
 
@@ -1060,6 +1061,32 @@ fn quote_of(pk: i64, got: Option<ItemResult>) -> Result<String, ComposeFail> {
     }
 }
 
+/// Ход загрузки вложений для окна (п. 39 обкатки): байты файлов, отданные на отправку, и их сумма.
+#[derive(Debug, Clone, Copy, Serialize)]
+pub(crate) struct UploadProgressDto {
+    sent: u64,
+    total: u64,
+}
+
+/// Отчёт транспорта о загрузке вложений — в канал окна: не чаще раза в 100 мс, конец — всегда.
+fn upload_reporter(channel: Channel<UploadProgressDto>) -> UploadProgress {
+    let last = std::sync::Mutex::new(None::<Instant>);
+    Arc::new(move |sent, total| {
+        let mut last = last.lock().unwrap_or_else(|p| p.into_inner());
+        if sent >= total || last.is_none_or(|t| t.elapsed() >= Duration::from_millis(100)) {
+            *last = Some(Instant::now());
+            let _ = channel.send(UploadProgressDto { sent, total });
+        }
+    })
+}
+
+/// Куда писать письмо (`write_draft`): `existing` — черновик уже на сервере (иначе создаётся новый),
+/// `progress` — отчёт о загрузке вложений.
+struct DraftWrite<'a> {
+    existing: Option<&'a str>,
+    progress: UploadProgress,
+}
+
 /// Чем кончилась запись черновика с вложениями (`write_draft`), если не всем.
 enum DraftFailure {
     /// Черновика на сервере нет или он не обновлён: ошибка команды.
@@ -1073,8 +1100,9 @@ enum DraftFailure {
 /// (`rewrite_draft`); затем сверка с сервером, новые файлы и удаление убранных. `prepared` — то,
 /// что вернул `prepare`. Ключ черновика запоминается после каждого шага. Возвращает черновик и
 /// признак, что вложения менялись.
-async fn write_draft(state: &AppState, sync: &SyncState, transport: &impl MailTransport, cs: &ComposeState, req: &ComposeRequest, prepared: (ComposeKind, OutgoingMessage, Vec<OutgoingAttachment>), existing: Option<&str>) -> Result<(ItemId, bool), DraftFailure> {
+async fn write_draft(state: &AppState, sync: &SyncState, transport: &impl MailTransport, cs: &ComposeState, req: &ComposeRequest, prepared: (ComposeKind, OutgoingMessage, Vec<OutgoingAttachment>), how: DraftWrite<'_>) -> Result<(ItemId, bool), DraftFailure> {
     let (kind, mut msg, files) = prepared;
+    let DraftWrite { existing, progress } = how;
     let target = match existing {
         Some(sid) => DraftTarget::Existing(cs.item_id(sid)),
         None => create_draft_fresh(state, sync, transport, cs, kind, &msg, req).await.map_err(DraftFailure::Before)?,
@@ -1092,7 +1120,7 @@ async fn write_draft(state: &AppState, sync: &SyncState, transport: &impl MailTr
     };
     let touched = !files.is_empty() || !removed.is_empty();
     if !files.is_empty() {
-        match step(sync, "CreateAttachment", ATTACH_TIMEOUT, transport.add_attachments(&current, &files)).await {
+        match step(sync, "CreateAttachment", ATTACH_TIMEOUT, transport.add_attachments(&current, &files, Some(progress))).await {
             Ok(id) => {
                 cs.remember(&id);
                 current = id;
@@ -1399,7 +1427,7 @@ async fn reconcile(sync: &SyncState, transport: &impl MailTransport, item: &Item
 /// на сервере (`draft_server_id`), он обновляется вместо создания, новые файлы прикладываются,
 /// убранные удаляются, и уходит он же.
 #[tauri::command]
-pub(crate) async fn compose_send(req: ComposeRequest, app: AppHandle, state: State<'_, AppState>, sync: State<'_, Arc<SyncState>>, cs: State<'_, ComposeState>) -> Result<SendReport, ComposeFail> {
+pub(crate) async fn compose_send(req: ComposeRequest, on_progress: Channel<UploadProgressDto>, app: AppHandle, state: State<'_, AppState>, sync: State<'_, Arc<SyncState>>, cs: State<'_, ComposeState>) -> Result<SendReport, ComposeFail> {
     const NOT_SENT: &str = "Письмо не отправлено, текст остался в этом окне";
     let _busy = cs.sending.try_lock().map_err(|_| ComposeFail::fixed("Отправка уже идёт"))?;
     let (kind, msg, files) = prepare(&state, &req, true).await?;
@@ -1409,7 +1437,7 @@ pub(crate) async fn compose_send(req: ComposeRequest, app: AppHandle, state: Sta
     let (to, cc, bcc) = (msg.to.len(), msg.cc.len(), msg.bcc.len());
     let started = Instant::now();
     let transport = sync.transport().await.map_err(|e| ComposeFail::connect(&e).prefixed(NOT_SENT))?;
-    let (current, touched) = match write_draft(&state, &sync, &transport, &cs, &req, (kind, msg, files), existing.as_deref()).await {
+    let (current, touched) = match write_draft(&state, &sync, &transport, &cs, &req, (kind, msg, files), DraftWrite { existing: existing.as_deref(), progress: upload_reporter(on_progress) }).await {
         Ok(v) => v,
         Err(DraftFailure::Before(why)) => {
             warn!(kind = ?req.kind, ?existing, ms = started.elapsed().as_millis() as u64, why = %why.message, retry = why.retry, "отправка: черновик не создан или не обновлён");
@@ -1436,6 +1464,7 @@ pub(crate) async fn compose_send(req: ComposeRequest, app: AppHandle, state: Sta
                 drop_local_draft(&app, &state.store, state.account, sid);
             }
             forget_local_draft(&state.store, req.local_draft_id.as_deref());
+            forget_dropped(&state.store, &req.attachments);
             info!(kind = ?req.kind, to, cc, bcc, attachments = attached, existing_draft = existing.is_some(), ms = started.elapsed().as_millis() as u64, "письмо отправлено");
             Ok(SendReport { sent: true, ..SendReport::default() })
         }
@@ -1687,7 +1716,7 @@ pub(crate) async fn compose_discard_draft(draft_server_id: String, app: AppHandl
 /// Получатели не обязательны. В ответе — черновик (`draft`) и, если вложения менялись, их список
 /// на сервере; если текст сохранён, а с вложениями не вышло, — `message` с причиной.
 #[tauri::command]
-pub(crate) async fn compose_save_draft(req: ComposeRequest, state: State<'_, AppState>, sync: State<'_, Arc<SyncState>>, cs: State<'_, ComposeState>) -> Result<SendReport, ComposeFail> {
+pub(crate) async fn compose_save_draft(req: ComposeRequest, on_progress: Channel<UploadProgressDto>, state: State<'_, AppState>, sync: State<'_, Arc<SyncState>>, cs: State<'_, ComposeState>) -> Result<SendReport, ComposeFail> {
     const NOT_SAVED: &str = "Черновик не сохранён на сервере, текст остался в этом окне";
     let _busy = cs.sending.try_lock().map_err(|_| ComposeFail::fixed("Отправка уже идёт"))?;
     let (kind, msg, files) = prepare(&state, &req, false).await?;
@@ -1695,7 +1724,7 @@ pub(crate) async fn compose_save_draft(req: ComposeRequest, state: State<'_, App
     let attached = files.len();
     let started = Instant::now();
     let transport = sync.transport().await.map_err(|e| ComposeFail::connect(&e).prefixed(NOT_SAVED))?;
-    let (id, touched, why) = match write_draft(&state, &sync, &transport, &cs, &req, (kind, msg, files), existing.as_deref()).await {
+    let (id, touched, why) = match write_draft(&state, &sync, &transport, &cs, &req, (kind, msg, files), DraftWrite { existing: existing.as_deref(), progress: upload_reporter(on_progress) }).await {
         Ok((id, touched)) => (id, touched, None),
         Err(DraftFailure::Before(why)) => {
             warn!(kind = ?req.kind, ?existing, ms = started.elapsed().as_millis() as u64, why = %why.message, retry = why.retry, "сохранение черновика не удалось");
@@ -1773,9 +1802,96 @@ pub(crate) async fn attachments_pick(app: AppHandle) -> CmdResult<Vec<PickedFile
     .map_err(err)?
 }
 
+// --- файлы, перетащенные в письмо (п. 37 обкатки) ---------------------------------------------
+// Странице окна путь к брошенному файлу недоступен — только содержимое. Окно отдаёт его телом
+// вызова, приложение кладёт копию рядом с базой учётной записи (`dropped/<случайное имя>/<имя
+// файла>`), и дальше это такое же вложение-по-пути, как файл из диалога. Копия убирается после
+// отправки письма; оставшиеся (письмо закрыли, не отправив) — через `DROPPED_KEEP`, если на них
+// не ссылается локальный черновик.
+
+const DROPPED_KEEP: Duration = Duration::from_secs(3 * 24 * 3600);
+
+fn dropped_dir(store: &Store) -> std::path::PathBuf {
+    store.path().parent().map(Path::to_path_buf).unwrap_or_default().join("dropped")
+}
+
+/// Имя брошенного файла, годное для диска: без пути, управляющих и запрещённых в Windows знаков,
+/// без точек и пробелов по краям; пустое — «вложение».
+pub(crate) fn dropped_file_name(raw: &str) -> String {
+    let base = raw.rsplit(['/', '\\']).next().unwrap_or("");
+    let clean: String = base.chars().map(|c| if c.is_control() || matches!(c, '<' | '>' | ':' | '"' | '|' | '?' | '*') { '_' } else { c }).collect();
+    let clean: String = clean.trim_matches(|c: char| c == '.' || c.is_whitespace()).chars().take(150).collect();
+    if clean.is_empty() { "вложение".into() } else { clean }
+}
+
+/// Убрать копии файлов отправленного письма (только те, что лежат в `dropped`).
+fn forget_dropped(store: &Store, paths: &[String]) {
+    let root = dropped_dir(store);
+    for p in paths {
+        let Some(dir) = Path::new(p.trim()).parent() else { continue };
+        if dir.parent() == Some(root.as_path())
+            && let Err(e) = std::fs::remove_dir_all(dir)
+        {
+            warn!(error = %e, "копия перетащенного файла не убрана");
+        }
+    }
+}
+
+/// Убрать копии старше `DROPPED_KEEP`, на которые не ссылается ни один локальный черновик.
+fn sweep_dropped(store: &Store, account: AccountId) {
+    let Ok(entries) = std::fs::read_dir(dropped_dir(store)) else { return };
+    let referenced: String = store.local_drafts(account).map(|ds| ds.into_iter().map(|d| d.attachments_json).collect()).unwrap_or_default();
+    let mut removed = 0usize;
+    for e in entries.flatten() {
+        let old = e.metadata().and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok()).is_some_and(|age| age > DROPPED_KEEP);
+        let name = e.file_name();
+        if old && !name.to_str().is_some_and(|n| referenced.contains(n)) && std::fs::remove_dir_all(e.path()).is_ok() {
+            removed += 1;
+        }
+    }
+    if removed > 0 {
+        info!(removed, "старые копии перетащенных файлов убраны");
+    }
+}
+
+/// Файл, брошенный в письмо: содержимое — тело вызова, имя — заголовок `x-file-name` (UTF-8 в
+/// base64: в заголовке допустим только ASCII). Возвращает копию как выбранный файл.
+#[tauri::command(async)]
+pub(crate) fn attachment_drop(request: tauri::ipc::Request<'_>, state: State<'_, AppState>) -> CmdResult<PickedFile> {
+    use base64::Engine as _;
+    static SWEPT: std::sync::Once = std::sync::Once::new();
+    SWEPT.call_once(|| sweep_dropped(&state.store, state.account));
+    let tauri::ipc::InvokeBody::Raw(bytes) = request.body() else {
+        return Err("Содержимое файла не получено".into());
+    };
+    let raw_name = request.headers().get("x-file-name").and_then(|v| base64::engine::general_purpose::STANDARD.decode(v.as_bytes()).ok()).and_then(|b| String::from_utf8(b).ok()).unwrap_or_default();
+    let name = dropped_file_name(&raw_name);
+    check_sizes(&[(name.clone(), bytes.len() as u64)])?;
+    let dir = dropped_dir(&state.store).join(uuid::Uuid::new_v4().simple().to_string());
+    let path = dir.join(&name);
+    std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(&path, bytes)).map_err(|e| {
+        warn!(error = %e, bytes = bytes.len(), "перетащенный файл не сохранён");
+        let _ = std::fs::remove_dir_all(&dir);
+        format!("Не удалось сохранить файл «{name}»")
+    })?;
+    debug!(bytes = bytes.len(), "перетащенный файл сохранён для вложения");
+    Ok(PickedFile { path: path.display().to_string(), name, size: bytes.len() as u64 })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dropped_file_name_is_safe_for_disk() {
+        assert_eq!(dropped_file_name("отчёт за 01.11.pdf"), "отчёт за 01.11.pdf");
+        assert_eq!(dropped_file_name("C:\\папка\\счёт.xlsx"), "счёт.xlsx");
+        assert_eq!(dropped_file_name("a/b/../план?*.docx"), "план__.docx");
+        assert_eq!(dropped_file_name("  имя. "), "имя");
+        assert_eq!(dropped_file_name(""), "вложение");
+        assert_eq!(dropped_file_name("..."), "вложение");
+        assert_eq!(dropped_file_name(&"я".repeat(400)).chars().count(), 150);
+    }
 
     fn r(kind: i64, name: Option<&str>, email: Option<&str>) -> RecipientDto {
         RecipientDto { kind, name: name.map(String::from), email: email.map(String::from) }

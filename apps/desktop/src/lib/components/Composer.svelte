@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onDestroy, onMount, tick, untrack } from "svelte";
-  import { api, errorMessage, failNetwork, failOriginalGone, failRetryable, formatSize, fullDate, isInlinePicture, messageNeedsFetch, onSyncProgress, personLabel, type ComposeContext, type ComposeRecipient, type ComposeRequest, type DraftAttachment, type DraftRef, type Importance, type LocalDraft, type Message, type PickedFile, type SignatureDto } from "../api";
+  import { api, errorMessage, failNetwork, failOriginalGone, failRetryable, formatSize, fullDate, isInlinePicture, messageNeedsFetch, onSyncProgress, personLabel, type ComposeContext, type ComposeRecipient, type ComposeRequest, type DraftAttachment, type DraftRef, type Importance, type LocalDraft, type Message, type PickedFile, type SignatureDto, type UploadProgress } from "../api";
   import { COMPOSE_TITLE, ICON } from "../actions";
   import { isValidEmail, mergeRecipients } from "../addresses";
   import { cleanDraftHtml, htmlToText, restoreDraftHtml } from "../html";
@@ -217,6 +217,12 @@
   }
 
   let error = $state<string | null>(null);
+  /** Ход загрузки вложений, пока идёт отправка или сохранение (п. 39 обкатки); null — файлы не грузятся. */
+  let upload = $state<UploadProgress | null>(null);
+  const onUpload = (p: UploadProgress) => {
+    if (alive && p.total > 0) upload = p;
+  };
+  const uploadPercent = $derived(upload ? Math.min(100, Math.floor((upload.sent / upload.total) * 100)) : 0);
   let lastAction = $state<"send" | "draft" | null>(null);
   /**
    * Оригинала ответа или пересылки больше нет, цитату не собрать (`original_gone`): какое действие
@@ -236,6 +242,10 @@
   // body. Тогда клавиши окна (E, Ctrl+R, Ctrl+Z) сочли бы, что фокус вне композера, и сработали бы
   // на беседу под ним. Поэтому на время занятости фокус переходит на сам композер — до того, как
   // поля выключатся ($effect.pre), — а после возвращается туда, где был.
+  $effect(() => {
+    // Действие кончилось: следующая отправка начнёт отсчёт загрузки заново.
+    if (busy == null) upload = null;
+  });
   let focusBeforeBusy: HTMLElement | null = null;
   $effect.pre(() => {
     if (busy == null) return;
@@ -254,6 +264,44 @@
       focusBeforeBusy = null;
       if (el?.isConnected && document.activeElement === root) el.focus({ preventScroll: true });
     });
+  });
+  // --- строка кнопок в одну строку (п. 38 обкатки) -------------------------------------------
+  // Кнопок много, область чтения бывает узкой. Чтобы строка не переносилась, подписи по очереди
+  // сменяются значками: «Сохранить черновик», затем «Отменить», затем «Отправить». Сколько
+  // убрать, решает замер: уровень повышается, пока кнопки не встанут в одну строку (ширина
+  // зависит от заголовка письма, кнопки «Совет» и надписи о ходе отправки — порогом её не задать).
+  let barEl = $state<HTMLElement | null>(null);
+  let squeeze = $state(0);
+  function fitBar() {
+    const bar = barEl;
+    if (!bar) return;
+    const wrapped = () => {
+      const kids = Array.from(bar.children, (k) => k.getBoundingClientRect());
+      return kids.length > 1 && kids.some((r) => r.top > kids[0].bottom - 2);
+    };
+    let level = 0;
+    // Атрибут ставится сразу в DOM: замер следующего уровня нужен до перерисовки.
+    for (bar.dataset.squeeze = "0"; level < 3 && wrapped(); bar.dataset.squeeze = String(level)) level++;
+    squeeze = level;
+  }
+  $effect(() => {
+    const bar = barEl;
+    if (!bar) return;
+    let width = -1;
+    const ro = new ResizeObserver(() => {
+      // Высота меняется от самого подбора (перенос пропал) — пересчитывать нужно только по ширине.
+      const w = Math.round(bar.getBoundingClientRect().width);
+      if (w === width) return;
+      width = w;
+      fitBar();
+    });
+    ro.observe(bar);
+    return () => ro.disconnect();
+  });
+  $effect(() => {
+    // Состав строки изменился (надпись о ходе, «Совет», заголовок): подобрать заново после перерисовки.
+    void [busy, title, adviceStatus?.available, droppingStray];
+    void tick().then(fitBar);
   });
   let cancelBtn = $state<HTMLButtonElement | null>(null);
   let sigBtn = $state<HTMLButtonElement | null>(null);
@@ -591,7 +639,7 @@
     lastSaveAt = Date.now();
     try {
       if (files) {
-        const rep = await api.composeSaveDraft(saveRequest());
+        const rep = await api.composeSaveDraft(saveRequest(), onUpload);
         if (!alive) return null;
         if (rep.draft) draftRef = rep.draft;
         if (rep.attachments) applyServerFiles(rep.attachments);
@@ -654,7 +702,7 @@
       // Идущее автосохранение должно закончиться: отправка пойдёт по его черновику.
       await autosavePromise;
       const key = snapshot;
-      const rep = await api.composeSend(request());
+      const rep = await api.composeSend(request(), onUpload);
       if (!alive) return;
       if (rep.sent) {
         finish("sent");
@@ -968,6 +1016,96 @@
   function removeFile(path: string) {
     attachments = attachments.filter((a) => a.path !== path);
   }
+
+  // --- файлы, перетащенные в письмо (п. 37 обкатки) ------------------------------------------
+  // Файл из Проводника, брошенный в любое место письма, становится вложением. Слушаем сам
+  // композер на фазе перехвата: иначе файл, брошенный на текст, браузер вставил бы картинкой.
+
+  /** Над письмом тянут файлы: показывается подсказка. Счётчик — входы минус выходы по вложенным элементам. */
+  let dropDepth = 0;
+  let dropActive = $state(false);
+  /** Сколько брошенных файлов ещё сохраняется. */
+  let dropSaving = $state(0);
+  const carriesFiles = (e: DragEvent) => Array.from(e.dataTransfer?.types ?? []).includes("Files");
+
+  function onFilesEnter(e: DragEvent) {
+    if (!carriesFiles(e)) return;
+    e.preventDefault();
+    dropDepth++;
+    dropActive = true;
+  }
+  function onFilesOver(e: DragEvent) {
+    if (!carriesFiles(e)) return;
+    e.preventDefault();
+    if (e.dataTransfer) e.dataTransfer.dropEffect = busy ? "none" : "copy";
+  }
+  function onFilesLeave(e: DragEvent) {
+    if (!carriesFiles(e)) return;
+    dropDepth = Math.max(0, dropDepth - 1);
+    if (dropDepth === 0) dropActive = false;
+  }
+  function onFilesDrop(e: DragEvent) {
+    if (!carriesFiles(e)) return;
+    e.preventDefault();
+    e.stopPropagation();
+    dropDepth = 0;
+    dropActive = false;
+    if (busy) return;
+    // Файлы берутся из события сразу: после первого await список в нём уже пуст.
+    const files: File[] = [];
+    let folders = 0;
+    for (const it of Array.from(e.dataTransfer?.items ?? [])) {
+      if (it.kind !== "file") continue;
+      if (it.webkitGetAsEntry?.()?.isDirectory) folders++;
+      else {
+        const f = it.getAsFile();
+        if (f) files.push(f);
+      }
+    }
+    void attachDropped(files, folders);
+  }
+
+  async function attachDropped(files: File[], folders: number) {
+    const problems: string[] = [];
+    if (folders) problems.push("папки не вкладываются, только файлы");
+    let total = attachments.reduce((s, a) => s + a.size, 0);
+    dropSaving += files.length;
+    for (const f of files) {
+      try {
+        if (f.size > FILE_MAX) problems.push(`«${f.name}» больше 25 МБ`);
+        else if (total + f.size > TOTAL_MAX) problems.push(`«${f.name}» не поместился: вложения вместе больше 35 МБ`);
+        else {
+          const picked = await api.attachmentDrop(f);
+          if (!alive) return;
+          attachments = [...attachments, picked];
+          total += picked.size;
+        }
+      } catch (e) {
+        problems.push(`«${f.name}»: ${errorMessage(e)}`);
+      } finally {
+        dropSaving--;
+      }
+    }
+    if (problems.length && alive) {
+      error = `Не всё вложено: ${problems.join("; ")}.`;
+      lastAction = null;
+    }
+  }
+
+  $effect(() => {
+    const el = root;
+    if (!el) return;
+    el.addEventListener("dragenter", onFilesEnter, true);
+    el.addEventListener("dragover", onFilesOver, true);
+    el.addEventListener("dragleave", onFilesLeave, true);
+    el.addEventListener("drop", onFilesDrop, true);
+    return () => {
+      el.removeEventListener("dragenter", onFilesEnter, true);
+      el.removeEventListener("dragover", onFilesOver, true);
+      el.removeEventListener("dragleave", onFilesLeave, true);
+      el.removeEventListener("drop", onFilesDrop, true);
+    };
+  });
   function removeServerFile(serverId: string) {
     if (!removedServerIds.includes(serverId)) removedServerIds = [...removedServerIds, serverId];
   }
@@ -1000,14 +1138,25 @@
 <svelte:window onkeydown={onWindowKey} />
 
 <section class="composer" class:standalone bind:this={root} tabindex="-1" aria-label={title} aria-busy={busy != null}>
-  <div class="bar">
+  {#if dropActive}
+    <!-- Подсказка, пока над письмом тянут файлы (п. 37); события мыши проходят сквозь неё. -->
+    <div class="drop-veil" aria-hidden="true"><span class="drop-hint">{busy ? "Подожди: письмо отправляется или сохраняется" : "Отпусти файлы — они станут вложениями"}</span></div>
+  {/if}
+  <div class="bar" bind:this={barEl} data-squeeze={squeeze}>
     <span class="kind">{title}</span>
-    <button class="btn primary" onclick={send} disabled={busy != null} title={hint("Отправить", "composer-send")}>
+    <!-- В узкой области чтения подписи трёх кнопок по очереди уступают место значкам (fitBar): строка остаётся одной. -->
+    <button class="btn primary act-send" onclick={send} disabled={busy != null} title={hint("Отправить", "composer-send")} aria-label="Отправить">
       <svg width="14" height="14" viewBox="0 0 16 16" aria-hidden="true"><path d="M2 8 14 2.5 11.5 14 8.5 9.5 2 8Zm6.5 1.5L12 5" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round" /></svg>
-      Отправить
+      <span class="act-label">Отправить</span>
     </button>
-    <button class="btn" onclick={saveDraft} disabled={busy != null} title={hint("Сохранить черновик на сервере", "composer-save")}>Сохранить черновик</button>
-    <button class="btn" bind:this={cancelBtn} onclick={() => (cancelAsk ? keepWriting() : requestCancel())} disabled={busy != null} title={hint("Отменить", "composer-cancel")} aria-haspopup="dialog" aria-expanded={cancelAsk}>Отменить</button>
+    <button class="btn act-save" onclick={saveDraft} disabled={busy != null} title={hint("Сохранить черновик на сервере", "composer-save")} aria-label="Сохранить черновик">
+      <svg class="act-icon" width="14" height="14" viewBox="0 0 16 16" aria-hidden="true"><path d={ICON.save} fill="none" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round" /></svg>
+      <span class="act-label">Сохранить черновик</span>
+    </button>
+    <button class="btn act-cancel" bind:this={cancelBtn} onclick={() => (cancelAsk ? keepWriting() : requestCancel())} disabled={busy != null} title={hint("Отменить", "composer-cancel")} aria-label="Отменить" aria-haspopup="dialog" aria-expanded={cancelAsk}>
+      <svg class="act-icon" width="14" height="14" viewBox="0 0 16 16" aria-hidden="true"><path d={ICON.close} fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" /></svg>
+      <span class="act-label">Отменить</span>
+    </button>
     {#if busy}
       <span class="progress caption" aria-live="polite">
         <span class="spinner" aria-hidden="true"></span>
@@ -1015,7 +1164,7 @@
       </span>
     {/if}
     <span class="spacer"></span>
-    <!-- Важность (п. 35): нажата одна из двух или ни одной; значками, как и вложение с подписью, — строка помещается в области чтения. -->
+    <!-- Важность (п. 35): нажата одна из двух или ни одной; значками, как и вложение с подписью. -->
     <button class="btn icon" class:on={importance === "High"} class:high={importance === "High"} onclick={() => toggleImportance("High")} disabled={busy != null} aria-pressed={importance === "High"} title="Высокая важность" aria-label="Высокая важность">
       <svg width="14" height="14" viewBox="0 0 16 16" aria-hidden="true"><path d={ICON.important} fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" /></svg>
     </button>
@@ -1037,6 +1186,16 @@
       </button>
     {/if}
   </div>
+
+  {#if upload}
+    <!-- Вложения уходят на сервер (п. 39): сколько уже отдано и полоса. -->
+    <div class="upload caption" role="status">
+      <span class="upload-text">{upload.sent < upload.total ? `Загружаю вложения: ${formatSize(upload.sent)} из ${formatSize(upload.total)} · ${uploadPercent} %` : "Вложения загружены, сервер принимает письмо…"}</span>
+      <div class="upload-track" role="progressbar" aria-label="Загрузка вложений" aria-valuemin="0" aria-valuemax="100" aria-valuenow={uploadPercent}>
+        <div class="upload-fill" style="width: {uploadPercent}%"></div>
+      </div>
+    </div>
+  {/if}
 
   {#if error}
     <div class="error" role="alert">
@@ -1074,7 +1233,7 @@
     </div>
   </div>
 
-  {#if attachments.length || keptServerFiles.length || originalFiles.length}
+  {#if attachments.length || keptServerFiles.length || originalFiles.length || dropSaving > 0}
     <div class="files" aria-label="Вложения">
       {#each keptServerFiles as f (f.server_id)}
         <span class="file server" title={[f.content_type ?? "", "Вложение черновика уже на сервере"].filter(Boolean).join("\n")}>
@@ -1092,6 +1251,12 @@
           <button class="file-x" onclick={() => removeFile(a.path)} disabled={busy != null} aria-label="Убрать вложение {a.name}">×</button>
         </span>
       {/each}
+      {#if dropSaving > 0}
+        <span class="file adding" role="status">
+          <span class="spinner small" aria-hidden="true"></span>
+          <span class="file-name">{dropSaving > 1 ? `Добавляю файлы: ${dropSaving}…` : "Добавляю файл…"}</span>
+        </span>
+      {/if}
       {#each originalFiles as a (a.attachment_pk)}
         <span class="file inherited" title="Вложение исходного письма: сервер добавит его к пересылке сам">
           <svg width="14" height="14" viewBox="0 0 16 16" aria-hidden="true"><path d={ICON.attach} fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" /></svg>
@@ -1178,6 +1343,32 @@
     border-radius: var(--radius-card);
     box-shadow: var(--shadow-2);
     min-width: 0;
+    /* Подсказка о брошенных файлах ложится поверх письма. */
+    position: relative;
+  }
+  .drop-veil {
+    position: absolute;
+    inset: 0;
+    z-index: 3;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border: 2px dashed var(--accent);
+    border-radius: inherit;
+    background: color-mix(in srgb, var(--bg-card) 82%, transparent);
+    pointer-events: none;
+  }
+  .drop-hint {
+    padding: var(--space-2) var(--space-4);
+    border-radius: var(--radius-card);
+    background: var(--bg-card);
+    box-shadow: var(--shadow-8);
+    font: var(--text-body-strong);
+    color: var(--fg-1);
+  }
+  .file.adding {
+    padding-right: 10px;
+    color: var(--fg-2);
   }
   /* Окно черновика (п. 32): композер — всё окно, без рамки карточки. */
   .composer.standalone {
@@ -1194,6 +1385,34 @@
     padding: var(--space-2) var(--space-3);
     border-bottom: 1px solid var(--stroke-1);
     flex-wrap: wrap;
+  }
+  /*
+   * Узкая область чтения (п. 38 обкатки): чтобы кнопки не переносились на вторую строку, подписи
+   * уступают место значкам — сначала «Сохранить черновик» (уровень 1), потом «Отменить» (2), потом
+   * «Отправить» (3). Уровень подбирает fitBar по настоящим размерам.
+   */
+  .act-icon {
+    display: none;
+  }
+  .bar:is([data-squeeze="1"], [data-squeeze="2"], [data-squeeze="3"]) .act-save,
+  .bar:is([data-squeeze="2"], [data-squeeze="3"]) .act-cancel {
+    width: var(--control-height);
+    padding: 0;
+    justify-content: center;
+  }
+  .bar:is([data-squeeze="1"], [data-squeeze="2"], [data-squeeze="3"]) .act-save .act-label,
+  .bar:is([data-squeeze="2"], [data-squeeze="3"]) .act-cancel .act-label,
+  .bar[data-squeeze="3"] .act-send .act-label {
+    display: none;
+  }
+  .bar:is([data-squeeze="1"], [data-squeeze="2"], [data-squeeze="3"]) .act-save .act-icon,
+  .bar:is([data-squeeze="2"], [data-squeeze="3"]) .act-cancel .act-icon {
+    display: block;
+  }
+  .bar[data-squeeze="3"] .act-send {
+    width: 44px;
+    padding: 0;
+    justify-content: center;
   }
   .kind {
     font: var(--text-body-strong);
@@ -1264,6 +1483,34 @@
     align-items: center;
     gap: var(--space-2);
     color: var(--fg-2);
+  }
+  /* Ход загрузки вложений (п. 39): строка под кнопками. */
+  .upload {
+    display: flex;
+    align-items: center;
+    gap: var(--space-3);
+    padding: var(--space-2) var(--space-3);
+    border-bottom: 1px solid var(--stroke-1);
+    color: var(--fg-2);
+  }
+  .upload-text {
+    flex: none;
+    white-space: nowrap;
+    font-variant-numeric: tabular-nums;
+  }
+  .upload-track {
+    flex: 1;
+    min-width: 60px;
+    height: 4px;
+    border-radius: 2px;
+    background: var(--stroke-1);
+    overflow: hidden;
+  }
+  .upload-fill {
+    height: 100%;
+    border-radius: 2px;
+    background: var(--accent);
+    transition: width var(--dur-normal) linear;
   }
 
   /* --- ошибка --- */
