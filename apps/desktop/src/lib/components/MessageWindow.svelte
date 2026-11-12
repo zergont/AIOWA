@@ -306,8 +306,11 @@
 
   async function onCloseRequest() {
     if (guarded && composerRef) {
-      const reason = await composerRef.askClose();
+      const ref = composerRef;
+      const reason = await ref.askClose();
       if (reason == null) return;
+      // Удаление локального черновика должно дойти до базы раньше, чем окно закроется.
+      await ref.localSettled();
     }
     closing = true;
     try {

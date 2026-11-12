@@ -756,10 +756,28 @@ pub(crate) fn quote_html(from: &str, sent: Option<&str>, to: &str, cc: &str, sub
 
 // --- база ----------------------------------------------------------------------------------
 
+/// Сколько держится посчитанный список своих адресов: он меняется раз в годы, а считается проходом
+/// по всем «Отправленным» (десятки тысяч писем) — на каждое открытие композера и «Совета» это лишнее.
+const OWN_ADDRESSES_TTL: Duration = Duration::from_secs(600);
+
+/// Свои адреса учётной записи с моментом подсчёта. Пустой список не запоминается: он бывает, пока
+/// «Отправленные» ещё не синхронизированы.
+static OWN_ADDRESSES: std::sync::Mutex<Option<(AccountId, Instant, Vec<String>)>> = std::sync::Mutex::new(None);
+
 /// Собственные адреса: самые частые отправители в «Отправленных» плюс логин, если он адрес;
 /// в нижнем регистре, без повторов.
 pub(crate) fn own_addresses_of(store: &Store, account: AccountId, user: &str) -> CmdResult<Vec<String>> {
-    let mut out = store.own_addresses(account).map_err(err)?;
+    let cached = OWN_ADDRESSES.lock().unwrap_or_else(|p| p.into_inner()).as_ref().filter(|(a, at, _)| *a == account && at.elapsed() < OWN_ADDRESSES_TTL).map(|(_, _, list)| list.clone());
+    let mut out = match cached {
+        Some(list) => list,
+        None => {
+            let list = store.own_addresses(account).map_err(err)?;
+            if !list.is_empty() {
+                *OWN_ADDRESSES.lock().unwrap_or_else(|p| p.into_inner()) = Some((account, Instant::now(), list.clone()));
+            }
+            list
+        }
+    };
     let login = user.trim().to_lowercase();
     if login.contains('@') && !out.contains(&login) {
         out.push(login);
@@ -1562,7 +1580,7 @@ pub(crate) async fn compose_expand_quote(req: ComposeRequest, state: State<'_, A
 
 /// Локальный черновик композера: записывается окном раз в одну-две секунды после правок, чтобы
 /// текст письма пережил падение или закрытие окна при любой связи (п. 22 обкатки).
-#[tauri::command]
+#[tauri::command(async)]
 pub(crate) fn compose_local_save(draft: LocalDraftDto, state: State<'_, AppState>) -> CmdResult<()> {
     let row = draft.to_row()?;
     if row.draft_id.is_empty() {
@@ -1572,14 +1590,14 @@ pub(crate) fn compose_local_save(draft: LocalDraftDto, state: State<'_, AppState
 }
 
 /// Убрать локальный черновик: письмо отправлено, сохранено на сервере или отброшено.
-#[tauri::command]
+#[tauri::command(async)]
 pub(crate) fn compose_local_drop(draft_id: String, state: State<'_, AppState>) -> CmdResult<()> {
     forget_local_draft(&state.store, Some(&draft_id));
     Ok(())
 }
 
 /// Локальные черновики, оставшиеся с прошлого запуска, свежие первыми: окно предлагает открыть их.
-#[tauri::command]
+#[tauri::command(async)]
 pub(crate) fn compose_local_list(app: AppHandle, state: State<'_, AppState>) -> CmdResult<Vec<LocalDraftDto>> {
     // Письма, открытые сейчас в окнах черновиков (п. 32), живут там: предлагать их не нужно.
     let open = crate::child_windows::local_drafts_in_windows(&app);
@@ -1588,7 +1606,7 @@ pub(crate) fn compose_local_list(app: AppHandle, state: State<'_, AppState>) -> 
 
 /// Один локальный черновик по ключу (окно черновика, п. 32, поднимает перенесённое в него письмо);
 /// `None` — его уже нет.
-#[tauri::command]
+#[tauri::command(async)]
 pub(crate) fn compose_local_get(draft_id: String, state: State<'_, AppState>) -> CmdResult<Option<LocalDraftDto>> {
     Ok(state.store.local_draft(draft_id.trim()).map_err(err)?.map(LocalDraftDto::from_row))
 }
@@ -1678,18 +1696,13 @@ pub(crate) async fn recipients_suggest(prefix: String, limit: Option<usize>, sta
     .map_err(err)?
 }
 
-#[tauri::command]
-pub(crate) fn own_addresses(state: State<'_, AppState>) -> CmdResult<Vec<String>> {
-    own_addresses_of(&state.store, state.account, &state.user)
-}
-
-#[tauri::command]
+#[tauri::command(async)]
 pub(crate) fn signature_get(state: State<'_, AppState>) -> CmdResult<SignatureDto> {
     signature_of(&state.store, state.account)
 }
 
 /// Сохранить подпись локально. HTML очищается так же, как тело письма.
-#[tauri::command]
+#[tauri::command(async)]
 pub(crate) fn signature_set(html: String, auto_add: bool, state: State<'_, AppState>) -> CmdResult<()> {
     let sig = SignatureDto { html: crate::sanitize_html(&html, &Arc::new(InlineMap::new())), auto_add };
     store_signature(&state.store, state.account, &sig)

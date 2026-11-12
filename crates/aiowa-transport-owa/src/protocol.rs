@@ -14,7 +14,6 @@ use serde_json::{json, Value};
 
 /// Версии схемы, которые браузерная OWA использует для разных операций.
 pub const V_2013: &str = "Exchange2013";
-pub const V_2016: &str = "V2016_02_03";
 pub const V_2017: &str = "V2017_08_18";
 
 /// Поля, которые запрашиваются у элементов при синхронизации с метаданными.
@@ -670,9 +669,6 @@ pub fn text_to_html(text: &str) -> String {
     out
 }
 
-/// Черновик из элемента ответа `GetItem` (`parse_message_full` плюс сведение тела к HTML): тело —
-/// `Body`, иначе `NormalizedBody`, иначе `UniqueBody`; тело типа `Text` переводится в HTML; без
-/// тела — пустая строка. Без `ItemId` черновика нет.
 /// Тип вложенного письма (`ItemAttachment`).
 pub const MESSAGE_RFC822: &str = "message/rfc822";
 
@@ -682,6 +678,9 @@ fn eml_name(name: Option<&str>) -> String {
     if base.to_ascii_lowercase().ends_with(".eml") { base.to_string() } else { format!("{base}.eml") }
 }
 
+/// Черновик из элемента ответа `GetItem` (`parse_message_full` плюс сведение тела к HTML): тело —
+/// `Body`, иначе `NormalizedBody`, иначе `UniqueBody`; тело типа `Text` переводится в HTML; без
+/// тела — пустая строка. Без `ItemId` черновика нет.
 pub fn parse_draft_content(item: &Value) -> Option<DraftContent> {
     let full = parse_message_full(item)?;
     let body_html = match &full.body {
@@ -1649,7 +1648,8 @@ pub fn find_people_array(v: &Value) -> Option<&Vec<Value>> {
 }
 
 /// Записи ответа `FindPeople` в порядке сервера (без имени и адреса пропускаются).
-pub fn parse_find_people(v: &Value) -> Vec<DirectoryPerson> {
+#[cfg(test)]
+fn parse_find_people(v: &Value) -> Vec<DirectoryPerson> {
     find_people_array(v).map(|a| a.iter().filter_map(parse_persona).collect()).unwrap_or_default()
 }
 
@@ -2281,7 +2281,8 @@ pub fn parse_attachment_root(msg: &Value) -> Option<ItemId> {
 }
 
 /// Идентификатор созданного вложения из ответа `CreateAttachment`: `Attachments[0].AttachmentId.Id`.
-pub fn parse_attachment_id(msg: &Value) -> Option<String> {
+#[cfg(test)]
+fn parse_attachment_id(msg: &Value) -> Option<String> {
     msg.pointer("/Attachments/0/AttachmentId/Id").and_then(Value::as_str).map(String::from)
 }
 

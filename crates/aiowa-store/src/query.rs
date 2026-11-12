@@ -224,8 +224,9 @@ impl SearchQuery {
     }
 }
 
-/// Совместимость: запрос без операторов, каждое слово как префикс (все слова обязательны).
-pub fn fts_query(user_query: &str) -> String {
+/// Запрос без операторов, каждое слово как префикс (все слова обязательны) — проверка `fts_words`.
+#[cfg(test)]
+fn fts_query(user_query: &str) -> String {
     fts_words(&fts_norm(user_query), true).join(" ")
 }
 

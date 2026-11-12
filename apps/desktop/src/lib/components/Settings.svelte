@@ -143,7 +143,7 @@
       if (s) s = { ...s, trusted_image_senders: (s.trusted_image_senders ?? []).filter((e) => e !== email) };
       flash("Сохранено");
     } catch (e) {
-      flash(errorMessage(e));
+      flash(errorMessage(e), true);
     }
   }
 

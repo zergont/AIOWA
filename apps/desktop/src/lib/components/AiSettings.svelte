@@ -227,7 +227,7 @@
       <input type="checkbox" checked={s.enabled} onchange={(e) => void update({ enabled: e.currentTarget.checked })} aria-describedby="{uid}-enabled-hint" />
       ИИ-функции
     </label>
-    <p class="hint" id="{uid}-enabled-hint">«Совет» при ответе и поиск на обычном языке появятся в следующих выпусках, здесь — подключения к моделям. Пока выключено, AIOWA сама к моделям не обращается; «Проверить» работает только по кнопке.</p>
+    <p class="hint" id="{uid}-enabled-hint">Включает «Совет» при ответе (кнопка в письме, которое пишешь); поиск на обычном языке появится в следующих выпусках. Пока выключено, AIOWA сама к моделям не обращается; «Проверить» работает только по кнопке.</p>
 
     <fieldset class="group">
       <legend class="label">Куда можно отправлять письма</legend>
@@ -388,7 +388,7 @@
             <option value="">— не назначено —</option>
             {#each s.profiles as p (p.id)}<option value={p.id}>{p.name}{p.model ? ` · ${p.model}` : ""}</option>{/each}
           </select>
-          <p class="hint">Быстрая модель: доводит разбор запроса на обычном языке, когда разбор без модели не справился.</p>
+          <p class="hint">Быстрая модель: доводит разбор запроса на обычном языке, когда разбор без модели не справился. Понадобится поиску на обычном языке — он ещё не выпущен.</p>
         </div>
       </section>
     {/if}

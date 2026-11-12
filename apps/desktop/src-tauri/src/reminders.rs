@@ -15,7 +15,7 @@
 //! В журнал попадают только счётчики: ни тем, ни мест.
 
 use crate::notify::NotifyState;
-use crate::{err, CmdResult};
+use crate::{err, now_ms, CmdResult};
 use aiowa_core::AccountId;
 use aiowa_store::{ReminderMark, ReminderRow, ReminderState, Store};
 use jiff::tz::TimeZone;
@@ -44,10 +44,6 @@ const MAX_SNOOZE_MINUTES: i64 = 7 * 24 * 60;
 /// Сколько тем перечислять в сводке.
 const SUMMARY_SUBJECTS: usize = 3;
 const REMINDER_EVENT: &str = "reminder";
-
-fn now_ms() -> i64 {
-    Timestamp::now().as_millisecond()
-}
 
 // --- DTO ------------------------------------------------------------------------------------
 
@@ -346,19 +342,19 @@ fn show_toast(app: &AppHandle, fresh: &[&ReminderRow], now_ms: i64) {
 // --- команды Tauri -----------------------------------------------------------
 
 /// Напоминания, которые пора показывать сейчас (при старте окна).
-#[tauri::command]
+#[tauri::command(async)]
 pub(crate) fn reminders_pending(rs: State<'_, Arc<RemindersState>>) -> CmdResult<Vec<ReminderDto>> {
     rs.pending()
 }
 
 /// Закрыть напоминание насовсем.
-#[tauri::command]
+#[tauri::command(async)]
 pub(crate) fn reminder_dismiss(calendar_pk: i64, rs: State<'_, Arc<RemindersState>>) -> CmdResult<()> {
     rs.dismiss(calendar_pk)
 }
 
 /// Отложить напоминание на `minutes` минут.
-#[tauri::command]
+#[tauri::command(async)]
 pub(crate) fn reminder_snooze(calendar_pk: i64, minutes: i64, rs: State<'_, Arc<RemindersState>>) -> CmdResult<()> {
     rs.snooze(calendar_pk, minutes)
 }

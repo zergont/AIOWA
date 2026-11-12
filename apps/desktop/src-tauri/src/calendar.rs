@@ -13,7 +13,7 @@
 
 use crate::ondemand::{describe_transport, timed_out, KeyedLocks};
 use crate::sync::SyncState;
-use crate::{err, sanitize_html, AppState, CmdResult, InlineMap};
+use crate::{err, now_ms, sanitize_html, AppState, CmdResult, InlineMap};
 use aiowa_core::{AccountId, Attendee, CalendarEvent, CalendarEventDetails, CalendarItemType, FreeBusy, ItemId, Participant, ResponseType};
 use aiowa_store::{CalendarRow, Store};
 use aiowa_transport::{MailTransport, TransportError};
@@ -45,10 +45,6 @@ impl CalendarState {
     pub(crate) fn item_lock(&self, calendar_pk: i64) -> Arc<tokio::sync::Mutex<()>> {
         self.items.get(calendar_pk)
     }
-}
-
-fn now_ms() -> i64 {
-    Timestamp::now().as_millisecond()
 }
 
 // --- DTO ------------------------------------------------------------------------------------

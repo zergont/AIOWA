@@ -3,7 +3,7 @@
  * дат и времени, раскладка событий по дням и колонкам. Даты — местное время машины,
  * миллисекунды событий — UTC, как отдаёт бэкенд. Без зависимостей от DOM и Svelte.
  */
-import type { CalendarEvent, CalendarEventDetails, EventParticipant, FreeBusy, FreeBusyChoice, ResponseType } from "./api";
+import { plural, type CalendarEvent, type CalendarEventDetails, type EventParticipant, type FreeBusy, type FreeBusyChoice, type ResponseType } from "./api";
 
 export type CalendarViewKind = "day" | "work" | "week" | "month";
 
@@ -483,14 +483,6 @@ export function periodTitle(kind: CalendarViewKind, range: ViewRange, anchor?: D
   if (kind === "day") return dayLong(range.days[0]);
   if (kind === "month") return monthTitle(anchor ?? range.days[Math.floor(range.days.length / 2)]);
   return dateRangeTitle(range.days[0], range.days[range.days.length - 1]);
-}
-
-export function plural(n: number, one: string, few: string, many: string): string {
-  const n10 = n % 10;
-  const n100 = n % 100;
-  if (n10 === 1 && n100 !== 11) return one;
-  if (n10 >= 2 && n10 <= 4 && (n100 < 12 || n100 > 14)) return few;
-  return many;
 }
 
 /** «30 мин», «1 ч 30 мин», «2 дня», «1 день 3 ч». */

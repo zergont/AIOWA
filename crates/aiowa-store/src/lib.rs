@@ -53,7 +53,8 @@ pub enum StoreError {
 
 pub type Result<T> = std::result::Result<T, StoreError>;
 
-/// Хранилище. Потокобезопасно за счёт мьютекса на соединении; операции короткие.
+/// Хранилище. Потокобезопасно за счёт мьютекса на соединении: соединение одно, поэтому чтения окна
+/// ждут записей синхронизации (пачка писем или тел — одна транзакция под этим мьютексом).
 pub struct Store {
     path: PathBuf,
     attachments_dir: PathBuf,
@@ -130,7 +131,6 @@ pub struct ItemRow {
 #[derive(Debug, Clone)]
 pub struct SearchHit {
     pub item_pk: i64,
-    pub rank: f64,
     pub subject: Option<String>,
     pub from_name: Option<String>,
     pub from_email: Option<String>,
@@ -461,6 +461,9 @@ impl Store {
              PRAGMA busy_timeout = 5000;
              PRAGMA cache_size = -65536;",
         )?;
+        // Разных выражений `prepare_cached` — больше сотни, а кэш rusqlite по умолчанию держит 16:
+        // чтения окна и запись синхронизации на одном соединении вытесняли выражения друг друга.
+        conn.set_prepared_statement_cache_capacity(128);
         schema::register_functions(&conn)?;
         schema::migrate(&conn)?;
         info!(path = %path.display(), "хранилище открыто");
@@ -532,6 +535,8 @@ impl Store {
 
     // --- папки --------------------------------------------------------------
 
+    /// Записать папки напрямую. Приложение пишет их пачкой иерархии; этим пользуются тесты
+    /// хранилища, синхронизации и приложения, чтобы подготовить базу.
     pub fn upsert_folders(&self, account: AccountId, folders: &[Folder]) -> Result<()> {
         self.with_tx(|tx| {
             let now = now_ms();
@@ -542,6 +547,8 @@ impl Store {
         })
     }
 
+    /// Только для тестов: состояние «папка удалена, письма живые», которое чинит `drop_items_of_deleted_folders`.
+    #[cfg(test)]
     pub fn mark_folder_deleted(&self, account: AccountId, id: &FolderId) -> Result<()> {
         self.with_conn(|c| {
             c.execute("UPDATE folders SET deleted = 1, updated_at = ?3 WHERE account_id = ?1 AND server_id = ?2", params![account.0, id.id, now_ms()])?;
@@ -980,15 +987,25 @@ impl Store {
     /// Применяет пачку изменений `SyncFolderItems` и новое состояние папки одной транзакцией:
     /// состояние никогда не уходит вперёд без изменений и не отстаёт от них.
     pub fn apply_item_batch(&self, account: AccountId, folder_pk: i64, changes: &[ItemChange], state: &SyncState, complete: bool) -> Result<ApplyStats> {
-        self.write_generation.fetch_add(1, Ordering::Relaxed);
-        self.with_tx(|tx| {
+        let stats = self.with_tx(|tx| {
             let stats = apply_changes_in_tx(tx, account, folder_pk, changes)?;
             tx.execute(
                 "UPDATE folders SET sync_state = ?2, sync_complete = ?3, last_synced_at = ?4 WHERE folder_pk = ?1",
                 params![folder_pk, state.0, complete as i64, now_ms()],
             )?;
             Ok(stats)
-        })
+        })?;
+        self.note_written(&stats);
+        Ok(stats)
+    }
+
+    /// Кэш подсказок адресатов устаревает, только когда письма добавились, изменились или ушли:
+    /// пустая пачка (так кончается каждый прогон по каждой папке) и пометки прочтения его не
+    /// трогают — иначе он перестраивался проходом по всем письмам после любой синхронизации.
+    fn note_written(&self, stats: &ApplyStats) {
+        if stats.created + stats.updated + stats.deleted > 0 {
+            self.write_generation.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     /// Применяет пачку изменений иерархии и её состояние одной транзакцией. Возвращает число upsert-ов.
@@ -1029,8 +1046,9 @@ impl Store {
 
     /// Применяет пачку изменений `SyncFolderItems` одной транзакцией (без состояния).
     pub fn apply_item_changes(&self, account: AccountId, folder_pk: i64, changes: &[ItemChange]) -> Result<ApplyStats> {
-        self.write_generation.fetch_add(1, Ordering::Relaxed);
-        self.with_tx(|tx| apply_changes_in_tx(tx, account, folder_pk, changes))
+        let stats = self.with_tx(|tx| apply_changes_in_tx(tx, account, folder_pk, changes))?;
+        self.note_written(&stats);
+        Ok(stats)
     }
 
     /// Помечает элементы удалёнными (например, `ErrorItemNotFound` при загрузке тела).
@@ -1183,12 +1201,16 @@ impl Store {
 
     /// Вложения писем папки, которые надо скачать: не инлайновые, ещё не скачанные, в окне
     /// по дате получения и не больше `max_size` байт. Самые свежие письма первыми.
+    /// `CROSS JOIN` закрепляет порядок: сначала ожидающие вложения (частичный индекс
+    /// `attachments_pending`, обычно их единицы), затем письмо по ключу. Без него планировщик шёл
+    /// от писем папки, и подсчёт по «Входящим» на 77 тыс. писем занимал 0,85 с — на каждую папку
+    /// каждого прогона.
     pub fn attachments_to_fetch(&self, account: AccountId, folder_pk: i64, since: Option<Timestamp>, max_size: i64, limit: usize) -> Result<Vec<AttachmentTodo>> {
         self.with_conn(|c| {
             let mut st = c.prepare_cached(
                 "SELECT a.attachment_pk, a.item_pk, a.server_id, a.name, a.content_type, a.size
-                 FROM attachments a JOIN items i ON i.item_pk = a.item_pk
-                 WHERE i.account_id = ?1 AND i.folder_pk = ?2 AND i.deleted = 0
+                 FROM attachments a CROSS JOIN items i ON i.item_pk = a.item_pk
+                 WHERE +i.account_id = ?1 AND i.folder_pk = ?2 AND i.deleted = 0
                    AND a.is_inline = 0 AND a.fetched_at IS NULL AND a.text_state = 0
                    AND (?3 IS NULL OR i.received_at >= ?3) AND (a.size IS NULL OR a.size <= ?4)
                  ORDER BY i.received_at DESC, a.attachment_pk LIMIT ?5",
@@ -1203,8 +1225,8 @@ impl Store {
     pub fn count_attachments_to_fetch(&self, account: AccountId, folder_pk: i64, since: Option<Timestamp>, max_size: i64) -> Result<i64> {
         self.with_conn(|c| {
             Ok(c.query_row(
-                "SELECT COUNT(*) FROM attachments a JOIN items i ON i.item_pk = a.item_pk
-                 WHERE i.account_id = ?1 AND i.folder_pk = ?2 AND i.deleted = 0
+                "SELECT COUNT(*) FROM attachments a CROSS JOIN items i ON i.item_pk = a.item_pk
+                 WHERE +i.account_id = ?1 AND i.folder_pk = ?2 AND i.deleted = 0
                    AND a.is_inline = 0 AND a.fetched_at IS NULL AND a.text_state = 0
                    AND (?3 IS NULL OR i.received_at >= ?3) AND (a.size IS NULL OR a.size <= ?4)",
                 params![account.0, folder_pk, ts_ms(since), max_size],
@@ -1213,8 +1235,6 @@ impl Store {
         })
     }
 
-    /// Кладёт скачанный файл в кэш и записывает текст; индекс письма пересобирается в той же
-    /// транзакции. Возвращает путь к файлу.
     /// Скачанные вложения общего типа без извлечённого текста (`TEXT_UNSUPPORTED`, тип пуст или
     /// `application/octet-stream`): среди них вложенные письма, скачанные до docs/obkatka.md п. 30.
     /// Возвращает ключ вложения, имя и путь файла в кэше.
@@ -1255,6 +1275,8 @@ impl Store {
         })
     }
 
+    /// Кладёт скачанный файл в кэш и записывает текст; индекс письма пересобирается в той же
+    /// транзакции. Возвращает путь к файлу.
     pub fn save_attachment(&self, todo: &AttachmentTodo, bytes: &[u8], content_type: Option<&str>, text: AttachmentText) -> Result<PathBuf> {
         std::fs::create_dir_all(&self.attachments_dir)?;
         let name = safe_file_name(todo.name.as_deref().unwrap_or("attachment"));
@@ -1561,7 +1583,7 @@ impl Store {
     /// сервера: скачаны до того, как клиент стал запрашивать `PR_LAST_VERB_EXECUTED`.
     pub fn items_to_check_verbs(&self, account: AccountId, since: Timestamp, limit: usize) -> Result<Vec<(i64, ItemId)>> {
         self.with_conn(|c| {
-            let mut st = c.prepare_cached("SELECT item_pk, server_id, change_key FROM items WHERE account_id = ?1 AND deleted = 0 AND verb_checked = 0 AND received_at >= ?2 ORDER BY received_at DESC LIMIT ?3")?;
+            let mut st = c.prepare_cached(schema::VERBS_TO_CHECK_SQL)?;
             let rows = st.query_map(params![account.0, ts_ms(Some(since)), limit as i64], |r| Ok((r.get::<_, i64>(0)?, ItemId { id: r.get(1)?, change_key: r.get(2)? })))?;
             rows.collect::<std::result::Result<Vec<_>, _>>().map_err(Into::into)
         })
@@ -1575,12 +1597,13 @@ impl Store {
         })
     }
 
-    /// Письма с усечённым ключом изменений (короче `min_len` символов): их ключи нужно
-    /// перечитать с сервера, иначе ответ и пересылка на них отказывают (`ErrorStaleObject`).
-    pub fn items_with_short_change_keys(&self, account: AccountId, min_len: usize, limit: usize) -> Result<Vec<(i64, ItemId)>> {
+    /// Письма с усечённым ключом изменений (короче `ItemId::MIN_FULL_CHANGE_KEY` символов): их
+    /// ключи нужно перечитать с сервера, иначе ответ и пересылка на них отказывают
+    /// (`ErrorStaleObject`). Читаются по частичному индексу `items_short_change_key` — обычно он пуст.
+    pub fn items_with_short_change_keys(&self, account: AccountId, limit: usize) -> Result<Vec<(i64, ItemId)>> {
         self.with_conn(|c| {
-            let mut st = c.prepare_cached("SELECT item_pk, server_id, change_key FROM items WHERE account_id = ?1 AND deleted = 0 AND change_key IS NOT NULL AND length(change_key) < ?2 ORDER BY item_pk LIMIT ?3")?;
-            let rows = st.query_map(params![account.0, min_len as i64, limit as i64], |r| Ok((r.get::<_, i64>(0)?, ItemId { id: r.get(1)?, change_key: r.get(2)? })))?;
+            let mut st = c.prepare_cached(&schema::short_change_keys_sql())?;
+            let rows = st.query_map(params![account.0, limit as i64], |r| Ok((r.get::<_, i64>(0)?, ItemId { id: r.get(1)?, change_key: r.get(2)? })))?;
             rows.collect::<std::result::Result<Vec<_>, _>>().map_err(Into::into)
         })
     }
@@ -1601,6 +1624,12 @@ impl Store {
     /// Вытесняет из кэша самые давно не использованные файлы, пока суммарный размер не
     /// уложится в квоту. Текст и хэш остаются в базе.
     pub fn evict_attachment_cache(&self, quota_bytes: u64) -> Result<EvictReport> {
+        // Обычный случай — кэш далеко от квоты: это видно по сумме размеров в базе (при сохранении
+        // размер равен длине файла), без обращения к диску за каждым файлом на каждом прогоне.
+        let known: i64 = self.with_conn(|c| Ok(c.query_row("SELECT COALESCE(SUM(size), 0) FROM attachments WHERE local_path IS NOT NULL", [], |r| r.get(0))?))?;
+        if u64::try_from(known).unwrap_or(0) <= quota_bytes {
+            return Ok(EvictReport { bytes_left: u64::try_from(known).unwrap_or(0), ..Default::default() });
+        }
         let rows: Vec<(i64, String, i64)> = self.with_conn(|c| {
             let mut st = c.prepare_cached("SELECT attachment_pk, local_path, COALESCE(size, 0) FROM attachments WHERE local_path IS NOT NULL ORDER BY last_access_at ASC, attachment_pk ASC")?;
             Ok(st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<std::result::Result<Vec<_>, _>>()?)
@@ -1707,10 +1736,11 @@ impl Store {
             }
             sql.push_str(&format!(" AND lower(i.from_email) IN ({})", marks.join(", ")));
         }
-        // Каждый адрес в `кому:` обязателен, как и остальные условия.
+        // Каждый адрес в `кому:` обязателен, как и остальные условия. Подзапрос отдаёт письма адреса
+        // по индексу получателей; с EXISTS на каждое письмо запрос перебирал весь ящик (0,4 с).
         for e in &q.to_exact {
             args.push(SqlValue::Text(e.clone()));
-            sql.push_str(&format!(" AND EXISTS (SELECT 1 FROM recipients r WHERE r.item_pk = i.item_pk AND r.kind IN (1, 2, 3) AND lower(r.email) = ?{})", args.len()));
+            sql.push_str(&format!(" AND i.item_pk IN (SELECT r.item_pk FROM recipients r WHERE lower(r.email) = ?{} AND r.kind IN (1, 2, 3))", args.len()));
         }
         args.push(SqlValue::Integer(limit as i64));
         // Как в OWA: результаты от новых к старым; релевантность (bm25) только разводит письма
@@ -1722,7 +1752,6 @@ impl Store {
             let rows = st.query_map(params_from_iter(args.iter()), |r| {
                 Ok((
                     r.get::<_, i64>(0)?,
-                    r.get::<_, f64>(1)?,
                     r.get::<_, Option<String>>(2)?,
                     r.get::<_, Option<String>>(3)?,
                     r.get::<_, Option<String>>(4)?,
@@ -1737,7 +1766,7 @@ impl Store {
             })?;
             let raw = rows.collect::<std::result::Result<Vec<_>, _>>()?;
             let mut hits = Vec::with_capacity(raw.len());
-            for (item_pk, rank, subject, from_name, from_email, received_at, folder_name, body_snip, att_snip, conversation_pk, preview, has_attachments) in raw {
+            for (item_pk, subject, from_name, from_email, received_at, folder_name, body_snip, att_snip, conversation_pk, preview, has_attachments) in raw {
                 let body_hit = body_snip.contains(MARK_OPEN);
                 let att_hit = att_snip.contains(MARK_OPEN);
                 let (snippet, attachment_name) = if att_hit && !body_hit {
@@ -1748,7 +1777,7 @@ impl Store {
                 };
                 let snippet = snippet.replace(MARK_OPEN, "[").replace(MARK_CLOSE, "]");
                 let preview = preview.filter(|p| !p.trim().is_empty());
-                hits.push(SearchHit { item_pk, rank, subject, from_name, from_email, received_at: ms_ts(received_at), folder_name, snippet, attachment_name, conversation_pk, preview, has_attachments });
+                hits.push(SearchHit { item_pk, subject, from_name, from_email, received_at: ms_ts(received_at), folder_name, snippet, attachment_name, conversation_pk, preview, has_attachments });
             }
             Ok(hits)
         })
@@ -1897,6 +1926,7 @@ impl Store {
     }
 
     /// Сбрасывает кэш подсказок получателей: следующий вызов `suggest_recipients` перестроит его.
+    #[cfg(test)]
     pub fn invalidate_recipient_cache(&self) {
         if let Ok(mut c) = self.recipient_cache.lock() {
             *c = None;
@@ -2061,8 +2091,6 @@ fn upsert_folder(tx: &Transaction, account: AccountId, f: &Folder, now: i64) -> 
     Ok(())
 }
 
-/// Поддерево папки (сама папка первой, затем не удалённые подпапки в ширину) по цепочке
-/// `parent_server_id`; защита от цикла — через множество увиденных и предел глубины.
 /// Помечает удалёнными папки `subtree` и их письма (письма снимаются с индекса, беседы — в
 /// `touched` для пересчёта). Возвращает число писем.
 fn delete_subtree_rows(tx: &Transaction, subtree: &[i64], now: i64, touched: &mut Touched) -> Result<usize> {
@@ -2083,6 +2111,8 @@ fn delete_subtree_rows(tx: &Transaction, subtree: &[i64], now: i64, touched: &mu
     Ok(items)
 }
 
+/// Поддерево папки (сама папка первой, затем не удалённые подпапки в ширину) по цепочке
+/// `parent_server_id`; защита от цикла — через множество увиденных и предел глубины.
 fn folder_subtree(tx: &Transaction, account_id: i64, folder_pk: i64) -> Result<Vec<i64>> {
     let mut out = vec![folder_pk];
     let mut queue: Vec<(i64, usize)> = vec![(folder_pk, 0)];
@@ -3260,11 +3290,11 @@ mod tests {
         assert_eq!(s.item_ref(a).unwrap().unwrap().id.change_key.as_deref(), Some(full.as_str()), "усечённый ключ не затирает полный");
         s.update_item_id(a, &ItemId { id: "A2".into(), change_key: None }).unwrap();
         assert_eq!(s.item_ref(a).unwrap().unwrap().id.change_key.as_deref(), Some(full.as_str()), "без ключа прежний остаётся");
-        assert!(s.items_with_short_change_keys(acc, ItemId::MIN_FULL_CHANGE_KEY, 10).unwrap().iter().all(|(pk, _)| *pk != a));
+        assert!(s.items_with_short_change_keys(acc, 10).unwrap().iter().all(|(pk, _)| *pk != a));
         s.update_item_id(a, &ItemId { id: "A3".into(), change_key: Some("CQAAAA==".into()) }).unwrap();
         let r = s.item_ref(a).unwrap().unwrap();
         assert_eq!((r.id.id.as_str(), r.id.change_key.as_deref()), ("A3", Some("CQAAAA==")), "новый идентификатор после переноса берётся целиком");
-        let short = s.items_with_short_change_keys(acc, ItemId::MIN_FULL_CHANGE_KEY, 10).unwrap();
+        let short = s.items_with_short_change_keys(acc, 10).unwrap();
         assert!(short.iter().any(|(pk, id)| *pk == a && id.id == "A3"), "усечённый ключ попадает в выборку на починку: {short:?}");
 
         // Последнее действие: письма из синхронизации считаются запрошенными (verb_checked = 1),

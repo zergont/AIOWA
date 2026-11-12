@@ -1,5 +1,5 @@
 <script lang="ts">
-  import type { NotifyStatus, SyncStage, SyncStatus } from "../api";
+  import { plural, type NotifyStatus, type SyncStage, type SyncStatus } from "../api";
   import { ICON } from "../actions";
   import { hint } from "../hotkeys";
   import UpdateNotice from "./UpdateNotice.svelte";
@@ -172,7 +172,7 @@
     <!-- Обновление приложения: «Доступна версия X · Установить», ход установки (updates.svelte.ts). -->
     <UpdateNotice />
     {#if status?.warnings_total}
-      <span class="warn" title={warningsTitle}>{status.warnings_total} {status.warnings_total === 1 ? "предупреждение" : status.warnings_total < 5 ? "предупреждения" : "предупреждений"}</span>
+      <span class="warn" title={warningsTitle}>{status.warnings_total} {plural(status.warnings_total, "предупреждение", "предупреждения", "предупреждений")}</span>
     {/if}
     <span class="summary" title={reportTitle}>{summary}</span>
     <DiskUsage {status} />

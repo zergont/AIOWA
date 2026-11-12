@@ -436,7 +436,6 @@ pub(crate) fn error_kind(e: &TransportError) -> String {
     }
 }
 
-/// Текст ошибки `ExpandDL` для окна: известные отказы словами, остальное — как везде.
 /// Ключ в `sync_state`: сервер ответил, что `ExpandDL` в OWA JSON не реализован (§ 5l). Признак
 /// постоянный для ящика: окно прячет «Развернуть», команда не ходит на сервер.
 pub(crate) const EXPAND_UNSUPPORTED_KEY: &str = "desktop.expand_dl_unsupported";
@@ -454,6 +453,7 @@ pub(crate) fn is_not_implemented(e: &TransportError) -> bool {
     }
 }
 
+/// Текст ошибки `ExpandDL` для окна: известные отказы словами, остальное — как везде.
 pub(crate) fn describe_expand(e: &TransportError) -> String {
     match e {
         e if is_not_implemented(e) => EXPAND_UNSUPPORTED.into(),
@@ -1033,7 +1033,7 @@ pub(crate) struct DirectoryCapsDto {
     can_expand: bool,
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub(crate) fn directory_capabilities(state: State<'_, AppState>) -> DirectoryCapsDto {
     DirectoryCapsDto { can_expand: !expand_unsupported(&state.store, state.account) }
 }

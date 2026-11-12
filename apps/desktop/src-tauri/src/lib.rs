@@ -149,6 +149,11 @@ fn window_close_confirmed(window: tauri::WebviewWindow, st: State<'_, CloseState
     window.close().map_err(err)
 }
 
+/// Текущее время в миллисекундах эпохи.
+pub(crate) fn now_ms() -> i64 {
+    Timestamp::now().as_millisecond()
+}
+
 fn ms(t: Option<Timestamp>) -> Option<i64> {
     t.map(|t| t.as_millisecond())
 }
@@ -701,7 +706,6 @@ fn disable_browser_accelerator_keys(app: &tauri::AppHandle) {
     }
 }
 
-#[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let log_dir = logging::init();
     info!(version = env!("CARGO_PKG_VERSION"), logs = ?log_dir, "AIOWA запущен");
@@ -907,7 +911,6 @@ pub fn run() {
             ai::ai_settings_set,
             ai::ai_profile_save,
             ai::ai_profile_delete,
-            ai::ai_profile_models,
             ai::ai_profile_test,
             ai::ai_journal,
             advice::ai_advice_status,
@@ -916,7 +919,6 @@ pub fn run() {
             advice::ai_advice_cancel,
             compose::compose_draft_attachments,
             compose::recipients_suggest,
-            compose::own_addresses,
             compose::signature_get,
             compose::signature_set,
             compose::signature_import_owa,
@@ -949,7 +951,6 @@ pub fn run() {
             window_close_confirmed,
             window_chrome::window_snap_layouts,
             setup::app_mode,
-            setup::setup_normalize_host,
             setup::setup_test_login,
             setup::setup_save,
             settings::settings_get,

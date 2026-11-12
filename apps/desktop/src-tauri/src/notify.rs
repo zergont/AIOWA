@@ -19,7 +19,7 @@
 
 use crate::ondemand::{describe_transport, timed_out};
 use crate::sync::SyncState;
-use crate::CmdResult;
+use crate::{now_ms, CmdResult};
 use aiowa_core::{AccountId, FolderId, ItemId, Participant};
 use aiowa_store::Store;
 use aiowa_transport::{new_guid, MailTransport, NotificationEvent, NotificationKind, SubscriptionRequest, TransportError};
@@ -62,10 +62,6 @@ const WINDOW_LABEL: &str = "main";
 const APP_TITLE: &str = "AIOWA";
 /// Сторона значка-наклейки на панели задач (Windows сам уменьшит до размера наложения).
 const BADGE_SIZE: u32 = 32;
-
-fn now_ms() -> i64 {
-    jiff::Timestamp::now().as_millisecond()
-}
 
 // --- DTO ------------------------------------------------------------------------------------
 
@@ -944,7 +940,7 @@ pub fn notify_status(state: State<'_, Arc<NotifyState>>) -> NotifyStatusDto {
     state.status()
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn notify_set_toasts(app: AppHandle, state: State<'_, Arc<NotifyState>>, enabled: bool) -> CmdResult<()> {
     state.set_toasts(&app, enabled)
 }

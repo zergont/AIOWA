@@ -49,7 +49,9 @@ pub fn html_to_text(html: &str) -> String {
         }
         if c == '&' {
             let rest = &html[i..];
-            let semi = rest.find(';').filter(|p| *p <= 10);
+            // `;` ищется только рядом: поиск до конца текста на каждом `&` делал разбор квадратичным
+            // (тело из одних амперсандов — секунды под транзакцией записи).
+            let semi = rest.as_bytes().iter().take(11).position(|b| *b == b';');
             if let Some(p) = semi {
                 let ent = &rest[1..p];
                 let decoded = match ent {

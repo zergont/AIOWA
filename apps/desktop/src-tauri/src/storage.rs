@@ -4,6 +4,7 @@
 //! сколько на компьютере: писем в базе и скачанных вложений по папкам, размер базы и кэша.
 //! В журнал — только числа.
 
+use crate::ondemand::{describe_transport, timed_out};
 use crate::sync::SyncState;
 use crate::{err, AppState, CmdResult};
 use serde::Serialize;
@@ -43,13 +44,26 @@ pub(crate) struct StorageDto {
     cache_size_bytes: u64,
 }
 
+/// Запрос к серверу под таймаутом; отказ, после которого сессия непригодна, сбрасывает транспорт
+/// (`SyncState::invalidate_on`), чтобы следующая команда вошла заново.
+async fn server_step<T>(sync: &SyncState, fut: impl std::future::Future<Output = Result<T, aiowa_transport::TransportError>>) -> CmdResult<T> {
+    match tokio::time::timeout(SERVER_TIMEOUT, fut).await {
+        Err(_) => Err(timed_out(SERVER_TIMEOUT)),
+        Ok(Err(e)) => {
+            sync.invalidate_on(&e).await;
+            Err(describe_transport(&e))
+        }
+        Ok(Ok(v)) => Ok(v),
+    }
+}
+
 /// Квота и размеры папок с сервера плюс локальные счётчики. Сервер не ответил — ошибка.
 #[tauri::command]
 pub(crate) async fn storage_info(state: State<'_, AppState>, sync: State<'_, Arc<SyncState>>) -> CmdResult<StorageDto> {
     let started = Instant::now();
     let transport = sync.transport().await.map_err(|e| e.to_string())?;
-    let quota = tokio::time::timeout(SERVER_TIMEOUT, transport.mailbox_quota()).await.map_err(|_| "Сервер не ответил за 30 с".to_string())?.map_err(|e| crate::ondemand::describe_transport(&e))?;
-    let sizes = tokio::time::timeout(SERVER_TIMEOUT, transport.folder_sizes()).await.map_err(|_| "Сервер не ответил за 30 с".to_string())?.map_err(|e| crate::ondemand::describe_transport(&e))?;
+    let quota = server_step(&sync, transport.mailbox_quota()).await?;
+    let sizes = server_step(&sync, transport.folder_sizes()).await?;
     let (store, account) = (state.store.clone(), state.account);
     let dto = tauri::async_runtime::spawn_blocking(move || -> CmdResult<StorageDto> {
         let known: HashMap<String, (i64, Option<String>)> = store.list_folders(account).map_err(err)?.into_iter().map(|(pk, f)| (f.id.id, (pk, f.distinguished))).collect();

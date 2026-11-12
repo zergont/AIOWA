@@ -14,7 +14,7 @@
 
 use crate::sync::SyncState;
 use crate::write::{apply_local, deleted_items_pk, move_action, prepare, rollback, send_to_server, Action, Changed, WriteFailure, WriteReport, WriteState};
-use crate::{err, AppState, CmdResult};
+use crate::{err, now_ms, AppState, CmdResult};
 use aiowa_core::Folder;
 use aiowa_store::ItemRef;
 use serde::{Deserialize, Serialize};
@@ -179,10 +179,6 @@ impl StagedState {
         // Отравленный мьютекс не страшен: внутри только записи книги.
         self.book.lock().unwrap_or_else(|p| p.into_inner())
     }
-}
-
-fn now_ms() -> i64 {
-    jiff::Timestamp::now().as_millisecond()
 }
 
 /// Операция записи по действию окна. Архив — перенос в папку архива.

@@ -485,7 +485,10 @@
     const ref = composerRef;
     void tick().then(async () => {
       const reason = await ref.askClose();
-      if (reason != null) void confirmClose();
+      if (reason == null) return;
+      // Удаление локального черновика должно дойти до базы раньше, чем окно закроется.
+      await ref.localSettled();
+      void confirmClose();
     });
   }
 
@@ -517,7 +520,9 @@
       error = "Сохраните или закройте письмо в композере и повторите установку";
       return false;
     }
-    return (await ref.askClose()) != null;
+    if ((await ref.askClose()) == null) return false;
+    await ref.localSettled();
+    return true;
   }
   setUpdateGuard(beforeUpdateInstall);
 
@@ -2427,6 +2432,10 @@
     align-items: center;
     max-width: 70vw;
     user-select: text;
+  }
+  /* Обе полосы сразу: ошибка встаёт над полосой несохранённого письма, а не поверх неё. */
+  .restore-bar + .error-bar {
+    bottom: 84px;
   }
   .error-bar button {
     color: var(--fg-2);

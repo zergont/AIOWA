@@ -86,7 +86,7 @@ pub(crate) struct AdviceStatusDto {
     place: Option<Place>,
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub(crate) fn ai_advice_status(state: State<'_, AppState>) -> CmdResult<AdviceStatusDto> {
     let cfg = AiConfig::load(&state.store, state.account);
     let profile = cfg.advice.as_deref().and_then(|id| cfg.profile(id).ok());

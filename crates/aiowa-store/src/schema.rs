@@ -1,10 +1,8 @@
 //! Схема базы и миграции через `PRAGMA user_version`.
 //! Правило: миграции только добавляют; переименования и удаления колонок через новую таблицу.
 //!
-//! Версия 3 (итерация 2): кэш и текст вложений, беседы с агрегатами по папкам,
-//! колонка `attachment_text` в индексе и нормализация ё→е функцией `fts_norm`.
-//! Версия 4 (этап 4): кэш событий календаря и окна, которые уже забирали с сервера.
-//! Версия 5: кэш справочника организации и индексы адресов без учёта регистра (карточка контакта).
+//! Что добавила каждая версия, написано у её шага в `migrate` и у её констант ниже
+//! (текущая — `CURRENT_VERSION`).
 
 use crate::text;
 use rusqlite::functions::FunctionFlags;
@@ -12,7 +10,7 @@ use rusqlite::types::ValueRef;
 use rusqlite::Connection;
 use tracing::info;
 
-pub const CURRENT_VERSION: i64 = 12;
+pub const CURRENT_VERSION: i64 = 13;
 
 /// Состояния текста вложения (`attachments.text_state`).
 pub const TEXT_PENDING: i64 = 0;
@@ -308,7 +306,6 @@ CREATE INDEX IF NOT EXISTS items_from_lower ON items(account_id, lower(from_emai
 CREATE INDEX IF NOT EXISTS recipients_email_lower ON recipients(lower(email));
 "#;
 
-pub const FTS_COLUMNS: &str = "subject, from_name, from_email, recipients, unique_text, attachment_text";
 
 /// Удаляет строку из индекса по текущим значениям источника. Вызывать ДО изменения
 /// items/bodies/recipients/attachments, иначе старые токены останутся в индексе навсегда.
@@ -592,7 +589,60 @@ pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
         }
         info!("схема базы обновлена до версии 12: журнал обращений к моделям");
     }
+    if version < 13 {
+        conn.execute_batch("BEGIN IMMEDIATE;")?;
+        let result = (|| -> rusqlite::Result<()> {
+            conn.execute_batch(&v13_indexes())?;
+            conn.pragma_update(None, "user_version", 13)?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => conn.execute_batch("COMMIT;")?,
+            Err(e) => {
+                let _ = conn.execute_batch("ROLLBACK;");
+                return Err(e);
+            }
+        }
+        info!("схема базы обновлена до версии 13: индексы дозапросов после синхронизации, сняты два неиспользуемых индекса");
+    }
     Ok(())
+}
+
+/// Письма окна, у которых последнее действие ещё не запрашивалось у сервера (`Store::items_to_check_verbs`).
+/// Условие повторяет частичный индекс `items_verb_unchecked` слово в слово — иначе планировщик его не возьмёт.
+pub(crate) const VERBS_TO_CHECK_SQL: &str = "SELECT item_pk, server_id, change_key FROM items
+ WHERE account_id = ?1 AND deleted = 0 AND verb_checked = 0 AND received_at >= ?2 ORDER BY received_at DESC LIMIT ?3";
+
+/// Условие частичного индекса писем с усечённым ключом изменений; длина — литералом: с параметром
+/// планировщик частичный индекс не использует.
+fn short_change_key_condition() -> String {
+    format!("deleted = 0 AND change_key IS NOT NULL AND length(change_key) < {}", aiowa_core::ItemId::MIN_FULL_CHANGE_KEY)
+}
+
+/// Письма с усечённым ключом изменений (`Store::items_with_short_change_keys`).
+pub(crate) fn short_change_keys_sql() -> String {
+    format!("SELECT item_pk, server_id, change_key FROM items WHERE account_id = ?1 AND {} ORDER BY item_pk LIMIT ?2", short_change_key_condition())
+}
+
+/// Версия 13 (аудит кода, 0.2.10).
+///
+/// Два дозапроса после каждого полного прогона синхронизации — письма без сведений о последнем
+/// действии и письма с усечённым ключом изменений — в установившемся состоянии не находят ничего,
+/// но без подходящего индекса каждый раз перебирали все письма ящика (по 0,4 с на 155 тыс. писем в
+/// отладочной сборке). Частичные индексы содержат только такие письма, то есть обычно пусты.
+///
+/// Сняты индексы, которые не нужны ни одному запросу: `items_conversation` (по серверному
+/// идентификатору беседы никто не выбирает, связь идёт через `conversation_pk`) и
+/// `recipients_email` (адрес получателя ищут только как `lower(email)`, индекс
+/// `recipients_email_lower`). Оба только удорожали запись каждого письма и получателя.
+fn v13_indexes() -> String {
+    format!(
+        "CREATE INDEX IF NOT EXISTS items_verb_unchecked ON items(account_id, received_at) WHERE deleted = 0 AND verb_checked = 0;
+         CREATE INDEX IF NOT EXISTS items_short_change_key ON items(account_id, item_pk) WHERE {};
+         DROP INDEX IF EXISTS items_conversation;
+         DROP INDEX IF EXISTS recipients_email;",
+        short_change_key_condition()
+    )
 }
 
 /// Версия 12: журнал обращений к языковым моделям (`docs/ai-layer-design.md` § 3.3) — что, куда
@@ -672,6 +722,25 @@ fn delete_tombstones_from_fts(conn: &Connection) -> rusqlite::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn v13_repair_queries_use_partial_indexes_and_unused_indexes_are_gone() {
+        let conn = Connection::open_in_memory().unwrap();
+        register_functions(&conn).unwrap();
+        migrate(&conn).unwrap();
+        let plan = |sql: &str, params: &[&dyn rusqlite::ToSql]| -> String {
+            let mut st = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+            st.query_map(params, |r| r.get::<_, String>("detail")).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap().join("\n")
+        };
+        let verbs = plan(VERBS_TO_CHECK_SQL, &[&1, &0, &10]);
+        assert!(verbs.contains("items_verb_unchecked"), "{verbs}");
+        assert!(!verbs.contains("TEMP B-TREE"), "порядок — из индекса: {verbs}");
+        let keys = plan(&short_change_keys_sql(), &[&1, &10]);
+        assert!(keys.contains("items_short_change_key"), "{keys}");
+        let indexes: Vec<String> = conn.prepare("SELECT name FROM sqlite_master WHERE type = 'index'").unwrap().query_map([], |r| r.get(0)).unwrap().collect::<rusqlite::Result<_>>().unwrap();
+        assert!(!indexes.iter().any(|n| n == "items_conversation" || n == "recipients_email"), "{indexes:?}");
+        assert!(indexes.iter().any(|n| n == "recipients_email_lower") && indexes.iter().any(|n| n == "items_conv_folder"));
+    }
 
     #[test]
     fn migrate_in_memory_twice() {

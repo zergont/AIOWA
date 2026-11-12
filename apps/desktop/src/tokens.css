@@ -13,7 +13,6 @@
   --text-body-strong: 600 14px/20px var(--font-ui);
   --text-body-large: 18px/24px var(--font-ui);
   --text-subtitle: 600 20px/28px var(--font-display);
-  --text-title: 600 28px/36px var(--font-display);
 
   /* сетка и радиусы */
   --space-1: 4px;
@@ -25,20 +24,14 @@
   --radius-control: 4px;
   --radius-card: 8px;
   --control-height: 32px;
-  --row-cozy: 56px;
-  --row-compact: 36px;
   --nav-width: 240px;
   --list-width: 380px;
-  --list-min: 280px;
-  --list-max: 520px;
   --read-min: 520px;
 
   /* движение */
   --dur-fast: 100ms;
   --dur-normal: 150ms;
-  --dur-slow: 200ms;
   --ease-in: cubic-bezier(0.1, 0.9, 0.2, 1);
-  --ease-out: cubic-bezier(0.9, 0.1, 1, 0.2);
 
   /* светлая тема: поверхности Fluent (Mica-база под навигацией, слой под контентом) */
   --bg-base: #f3f3f3;
@@ -173,6 +166,5 @@
   :root {
     --dur-fast: 0ms;
     --dur-normal: 0ms;
-    --dur-slow: 0ms;
   }
 }

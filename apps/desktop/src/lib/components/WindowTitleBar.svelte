@@ -1,27 +1,21 @@
 <script lang="ts">
   /**
-   * Шапка отдельного окна письма и черновика (п. 32 обкатки): знак, заголовок, свои кнопки и кнопки
+   * Шапка отдельного окна письма и черновика (п. 32 обкатки): знак, заголовок и кнопки
    * окна, как у главного окна (п. 14). Пустые места, знак и заголовок перетаскивают окно, двойной
    * щелчок по ним разворачивает.
    */
-  import type { Snippet } from "svelte";
   import Logo from "./Logo.svelte";
   import WindowControls from "./WindowControls.svelte";
 
   interface Props {
     title: string;
-    /** Кнопки окна справа от заголовка (перед «Свернуть»). */
-    actions?: Snippet;
   }
-  let { title, actions }: Props = $props();
+  let { title }: Props = $props();
 </script>
 
 <header class="titlebar" data-tauri-drag-region>
   <span class="brand" data-tauri-drag-region><Logo size={16} /></span>
   <span class="title" data-tauri-drag-region {title}>{title}</span>
-  {#if actions}
-    <div class="actions">{@render actions()}</div>
-  {/if}
   <div class="controls"><WindowControls /></div>
 </header>
 
@@ -48,11 +42,6 @@
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
-  }
-  .actions {
-    display: flex;
-    align-items: center;
-    gap: var(--space-1);
   }
   .controls {
     align-self: stretch;

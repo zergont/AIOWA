@@ -67,8 +67,7 @@
     else selectOne(c);
   }
   function onRowDblClick(c: Conversation) {
-    if (onopenwindow) onopenwindow(c, inDrafts);
-    else if (inDrafts && onopendraft) onopendraft(c);
+    onopenwindow?.(c, inDrafts);
   }
 
   // Простая виртуализация: рисуем только строки в окне прокрутки плюс запас. Высота строки одна на
@@ -628,6 +627,7 @@
   class:kbd
   style="--row: {ROW}px"
   bind:this={scroller}
+  bind:clientHeight={viewport}
   onscroll={onScroll}
   onpointermove={() => (kbd = false)}
   role="listbox"

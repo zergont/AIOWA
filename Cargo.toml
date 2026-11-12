@@ -5,7 +5,7 @@ members = ["crates/*", "apps/desktop/src-tauri"]
 exclude = ["spike/owa-probe"]
 
 [workspace.package]
-version = "0.2.9"
+version = "0.2.10"
 edition = "2024"
 publish = false
 
@@ -44,7 +44,6 @@ percent-encoding = "2"
 rusqlite = { version = "0.40", default-features = false, features = ["bundled", "cache", "modern_sqlite", "functions"] }
 # Миграции делаем сами через PRAGMA user_version: внешний крейт миграций привязан к своей версии rusqlite.
 zstd = "0.14"
-html2text = "0.17"
 sha2 = "0.11"
 
 # извлечение текста из вложений

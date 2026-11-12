@@ -296,7 +296,6 @@ fn truncate(s: &str, n: usize) -> String {
     out
 }
 
-/// Классификация редиректа после запроса к сессии.
 /// Ответ пробного GET `service.svc/s/<op>` (`OwaTransport::service_get_probe`).
 #[derive(Debug, Clone)]
 pub struct ServiceGetReply {
@@ -309,6 +308,7 @@ pub struct ServiceGetReply {
     pub bytes: Vec<u8>,
 }
 
+/// Классификация редиректа после запроса к сессии.
 fn classify_redirect(location: &str) -> TransportError {
     let lower = location.to_ascii_lowercase();
     if lower.contains("logon.aspx") {
@@ -744,7 +744,7 @@ impl OwaTransport {
     async fn get_attachment_json(&self, id: &str, max_bytes: u64) -> Result<AttachmentContent> {
         let v = self.call_unpermitted("GetAttachment", protocol::V_2013, protocol::get_attachment_body(id)).await?;
         let msg = Self::first_message("GetAttachment", &v)?;
-        let att = msg.pointer("/Attachments/0").ok_or_else(|| TransportError::Protocol { op: "GetAttachment".into(), status: 200, raw: format!("нет Attachments: {}", protocol::json_shape(&msg, 2)) })?;
+        let att = msg.pointer("/Attachments/0").ok_or_else(|| TransportError::Protocol { op: "GetAttachment".into(), status: 200, raw: format!("нет Attachments: {}", protocol::json_shape(msg, 2)) })?;
         let content = protocol::str_of(att, "Content").ok_or_else(|| TransportError::Protocol {
             op: "GetAttachment".into(),
             status: 200,
@@ -843,9 +843,9 @@ impl OwaTransport {
         };
         let v = self.call(op, protocol::V_2017, body).await?;
         let msg = Self::first_message(op, &v)?;
-        let (events, includes_last) = protocol::parse_calendar_view(&msg);
+        let (events, includes_last) = protocol::parse_calendar_view(msg);
         // Форма ответа без содержимого: ключи, формат даты, значения перечислений (не персональные).
-        let root = msg.get("RootFolder").unwrap_or(&msg);
+        let root = msg.get("RootFolder").unwrap_or(msg);
         let root_keys: Vec<&str> = root.as_object().map(|o| o.keys().map(String::as_str).collect()).unwrap_or_default();
         let first = root.pointer("/Items/0");
         let item_keys: Vec<&str> = first.and_then(Value::as_object).map(|o| o.keys().map(String::as_str).collect()).unwrap_or_default();
@@ -863,7 +863,7 @@ impl OwaTransport {
                     .collect()
             })
             .unwrap_or_default();
-        debug!(op, mode, response_type = protocol::str_of(&msg, "__type").unwrap_or("?"), ?root_keys, ?item_keys, start_raw, items = events.len(), includes_last, total_in_view = ?protocol::i64_of(root, "TotalItemsInView"), ?enums, "форма ответа календаря");
+        debug!(op, mode, response_type = protocol::str_of(msg, "__type").unwrap_or("?"), ?root_keys, ?item_keys, start_raw, items = events.len(), includes_last, total_in_view = ?protocol::i64_of(root, "TotalItemsInView"), ?enums, "форма ответа календаря");
         Ok((events, includes_last))
     }
 
@@ -950,10 +950,10 @@ impl OwaTransport {
             let v = self.call("GetUserConfiguration", protocol::V_2013, protocol::get_user_configuration_body(base)).await?;
             match Self::first_message("GetUserConfiguration", &v) {
                 Ok(m) => {
-                    let dict = protocol::user_configuration_dictionary(&m);
+                    let dict = protocol::user_configuration_dictionary(m);
                     let keys: Vec<&str> = dict.iter().map(|(k, _)| k.as_str()).collect();
-                    debug!(base, entries = dict.len(), ?keys, shape = %protocol::json_shape(&m, 5), "GetUserConfiguration: словарь OWA.UserOptions");
-                    return Ok(Some(m));
+                    debug!(base, entries = dict.len(), ?keys, shape = %protocol::json_shape(m, 5), "GetUserConfiguration: словарь OWA.UserOptions");
+                    return Ok(Some(m.clone()));
                 }
                 Err(TransportError::Server { code, message }) if code == "ErrorItemNotFound" => {
                     debug!(base, message, "GetUserConfiguration: объекта OWA.UserOptions нет в этой папке");
@@ -974,7 +974,7 @@ impl OwaTransport {
         };
         let v = self.call("DeleteItem", protocol::V_2017, protocol::delete_calendar_item_body(id, delete_type, send_cancellations)).await?;
         let m = Self::first_message("DeleteItem", &v)?;
-        Self::log_shape("DeleteItem", &m);
+        Self::log_shape("DeleteItem", m);
         debug!(delete_type, send_cancellations, "событие календаря удалено");
         Ok(())
     }
@@ -1000,7 +1000,7 @@ impl OwaTransport {
         let mut last_err: Option<TransportError> = None;
         for (i, (code, shape)) in candidates.iter().enumerate() {
             let body = protocol::get_meeting_request_body(id, *shape, 4096);
-            let msg = match self.call("GetItem", protocol::V_2017, body).await.and_then(|v| Self::first_message("GetItem", &v)) {
+            let msg = match self.call("GetItem", protocol::V_2017, body).await.and_then(|v| Self::first_message("GetItem", &v).cloned()) {
                 Ok(m) => m,
                 Err(e) if i + 1 < candidates.len() && (matches!(&e, TransportError::Protocol { status: 500, .. }) || matches!(&e, TransportError::Server { code, .. } if code.contains("Property") || code.contains("Shape"))) => {
                     warn!(error = %e, "GetItem письма о встрече: форма {:?} отвергнута, пробую следующую", shape);
@@ -1253,7 +1253,7 @@ impl OwaTransport {
         };
         let mut last_err: Option<TransportError> = None;
         for (i, (code, version)) in candidates.iter().enumerate() {
-            match self.call(op, version, body.clone()).await.and_then(|v| Self::first_message(op, &v)) {
+            match self.call(op, version, body.clone()).await.and_then(|v| Self::first_message(op, &v).cloned()) {
                 Ok(msg) => {
                     if known == FOLDER_VERSION_UNKNOWN {
                         info!(op, version, "папки: сервер принял форму запроса");
@@ -1285,22 +1285,23 @@ impl OwaTransport {
         debug!(op, response_type = protocol::str_of(msg, "__type").unwrap_or("?"), response_code = protocol::str_of(msg, "ResponseCode").unwrap_or("?"), ?msg_keys, ?folder_keys, ?id_len, ?ck_len, "форма ответа");
     }
 
-    /// Первое сообщение ответа, с проверкой `ResponseClass`.
-    fn first_message(op: &str, v: &Value) -> Result<Value> {
+    /// Первое сообщение ответа, с проверкой `ResponseClass`. Ссылкой внутрь ответа: разбор идёт
+    /// по ссылке, а копия дерева на каждую пачку писем и на base64 вложения была лишней.
+    fn first_message<'a>(op: &str, v: &'a Value) -> Result<&'a Value> {
         let msgs = protocol::response_messages(v);
         let Some(first) = msgs.first() else {
             if let Some(code) = v.pointer("/Body/ResponseCode").and_then(Value::as_str) {
                 if code != "NoError" {
                     return Err(TransportError::Server { code: code.to_string(), message: v.pointer("/Body/MessageText").and_then(Value::as_str).unwrap_or("").to_string() });
                 }
-                return Ok(v["Body"].clone());
+                return Ok(&v["Body"]);
             }
             return Err(TransportError::Protocol { op: op.into(), status: 200, raw: format!("нет ResponseMessages: {}", protocol::json_shape(v, 2)) });
         };
         if let Some((code, message)) = protocol::message_error(first) {
             return Err(server_error(code, message, first));
         }
-        Ok((*first).clone())
+        Ok(first)
     }
 }
 
@@ -1542,7 +1543,7 @@ impl OwaTransport {
     /// Участники из ответа `ExpandDL`; отказ сервера (не список, нет доступа) — `Server`.
     pub fn expand_dl_result(v: &Value) -> Result<Vec<DirectoryPerson>> {
         let msg = Self::first_message("ExpandDL", v)?;
-        let people = protocol::parse_expand_dl(&msg);
+        let people = protocol::parse_expand_dl(msg);
         let total = msg.pointer("/DLExpansion/TotalItemsInView").and_then(Value::as_i64);
         debug!(parsed = people.len(), ?total, "ExpandDL: участники списка");
         Ok(people)
@@ -1591,7 +1592,7 @@ impl MailTransport for OwaTransport {
         let mut with_distinguished = true;
         loop {
             let body = protocol::sync_folder_hierarchy_body(state, with_distinguished);
-            match self.call("SyncFolderHierarchy", protocol::V_2013, body).await.and_then(|v| Self::first_message("SyncFolderHierarchy", &v)) {
+            match self.call("SyncFolderHierarchy", protocol::V_2013, body).await.and_then(|v| Self::first_message("SyncFolderHierarchy", &v).cloned()) {
                 Ok(msg) => {
                     let (state, changes, includes_last) = protocol::parse_folder_changes(&msg);
                     return Ok(FolderChanges { state, changes, includes_last });
@@ -1610,7 +1611,7 @@ impl MailTransport for OwaTransport {
         let body = protocol::sync_folder_items_body(folder, state, max, with_meta);
         let v = self.call("SyncFolderItems", protocol::V_2013, body).await?;
         let msg = Self::first_message("SyncFolderItems", &v)?;
-        let (state, changes, includes_last) = protocol::parse_item_changes(&msg, max);
+        let (state, changes, includes_last) = protocol::parse_item_changes(msg, max);
         Ok(ItemChanges { state, changes, includes_last })
     }
 
@@ -1619,10 +1620,10 @@ impl MailTransport for OwaTransport {
         let started = Instant::now();
         let v = self.call("SyncFolderItems", protocol::V_2013, protocol::sync_contact_items_body(folder, state, max)).await?;
         let msg = Self::first_message("SyncFolderItems", &v)?;
-        let (state, mut changes, includes_last) = protocol::parse_contact_changes(&msg, max);
+        let (state, mut changes, includes_last) = protocol::parse_contact_changes(msg, max);
         if !changes.is_empty() {
             // Форма ответа — только имена ключей (§ 5q снята с живого сервера по этой записи).
-            debug!(form = %protocol::contact_form_keys(&msg), changes = changes.len(), includes_last, ms = started.elapsed().as_millis() as u64, "SyncFolderItems контактов: форма AllProperties (базовые поля)");
+            debug!(form = %protocol::contact_form_keys(msg), changes = changes.len(), includes_last, ms = started.elapsed().as_millis() as u64, "SyncFolderItems контактов: форма AllProperties (базовые поля)");
         }
         // Полные поля — `GetItem` по созданным и изменённым: отказ всего вызова — отказ страницы
         // (состояние не продвигается, повтор в следующий прогон); отказ по одному элементу
@@ -1651,7 +1652,7 @@ impl MailTransport for OwaTransport {
         let started = Instant::now();
         let v = self.call("FindItem", protocol::V_2017, protocol::find_recent_items_body(folder, max, 0)).await?;
         let msg = Self::first_message("FindItem", &v)?;
-        let found = protocol::parse_find_items(&msg, max);
+        let found = protocol::parse_find_items(msg, max);
         debug!(requested = max, items = found.items.len(), raw = found.raw_count, total_in_view = ?found.total_in_view, includes_last = found.includes_last, ms = started.elapsed().as_millis() as u64, "FindItem: последние письма папки");
         Ok(found.items)
     }
@@ -1785,8 +1786,8 @@ impl MailTransport for OwaTransport {
     async fn create_draft(&self, kind: &ComposeKind, msg: &OutgoingMessage) -> Result<ItemId> {
         let v = self.call("CreateItem", protocol::V_2017, protocol::create_item_body(kind, msg)).await?;
         let m = Self::first_message("CreateItem", &v)?;
-        Self::log_shape("CreateItem", &m);
-        protocol::parse_created_item_id(&m).ok_or_else(|| TransportError::Protocol { op: "CreateItem".into(), status: 200, raw: format!("нет Items[0].ItemId: {}", protocol::json_shape(&m, 2)) })
+        Self::log_shape("CreateItem", m);
+        protocol::parse_created_item_id(m).ok_or_else(|| TransportError::Protocol { op: "CreateItem".into(), status: 200, raw: format!("нет Items[0].ItemId: {}", protocol::json_shape(m, 2)) })
     }
 
     async fn add_attachments(&self, item: &ItemId, files: &[OutgoingAttachment]) -> Result<ItemId> {
@@ -1795,8 +1796,8 @@ impl MailTransport for OwaTransport {
             let body = protocol::create_attachment_body(&current, f);
             let v = self.call_with_timeout("CreateAttachment", protocol::V_2017, body, Some(self.inner.config.upload_timeout)).await?;
             let m = Self::first_message("CreateAttachment", &v)?;
-            Self::log_shape("CreateAttachment", &m);
-            match protocol::parse_attachment_root(&m) {
+            Self::log_shape("CreateAttachment", m);
+            match protocol::parse_attachment_root(m) {
                 Some(root) => {
                     debug!(index = i, bytes = f.bytes.len(), root_same = root.id == current.id, ck_len = root.change_key.as_deref().map(str::len), "вложение приложено");
                     current = root;
@@ -1812,15 +1813,15 @@ impl MailTransport for OwaTransport {
     async fn send_draft(&self, item: &ItemId) -> Result<()> {
         let v = self.call("SendItem", protocol::V_2017, protocol::send_item_body(item)).await?;
         let m = Self::first_message("SendItem", &v)?;
-        Self::log_shape("SendItem", &m);
+        Self::log_shape("SendItem", m);
         Ok(())
     }
 
     async fn update_draft(&self, item: &ItemId, msg: &OutgoingMessage) -> Result<ItemId> {
         let v = self.call("UpdateItem", protocol::V_2017, protocol::update_draft_body(item, msg)).await?;
         let m = Self::first_message("UpdateItem", &v)?;
-        Self::log_shape("UpdateItem", &m);
-        let new_id = protocol::written_item_id(&m);
+        Self::log_shape("UpdateItem", m);
+        let new_id = protocol::written_item_id(m);
         debug!(
             subject_len = msg.subject.chars().count(),
             body_chars = msg.body_html.chars().count(),
@@ -1890,7 +1891,7 @@ impl MailTransport for OwaTransport {
         for (i, (code, shape)) in candidates.iter().enumerate() {
             let more = i + 1 < candidates.len();
             let body = protocol::get_draft_body(id, *shape, self.inner.config.max_body_size);
-            let msg = match self.call("GetItem", protocol::V_2017, body).await.and_then(|v| Self::first_message("GetItem", &v)) {
+            let msg = match self.call("GetItem", protocol::V_2017, body).await.and_then(|v| Self::first_message("GetItem", &v).cloned()) {
                 Ok(m) => m,
                 Err(e) if more && (is_shape_rejection(&e) || matches!(&e, TransportError::Server { code, .. } if protocol::is_property_code(code))) => {
                     warn!(error = %e, "GetItem черновика: форма {:?} отвергнута, пробую следующую", shape);
@@ -1971,7 +1972,7 @@ impl MailTransport for OwaTransport {
         let mut last_err: Option<TransportError> = None;
         for (i, (code, shape)) in candidates.iter().enumerate() {
             let body = protocol::get_calendar_item_body(id, *shape, self.inner.config.max_body_size);
-            let result = self.call("GetItem", protocol::V_2017, body).await.and_then(|v| Self::first_message("GetItem", &v));
+            let result = self.call("GetItem", protocol::V_2017, body).await.and_then(|v| Self::first_message("GetItem", &v).cloned());
             let msg = match result {
                 Ok(m) => m,
                 // Отказ по форме запроса (HTTP 500 на неизвестное свойство, ErrorInvalidPropertyRequest и т. п.):
@@ -2004,7 +2005,7 @@ impl MailTransport for OwaTransport {
             // У экземпляра повторяющейся встречи образца повторения нет: он у её «мастера»,
             // который достаётся по идентификатору экземпляра. Отказ сервера здесь не фатален.
             if details.recurrence_text.is_none() && details.event.calendar_type.is_recurring() {
-                match self.call("GetItem", protocol::V_2017, protocol::get_recurring_master_body(id)).await.and_then(|v| Self::first_message("GetItem", &v)) {
+                match self.call("GetItem", protocol::V_2017, protocol::get_recurring_master_body(id)).await.and_then(|v| Self::first_message("GetItem", &v).cloned()) {
                     Ok(m) => {
                         let rec = m.pointer("/Items/0/Recurrence");
                         details.recurrence_text = rec.and_then(protocol::recurrence_text);
@@ -2034,8 +2035,8 @@ impl MailTransport for OwaTransport {
         let body = protocol::create_calendar_item_body(item, time_zone.is_some() && item.is_all_day);
         let v = self.call_in_zone("CreateItem", protocol::V_2017, time_zone, body, None, false).await?;
         let m = Self::first_message("CreateItem", &v)?;
-        Self::log_shape("CreateItem", &m);
-        let id = protocol::parse_created_item_id(&m).ok_or_else(|| TransportError::Protocol { op: "CreateItem".into(), status: 200, raw: format!("нет Items[0].ItemId: {}", protocol::json_shape(&m, 2)) })?;
+        Self::log_shape("CreateItem", m);
+        let id = protocol::parse_created_item_id(m).ok_or_else(|| TransportError::Protocol { op: "CreateItem".into(), status: 200, raw: format!("нет Items[0].ItemId: {}", protocol::json_shape(m, 2)) })?;
         debug!(attendees = item.required.len() + item.optional.len(), all_day = item.is_all_day, reminder = ?item.reminder_minutes, zone = time_zone.is_some(), id_len = id.id.len(), ck_len = id.change_key.as_deref().map(str::len), "событие календаря создано");
         Ok(id)
     }
@@ -2050,8 +2051,8 @@ impl MailTransport for OwaTransport {
         // второй раз; без неё (`SendToNone`, `AlwaysOverwrite`) — повторяется, как запись писем.
         let v = self.call_in_zone("UpdateItem", protocol::V_2017, time_zone, body, None, !send_updates).await?;
         let m = Self::first_message("UpdateItem", &v)?;
-        Self::log_shape("UpdateItem", &m);
-        Ok(protocol::written_item_id(&m).unwrap_or_else(|| id.clone()))
+        Self::log_shape("UpdateItem", m);
+        Ok(protocol::written_item_id(m).unwrap_or_else(|| id.clone()))
     }
 
     async fn delete_calendar_item(&self, id: &ItemId, send_cancellations: bool) -> Result<()> {
@@ -2061,7 +2062,7 @@ impl MailTransport for OwaTransport {
     async fn respond_to_meeting(&self, reference: &ItemId, response: MeetingResponse, send_response: bool, body_html: Option<&str>) -> Result<()> {
         let v = self.call("CreateItem", protocol::V_2017, protocol::respond_to_meeting_body(reference, response, send_response, body_html)).await?;
         let m = Self::first_message("CreateItem", &v)?;
-        Self::log_shape("CreateItem", &m);
+        Self::log_shape("CreateItem", m);
         debug!(response = response.key(), send_response, "ответ на приглашение принят сервером");
         Ok(())
     }

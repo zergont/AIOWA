@@ -6,6 +6,7 @@
 //! событий в журнал не попадает: только типы, ключи и счётчики.
 
 use crate::protocol::{self, str_of};
+use crate::truncate;
 use aiowa_core::{FolderId, ItemId, Participant};
 use aiowa_transport::{NotificationEvent, NotificationKind, PresenceChange, SubscriptionRequest, SubscriptionResult};
 use serde_json::{json, Value};
@@ -112,14 +113,6 @@ pub fn parse_subscription_results(v: &Value, subs: &[SubscriptionRequest]) -> Ve
             }
         })
         .collect()
-}
-
-fn truncate(s: &str, n: usize) -> String {
-    let mut out: String = s.chars().take(n).collect();
-    if s.chars().count() > n {
-        out.push('…');
-    }
-    out
 }
 
 /// Предел буфера без единого открывающего тега: дальше начало отбрасывается.

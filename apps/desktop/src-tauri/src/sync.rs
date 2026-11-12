@@ -13,6 +13,7 @@ use aiowa_store::{ContactApplyStats, Store};
 use aiowa_sync::{Engine, FolderSelection, SyncEvent, SyncOptions, SyncReport, SyncStage};
 use aiowa_transport::{Credentials, MailTransport, TransportError, WriteResult};
 use aiowa_transport_owa::{OwaConfig, OwaTransport};
+use crate::now_ms;
 use secrecy::SecretString;
 use serde::Serialize;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -218,10 +219,6 @@ const RECONCILED_KEY: &str = "hierarchy_reconciled_at";
 const RECONCILE_EVERY_MS: i64 = 24 * 60 * 60 * 1000;
 
 const MAX_WARNINGS: usize = 5;
-
-fn now_ms() -> i64 {
-    jiff::Timestamp::now().as_millisecond()
-}
 
 fn load_password(user: &str) -> Result<SecretString, String> {
     let entry = keyring::Entry::new(KEYRING_SERVICE, user).map_err(|e| format!("keyring: {e}"))?;
@@ -570,6 +567,10 @@ impl SyncState {
             Arc::new(move |e: &SyncEvent| st.on_event(&app, e))
         };
         let engine = Engine::new(Arc::new(transport.clone()), self.store.clone(), self.account, cancel.clone()).on_progress(progress);
+        // Дозапросы по старым письмам и контакты — только после полного прогона (запуск, таймер,
+        // «Обновить»): прогон по одной папке от уведомления сервера или после отправки письма
+        // должен кончаться сразу, без проходов по базе и без запросов по папкам контактов.
+        let full_run = matches!(scope, Scope::AllMail);
         let folders = match scope {
             Scope::AllMail => FolderSelection::AllMail,
             Scope::Folders(pks) => FolderSelection::Ids(pks),
@@ -604,9 +605,11 @@ impl SyncState {
         if self.reconcile_due() {
             self.reconcile_folders(&engine).await;
         }
-        self.repair_change_keys(&transport, &cancel).await;
-        self.backfill_verbs(&transport, body_days, &cancel).await;
-        self.sync_contacts(app, &transport, &cancel).await;
+        if full_run {
+            self.repair_change_keys(&transport, &cancel).await;
+            self.backfill_verbs(&transport, body_days, &cancel).await;
+            self.sync_contacts(app, &transport, &cancel).await;
+        }
         // Остановка на дозапросах или контактах прерывает только их: почта к этому моменту уже
         // синхронизирована, и отчёт прогона — удачный (счётчик непрочитанных, запуск канала
         // уведомлений); недоделанное продолжит следующий прогон.
@@ -780,7 +783,7 @@ impl SyncState {
     async fn repair_change_keys(&self, transport: &OwaTransport, cancel: &AtomicBool) {
         const BATCH: usize = 25;
         const PER_RUN: usize = 1000;
-        let rows = match self.store.items_with_short_change_keys(self.account, ItemId::MIN_FULL_CHANGE_KEY, PER_RUN) {
+        let rows = match self.store.items_with_short_change_keys(self.account, PER_RUN) {
             Ok(rows) => rows,
             Err(e) => {
                 warn!(error = %e, "письма с усечёнными ключами не выбраны");

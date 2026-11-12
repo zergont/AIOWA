@@ -1,12 +1,13 @@
 <script lang="ts">
   import { api, errorMessage, formatSize, fullDate, personLabel, type Attachment, type EmbeddedMessage, type EmbeddedPerson, type PreviewDto } from "../api";
-  import { hint, isTopLayer, keysOf, layer } from "../hotkeys";
+  import { hint, isTopLayer, layer } from "../hotkeys";
   import BodyFrame from "./BodyFrame.svelte";
   import WindowControls from "./WindowControls.svelte";
   import { darkMailByDefault, windowIsDark } from "../darkmail.svelte";
 
   /**
-   * Предпросмотр вложений письма поверх области чтения: картинка, PDF, текст (в том числе HTML — как
+   * Просмотр вложений письма в своём окне Windows (п. 31, `AttachmentWindow`): на всё окно, шапка —
+   * заголовок окна (перетаскивание, кнопки окна). Картинка, PDF, текст (в том числе HTML — как
    * текст, без выполнения). Файл отдаёт протокол aiowa-att из кэша вложений; адрес и тип — у бэкенда
    * (`attachment_preview_url`, при необходимости он сначала скачивает файл). Стрелки листают вложения.
    */
@@ -23,15 +24,8 @@
     /** Скрыть ошибку действия. */
     onclearerror?: (a: Attachment) => void;
     onclose: () => void;
-    /**
-     * Своё окно Windows (п. 31, `AttachmentWindow`): без подложки, на всё окно, шапка — заголовок
-     * окна (перетаскивание, кнопки окна вместо «Закрыть»).
-     */
-    standalone?: boolean;
   }
-  let { files, index = $bindable(0), onopen, onsave, status, onclearerror, onclose, standalone = false }: Props = $props();
-  /** Атрибут перетаскивания окна для шапки окна просмотра (у слоя поверх окна его нет). */
-  const drag = $derived(standalone ? "" : undefined);
+  let { files, index = $bindable(0), onopen, onsave, status, onclearerror, onclose }: Props = $props();
 
   const uid = $props.id();
   /** Текст больше этого в окно не грузится: предлагается открыть файл. */
@@ -58,7 +52,6 @@
   let loading = $state(false);
   let error = $state<string | null>(null);
   let dialogEl = $state<HTMLDivElement | null>(null);
-  let closeBtn = $state<HTMLButtonElement | null>(null);
 
   /** Вид показа по типу от бэкенда. */
   const mode = $derived.by((): "image" | "pdf" | "text" | "message" | "none" => {
@@ -151,10 +144,6 @@
     })();
   });
 
-  $effect(() => {
-    closeBtn?.focus();
-  });
-
   function go(delta: number) {
     const next = index + delta;
     if (next >= 0 && next < files.length) index = next;
@@ -205,25 +194,20 @@
         break;
     }
   }
-
-  function onBackdrop(e: MouseEvent) {
-    if (e.target === e.currentTarget) onclose();
-  }
 </script>
 
 <svelte:window onkeydown={onKey} />
 
-<!-- Подложка только для мыши: закрытие с клавиатуры — Esc (обработчик окна выше), поэтому для читалок она «презентационная». -->
-<div class="overlay" class:standalone role="presentation" onclick={standalone ? undefined : onBackdrop}>
-  <div class="dialog" role="dialog" aria-modal={!standalone} aria-labelledby="{uid}-title" aria-busy={loading} bind:this={dialogEl} {@attach layer}>
-    <header class="head" data-tauri-drag-region={drag}>
+<div class="overlay">
+  <div class="dialog" role="dialog" aria-modal="false" aria-labelledby="{uid}-title" aria-busy={loading} bind:this={dialogEl} {@attach layer}>
+    <header class="head" data-tauri-drag-region>
       <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path d="M3 2.5h7l3 3v8H3v-11Zm7 0v3h3" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round" /></svg>
-      <h2 class="title" id="{uid}-title" title={name} data-tauri-drag-region={drag}>{name}</h2>
+      <h2 class="title" id="{uid}-title" title={name} data-tauri-drag-region>{name}</h2>
       <span class="caption size">{formatSize(file?.size ?? dto?.size ?? null)}</span>
       {#if files.length > 1}
         <span class="caption pos" aria-live="polite">{index + 1} из {files.length}</span>
       {/if}
-      <span class="spacer" data-tauri-drag-region={drag}></span>
+      <span class="spacer" data-tauri-drag-region></span>
       {#if canOpen}
         <button class="btn" onclick={() => file && onopen(file)} disabled={!file || actionBusy != null} aria-busy={actionBusy === "open"} title="Открыть в системном приложении">
           {#if actionBusy === "open"}<span class="spinner" aria-hidden="true"></span>{/if}
@@ -234,14 +218,10 @@
         {#if actionBusy === "save"}<span class="spinner" aria-hidden="true"></span>{/if}
         Сохранить как…
       </button>
-      {#if standalone}
-        <!-- Окно просмотра: кнопки окна, как у главного; Esc закрывает его так же. -->
-        <div class="window-controls">
-          <WindowControls />
-        </div>
-      {:else}
-        <button class="btn" bind:this={closeBtn} onclick={onclose} title={`Закрыть (${keysOf("preview-close")}; пока фокус внутри PDF — кнопкой)`}>Закрыть</button>
-      {/if}
+      <!-- Кнопки окна, как у главного; Esc закрывает его так же. -->
+      <div class="window-controls">
+        <WindowControls />
+      </div>
     </header>
 
     {#if status?.error}
@@ -347,34 +327,13 @@
 </div>
 
 <style>
+  /* Своё окно просмотра (п. 31): на всё окно, без подложки и рамки. */
   .overlay {
-    position: fixed;
-    inset: 0;
-    z-index: 90;
-    background: rgba(0, 0, 0, 0.45);
+    height: 100%;
     display: flex;
     align-items: center;
     justify-content: center;
-    padding: var(--space-6);
-  }
-  /* Своё окно просмотра (п. 31): без подложки и рамки диалога, на всё окно. */
-  .overlay.standalone {
-    position: static;
-    height: 100%;
-    padding: 0;
     background: var(--bg-card);
-  }
-  .standalone .dialog {
-    width: 100%;
-    height: 100%;
-    border: 0;
-    border-radius: 0;
-    box-shadow: none;
-  }
-  .standalone .head {
-    min-height: 40px;
-    padding-block: 0;
-    padding-right: 0;
   }
   .window-controls {
     align-self: stretch;
@@ -384,12 +343,9 @@
   .dialog {
     display: flex;
     flex-direction: column;
-    width: min(1100px, 100%);
-    height: min(860px, 100%);
+    width: 100%;
+    height: 100%;
     background: var(--bg-card);
-    border: 1px solid var(--stroke-2);
-    border-radius: var(--radius-card);
-    box-shadow: var(--shadow-16);
     color: var(--fg-1);
     overflow: hidden;
   }
@@ -397,7 +353,8 @@
     display: flex;
     align-items: center;
     gap: var(--space-2);
-    padding: var(--space-2) var(--space-3);
+    min-height: 40px;
+    padding: 0 0 0 var(--space-3);
     border-bottom: 1px solid var(--stroke-1);
     color: var(--fg-2);
   }

@@ -34,7 +34,6 @@
   let query = $state("");
   let contacts = $state<PersonalContact[]>([]);
   let loaded = $state(false);
-  let loading = $state(false);
   let failure = $state<string | null>(null);
   let selectedPk = $state<number | null>(null);
   /** Сколько контактов (и отдельно групп) в списке; остальные — через поиск. */
@@ -69,7 +68,6 @@
   let request = 0;
   async function load() {
     const n = ++request;
-    loading = true;
     failure = null;
     try {
       // На одну запись больше предела: так видно, что список обрезан.
@@ -88,8 +86,6 @@
       void primePhotos(list.map((c) => c.email));
     } catch (e) {
       if (n === request) failure = errorMessage(e);
-    } finally {
-      if (n === request) loading = false;
     }
   }
 

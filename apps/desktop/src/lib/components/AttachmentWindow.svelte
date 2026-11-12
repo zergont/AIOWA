@@ -100,7 +100,7 @@
 </script>
 
 {#if files.length}
-  <AttachmentPreview standalone {files} bind:index onopen={openFile} onsave={saveFile} status={status(files[index]?.attachment_pk ?? -1)} onclearerror={(a) => setStatus(a.attachment_pk, { error: null })} onclose={close} />
+  <AttachmentPreview {files} bind:index onopen={openFile} onsave={saveFile} status={status(files[index]?.attachment_pk ?? -1)} onclearerror={(a) => setStatus(a.attachment_pk, { error: null })} onclose={close} />
 {:else}
   <main class="empty">
     <p class="caption">{loadError ?? "Загружаю вложения…"}</p>

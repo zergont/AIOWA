@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onDestroy, onMount, untrack } from "svelte";
-  import { api, errorMessage, failNetwork, failOriginalGone, failRetryable, formatSize, fullDate, isInlinePicture, messageNeedsFetch, onSyncProgress, personLabel, type ComposeContext, type ComposeRecipient, type ComposeRequest, type DraftAttachment, type DraftRef, type Message, type PickedFile, type SignatureDto } from "../api";
+  import { api, errorMessage, failNetwork, failOriginalGone, failRetryable, formatSize, fullDate, isInlinePicture, messageNeedsFetch, onSyncProgress, personLabel, type ComposeContext, type ComposeRecipient, type ComposeRequest, type DraftAttachment, type DraftRef, type LocalDraft, type Message, type PickedFile, type SignatureDto } from "../api";
   import { COMPOSE_TITLE, ICON } from "../actions";
   import { isValidEmail, mergeRecipients } from "../addresses";
   import { cleanDraftHtml, htmlToText, restoreDraftHtml } from "../html";
@@ -229,7 +229,9 @@
   const normHtml = (h: string) => new DOMParser().parseFromString(h, "text/html").body.innerHTML;
   // Восстановленный локальный черновик на сервере не сохранён: отсчёт правок — от пустого письма.
   const init = untrack(() => (ctx.restore ? { subject: "", bodyText: "", bodyHtml: normHtml("<div><br></div>"), to: "", cc: "", bcc: "" } : { subject: ctx.subject, bodyText: htmlToText(startBody), bodyHtml: normHtml(startBody), to: keyOf(to), cc: keyOf(cc), bcc: keyOf(bcc) }));
-  const isDirty = $derived(subject !== init.subject || keyOf(to) !== init.to || keyOf(cc) !== init.cc || keyOf(bcc) !== init.bcc || attachments.length > 0 || removedServerIds.length > 0 || htmlToText(body) !== init.bodyText || (body !== startBody && normHtml(body) !== init.bodyHtml));
+  /** Текст тела без разметки: считается раз на правку, нужен и «есть правки», и «письмо непустое». */
+  const bodyText = $derived(htmlToText(body));
+  const isDirty = $derived(subject !== init.subject || keyOf(to) !== init.to || keyOf(cc) !== init.cc || keyOf(bcc) !== init.bcc || attachments.length > 0 || removedServerIds.length > 0 || bodyText !== init.bodyText || (body !== startBody && normHtml(body) !== init.bodyHtml));
   /**
    * Черновик, который создал сам композер и автор не сохранял (п. 33): при нетронутом письме он
    * лишний и при закрытии убирается. Для родителя письмо с ним — «с правками»: закрытие окна,
@@ -423,7 +425,7 @@
 
   /** Что именно сохраняется: тема, получатели и разметка тела (форматирование тоже правка). */
   const snapshot = $derived(JSON.stringify([subject.trim(), keyOf(to), keyOf(cc), keyOf(bcc), body]));
-  const nonEmpty = $derived(subject.trim() !== "" || to.length + cc.length + bcc.length > 0 || htmlToText(body) !== "");
+  const nonEmpty = $derived(subject.trim() !== "" || to.length + cc.length + bcc.length > 0 || bodyText !== "");
   /** Снимок, который лежит на сервере; у открытого черновика — его начальное состояние. */
   let lastSavedKey = $state<string | null>(untrack(() => (ctx.draft ? snapshot : null)));
   /** Снимок, на котором автосохранение отказало: повтор только после правки. */
@@ -450,10 +452,18 @@
   // Связь вернулась (прогон синхронизации прошёл без ошибки): не ждать паузу, повторить сразу.
   onMount(() => {
     let unlisten: (() => void) | undefined;
+    let gone = false;
     void onSyncProgress((s) => {
       if (!s.running && !s.last_error && autosaveNetwork && alive && !busy && !autosaving) autosave();
-    }).then((u) => (unlisten = u));
-    return () => unlisten?.();
+    }).then((u) => {
+      // Композер закрыли, пока подписка оформлялась: снять её сразу, иначе она осталась бы навсегда.
+      if (gone) u();
+      else unlisten = u;
+    });
+    return () => {
+      gone = true;
+      unlisten?.();
+    };
   });
 
   // --- локальный черновик ------------------------------------------------------------------
@@ -473,24 +483,47 @@
     return () => clearTimeout(t);
   });
 
+  // Запись и удаление идут строго по очереди: команды бэкенда выполняются в пуле потоков, и без
+  // очереди удаление могло бы обогнать ещё не законченную запись — черновик остался бы в базе и
+  // всплыл бы полосой «Несохранённое письмо». Пустая очередь команду не задерживает.
+  let localQueue: Promise<unknown> = Promise.resolve();
+  let localPending = 0;
+  /** Локальный черновик убран: запоздавшая запись его не вернёт. */
+  let localDropped = false;
+  function queueLocal<T>(job: () => Promise<T>): Promise<T> {
+    const run = localPending === 0 ? job() : localQueue.then(job, job);
+    localPending++;
+    const done = () => {
+      localPending--;
+    };
+    localQueue = run.then(done, done);
+    return run;
+  }
+  /** Начатые записи и удаление локального черновика дошли до базы: окно ждёт этого перед закрытием. */
+  export function localSettled(): Promise<void> {
+    return localQueue.then(() => {});
+  }
+
   /** Записать локальный черновик; null — записан, иначе текст ошибки. */
   async function saveLocal(key: string): Promise<string | null> {
     if (!alive) return "окно письма уже закрыто";
+    if (localDropped) return "письмо уже закрыто";
+    const draft: LocalDraft = {
+      draft_id: localId,
+      kind,
+      reference_item_pk: referencePk,
+      draft_server_id: draftRef?.server_id ?? null,
+      subject: subject.trim(),
+      to: clean(to),
+      cc: clean(cc),
+      bcc: clean(bcc),
+      body_html: restoreDraftHtml(body),
+      attachments: $state.snapshot(attachments),
+      removed_attachment_ids: $state.snapshot(removedServerIds),
+      updated_ms: Date.now(),
+    };
     try {
-      await api.composeLocalSave({
-        draft_id: localId,
-        kind,
-        reference_item_pk: referencePk,
-        draft_server_id: draftRef?.server_id ?? null,
-        subject: subject.trim(),
-        to: clean(to),
-        cc: clean(cc),
-        bcc: clean(bcc),
-        body_html: restoreDraftHtml(body),
-        attachments: $state.snapshot(attachments),
-        removed_attachment_ids: $state.snapshot(removedServerIds),
-        updated_ms: Date.now(),
-      });
+      await queueLocal(() => api.composeLocalSave(draft));
       if (alive) lastLocalKey = key;
       return null;
     } catch (e) {
@@ -500,7 +533,8 @@
   }
 
   function dropLocal() {
-    void api.composeLocalDrop(localId).catch((e) => console.warn("compose_local_drop:", errorMessage(e)));
+    localDropped = true;
+    void queueLocal(() => api.composeLocalDrop(localId)).catch((e) => console.warn("compose_local_drop:", errorMessage(e)));
   }
 
   /**
@@ -1021,7 +1055,7 @@
   {/if}
 
   {#if adviceOpen && adviceKind && adviceRef != null && adviceStatus}
-    <AdvicePanel kind={adviceKind} referencePk={adviceRef} status={adviceStatus} typed={() => (isDirty ? htmlToText(body) : "")} canReplace={!quoteInText} oninsert={insertAdvice} onclose={() => (adviceOpen = false)} />
+    <AdvicePanel kind={adviceKind} referencePk={adviceRef} status={adviceStatus} typed={() => (isDirty ? bodyText : "")} canReplace={!quoteInText} oninsert={insertAdvice} onclose={() => (adviceOpen = false)} />
   {/if}
 
   <div class="editor-wrap">

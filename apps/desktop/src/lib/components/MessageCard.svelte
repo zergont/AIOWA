@@ -365,6 +365,7 @@
 
   onDestroy(() => {
     for (const t of savedTimers.values()) clearTimeout(t);
+    clearTimeout(copyTimer);
   });
 
   // --- предпросмотр вложений ----------------------------------------------------
@@ -886,17 +887,6 @@
   }
   .card:not(.expanded) .head:hover {
     background: var(--bg-hover);
-  }
-  .avatar {
-    width: 36px;
-    height: 36px;
-    border-radius: 50%;
-    background: var(--accent-soft);
-    color: var(--accent);
-    font: var(--text-body-strong);
-    display: flex;
-    align-items: center;
-    justify-content: center;
   }
   .who {
     min-width: 0;

@@ -66,6 +66,26 @@ pub struct ConversationCursor {
     pub conversation_pk: i64,
 }
 
+/// Письма беседы. `+i.account_id` (унарный плюс) не даёт планировщику взять индекс по учётной
+/// записи: статистики в базе нет, и без подсказки он выбирал `items_from_lower (account_id=?)` —
+/// перебор всех писем ящика на каждое открытие беседы (0,4 с на 155 тыс. писем в отладочной
+/// сборке) вместо `items_conv_folder`. План закреплён тестом `conversation_queries_use_conversation_index`.
+fn conversation_messages_sql() -> String {
+    format!(
+        "{HEAD_SELECT} WHERE i.conversation_pk = ?1 AND +i.account_id = ?2 AND i.deleted = 0
+         ORDER BY COALESCE(i.received_at, i.sent_at) DESC, i.item_pk DESC"
+    )
+}
+
+/// Ключи писем беседы — в том же порядке и с той же подсказкой планировщику: окно зовёт их после
+/// каждого события синхронизации.
+const CONVERSATION_KEYS_SQL: &str = "SELECT i.item_pk, i.body_state, i.is_read,
+        (SELECT COUNT(*) FROM attachments a WHERE a.item_pk = i.item_pk AND a.local_path IS NOT NULL),
+        i.flag_status = 'Flagged'
+ FROM items i
+ WHERE i.conversation_pk = ?1 AND +i.account_id = ?2 AND i.deleted = 0
+ ORDER BY COALESCE(i.received_at, i.sent_at) DESC, i.item_pk DESC";
+
 impl ConversationRow {
     /// Курсор страницы, следующей за этой строкой: по числу из базы, у беседы без даты — 0.
     pub fn cursor(&self) -> ConversationCursor {
@@ -204,12 +224,10 @@ impl Store {
     }
 
     /// Письма беседы во всех папках, новые первыми (как в OWA: свежий ответ сверху).
+    /// Запрос — `conversation_messages_sql`: по индексу беседы, а не перебором ящика.
     pub fn conversation_messages(&self, account: AccountId, conversation_pk: i64) -> Result<Vec<MessageHead>> {
         self.with_conn(|c| {
-            let mut st = c.prepare_cached(&format!(
-                "{HEAD_SELECT} WHERE i.conversation_pk = ?1 AND i.account_id = ?2 AND i.deleted = 0
-                 ORDER BY COALESCE(i.received_at, i.sent_at) DESC, i.item_pk DESC"
-            ))?;
+            let mut st = c.prepare_cached(&conversation_messages_sql())?;
             let rows = st.query_map(params![conversation_pk, account.0], head_row)?;
             let mut heads = rows.collect::<std::result::Result<Vec<_>, _>>()?;
             fill_reply_to(c, &mut heads)?;
@@ -220,14 +238,7 @@ impl Store {
     /// Ключи писем беседы в том же порядке, что `conversation_messages`.
     pub fn conversation_keys(&self, account: AccountId, conversation_pk: i64) -> Result<Vec<MessageKey>> {
         self.with_conn(|c| {
-            let mut st = c.prepare_cached(
-                "SELECT i.item_pk, i.body_state, i.is_read,
-                        (SELECT COUNT(*) FROM attachments a WHERE a.item_pk = i.item_pk AND a.local_path IS NOT NULL),
-                        i.flag_status = 'Flagged'
-                 FROM items i
-                 WHERE i.conversation_pk = ?1 AND i.account_id = ?2 AND i.deleted = 0
-                 ORDER BY COALESCE(i.received_at, i.sent_at) DESC, i.item_pk DESC",
-            )?;
+            let mut st = c.prepare_cached(CONVERSATION_KEYS_SQL)?;
             let rows = st.query_map(params![conversation_pk, account.0], |r| {
                 Ok(MessageKey { item_pk: r.get(0)?, body_state: r.get(1)?, is_read: r.get::<_, i64>(2)? != 0, cached: r.get(3)?, is_flagged: r.get::<_, Option<i64>>(4)?.unwrap_or(0) != 0 })
             })?;
@@ -425,6 +436,22 @@ mod tests {
             .unwrap()
             .join("\n");
         assert!(plan.contains("items_conv_folder"), "{plan}");
+    }
+
+    #[test]
+    fn conversation_queries_use_conversation_index() {
+        let s = tmp_store("conversation-plan");
+        for sql in [conversation_messages_sql(), CONVERSATION_KEYS_SQL.to_string()] {
+            let plan = s
+                .with_conn(|c| {
+                    let mut st = c.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))?;
+                    let rows = st.query_map(params![1, 1], |r| r.get::<_, String>("detail"))?;
+                    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+                })
+                .unwrap()
+                .join("\n");
+            assert!(plan.contains("items_conv_folder (conversation_pk=?)"), "беседа читается по своему индексу, а не перебором ящика: {plan}");
+        }
     }
 
     #[test]

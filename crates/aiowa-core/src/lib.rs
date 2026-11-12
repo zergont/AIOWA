@@ -518,12 +518,6 @@ pub struct DraftContent {
 }
 
 impl DraftContent {
-    /// Исходящее письмо из содержимого черновика: то, что композер правит и отдаёт в
-    /// `update_draft`/`compose_send`.
-    pub fn to_outgoing(&self) -> OutgoingMessage {
-        OutgoingMessage { to: self.to.clone(), cc: self.cc.clone(), bcc: self.bcc.clone(), subject: self.subject.clone(), body_html: self.body_html.clone(), importance: self.importance }
-    }
-
     /// Файловые вложения (без инлайновых картинок тела): их показывает список вложений композера.
     pub fn file_attachments(&self) -> impl Iterator<Item = &AttachmentMeta> {
         self.attachments.iter().filter(|a| !a.is_inline)
@@ -1017,11 +1011,6 @@ impl MeetingMessageKind {
         }
     }
 
-    /// Письмо о встрече вообще (любого вида, включая `Other` с префиксом класса).
-    pub fn is_meeting_class(class: &str) -> bool {
-        class.trim().to_ascii_lowercase().starts_with(&Self::CLASS_PREFIX.to_ascii_lowercase())
-    }
-
     /// Ключ для интерфейса: `request`, `cancellation`, `response`, `other`.
     pub const fn key(self) -> &'static str {
         match self {
@@ -1335,7 +1324,6 @@ mod tests {
         assert_eq!(MeetingMessageKind::from_item_class("IPM.Schedule.Meeting.Resp.Pos"), MeetingMessageKind::Response);
         assert_eq!(MeetingMessageKind::from_item_class("IPM.Schedule.Meeting.Notification.Forward"), MeetingMessageKind::Other);
         assert_eq!(MeetingMessageKind::from_item_class("IPM.Note"), MeetingMessageKind::Other);
-        assert!(MeetingMessageKind::is_meeting_class("IPM.Schedule.Meeting.Notification.Forward") && !MeetingMessageKind::is_meeting_class("IPM.Note"));
         assert_eq!(MeetingMessageKind::Cancellation.key(), "cancellation");
         assert_eq!(response_from_item_class("IPM.Schedule.Meeting.Resp.Pos"), Some(ResponseType::Accept));
         assert_eq!(response_from_item_class("IPM.Schedule.Meeting.Resp.Neg"), Some(ResponseType::Decline));
@@ -1416,7 +1404,7 @@ mod tests {
     }
 
     #[test]
-    fn draft_content_to_outgoing_and_file_attachments() {
+    fn draft_content_file_attachments() {
         let att = |id: &str, inline: bool| AttachmentMeta { id: id.into(), name: Some(format!("{id}.txt")), content_type: None, size: Some(3), is_inline: inline, content_id: None };
         let d = DraftContent {
             id: ItemId { id: "D".into(), change_key: Some("k".into()) },
@@ -1429,8 +1417,6 @@ mod tests {
             attachments: vec![att("a1", false), att("img", true), att("a2", false)],
             is_truncated: false,
         };
-        let out = d.to_outgoing();
-        assert_eq!((out.subject.as_str(), out.body_html.as_str(), out.to.len(), out.importance), ("Тема", "<p>х</p>", 1, Importance::High));
         assert_eq!(d.file_attachments().map(|a| a.id.as_str()).collect::<Vec<_>>(), vec!["a1", "a2"], "инлайновые картинки в списке файлов не показываются");
     }
 

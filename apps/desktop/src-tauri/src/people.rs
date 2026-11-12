@@ -257,6 +257,27 @@ async fn timed<T>(fut: impl std::future::Future<Output = Result<T, String>>) -> 
     tokio::time::timeout(WRITE_TIMEOUT, fut).await.unwrap_or_else(|_| Err(timed_out(WRITE_TIMEOUT)))
 }
 
+/// Отказ транспорта внутри шага записи: текст — пользователю, сама ошибка — чтобы после шага
+/// сбросить непригодную сессию (`SyncState::invalidate_on`), как делают остальные модули записи.
+/// Без сброса следующая команда шла бы в ту же мёртвую сессию.
+#[derive(Default)]
+struct TransportFail(std::sync::Mutex<Option<aiowa_transport::TransportError>>);
+
+impl TransportFail {
+    fn note(&self, e: aiowa_transport::TransportError) -> String {
+        let text = describe_transport(&e);
+        *self.0.lock().unwrap_or_else(|p| p.into_inner()) = Some(e);
+        text
+    }
+
+    async fn settle(&self, sync: &SyncState) {
+        let e = self.0.lock().unwrap_or_else(|p| p.into_inner()).take();
+        if let Some(e) = e {
+            sync.invalidate_on(&e).await;
+        }
+    }
+}
+
 /// Создать (`contact_pk` нет) или изменить личный контакт. Новый — в папку «Контакты». Перед
 /// правкой поля перечитываются с сервера (прежние значения `UpdatePersona` — серверные), после
 /// записи контакт перечитывается `GetItem` и ложится в базу. Возвращает контакт из базы.
@@ -285,8 +306,9 @@ pub(crate) async fn contact_save(contact_pk: Option<i64>, form: ContactFormDto, 
     let transport = sync.transport().await.map_err(|e| e.to_string())?;
     let t = &transport;
     let started = Instant::now();
+    let lost = TransportFail::default();
     let item_id = timed(async {
-        let fail = |e: aiowa_transport::TransportError| describe_transport(&e);
+        let fail = |e: aiowa_transport::TransportError| lost.note(e);
         match &existing {
             None => {
                 let v = t.persona_call("CreatePersona", protocol::create_persona_body(&folder, PERSONA_PERSON, persona_updates(None, &form))).await.map_err(fail)?;
@@ -305,7 +327,9 @@ pub(crate) async fn contact_save(contact_pk: Option<i64>, form: ContactFormDto, 
             }
         }
     })
-    .await?;
+    .await;
+    lost.settle(&sync).await;
+    let item_id = item_id?;
     let saved = timed(async { t.get_contact_items(std::slice::from_ref(&item_id)).await.map_err(|e| describe_transport(&e)) })
         .await
         .ok()
@@ -339,13 +363,16 @@ pub(crate) async fn contact_delete(contact_pk: i64, app: AppHandle, state: State
     let folder = FolderId { id: folder.server_id, change_key: None };
     let transport = sync.transport().await.map_err(|e| e.to_string())?;
     let t = &transport;
-    timed(async {
-        let fail = |e: aiowa_transport::TransportError| describe_transport(&e);
+    let lost = TransportFail::default();
+    let deleted = timed(async {
+        let fail = |e: aiowa_transport::TransportError| lost.note(e);
         let persona = persona_of(t, &folder, &row.item.item_id).await.map_err(fail)?.ok_or("Контакт не найден среди людей папки: удалите его в OWA")?;
         t.delete_personas(&[persona]).await.map_err(fail)?;
         Ok(())
     })
-    .await?;
+    .await;
+    lost.settle(&sync).await;
+    deleted?;
     let removed = {
         let store = store.clone();
         tauri::async_runtime::spawn_blocking(move || store.remove_contact(account, contact_pk)).await.map_err(err)?.map_err(err)?

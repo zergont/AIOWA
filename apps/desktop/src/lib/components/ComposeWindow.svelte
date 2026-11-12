@@ -84,6 +84,9 @@
   async function onclose(reason: CloseReason) {
     if (closing) return;
     closing = true;
+    // Записи локального черновика, начатые композером, должны дойти до базы раньше, чем окно
+    // закроется: порядок держит очередь композера.
+    await composerRef?.localSettled();
     // Локальный черновик убирается до закрытия: главное окно перечитает их сразу после.
     if (reason !== "local" && reason !== "window") await api.composeLocalDrop(localId).catch(() => {});
     if (reason !== "cancel") await composeFinished(reason).catch((e) => console.warn("compose-finished:", errorMessage(e)));

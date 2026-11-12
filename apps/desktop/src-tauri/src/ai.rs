@@ -66,7 +66,6 @@ impl AiState {
         Ok(Self { gateway, tests: Mutex::new(HashMap::new()), advice: Mutex::new(HashMap::new()) })
     }
 
-    /// Отменить идущую проверку профиля (и забыть её).
     /// Новый «Совет»: запомнить его отмену (прежний с тем же номером — отменить).
     pub(crate) fn start_advice(&self, request_id: &str) -> Cancel {
         let c = Cancel::new();
@@ -86,6 +85,7 @@ impl AiState {
         }
     }
 
+    /// Отменить идущую проверку профиля (и забыть её).
     fn cancel_test(&self, id: &str) {
         if let Some(c) = self.tests.lock().unwrap_or_else(|p| p.into_inner()).remove(id) {
             c.cancel();
@@ -253,12 +253,12 @@ pub(crate) struct ProfileInput {
 
 // --- команды --------------------------------------------------------------------------------
 
-#[tauri::command]
+#[tauri::command(async)]
 pub(crate) fn ai_settings(state: State<'_, AppState>) -> CmdResult<AiSettingsDto> {
     Ok(dto(&AiConfig::load(&state.store, state.account)))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub(crate) fn ai_settings_set(patch: AiSettingsPatch, state: State<'_, AppState>) -> CmdResult<AiSettingsDto> {
     let mut cfg = AiConfig::load(&state.store, state.account);
     if let Some(v) = patch.enabled {
@@ -284,7 +284,7 @@ pub(crate) fn ai_settings_set(patch: AiSettingsPatch, state: State<'_, AppState>
 
 /// Сохранить подключение (новое или изменённое). `key` — новый ключ (пустой — не менять),
 /// `clear_key` — убрать сохранённый.
-#[tauri::command]
+#[tauri::command(async)]
 pub(crate) fn ai_profile_save(profile: ProfileInput, key: Option<String>, clear_key: bool, state: State<'_, AppState>, ai: State<'_, AiState>) -> CmdResult<AiSettingsDto> {
     let mut cfg = AiConfig::load(&state.store, state.account);
     let key = key.map(|k| k.trim().to_string()).filter(|k| !k.is_empty());
@@ -331,7 +331,7 @@ pub(crate) fn ai_profile_save(profile: ProfileInput, key: Option<String>, clear_
     Ok(dto(&cfg))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub(crate) fn ai_profile_delete(id: String, state: State<'_, AppState>, ai: State<'_, AiState>) -> CmdResult<AiSettingsDto> {
     let mut cfg = AiConfig::load(&state.store, state.account);
     let before = cfg.profiles.len();
@@ -349,15 +349,6 @@ pub(crate) fn ai_profile_delete(id: String, state: State<'_, AppState>, ai: Stat
     cfg.save(&state.store, state.account)?;
     info!("подключение к модели удалено");
     Ok(dto(&cfg))
-}
-
-/// Модели подключения — для выбора модели в настройках.
-#[tauri::command]
-pub(crate) async fn ai_profile_models(id: String, state: State<'_, AppState>, ai: State<'_, AiState>) -> CmdResult<Vec<ModelInfo>> {
-    let cfg = AiConfig::load(&state.store, state.account);
-    let profile = cfg.profile(&id)?.clone();
-    let key = key_get(&id);
-    ai.gateway.list_models(&profile, key.as_ref(), cfg.mode, &Cancel::new()).await.map_err(|e| e.to_string())
 }
 
 /// Итог проверки подключения: список моделей и короткий ответ выбранной модели.
@@ -491,7 +482,7 @@ pub(crate) struct AiJournalDto {
 }
 
 /// Журнал обращений: последние 30 и итоги за 30 дней.
-#[tauri::command]
+#[tauri::command(async)]
 pub(crate) fn ai_journal(state: State<'_, AppState>) -> CmdResult<AiJournalDto> {
     let recent = state.store.ai_calls_recent(state.account, 30).map_err(err)?;
     let since = jiff::Timestamp::now().as_millisecond() - 30 * 24 * 3600 * 1000;

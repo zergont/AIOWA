@@ -1134,7 +1134,6 @@ export const api = {
   contactDelete: (contactPk: number) => invoke<void>("contact_delete", { contactPk }),
   /** Что умеет справочник на этом сервере: раскрытие списков рассылки бывает не реализовано (§ 5l). */
   directoryCapabilities: () => invoke<{ can_expand: boolean }>("directory_capabilities"),
-  ownAddresses: () => invoke<string[]>("own_addresses"),
   signatureGet: () => invoke<SignatureDto>("signature_get"),
   signatureSet: (html: string, autoAdd: boolean) => invoke<void>("signature_set", { html, autoAdd }),
   /** Подпись из настроек OWA; сохраняется локально; отказ строкой, если подписи нет. */
@@ -1216,7 +1215,6 @@ export const api = {
   /** Сохранить подключение; `key` — новый ключ (пустой — не менять), `clearKey` — убрать сохранённый. Ключ обратно не возвращается. */
   aiProfileSave: (profile: AiProfileInput, key: string | null, clearKey: boolean) => invoke<AiSettings>("ai_profile_save", { profile, key, clearKey }),
   aiProfileDelete: (id: string) => invoke<AiSettings>("ai_profile_delete", { id }),
-  aiProfileModels: (id: string) => invoke<AiModel[]>("ai_profile_models", { id }),
   /** «Проверить»: список моделей и короткий ответ выбранной модели. */
   aiProfileTest: (id: string) => invoke<AiTest>("ai_profile_test", { id }),
   aiJournal: () => invoke<AiJournal>("ai_journal"),
@@ -1469,11 +1467,6 @@ export function onCalendarChanged(cb: () => void): Promise<UnlistenFn> {
 /** Личные контакты изменились после синхронизации (сколько добавлено, изменено, ушло). */
 export function onContactsChanged(cb: (ev: { created: number; updated: number; deleted: number }) => void): Promise<UnlistenFn> {
   return listen<{ created: number; updated: number; deleted: number }>("contacts-changed", (e) => cb(e.payload));
-}
-
-/** Подписка на изменение настроек (свежий снимок после settings_set). Возвращает функцию отписки. */
-export function onSettingsChanged(cb: (s: Settings) => void): Promise<UnlistenFn> {
-  return listen<Settings>("settings-changed", (e) => cb(e.payload));
 }
 
 /** Подписка на напоминания планировщика: пора показать события из списка. Возвращает функцию отписки. */

@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use std::ops::RangeInclusive;
 use std::path::Path;
 use std::sync::Arc;
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, State};
 use tracing::{info, warn};
 
 pub(crate) const BODY_DAYS_KEY: &str = "desktop.body_days";
@@ -288,8 +288,7 @@ pub(crate) async fn settings_get(state: State<'_, AppState>, setup: State<'_, Se
     snapshot_async(&state, &setup).await
 }
 
-/// Частичное изменение настроек: сначала проверка всего патча, затем запись. Возвращает новый
-/// снимок и рассылает его окну событием `settings-changed`.
+/// Частичное изменение настроек: сначала проверка всего патча, затем запись. Возвращает новый снимок.
 #[tauri::command]
 pub(crate) async fn settings_set(patch: SettingsPatch, app: AppHandle, state: State<'_, AppState>, setup: State<'_, SetupState>, notify: State<'_, Arc<NotifyState>>) -> CmdResult<SettingsDto> {
     let planned = plan(&patch)?;
@@ -302,11 +301,7 @@ pub(crate) async fn settings_set(patch: SettingsPatch, app: AppHandle, state: St
     if !planned.values.is_empty() || planned.toasts.is_some() {
         info!(changed = ?planned.values.iter().map(|(k, _)| *k).collect::<Vec<_>>(), toasts = ?planned.toasts, "настройки изменены");
     }
-    let dto = snapshot_async(&state, &setup).await?;
-    if let Err(e) = app.emit("settings-changed", dto.clone()) {
-        warn!(error = %e, "не удалось отправить событие settings-changed");
-    }
-    Ok(dto)
+    snapshot_async(&state, &setup).await
 }
 
 /// Список доверенных отправителей внешних картинок с адресом `email` (`trusted`) или без него:
@@ -329,19 +324,15 @@ pub(crate) fn with_trusted_sender(list: &[String], email: &str, trusted: bool) -
 }
 
 /// «Всегда показывать картинки от этого отправителя» и удаление из списка в настройках: новый
-/// снимок настроек, он же — событием `settings-changed`.
+/// снимок настроек.
 #[tauri::command]
-pub(crate) async fn settings_trust_image_sender(email: String, trusted: bool, app: AppHandle, state: State<'_, AppState>, setup: State<'_, SetupState>) -> CmdResult<SettingsDto> {
+pub(crate) async fn settings_trust_image_sender(email: String, trusted: bool, state: State<'_, AppState>, setup: State<'_, SetupState>) -> CmdResult<SettingsDto> {
     let current = Prefs::load(&state.store, state.account).trusted_image_senders;
     let next = with_trusted_sender(&current, &email, trusted)?;
     let json = serde_json::to_string(&next).map_err(err)?;
     state.store.set_state(state.account, TRUSTED_IMAGE_SENDERS_KEY, Some(&json)).map_err(|e| format!("Не удалось сохранить настройку: {e}"))?;
     info!(trusted, senders = next.len(), "доверенные отправители внешних картинок изменены");
-    let dto = snapshot_async(&state, &setup).await?;
-    if let Err(e) = app.emit("settings-changed", dto.clone()) {
-        warn!(error = %e, "не удалось отправить событие settings-changed");
-    }
-    Ok(dto)
+    snapshot_async(&state, &setup).await
 }
 
 /// Смена пароля: проверка входа с новым паролем (отдельная сессия: вход, иерархия папок, выход;

@@ -249,7 +249,7 @@ pub(crate) fn local_drafts_in_windows(app: &AppHandle) -> Vec<String> {
 
 /// Файловые вложения письма для окна просмотра (картинки текста письма — тоже: окно само
 /// оставит только файлы, как карточка письма).
-#[tauri::command]
+#[tauri::command(async)]
 pub(crate) fn item_attachments(item_pk: i64, state: State<'_, AppState>) -> CmdResult<Vec<AttachmentDto>> {
     state.store.item_ref(item_pk).map_err(err)?.ok_or_else(|| "Письмо удалено".to_string())?;
     let (rows, _) = prepare_attachments(&state.store, item_pk, None)?;

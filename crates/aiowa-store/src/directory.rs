@@ -193,6 +193,7 @@ impl Store {
     }
 
     /// Момент последней записи адреса в кэш справочника (миллисекунды UTC), если запись есть.
+    #[cfg(test)]
     pub fn directory_person_fetched_at(&self, account: AccountId, email: &str) -> Result<Option<i64>> {
         let key = email.trim().to_lowercase();
         self.with_conn(|c| Ok(c.query_row("SELECT fetched_at FROM directory_people WHERE account_id = ?1 AND email = ?2", params![account.0, key], |r| r.get::<_, i64>(0)).optional()?))

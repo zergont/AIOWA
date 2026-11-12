@@ -25,7 +25,7 @@
 //!
 //! Журнал: только версии и коды ошибок, без адресов и текста ответов.
 
-use crate::{err, AppState, CmdResult};
+use crate::{err, now_ms, AppState, CmdResult};
 use serde::Serialize;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -206,10 +206,6 @@ fn note_background_failure(st: &UpdatesState, at_ms: i64) -> u32 {
     let count = inner.backoff.map_or(0, |b| b.count).saturating_add(1);
     inner.backoff = Some(Backoff { last_ms: at_ms, count });
     count
-}
-
-fn now_ms() -> i64 {
-    jiff::Timestamp::now().as_millisecond()
 }
 
 fn current_version(app: &AppHandle) -> String {

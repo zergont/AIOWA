@@ -397,12 +397,6 @@ pub(crate) fn app_mode(setup: State<'_, SetupState>) -> AppModeDto {
     }
 }
 
-/// Адрес сервера после нормализации — подсказка мастера под полем ввода.
-#[tauri::command]
-pub(crate) fn setup_normalize_host(host: String) -> CmdResult<String> {
-    config::normalize_host(&host)
-}
-
 /// Проверка входа с введёнными данными. Ошибка входа — не ошибка команды, а `ok = false`.
 #[tauri::command]
 pub(crate) async fn setup_test_login(host: String, user: String, password: String, setup: State<'_, SetupState>) -> CmdResult<LoginCheckDto> {
