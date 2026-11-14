@@ -60,8 +60,8 @@ pub(crate) struct AdviceRequest {
 /// Письмо, на которое модель может сослаться: номер и подпись для чипа.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct CtxRef {
-    id: i64,
-    label: String,
+    pub(crate) id: i64,
+    pub(crate) label: String,
 }
 
 /// События «Совета» в окно.
@@ -149,6 +149,7 @@ pub(crate) async fn ai_advice(req: AdviceRequest, on_event: Channel<AdviceEvent>
             messages: vec![Message::user(prompt.user.clone())],
             max_tokens: MAX_TOKENS,
             effort: (profile.kind == ProviderKind::Anthropic).then_some(Effort::Medium),
+            json_schema: None,
         };
         let started = Instant::now();
         let channel = on_event.clone();
@@ -245,24 +246,16 @@ async fn collect(req: &AdviceRequest, state: &AppState, sync: &SyncState, od: &O
     let mut refs = Vec::with_capacity(heads.len());
     let mut facts = String::new();
     for h in &heads {
-        let text = visible_text(&store, h)?;
-        let recipients = store.recipients(h.item_pk).map_err(err)?;
-        let person = |r: &aiowa_store::ui::RecipientRow| Person { name: r.name.clone(), email: r.email.clone() };
-        let to: Vec<Person> = recipients.iter().filter(|r| r.kind == 1).map(person).collect();
-        let cc: Vec<Person> = recipients.iter().filter(|r| r.kind == 2).map(person).collect();
-        let attachments: Vec<String> = store.attachments_of_item(h.item_pk).map_err(err)?.into_iter().filter(|a| !a.is_inline).filter_map(|a| a.name).collect();
-        let mine = h.from_email.as_deref().is_some_and(|e| own.iter().any(|o| o.eq_ignore_ascii_case(e)));
-        let when = h.received_at.or(h.sent_at);
-        let from = Person { name: h.from_name.clone(), email: h.from_email.clone() };
-        refs.push(CtxRef { id: h.item_pk, label: chip_label(&from, when, &tz) });
-        for p in std::iter::once(&from).chain(&to).chain(&cc) {
+        let (m, r) = context_message(&store, h, &own, &tz)?;
+        for p in std::iter::once(&m.from).chain(&m.to).chain(&m.cc) {
             facts.push_str(&format!("{} {}\n", p.name.as_deref().unwrap_or(""), p.email.as_deref().unwrap_or("")));
         }
-        facts.push_str(&text);
+        facts.push_str(&m.text);
         facts.push('\n');
-        facts.push_str(h.subject.as_deref().unwrap_or(""));
+        facts.push_str(&m.subject);
         facts.push('\n');
-        messages.push(CtxMessage { id: h.item_pk, date: when.map(|t| ru_datetime(t, &tz)).unwrap_or_default(), from, to, cc, subject: h.subject.clone().unwrap_or_default(), text, attachments, mine });
+        refs.push(r);
+        messages.push(m);
     }
 
     // Образец стиля: мои письма главному адресату (отправитель исходного, а если это я — первый получатель).
@@ -300,6 +293,23 @@ async fn collect(req: &AdviceRequest, state: &AppState, sync: &SyncState, od: &O
         budget_chars: if place == Place::Cloud { BUDGET_CLOUD } else { BUDGET_OWN },
     };
     Ok(Collected { input, refs, facts })
+}
+
+/// Письмо, как его видит модель («Совет», «Кратко по найденному»): дата, отправитель и получатели,
+/// тема, видимый текст без скрытых блоков, имена файловых вложений; `mine` — письмо с одного из
+/// адресов `own`. Вторым — подпись чипа-ссылки на это письмо.
+pub(crate) fn context_message(store: &Store, h: &MessageHead, own: &[String], tz: &TimeZone) -> CmdResult<(CtxMessage, CtxRef)> {
+    let text = visible_text(store, h)?;
+    let recipients = store.recipients(h.item_pk).map_err(err)?;
+    let person = |r: &aiowa_store::ui::RecipientRow| Person { name: r.name.clone(), email: r.email.clone() };
+    let to: Vec<Person> = recipients.iter().filter(|r| r.kind == 1).map(person).collect();
+    let cc: Vec<Person> = recipients.iter().filter(|r| r.kind == 2).map(person).collect();
+    let attachments: Vec<String> = store.attachments_of_item(h.item_pk).map_err(err)?.into_iter().filter(|a| !a.is_inline).filter_map(|a| a.name).collect();
+    let mine = h.from_email.as_deref().is_some_and(|e| own.iter().any(|o| o.eq_ignore_ascii_case(e)));
+    let when = h.received_at.or(h.sent_at);
+    let from = Person { name: h.from_name.clone(), email: h.from_email.clone() };
+    let reference = CtxRef { id: h.item_pk, label: chip_label(&from, when, tz) };
+    Ok((CtxMessage { id: h.item_pk, date: when.map(|t| ru_datetime(t, tz)).unwrap_or_default(), from, to, cc, subject: h.subject.clone().unwrap_or_default(), text, attachments, mine }, reference))
 }
 
 /// Видимый текст письма без истории цитат; тела нет — начало письма из списка.
@@ -345,7 +355,7 @@ fn ru_datetime(t: Timestamp, tz: &TimeZone) -> String {
     format!("{} {} {}, {:02}:{:02}", z.day(), MONTHS[(z.month() - 1) as usize], z.year(), z.hour(), z.minute())
 }
 
-fn ru_today(tz: &TimeZone) -> String {
+pub(crate) fn ru_today(tz: &TimeZone) -> String {
     let z = Timestamp::now().to_zoned(tz.clone());
     let wd = z.weekday().to_monday_zero_offset() as usize;
     format!("{} {} {}, {}", z.day(), MONTHS[(z.month() - 1) as usize], z.year(), WEEKDAYS[wd])

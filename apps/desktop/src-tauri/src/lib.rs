@@ -84,6 +84,7 @@ mod ondemand;
 mod people;
 mod preview;
 mod reminders;
+mod search;
 mod settings;
 mod setup;
 mod staged;
@@ -301,23 +302,6 @@ struct MessageKeyDto {
     /// Вложений с файлом в кэше по базе (без проверки диска).
     cached: i64,
     is_flagged: bool,
-}
-
-#[derive(Serialize)]
-struct SearchHitDto {
-    item_pk: i64,
-    conversation_pk: Option<i64>,
-    subject: Option<String>,
-    from_name: Option<String>,
-    from_email: Option<String>,
-    received_ms: Option<i64>,
-    folder_name: Option<String>,
-    snippet: String,
-    attachment_name: Option<String>,
-    /// Начало текста письма: строка результата показывает его, когда фрагмента нет.
-    preview: Option<String>,
-    /// У письма есть вложения: строка результата рисует скрепку (п. 29).
-    has_attachments: bool,
 }
 
 /// Ключ сопоставления `src="cid:…"` с `Content-ID` вложения: без схемы `cid:`, URL-декодирован,
@@ -589,28 +573,6 @@ fn conversation_key(state: State<'_, AppState>, conversation_pk: i64) -> CmdResu
     Ok(keys.into_iter().map(|k| MessageKeyDto { item_pk: k.item_pk, body_state: k.body_state, is_read: k.is_read, cached: k.cached, is_flagged: k.is_flagged }).collect())
 }
 
-#[tauri::command(async)]
-fn search(state: State<'_, AppState>, query: String, limit: Option<usize>) -> CmdResult<Vec<SearchHitDto>> {
-    let hits = state.store.search(state.account, &query, limit.unwrap_or(50).clamp(1, 200)).map_err(err)?;
-    let mut out = Vec::with_capacity(hits.len());
-    for h in hits {
-        out.push(SearchHitDto {
-            item_pk: h.item_pk,
-            conversation_pk: h.conversation_pk,
-            subject: h.subject,
-            from_name: h.from_name,
-            from_email: h.from_email,
-            received_ms: ms(h.received_at),
-            folder_name: h.folder_name,
-            snippet: h.snippet,
-            attachment_name: h.attachment_name,
-            preview: h.preview,
-            has_attachments: h.has_attachments,
-        });
-    }
-    Ok(out)
-}
-
 /// Состояния почты, которым нужна база: есть только в режиме почты.
 struct MailParts {
     state: AppState,
@@ -661,7 +623,38 @@ fn open_mail(boot: &config::MailBoot, config_dir: &Path) -> Result<MailParts, St
     let notify = Arc::new(notify::NotifyState::new(store.clone(), account, sync.clone()));
     let reminders = Arc::new(reminders::RemindersState::new(store.clone(), account));
     let ai = ai::AiState::new(store.clone(), account)?;
+    index_previews_in_background(store.clone());
     Ok(MailParts { state: AppState { store, account, host: boot.host.clone(), user: boot.user.clone() }, sync, notify, reminders, ai })
+}
+
+/// Доиндексация начала текста писем после обновления до схемы 15 (`Store::index_previews`): в
+/// фоне, короткими пачками с паузами, чтобы окно и синхронизация не ждали базу. Прерванная
+/// закрытием программы продолжится со следующего запуска; когда всё сделано — один пустой запрос.
+fn index_previews_in_background(store: Arc<Store>) {
+    const BATCH: usize = 200;
+    let spawned = std::thread::Builder::new().name("index-previews".into()).spawn(move || {
+        // Сначала — запуск окна и первая синхронизация.
+        std::thread::sleep(std::time::Duration::from_secs(5));
+        let started = std::time::Instant::now();
+        let mut total = 0usize;
+        loop {
+            match store.index_previews(BATCH) {
+                Ok(0) => break,
+                Ok(n) => total += n,
+                Err(e) => {
+                    warn!(error = %e, done = total, "доиндексация начала текста писем остановлена");
+                    return;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(30));
+        }
+        if total > 0 {
+            info!(items = total, elapsed_s = started.elapsed().as_secs_f32(), "начало текста писем доиндексировано для поиска");
+        }
+    });
+    if let Err(e) = spawned {
+        warn!(error = %e, "поток доиндексации начала текста писем не запущен");
+    }
 }
 
 /// Выключает браузерные клавиши WebView2 в главном окне (`AreBrowserAcceleratorKeysEnabled`):
@@ -867,7 +860,13 @@ pub fn run() {
             conversations,
             conversation,
             conversation_key,
-            search,
+            search::search,
+            search::search_ai_status,
+            search::search_refine,
+            search::search_refine_cancel,
+            search::search_digest_preview,
+            search::search_digest,
+            search::search_digest_cancel,
             sync::sync_start,
             sync::sync_status,
             sync::sync_cancel,

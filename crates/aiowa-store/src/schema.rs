@@ -10,7 +10,7 @@ use rusqlite::types::ValueRef;
 use rusqlite::Connection;
 use tracing::info;
 
-pub const CURRENT_VERSION: i64 = 14;
+pub const CURRENT_VERSION: i64 = 15;
 
 /// Состояния текста вложения (`attachments.text_state`).
 pub const TEXT_PENDING: i64 = 0;
@@ -242,6 +242,49 @@ INSERT INTO items_fts(items_fts) VALUES('rebuild');
 UPDATE items SET fts_indexed = 1 WHERE deleted = 0;
 UPDATE items SET fts_indexed = 0 WHERE deleted = 1;
 "#;
+
+/// Версия 15 (шаг И3, поиск на обычном языке): у письма без загруженного текста в индекс идёт
+/// начало текста (`items.preview`, первые строки письма от сервера). До этого у писем старше окна
+/// «глубина тел» искались только тема и участники, хотя начало текста в базе было почти у всех.
+///
+/// Индекс не пересобирается при обновлении: база открывается до появления окна, и пересборка на
+/// ящике в 155 тыс. писем держала бы программу невидимой десятки секунд. Вместо этого у письма
+/// есть признак `fts_preview` — «начало текста в индексе». Представление отдаёт начало текста
+/// только при нём, поэтому сразу после обновления индекс согласован с источником без единой
+/// записи. Признак ставится при любой записи письма в индекс (`fts_insert`), а старые письма
+/// доиндексируются в фоне пачками (`Store::index_previews`); поиск всё это время работает.
+/// Когда текст письма загружается, он заменяет начало.
+const V15_VIEW: &str = r#"
+DROP VIEW IF EXISTS items_fts_src;
+CREATE VIEW items_fts_src AS
+  SELECT i.item_pk,
+         fts_norm(COALESCE(i.subject, ''))    AS subject,
+         fts_norm(COALESCE(i.from_name, ''))  AS from_name,
+         COALESCE(i.from_email, '')           AS from_email,
+         fts_norm(COALESCE((SELECT group_concat(COALESCE(r.name, '') || ' ' || COALESCE(r.email, ''), ', ')
+                     FROM recipients r WHERE r.item_pk = i.item_pk AND r.kind IN (1, 2)), '')) AS recipients,
+         fts_norm(COALESCE(NULLIF(b.unique_text, ''), CASE WHEN i.fts_preview = 1 THEN i.preview END, '')) AS unique_text,
+         fts_norm(COALESCE((SELECT group_concat(COALESCE(a.name, '') || char(10) || COALESCE(a.text, ''), char(10))
+                     FROM attachments a WHERE a.item_pk = i.item_pk AND a.is_inline = 0), '')) AS attachment_text
+    FROM items i LEFT JOIN bodies b ON b.item_pk = i.item_pk;
+"#;
+
+/// Индексы версии 15.
+///
+/// `items_account_date` — письма ящика по дате, свежие первыми: поиск идёт по нему от новых писем
+/// к старым и останавливается, набрав нужное число (`search_ids_sql`), а условия без слов («за
+/// октябрь», «непрочитанные») берут из него сразу нужный отрезок дат. Выражение даты и условие —
+/// слово в слово как в запросе, иначе планировщик индекс не возьмёт.
+///
+/// `items_preview_pending` — письма, чьё начало текста ещё не в индексе поиска: очередь фоновой
+/// доиндексации. Сразу после обновления в нём все письма, по её окончании он пуст.
+const V15_INDEX: &str = "CREATE INDEX IF NOT EXISTS items_account_date ON items(account_id, COALESCE(received_at, sent_at) DESC) WHERE deleted = 0;
+CREATE INDEX IF NOT EXISTS items_preview_pending ON items(item_pk) WHERE fts_preview = 0;";
+
+/// Очередь доиндексации начала текста: условие повторяет частичный индекс слово в слово.
+pub(crate) const PREVIEW_PENDING_SQL: &str = "SELECT i.item_pk, i.fts_indexed,
+        (i.preview IS NOT NULL AND i.preview != '' AND NOT EXISTS (SELECT 1 FROM bodies b WHERE b.item_pk = i.item_pk AND b.unique_text != ''))
+   FROM items i INDEXED BY items_preview_pending WHERE i.fts_preview = 0 ORDER BY i.item_pk DESC LIMIT ?1";
 
 /// Версия 4: кэш календаря. `calendar_items` — экземпляры событий, как их отдаёт `FindItem` с
 /// `CalendarView` (повторяющиеся встречи уже развёрнуты, у каждого экземпляра свой `server_id`);
@@ -611,6 +654,24 @@ pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
         conn.pragma_update(None, "user_version", 14)?;
         info!("схема базы обновлена до версии 14: важность в локальном черновике");
     }
+    if version < 15 {
+        conn.execute_batch("BEGIN IMMEDIATE;")?;
+        let result = (|| -> rusqlite::Result<()> {
+            add_column_if_missing(conn, "items", "fts_preview", "INTEGER NOT NULL DEFAULT 0")?;
+            conn.execute_batch(V15_VIEW)?;
+            conn.execute_batch(V15_INDEX)?;
+            conn.pragma_update(None, "user_version", 15)?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => conn.execute_batch("COMMIT;")?,
+            Err(e) => {
+                let _ = conn.execute_batch("ROLLBACK;");
+                return Err(e);
+            }
+        }
+        info!("схема базы обновлена до версии 15: начало текста писем в поиске (доиндексация в фоне), индекс писем по дате");
+    }
     Ok(())
 }
 
@@ -777,6 +838,65 @@ mod tests {
         conn.execute(FTS_DELETE_SQL, [7i64]).unwrap();
         let n: i64 = conn.query_row("SELECT COUNT(*) FROM items_fts WHERE items_fts MATCH 'письм*'", [], |r| r.get(0)).unwrap();
         assert_eq!(n, 0);
+    }
+
+    /// Версия 15: обновление ничего не пересобирает, индекс остаётся согласованным с источником;
+    /// начало текста попадает в индекс при записи письма (признак `fts_preview`), загруженный текст
+    /// его заменяет.
+    #[test]
+    fn v15_adds_preview_flag_without_rebuild() {
+        let conn = Connection::open_in_memory().unwrap();
+        register_functions(&conn).unwrap();
+        migrate(&conn).unwrap();
+        // База версии 14: представление без начала текста и без признака, индекс построен по нему.
+        conn.execute_batch("DROP INDEX items_preview_pending; DROP INDEX items_account_date; DROP VIEW items_fts_src; ALTER TABLE items DROP COLUMN fts_preview;").unwrap();
+        conn.execute_batch(V3_VIEW).unwrap();
+        conn.pragma_update(None, "user_version", 14).unwrap();
+        conn.execute_batch(
+            "INSERT INTO accounts(account_id, host, login, created_at) VALUES (1, 'h', 'u', 0);
+             INSERT INTO folders(folder_pk, account_id, server_id, display_name, updated_at) VALUES (1, 1, 'F', 'Входящие', 0);
+             INSERT INTO items(item_pk, account_id, server_id, folder_pk, subject, preview, updated_at)
+               VALUES (1, 1, 'A', 1, 'Старое письмо', 'Просим согласовать смету на ремонт', 0),
+                      (2, 1, 'B', 1, 'Свежее письмо', 'Начало про трансформатор', 0);
+             INSERT INTO bodies(item_pk, body_type, unique_text, fetched_at) VALUES (2, 'HTML', 'Полный текст про выключатель', 0);",
+        )
+        .unwrap();
+        for pk in [1i64, 2] {
+            conn.execute(FTS_INSERT_SQL, [pk]).unwrap();
+            conn.execute("UPDATE items SET fts_indexed = 1 WHERE item_pk = ?1", [pk]).unwrap();
+        }
+        let count = |q: &str| -> i64 { conn.query_row("SELECT COUNT(*) FROM items_fts WHERE items_fts MATCH ?1", [q], |r| r.get(0)).unwrap() };
+        let consistent = || conn.execute("INSERT INTO items_fts(items_fts, rank) VALUES('integrity-check', 1)", []).is_ok();
+        assert_eq!((count("смету"), count("выключатель"), count("письмо")), (0, 1, 2));
+
+        migrate(&conn).unwrap();
+        let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(v, CURRENT_VERSION);
+        // Сразу после обновления: искомое прежнее, индекс согласован с новым представлением.
+        assert_eq!((count("смету"), count("выключатель"), count("письмо")), (0, 1, 2));
+        assert!(consistent(), "индекс согласован с источником без пересборки");
+        let pending: i64 = conn.query_row("SELECT COUNT(*) FROM items WHERE fts_preview = 0", [], |r| r.get(0)).unwrap();
+        assert_eq!(pending, 2, "все письма ждут доиндексации");
+        let plan: String = conn.query_row(&format!("EXPLAIN QUERY PLAN {PREVIEW_PENDING_SQL}"), [10], |r| r.get(3)).unwrap();
+        assert!(plan.contains("items_preview_pending"), "{plan}");
+
+        // Письмо без текста: снять по старым значениям, поставить признак, записать заново.
+        conn.execute(FTS_DELETE_SQL, [1i64]).unwrap();
+        conn.execute("UPDATE items SET fts_preview = 1 WHERE item_pk = 1", []).unwrap();
+        conn.execute(FTS_INSERT_SQL, [1i64]).unwrap();
+        assert_eq!(count("смету"), 1, "начало текста письма без тела — в индексе");
+        // Письмо с текстом: признак ничего не меняет в индексе — начало не ищется, текст ищется.
+        conn.execute("UPDATE items SET fts_preview = 1 WHERE item_pk = 2", []).unwrap();
+        assert_eq!((count("выключатель"), count("трансформатор")), (1, 0), "загруженный текст заменяет начало");
+        assert!(consistent());
+        let snip: String = conn.query_row("SELECT snippet(items_fts, 4, '[', ']', '…', 8) FROM items_fts WHERE items_fts MATCH 'смету'", [], |r| r.get(0)).unwrap();
+        assert!(snip.contains("[смету]"), "{snip}");
+        // Текст пришёл — начало ушло из индекса.
+        conn.execute(FTS_DELETE_SQL, [1i64]).unwrap();
+        conn.execute("INSERT INTO bodies(item_pk, body_type, unique_text, fetched_at) VALUES (1, 'HTML', 'Договор подряда во вложении', 0)", []).unwrap();
+        conn.execute(FTS_INSERT_SQL, [1i64]).unwrap();
+        assert_eq!((count("смету"), count("подряда")), (0, 1));
+        assert!(consistent());
     }
 
     #[test]

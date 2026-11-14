@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount, tick, untrack } from "svelte";
-  import { api, contextFromLocal, conversationKeyOf, conversationsText, errorMessage, itemKindOf, messageNeedsFetch, messagesKey, newMailSender, onCalendarChanged, onCloseRequested, onComposeFinished, onFoldersChanged, onItemsChanged, onLocalDraftsChanged, onNewMail, onNotifyStatus, onReminder, onSyncProgress, onWriteFailed, type AccountInfo, type ComposeContext, type ComposeKind, type ComposeRecipient, type ContactForm, type Conversation, type Folder, type ItemsChanged, type Message, type NewMail, type NotifyStatus, type ReminderDto, type SearchHit, type StageAction, type StagedDto, type SyncStatus, type WriteReport } from "./lib/api";
+  import { api, contextFromLocal, conversationKeyOf, conversationsText, errorMessage, itemKindOf, messageNeedsFetch, messagesKey, newMailSender, onCalendarChanged, onCloseRequested, onComposeFinished, onFoldersChanged, onItemsChanged, onLocalDraftsChanged, onNewMail, onNotifyStatus, onReminder, onSyncProgress, onWriteFailed, type AccountInfo, type ComposeContext, type ComposeKind, type ComposeRecipient, type ContactForm, type Conversation, type Folder, type ItemsChanged, type Message, type NewMail, type NotifyStatus, type ReminderDto, type SearchAiStatus, type SearchHit, type SearchInfo, type SearchRefineState, type SearchResult, type StageAction, type StagedDto, type SyncStatus, type WriteReport } from "./lib/api";
   import { onSyncLive, type SyncLive } from "./lib/api";
   import { ICON, failureText, findArchiveFolder, type DragPayload, type ItemAction } from "./lib/actions";
   import { focusBack, type Anchor } from "./lib/popover";
@@ -59,6 +59,12 @@
   let query = $state("");
   let searchHits = $state<SearchHit[] | null>(null);
   let searching = $state(false);
+  /** Как понят запрос, по которому показаны результаты поиска. */
+  let searchInfo = $state<SearchInfo | null>(null);
+  /** Доводка запроса моделью (только по Enter и только при включённых ИИ-функциях). */
+  let searchRefine = $state<SearchRefineState | null>(null);
+  /** Что из ИИ доступно поиску; перечитывается не чаще раза в полминуты. */
+  let searchAi = $state<SearchAiStatus | null>(null);
   let error = $state<string | null>(null);
   let listWidth = $state(380);
   let syncStatus = $state<SyncStatus | null>(null);
@@ -588,7 +594,7 @@
     selectedPks = new Set();
     messages = [];
     cancelSearch();
-    searchHits = null;
+    hideSearch();
     loadingList = true;
     try {
       conversations = await api.conversations(f.folder_pk, undefined, PAGE);
@@ -1168,6 +1174,34 @@
     clearTimeout(searchTimer);
     searchSeq++;
     searching = false;
+    // Запрос меняется — доводка прежнего моделью больше не нужна.
+    if (searchRefine?.state === "running") void api.searchRefineCancel().catch(() => {});
+    searchRefine = null;
+  }
+
+  /** Результаты и то, как понят запрос `q`. */
+  function showSearch(q: string, r: SearchResult) {
+    searchHits = r.hits;
+    searchInfo = { query: q, chips: r.chips, canonical: r.canonical, strict: r.strict, relaxedNote: r.relaxed_note };
+    void refreshSearchAi();
+  }
+
+  function hideSearch() {
+    searchHits = null;
+    searchInfo = null;
+  }
+
+  let searchAiAt = 0;
+  /** Что из ИИ доступно поиску (кнопка «Кратко», доводка запроса): настройки могли измениться. */
+  async function refreshSearchAi(force = false): Promise<SearchAiStatus | null> {
+    if (!force && Date.now() - searchAiAt < 30_000) return searchAi;
+    searchAiAt = Date.now();
+    try {
+      searchAi = await api.searchAiStatus();
+    } catch {
+      searchAi = null;
+    }
+    return searchAi;
   }
 
   function onQueryInput() {
@@ -1176,15 +1210,15 @@
     suggestOpen = true;
     updateSuggestions(q);
     if (!q) {
-      searchHits = null;
+      hideSearch();
       return;
     }
     const seq = searchSeq;
     searchTimer = setTimeout(async () => {
       searching = true;
       try {
-        const hits = await api.search(q, 100);
-        if (seq === searchSeq) searchHits = hits;
+        const r = await api.search(q, 100);
+        if (seq === searchSeq) showSearch(q, r);
       } catch (e) {
         if (seq === searchSeq) error = errorMessage(e);
       } finally {
@@ -1196,7 +1230,7 @@
   function clearSearch() {
     cancelSearch();
     query = "";
-    searchHits = null;
+    hideSearch();
     suggestOpen = false;
     resetSuggestions();
   }
@@ -1206,15 +1240,17 @@
     cancelSearch();
     const q = query.trim();
     if (!q) {
-      searchHits = null;
+      hideSearch();
       return;
     }
     const seq = searchSeq;
     searching = true;
     api
       .search(q, 100)
-      .then((hits) => {
-        if (seq === searchSeq) searchHits = hits;
+      .then((r) => {
+        if (seq !== searchSeq) return;
+        showSearch(q, r);
+        void refineSearch(q, r, seq);
       })
       .catch((e) => {
         if (seq === searchSeq) error = errorMessage(e);
@@ -1222,6 +1258,55 @@
       .finally(() => {
         if (seq === searchSeq) searching = false;
       });
+  }
+
+  /**
+   * Доводка запроса быстрой моделью (docs/ai-layer-design.md § 5.3): только после явного поиска
+   * (Enter), только если ИИ-функции включены и разбор без модели чего-то не понял или ничего не
+   * нашёл, и только для фразы — запрос из одних операторов модели не нужен. Ответ применяется,
+   * если запрос за это время не изменился: при пустой выдаче — сам, иначе предложением.
+   */
+  async function refineSearch(q: string, r: SearchResult, seq: number) {
+    const words = q.split(/\s+/).filter((w) => !/^[^\s:]+:/.test(w));
+    if (words.length < 3 || (r.unknown.length === 0 && r.hits.length > 0)) return;
+    const ai = await refreshSearchAi(true);
+    if (seq !== searchSeq || !ai?.refine.available) return;
+    searchRefine = { state: "running" };
+    try {
+      const data = await api.searchRefine(q, 100);
+      if (seq !== searchSeq) return;
+      if (!data) {
+        searchRefine = null;
+      } else if (r.hits.length === 0 && data.result.hits.length > 0) {
+        // По запросу как он набран пусто: показываем найденное по уточнению, запрос в строке прежний.
+        searchHits = data.result.hits;
+        searchInfo = { query: q, chips: [], canonical: data.operators, strict: data.result.strict, relaxedNote: data.result.relaxed_note };
+        searchRefine = { state: "applied", data };
+      } else if (data.result.hits.length > 0) {
+        searchRefine = { state: "offer", data };
+      } else {
+        searchRefine = null;
+      }
+    } catch (e) {
+      if (seq !== searchSeq) return;
+      const text = errorMessage(e);
+      searchRefine = text === "Отменено" ? null : { state: "error", text };
+    }
+  }
+
+  /** Правка условия из чипа: текст запроса с `start` по `end` заменяется на `text`, поиск — заново. */
+  function editSearchQuery(start: number, end: number, text: string) {
+    const base = searchInfo?.query ?? query.trim();
+    query = `${base.slice(0, start)} ${text} ${base.slice(end)}`.replace(/\s+/g, " ").trim();
+    if (query) finishPick();
+    else clearSearch();
+  }
+
+  /** Запрос операторами — в строку поиска (из строки «в операторах» или из предложения модели). */
+  function searchByOperators(text: string) {
+    query = text;
+    finishPick();
+    void tick().then(() => document.getElementById("search-input")?.focus());
   }
 
   // --- подсказки поиска (п. 9 обкатки) ----------------------------------------------------
@@ -2109,7 +2194,7 @@
 
   <section class="list" class:off={section !== "mail"} aria-label="Список бесед">
     {#if searchHits !== null}
-      <SearchResults hits={searchHits} {searching} {query} onopen={openConversationByPk} onopenwindow={(pk, subject) => void openMessageWindow(pk, subject)} onclear={clearSearch} selectedPk={selected?.conversation_pk ?? null} />
+      <SearchResults hits={searchHits} {searching} {query} info={searchInfo} refine={searchRefine} ai={searchAi} onopen={openConversationByPk} onopenwindow={(pk, subject) => void openMessageWindow(pk, subject)} onclear={clearSearch} onedit={editSearchQuery} onoperators={searchByOperators} onrefineclose={() => (searchRefine = null)} selectedPk={selected?.conversation_pk ?? null} />
     {:else}
       <ConversationList folder={selectedFolder} {conversations} {selected} {selectedPks} loading={loadingList} {hasMore} onselect={openConversation} onselection={onMultiSelection} onmore={loadMore} {folders} archiveFolderPk={archiveFolder?.folder_pk ?? null} onaction={onListAction} oncompose={composeFromConversation} onopendraft={openDraftFromConversation} onopenwindow={(c, drafts) => void openConversationWindow(c, drafts)} />
     {/if}

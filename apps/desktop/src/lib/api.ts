@@ -196,6 +196,95 @@ export interface SearchHit {
   has_attachments: boolean;
 }
 
+/** Другой вариант условия: чем заменить его текст в запросе. */
+export interface SearchChipOption {
+  label: string;
+  operator: string;
+}
+
+/**
+ * Условие, понятое из слов запроса на обычном языке («от диспетчера» → «от: Диспетчерская
+ * служба»): подпись, место в запросе (индексы строки) и оператор, которым этот текст можно
+ * заменить. Правка чипа — правка текста запроса.
+ */
+export interface SearchChip {
+  kind: "from" | "to" | "with" | "period" | "attachment" | "folder" | "unread" | "flagged" | "subject";
+  label: string;
+  start: number;
+  end: number;
+  operator: string;
+  options: SearchChipOption[];
+  note: string | null;
+}
+
+/** Итог поиска: письма и то, как понят запрос (`SearchDto` в src-tauri/src/search.rs). */
+export interface SearchResult {
+  hits: SearchHit[];
+  chips: SearchChip[];
+  /** Запрос операторами: во что превратилась фраза. */
+  canonical: string;
+  /** Слова, которые разбор не понял: повод позвать модель. */
+  unknown: string[];
+  /** Столько первых писем найдено по самому запросу; остальные — по ослабленному условию. */
+  strict: number;
+  relaxed_note: string | null;
+}
+
+/** Запрос, доведённый моделью: операторами, подписями условий и выдачей по нему. */
+export interface SearchRefined {
+  operators: string;
+  labels: string[];
+  result: SearchResult;
+  ms: number;
+  cached: boolean;
+}
+
+/** Как понят запрос, по которому показаны письма (чипы над результатами поиска). */
+export interface SearchInfo {
+  /** Запрос, как он ушёл в поиск: места чипов — в нём. */
+  query: string;
+  chips: SearchChip[];
+  /** Тот же запрос операторами. */
+  canonical: string;
+  /** Столько первых писем найдено по самому запросу; дальше — по ослабленному условию. */
+  strict: number;
+  relaxedNote: string | null;
+}
+
+/**
+ * Доводка запроса моделью: идёт; предлагает другой разбор; уже применена (по запросу как он
+ * набран ничего не нашлось); не удалась.
+ */
+export type SearchRefineState = { state: "running" } | { state: "offer" | "applied"; data: SearchRefined } | { state: "error"; text: string };
+
+/** Что из ИИ доступно поиску: доводка запроса и «Кратко по найденному». */
+export interface SearchAiStatus {
+  refine: AiAdviceStatus;
+  digest: AiAdviceStatus;
+}
+
+export interface DigestRequest {
+  request_id: string;
+  query: string;
+  /** Письма выдачи в порядке показа: модель читает первые двадцать. */
+  item_pks: number[];
+  total: number;
+}
+
+export type DigestEvent =
+  | { type: "progress"; done: number; total: number }
+  | { type: "context"; messages: AdviceRef[]; truncated: boolean; chars: number; first_ms: number | null; last_ms: number | null; senders: number }
+  | { type: "text"; text: string }
+  | { type: "done"; stop: string; cited: number[]; input_tokens: number | null; output_tokens: number | null; ms: number };
+
+export interface DigestPreview {
+  system: string;
+  user: string;
+  chars: number;
+  truncated: boolean;
+  read: number;
+}
+
 /** Этап синхронизации; совпадает с `StageDto` в src-tauri/src/sync.rs. */
 export type SyncStage = "login" | "hierarchy" | "recent" | "items" | "bodies" | "attachments";
 
@@ -1035,7 +1124,20 @@ export const api = {
   conversation: (conversationPk: number) => invoke<Message[]>("conversation", { conversationPk }),
   /** Дешёвый ключ беседы: один запрос без тел и картинок. */
   conversationKey: (conversationPk: number) => invoke<MessageKey[]>("conversation_key", { conversationPk }),
-  search: (query: string, limit = 50) => invoke<SearchHit[]>("search", { query, limit }),
+  /** Поиск по локальной базе: письма и то, как понят запрос. Модель не участвует. */
+  search: (query: string, limit = 50) => invoke<SearchResult>("search", { query, limit }),
+  searchAiStatus: () => invoke<SearchAiStatus>("search_ai_status"),
+  /** Доводка запроса быстрой моделью; `null` — модель ничего не добавила к разбору без неё. */
+  searchRefine: (query: string, limit = 50) => invoke<SearchRefined | null>("search_refine", { query, limit }),
+  searchRefineCancel: () => invoke<void>("search_refine_cancel"),
+  searchDigestPreview: (req: DigestRequest) => invoke<DigestPreview>("search_digest_preview", { req }),
+  /** «Кратко по найденному»: события (догрузка, контекст, куски ответа, итог) — в `onEvent`. */
+  searchDigest: (req: DigestRequest, onEvent: (e: DigestEvent) => void) => {
+    const channel = new Channel<DigestEvent>();
+    channel.onmessage = onEvent;
+    return invoke<void>("search_digest", { req, onEvent: channel });
+  },
+  searchDigestCancel: (requestId: string) => invoke<void>("search_digest_cancel", { requestId }),
   /** Догрузить тело письма и инлайновые картинки с сервера (если их ещё нет) и вернуть свежий DTO. */
   messageFetch: (itemPk: number) => invoke<Message>("message_fetch", { itemPk }),
   /** Скачать вложение при необходимости и открыть системным приложением. */

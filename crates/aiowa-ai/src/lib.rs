@@ -7,7 +7,9 @@
 
 pub mod advice;
 pub mod anthropic;
+pub mod digest;
 pub mod mailtext;
+pub mod nlsearch;
 pub mod openai;
 pub mod profile;
 pub mod sse;
@@ -77,15 +79,27 @@ pub enum Effort {
     High,
 }
 
+/// Схема JSON, по которой модель должна ответить (`docs/ai-layer-design.md` § 2, принцип 7).
+#[derive(Debug, Clone, PartialEq)]
+pub struct JsonSchema {
+    /// Имя схемы для провайдера: латиница, цифры, подчёркивание.
+    pub name: &'static str,
+    pub schema: Value,
+}
+
 /// Запрос к модели.
 #[derive(Debug, Clone)]
 pub struct ChatRequest {
-    /// Функция для журнала: «проверка», «совет», «разбор».
+    /// Функция для журнала: «проверка», «совет», «разбор», «кратко».
     pub feature: &'static str,
     pub system: String,
     pub messages: Vec<Message>,
     pub max_tokens: u32,
     pub effort: Option<Effort>,
+    /// Ответ — JSON по схеме: у Anthropic — `output_config.format`, у OpenAI-совместимых —
+    /// `response_format`. Сервер, который этого не понимает, отвечает отказом — см.
+    /// [`Gateway::chat_json`].
+    pub json_schema: Option<JsonSchema>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -350,6 +364,24 @@ impl Gateway {
         info!(feature = req.feature, place = ?place, outcome = %record.outcome, ms = record.duration_ms, input = ?input_tokens, output = ?output_tokens, "обращение к модели");
         (self.journal)(record);
         result
+    }
+
+    /// Обращение к модели за JSON-объектом по схеме запроса (`req.json_schema`). Сервер, который
+    /// схему в запросе не понимает (отказ «неверный запрос»), спрашивается ещё раз без неё: схема
+    /// должна быть описана и в промпте. Ответ — объект из текста модели; проверка полей — за
+    /// вызывающим. Оба обращения попадают в журнал.
+    pub async fn chat_json(&self, profile: &Profile, key: Option<&SecretString>, mode: PrivacyMode, req: &ChatRequest, cancel: &Cancel) -> Result<(Value, ChatOutcome), AiError> {
+        let mut sink = |_: &str| {};
+        let out = match self.chat(profile, key, mode, req, &mut sink, cancel).await {
+            Err(AiError::BadRequest(_)) if req.json_schema.is_some() => {
+                debug!("сервер модели не принял схему ответа в запросе: повтор без неё");
+                let plain = ChatRequest { json_schema: None, ..req.clone() };
+                self.chat(profile, key, mode, &plain, &mut sink, cancel).await?
+            }
+            other => other?,
+        };
+        let value = nlsearch::extract_json(&out.text).filter(Value::is_object).ok_or_else(|| AiError::Protocol("модель ответила не JSON-объектом".into()))?;
+        Ok((value, out))
     }
 
     async fn stream(&self, profile: &Profile, key: Option<&SecretString>, url: url::Url, body: Vec<u8>, on_text: &mut (dyn FnMut(&str) + Send), cancel: &Cancel) -> Result<ChatOutcome, AiError> {

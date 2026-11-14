@@ -27,6 +27,9 @@ pub fn request_body(model: &str, req: &ChatRequest, openai_cloud: bool, extra: O
     } else {
         body["max_tokens"] = json!(req.max_tokens);
     }
+    if let Some(s) = &req.json_schema {
+        body["response_format"] = json!({ "type": "json_schema", "json_schema": { "name": s.name, "schema": s.schema, "strict": true } });
+    }
     // Дополнительные поля профиля (расширения своих шлюзов) не меняют того, что задано выше.
     if let (Some(extra), Some(obj)) = (extra, body.as_object_mut()) {
         for (k, v) in extra {
@@ -144,7 +147,11 @@ mod tests {
 
     #[test]
     fn body_differs_for_openai_cloud_and_own_servers() {
-        let req = ChatRequest { feature: "проверка", system: "Система".into(), messages: vec![Message::user("Привет")], max_tokens: 256, effort: None };
+        let req = ChatRequest { feature: "проверка", system: "Система".into(), messages: vec![Message::user("Привет")], max_tokens: 256, effort: None, json_schema: None };
+        let with_schema = ChatRequest { json_schema: Some(crate::JsonSchema { name: "search", schema: json!({ "type": "object" }) }), ..req.clone() };
+        let b = request_body("m", &with_schema, false, None);
+        assert_eq!(b["response_format"], json!({ "type": "json_schema", "json_schema": { "name": "search", "schema": { "type": "object" }, "strict": true } }));
+        assert!(request_body("m", &req, false, None).get("response_format").is_none());
         let own = request_body("qwen3", &req, false, None);
         assert_eq!(own["messages"][0]["role"], "system");
         assert_eq!(own["messages"][1]["content"], "Привет");

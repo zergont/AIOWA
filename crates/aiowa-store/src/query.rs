@@ -1,10 +1,14 @@
 //! Разбор поискового запроса в духе OWA: операторы `от:`/`from:`, `кому:`/`to:`,
-//! `тема:`/`subject:`, `вложение:`/`has:attachment`, `папка:`/`in:`, `после:`/`до:` по датам;
-//! остальной текст ищется по словам как префиксы. Значения в кавычках: `от:"Иван Петров"`.
+//! `переписка:`/`with:`, `тема:`/`subject:`, `вложение:`/`has:attachment`, `папка:`/`in:`,
+//! `после:`/`до:`/`дата:` по датам, `прочитано:`, `флаг:`; остальной текст ищется по словам как
+//! префиксы. Значения в кавычках: `от:"Иван Петров"`. Несколько адресов через запятую
+//! (`от:a@x.ru,b@x.ru`) — любой из них. Запрос на обычном языке разбирает `nlquery` и сводит к
+//! этим же условиям.
 
-use crate::text::fts_norm;
+use crate::text::{fts_norm, norm_lower};
 use jiff::civil::Date;
 use jiff::tz::TimeZone;
+use std::collections::BTreeMap;
 
 /// Слово или фраза свободного текста.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -32,17 +36,99 @@ pub struct SearchQuery {
     pub after_ms: Option<i64>,
     /// Конец окна по дате получения, мс UTC, не включительно.
     pub before_ms: Option<i64>,
+    /// `кому:a@x.ru,b@x.ru` — любой адрес группы среди получателей; каждая группа обязательна.
+    pub to_any: Vec<Vec<String>>,
+    /// `переписка:адрес` — адрес группы отправителем или среди получателей; каждая группа обязательна.
+    pub with_any: Vec<Vec<String>>,
+    /// `переписка:слово` — слово в отправителе или получателях.
+    pub with: Vec<String>,
+    /// `прочитано:нет` — только непрочитанные (`Some(true)`), `прочитано:да` — только прочитанные.
+    pub unread: Option<bool>,
+    /// `флаг:да` — только с флагом, `флаг:нет` — без него.
+    pub flagged: Option<bool>,
+    /// `вложение:pdf` — вид вложения по расширению имени файла (любой из названных).
+    pub attachment_kinds: Vec<AttachmentKind>,
+    /// Другие формы слов запроса (`morph::forms`): слово в нижнем регистре → точные токены,
+    /// которые ищутся вместе с ним. Заполняет `nlquery`; у слов в кавычках форм нет.
+    pub forms: BTreeMap<String, Vec<String>>,
 }
 
-struct RawToken {
-    key: Option<String>,
-    value: String,
-    quoted: bool,
+/// Вид вложения в запросе: «с таблицей», `вложение:pdf`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttachmentKind {
+    Pdf,
+    Sheet,
+    Doc,
+    Image,
+    Archive,
+    Slides,
+}
+
+impl AttachmentKind {
+    /// Значение оператора `вложение:`.
+    pub fn code(self) -> &'static str {
+        match self {
+            AttachmentKind::Pdf => "pdf",
+            AttachmentKind::Sheet => "таблица",
+            AttachmentKind::Doc => "документ",
+            AttachmentKind::Image => "картинка",
+            AttachmentKind::Archive => "архив",
+            AttachmentKind::Slides => "презентация",
+        }
+    }
+
+    /// Подпись чипа.
+    pub fn label(self) -> &'static str {
+        match self {
+            AttachmentKind::Pdf => "PDF",
+            AttachmentKind::Sheet => "таблица",
+            AttachmentKind::Doc => "документ Word",
+            AttachmentKind::Image => "картинка",
+            AttachmentKind::Archive => "архив",
+            AttachmentKind::Slides => "презентация",
+        }
+    }
+
+    /// Расширения имён файлов этого вида, в нижнем регистре, с точкой.
+    pub fn extensions(self) -> &'static [&'static str] {
+        match self {
+            AttachmentKind::Pdf => &[".pdf"],
+            AttachmentKind::Sheet => &[".xlsx", ".xls", ".xlsm", ".xlsb", ".csv", ".ods"],
+            AttachmentKind::Doc => &[".docx", ".doc", ".rtf", ".odt"],
+            AttachmentKind::Image => &[".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tif", ".tiff", ".heic", ".webp"],
+            AttachmentKind::Archive => &[".zip", ".rar", ".7z"],
+            AttachmentKind::Slides => &[".pptx", ".ppt", ".odp"],
+        }
+    }
+
+    /// Вид по значению оператора: `pdf`, `таблица`, `xlsx`, `excel`, `word`, `картинка`, `zip`…
+    pub fn parse(value: &str) -> Option<Self> {
+        Some(match norm_lower(value.trim()).as_str() {
+            "pdf" | "пдф" => AttachmentKind::Pdf,
+            "таблица" | "excel" | "эксель" | "xlsx" | "xls" | "csv" => AttachmentKind::Sheet,
+            "документ" | "word" | "ворд" | "docx" | "doc" => AttachmentKind::Doc,
+            "картинка" | "фото" | "изображение" | "jpg" | "jpeg" | "png" => AttachmentKind::Image,
+            "архив" | "zip" | "rar" | "7z" => AttachmentKind::Archive,
+            "презентация" | "pptx" | "ppt" => AttachmentKind::Slides,
+            _ => return None,
+        })
+    }
+}
+
+/// Кусок запроса между пробелами: `ключ:значение`, слово или фраза в кавычках.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RawToken {
+    pub(crate) key: Option<String>,
+    pub(crate) value: String,
+    pub(crate) quoted: bool,
+    /// Место в запросе, в символах: начало и конец (не включительно).
+    pub(crate) start: usize,
+    pub(crate) end: usize,
 }
 
 /// Делит строку на токены по пробелам с учётом кавычек; `ключ:значение` распознаётся
 /// по первому двоеточию, если ключ состоит из букв.
-fn split_tokens(input: &str) -> Vec<RawToken> {
+pub(crate) fn split_tokens(input: &str) -> Vec<RawToken> {
     let mut out = Vec::new();
     let chars: Vec<char> = input.chars().collect();
     let mut i = 0;
@@ -51,6 +137,7 @@ fn split_tokens(input: &str) -> Vec<RawToken> {
             i += 1;
             continue;
         }
+        let start = i;
         let mut text = String::new();
         let mut quoted = false;
         let mut key: Option<String> = None;
@@ -80,7 +167,7 @@ fn split_tokens(input: &str) -> Vec<RawToken> {
             text.push(c);
             i += 1;
         }
-        out.push(RawToken { key, value: text, quoted });
+        out.push(RawToken { key, value: text, quoted, start, end: i.min(chars.len()) });
     }
     out
 }
@@ -128,77 +215,146 @@ fn is_full_address(s: &str) -> bool {
     !local.is_empty() && !domain.contains('@') && !s.chars().any(char::is_whitespace) && domain.contains('.') && domain.split('.').all(|p| !p.is_empty())
 }
 
+/// Список полных адресов через запятую (`a@x.ru,b@x.ru`), в нижнем регистре; `None` — в значении
+/// есть что-то кроме полных адресов.
+fn address_list(value: &str) -> Option<Vec<String>> {
+    let parts: Vec<&str> = value.split(',').map(str::trim).filter(|p| !p.is_empty()).collect();
+    (!parts.is_empty() && parts.iter().all(|p| is_full_address(p))).then(|| parts.iter().map(|p| p.to_lowercase()).collect())
+}
+
+fn yes_no(value: &str) -> Option<bool> {
+    match norm_lower(value.trim()).as_str() {
+        "да" | "yes" | "1" | "true" | "есть" => Some(true),
+        "нет" | "no" | "0" | "false" => Some(false),
+        _ => None,
+    }
+}
+
+/// Применить один кусок запроса: оператор, слово или фразу.
+pub(crate) fn apply_token(q: &mut SearchQuery, t: &RawToken) {
+    let value = fts_norm(t.value.trim());
+    match t.key.as_deref() {
+        Some("от" | "from") if !value.is_empty() => match address_list(&t.value) {
+            Some(list) => q.from_exact.extend(list),
+            None => q.from.push(value),
+        },
+        Some("кому" | "to") if !value.is_empty() => match address_list(&t.value) {
+            Some(mut list) if list.len() == 1 => q.to_exact.append(&mut list),
+            Some(list) => q.to_any.push(list),
+            None => q.to.push(value),
+        },
+        Some("переписка" | "with") if !value.is_empty() => match address_list(&t.value) {
+            Some(list) => q.with_any.push(list),
+            None => q.with.push(value),
+        },
+        Some("тема" | "subject") if !value.is_empty() => q.subject.push(value),
+        Some("папка" | "in" | "folder") if !value.is_empty() => q.folder = Some(value),
+        Some("вложение" | "вложения" | "attachment") => {
+            q.has_attachment = !matches!(value.to_lowercase().as_str(), "нет" | "no" | "0" | "false");
+            if let Some(kind) = AttachmentKind::parse(&value)
+                && !q.attachment_kinds.contains(&kind)
+            {
+                q.attachment_kinds.push(kind);
+            }
+        }
+        Some("has" | "есть") => {
+            if matches!(value.to_lowercase().as_str(), "attachment" | "attachments" | "вложение" | "вложения" | "файл") {
+                q.has_attachment = true;
+            }
+        }
+        Some("после" | "after" | "since" | "с") => {
+            if let Some((start, _)) = parse_date_range(&value) {
+                q.after_ms = Some(start);
+            }
+        }
+        Some("до" | "before" | "по") => {
+            if let Some((_, end)) = parse_date_range(&value) {
+                q.before_ms = Some(end);
+            }
+        }
+        Some("дата" | "date") => {
+            if let Some((start, end)) = parse_date_range(&value) {
+                q.after_ms = Some(start);
+                q.before_ms = Some(end);
+            }
+        }
+        Some("прочитано" | "isread" | "read") => {
+            if let Some(read) = yes_no(&value) {
+                q.unread = Some(!read);
+            }
+        }
+        Some("флаг" | "isflagged" | "flag") => q.flagged = Some(yes_no(&value).unwrap_or(true)),
+        Some(k) => {
+            // Неизвестный оператор: ищем как текст вместе с ключом.
+            let text = format!("{k} {value}");
+            if !text.trim().is_empty() {
+                q.terms.push(Term { text: text.trim().to_string(), phrase: t.quoted });
+            }
+        }
+        None => {
+            if !value.is_empty() {
+                q.terms.push(Term { text: value, phrase: t.quoted });
+            }
+        }
+    }
+}
+
 pub fn parse(input: &str) -> SearchQuery {
     let mut q = SearchQuery::default();
     for t in split_tokens(input) {
-        let value = fts_norm(t.value.trim());
-        match t.key.as_deref() {
-            Some("от" | "from") if !value.is_empty() => {
-                if is_full_address(t.value.trim()) {
-                    q.from_exact.push(t.value.trim().to_lowercase());
-                } else {
-                    q.from.push(value);
-                }
-            }
-            Some("кому" | "to") if !value.is_empty() => {
-                if is_full_address(t.value.trim()) {
-                    q.to_exact.push(t.value.trim().to_lowercase());
-                } else {
-                    q.to.push(value);
-                }
-            }
-            Some("тема" | "subject") if !value.is_empty() => q.subject.push(value),
-            Some("папка" | "in" | "folder") if !value.is_empty() => q.folder = Some(value),
-            Some("вложение" | "вложения" | "attachment") => q.has_attachment = !matches!(value.to_lowercase().as_str(), "нет" | "no" | "0" | "false"),
-            Some("has" | "есть") => {
-                if matches!(value.to_lowercase().as_str(), "attachment" | "attachments" | "вложение" | "вложения" | "файл") {
-                    q.has_attachment = true;
-                }
-            }
-            Some("после" | "after" | "since" | "с") => {
-                if let Some((start, _)) = parse_date_range(&value) {
-                    q.after_ms = Some(start);
-                }
-            }
-            Some("до" | "before" | "по") => {
-                if let Some((_, end)) = parse_date_range(&value) {
-                    q.before_ms = Some(end);
-                }
-            }
-            Some(k) => {
-                // Неизвестный оператор: ищем как текст вместе с ключом.
-                let text = format!("{k} {value}");
-                if !text.trim().is_empty() {
-                    q.terms.push(Term { text: text.trim().to_string(), phrase: t.quoted });
-                }
-            }
-            None => {
-                if !value.is_empty() {
-                    q.terms.push(Term { text: value, phrase: t.quoted });
-                }
-            }
-        }
+        apply_token(&mut q, &t);
     }
     q
 }
 
-/// Слово как префиксный токен FTS5 в кавычках; служебные символы отрезаются по краям.
-fn fts_words(text: &str, prefix: bool) -> Vec<String> {
+/// Слова текста для FTS5: служебные символы отрезаются по краям.
+pub(crate) fn plain_words(text: &str) -> impl Iterator<Item = &str> {
     text.split(|c: char| c.is_whitespace() || matches!(c, ',' | ';' | ':' | '(' | ')' | '[' | ']' | '{' | '}' | '"' | '\'' | '*' | '^'))
         .map(|w| w.trim_matches(|c: char| !c.is_alphanumeric()))
         .filter(|w| !w.is_empty())
-        .map(|w| if prefix { format!("\"{}\"*", w.replace('"', "\"\"")) } else { format!("\"{}\"", w.replace('"', "\"\"")) })
-        .collect()
+}
+
+fn quoted(word: &str, prefix: bool) -> String {
+    if prefix { format!("\"{}\"*", word.replace('"', "\"\"")) } else { format!("\"{}\"", word.replace('"', "\"\"")) }
+}
+
+/// Слово как префиксный токен FTS5 в кавычках.
+fn fts_words(text: &str, prefix: bool) -> Vec<String> {
+    plain_words(text).map(|w| quoted(w, prefix)).collect()
 }
 
 impl SearchQuery {
     /// Есть ли хоть одно условие.
     pub fn is_empty(&self) -> bool {
-        self.terms.is_empty() && self.from.is_empty() && self.to.is_empty() && self.from_exact.is_empty() && self.to_exact.is_empty() && self.subject.is_empty() && !self.has_attachment && self.folder.is_none() && self.after_ms.is_none() && self.before_ms.is_none()
+        self.terms.is_empty()
+            && self.from.is_empty()
+            && self.to.is_empty()
+            && self.from_exact.is_empty()
+            && self.to_exact.is_empty()
+            && self.subject.is_empty()
+            && !self.has_attachment
+            && self.folder.is_none()
+            && self.after_ms.is_none()
+            && self.before_ms.is_none()
+            && self.to_any.is_empty()
+            && self.with_any.is_empty()
+            && self.with.is_empty()
+            && self.unread.is_none()
+            && self.flagged.is_none()
     }
 
-    /// Выражение `MATCH` для FTS5 или `None`, если текстовых условий нет (остались только фильтры).
-    pub fn fts_match(&self) -> Option<String> {
+    /// Слова текста как префиксы; у слова с известными формами — «слово или любая его форма».
+    fn expanded_words(&self, text: &str) -> Vec<String> {
+        plain_words(text)
+            .map(|w| match self.forms.get(&norm_lower(w)).filter(|f| !f.is_empty()) {
+                Some(forms) => format!("({} OR {})", quoted(w, true), forms.iter().map(|f| quoted(f, false)).collect::<Vec<_>>().join(" OR ")),
+                None => quoted(w, true),
+            })
+            .collect()
+    }
+
+    /// Выражения FTS5 для слов и фраз свободного текста, по одному на слово или фразу.
+    fn term_parts(&self) -> Vec<String> {
         let mut parts: Vec<String> = Vec::new();
         for t in &self.terms {
             if t.phrase {
@@ -208,15 +364,34 @@ impl SearchQuery {
                     parts.push(words.join(" + "));
                 }
             } else {
-                parts.extend(fts_words(&t.text, true));
+                parts.extend(self.expanded_words(&t.text));
             }
         }
-        for (cols, values) in [("{from_name from_email}", &self.from), ("recipients", &self.to), ("subject", &self.subject)] {
+        parts
+    }
+
+    /// Выражение `MATCH`: хотя бы одно слово или фраза свободного текста — в именах или тексте
+    /// вложений письма. `None`, если слов нет.
+    pub fn attachment_match(&self) -> Option<String> {
+        let parts = self.term_parts();
+        (!parts.is_empty()).then(|| format!("attachment_text: ({})", parts.join(" OR ")))
+    }
+
+    /// Выражение `MATCH` для FTS5 или `None`, если текстовых условий нет (остались только фильтры).
+    pub fn fts_match(&self) -> Option<String> {
+        let mut parts = self.term_parts();
+        for (cols, values) in [("{from_name from_email}", &self.from), ("recipients", &self.to), ("{from_name from_email recipients}", &self.with)] {
             for v in values {
                 let words = fts_words(v, true);
                 if !words.is_empty() {
                     parts.push(format!("{cols}: ({})", words.join(" ")));
                 }
+            }
+        }
+        for v in &self.subject {
+            let words = self.expanded_words(v);
+            if !words.is_empty() {
+                parts.push(format!("subject: ({})", words.join(" ")));
             }
         }
         // Между фразами и выражениями в скобках FTS5 требует явный AND.
@@ -295,6 +470,45 @@ mod tests {
         let q = parse("кому:a@x.ru кому:B@x.ru");
         assert_eq!(q.to_exact, vec!["a@x.ru", "b@x.ru"]);
         assert!(q.to.is_empty() && q.fts_match().is_none());
+    }
+
+    #[test]
+    fn address_lists_and_new_operators() {
+        // Несколько адресов через запятую — любой из них.
+        let q = parse("от:a@x.ru,B@x.ru кому:c@x.ru,d@x.ru кому:e@x.ru переписка:f@x.ru,g@x.ru переписка:иванов");
+        assert_eq!(q.from_exact, vec!["a@x.ru", "b@x.ru"]);
+        assert_eq!(q.to_any, vec![vec!["c@x.ru".to_string(), "d@x.ru".to_string()]]);
+        assert_eq!(q.to_exact, vec!["e@x.ru"]);
+        assert_eq!(q.with_any, vec![vec!["f@x.ru".to_string(), "g@x.ru".to_string()]]);
+        assert_eq!(q.with, vec!["иванов"]);
+        assert_eq!(q.fts_match().as_deref(), Some("{from_name from_email recipients}: (\"иванов\"*)"));
+        // Список, где не всё адреса, — поиск по словам, как раньше.
+        assert_eq!(parse("от:a@x.ru,иванов").from, vec!["a@x.ru,иванов"]);
+        // Состояние письма и вид вложения.
+        let q = parse("прочитано:нет флаг:да вложение:pdf вложение:таблица");
+        assert_eq!((q.unread, q.flagged, q.has_attachment), (Some(true), Some(true), true));
+        assert_eq!(q.attachment_kinds, vec![AttachmentKind::Pdf, AttachmentKind::Sheet]);
+        assert!(!q.is_empty() && q.fts_match().is_none());
+        assert_eq!(parse("isread:yes").unread, Some(false));
+        assert_eq!(parse("флаг:нет").flagged, Some(false));
+        assert!(parse("вложение:нет").attachment_kinds.is_empty() && !parse("вложение:нет").has_attachment);
+        // `дата:` — обе границы разом.
+        let q = parse("дата:2026-10");
+        assert_eq!((q.after_ms, q.before_ms), parse_date_range("2026-10").map(|(a, b)| (Some(a), Some(b))).unwrap());
+        // Место кусков в запросе — в символах.
+        let tokens = split_tokens("от:иванов  «точная фраза» слово");
+        assert_eq!(tokens.iter().map(|t| (t.start, t.end)).collect::<Vec<_>>(), vec![(0, 9), (11, 25), (26, 31)]);
+    }
+
+    #[test]
+    fn word_forms_in_match() {
+        let mut q = parse("договора тема:поставки \"точная фраза\"");
+        q.forms.insert("договора".into(), vec!["договор".into(), "договору".into()]);
+        q.forms.insert("поставки".into(), vec!["поставка".into()]);
+        q.forms.insert("точная".into(), vec!["точный".into()]);
+        assert_eq!(q.fts_match().unwrap(), "(\"договора\"* OR \"договор\" OR \"договору\") AND \"точная\" + \"фраза\" AND subject: ((\"поставки\"* OR \"поставка\"))");
+        assert_eq!(q.attachment_match().unwrap(), "attachment_text: ((\"договора\"* OR \"договор\" OR \"договору\") OR \"точная\" + \"фраза\")");
+        assert_eq!(parse("от:иванов вложение:").attachment_match(), None);
     }
 
     #[test]

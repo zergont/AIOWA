@@ -32,6 +32,9 @@ pub fn request_body(model: &str, req: &ChatRequest) -> Value {
     if let Some(e) = req.effort {
         body["output_config"] = json!({ "effort": match e { Effort::Low => "low", Effort::Medium => "medium", Effort::High => "high" } });
     }
+    if let Some(s) = &req.json_schema {
+        body["output_config"]["format"] = json!({ "type": "json_schema", "schema": s.schema });
+    }
     body
 }
 
@@ -166,7 +169,11 @@ mod tests {
 
     #[test]
     fn body_has_model_system_messages_and_effort() {
-        let req = ChatRequest { feature: "проверка", system: "Ты помощник".into(), messages: vec![Message::user("Привет")], max_tokens: 512, effort: Some(Effort::Low) };
+        let req = ChatRequest { feature: "проверка", system: "Ты помощник".into(), messages: vec![Message::user("Привет")], max_tokens: 512, effort: Some(Effort::Low), json_schema: None };
+        let with_schema = ChatRequest { json_schema: Some(crate::JsonSchema { name: "search", schema: json!({ "type": "object" }) }), ..req.clone() };
+        assert_eq!(request_body("m", &with_schema)["output_config"], json!({ "effort": "low", "format": { "type": "json_schema", "schema": { "type": "object" } } }));
+        let no_effort = ChatRequest { effort: None, ..with_schema.clone() };
+        assert_eq!(request_body("m", &no_effort)["output_config"], json!({ "format": { "type": "json_schema", "schema": { "type": "object" } } }));
         let b = request_body("claude-opus-5-5", &req);
         assert_eq!(b["model"], "claude-opus-5-5");
         assert_eq!(b["stream"], true);
@@ -174,7 +181,7 @@ mod tests {
         assert_eq!(b["messages"][0]["role"], "user");
         assert_eq!(b["output_config"]["effort"], "low");
         assert!(b.get("temperature").is_none(), "параметры выборки этой версией API не принимаются");
-        let plain = request_body("m", &ChatRequest { feature: "x", system: String::new(), messages: vec![Message::user("a")], max_tokens: 10, effort: None });
+        let plain = request_body("m", &ChatRequest { feature: "x", system: String::new(), messages: vec![Message::user("a")], max_tokens: 10, effort: None, json_schema: None });
         assert!(plain.get("system").is_none() && plain.get("output_config").is_none());
     }
 

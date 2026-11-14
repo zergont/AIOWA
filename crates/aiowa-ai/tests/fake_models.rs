@@ -132,7 +132,7 @@ fn profile(kind: ProviderKind, base: &str, model: &str) -> Profile {
 }
 
 fn req() -> ChatRequest {
-    ChatRequest { feature: "проверка", system: "Отвечай одним словом".into(), messages: vec![Message::user("Готов?")], max_tokens: 64, effort: Some(Effort::Low) }
+    ChatRequest { feature: "проверка", system: "Отвечай одним словом".into(), messages: vec![Message::user("Готов?")], max_tokens: 64, effort: Some(Effort::Low), json_schema: None }
 }
 
 fn key(s: &str) -> SecretString {
@@ -287,4 +287,64 @@ async fn errors_policy_timeout_and_cancel() {
 
     let outcomes: Vec<String> = log.lock().unwrap().iter().map(|r| r.outcome.clone()).collect();
     assert_eq!(outcomes, ["auth", "rate_limited", "bad_request", "timeout", "cancelled"]);
+}
+
+/// Ответ по JSON-схеме (доводка разбора запроса, шаг И3): схема уходит в запросе; сервер, который
+/// её не понимает, спрашивается ещё раз без неё; ответ не JSON — отказ, а не пустые условия.
+#[tokio::test]
+async fn json_by_schema_with_fallback() {
+    use aiowa_ai::{nlsearch, JsonSchema};
+    let server = serve(Arc::new(|r: &Seen| {
+        let body = if r.method == "POST" { r.json() } else { Value::Null };
+        let content = |text: &str| serde_json::json!({ "model": "fast", "choices": [{ "index": 0, "message": { "role": "assistant", "content": text }, "finish_reason": "stop" }], "usage": { "prompt_tokens": 400, "completion_tokens": 60 } }).to_string();
+        match r.path.as_str() {
+            // Старый сервер: схему в запросе не понимает.
+            "/old/v1/chat/completions" if body.get("response_format").is_some() => json_reply("400 Bad Request", r#"{"error":{"message":"response_format is not supported"}}"#),
+            "/old/v1/chat/completions" => json_reply("200 OK", &content("```json\n{\"from\": [\"Иванов\"], \"words\": [\"ремонт\"], \"date_from\": \"2026-10-01\", \"date_to\": \"2026-10-31\"}\n```")),
+            "/new/v1/chat/completions" => json_reply("200 OK", &content("{\"from\": [], \"words\": [\"акт\"], \"unread\": true}")),
+            "/chatty/v1/chat/completions" => json_reply("200 OK", &content("Конечно! Вот что я думаю о вашем запросе.")),
+            _ => json_reply("404 Not Found", r#"{"error":"not found"}"#),
+        }
+    }))
+    .await;
+    let (gw, log) = gateway();
+    let request = ChatRequest {
+        feature: "разбор",
+        system: nlsearch::SYSTEM.into(),
+        messages: vec![Message::user(nlsearch::user_message("письма от Иванова про ремонт за октябрь", "13 ноября 2026, пятница (2026-11-13)"))],
+        max_tokens: 512,
+        effort: None,
+        json_schema: Some(JsonSchema { name: "search_query", schema: nlsearch::schema() }),
+    };
+
+    // Сервер без поддержки схемы: два обращения, второе — без `response_format`.
+    let old = profile(ProviderKind::OpenAi, &format!("{}/old/v1", server.base), "fast");
+    let (value, out) = gw.chat_json(&old, None, PrivacyMode::Any, &request, &Cancel::new()).await.unwrap();
+    let parsed = nlsearch::parse(&value).unwrap();
+    assert_eq!((parsed.from.as_slice(), parsed.words.as_slice()), (&["Иванов".to_string()][..], &["ремонт".to_string()][..]));
+    assert_eq!((parsed.date_from.as_deref(), parsed.date_to.as_deref()), (Some("2026-10-01"), Some("2026-10-31")));
+    assert_eq!(out.output_tokens, Some(60));
+    let posts: Vec<Value> = server.seen.lock().unwrap().iter().filter(|s| s.path.starts_with("/old/")).map(Seen::json).collect();
+    assert_eq!(posts.len(), 2);
+    assert_eq!(posts[0]["response_format"]["json_schema"]["name"], "search_query");
+    assert_eq!(posts[0]["response_format"]["json_schema"]["strict"], true);
+    assert!(posts[1].get("response_format").is_none());
+    assert!(posts[1]["messages"][1]["content"].as_str().unwrap().contains("Схема ответа (JSON)"), "схема есть и в промпте");
+
+    // Сервер со схемой: одно обращение.
+    let new = profile(ProviderKind::OpenAi, &format!("{}/new/v1", server.base), "fast");
+    let (value, _) = gw.chat_json(&new, None, PrivacyMode::Any, &request, &Cancel::new()).await.unwrap();
+    let parsed = nlsearch::parse(&value).unwrap();
+    assert!(parsed.unread && parsed.words == ["акт"]);
+    assert_eq!(server.seen.lock().unwrap().iter().filter(|s| s.path.starts_with("/new/")).count(), 1);
+
+    // Модель ответила прозой: отказ с понятным кодом.
+    let chatty = profile(ProviderKind::OpenAi, &format!("{}/chatty/v1", server.base), "fast");
+    let e = gw.chat_json(&chatty, None, PrivacyMode::Any, &request, &Cancel::new()).await.unwrap_err();
+    assert!(matches!(e, AiError::Protocol(_)), "{e:?}");
+
+    // В журнале — все обращения, дошедшие до серверов, функцией «разбор».
+    let records = log.lock().unwrap().clone();
+    assert_eq!(records.iter().map(|r| r.outcome.as_str()).collect::<Vec<_>>(), ["bad_request", "ok", "ok", "ok"]);
+    assert!(records.iter().all(|r| r.feature == "разбор"));
 }

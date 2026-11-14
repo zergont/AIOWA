@@ -37,9 +37,17 @@ const KEY_MAX: usize = 512;
 pub(crate) struct AiState {
     pub(crate) gateway: Gateway,
     tests: Mutex<HashMap<String, Cancel>>,
-    /// Идущие «Советы» по номеру просьбы окна: отмена из панели и при закрытии композера.
+    /// Идущие «Советы» и «Кратко по найденному» по номеру просьбы окна: отмена из панели и при
+    /// её закрытии.
     advice: Mutex<HashMap<String, Cancel>>,
+    /// Идущая доводка поискового запроса: новая отменяет прежнюю, смена запроса — тоже.
+    refine: Mutex<Option<Cancel>>,
+    /// Разборы запросов моделью: ключ — день, подключение с моделью и запрос. Только в памяти.
+    refine_cache: Mutex<HashMap<String, aiowa_ai::nlsearch::Parsed>>,
 }
+
+/// Разборов запросов в памяти самое большее: дальше память очищается целиком.
+const REFINE_CACHE_MAX: usize = 200;
 
 impl AiState {
     /// Шлюз с журналом в базу учётной записи.
@@ -63,7 +71,34 @@ impl AiState {
             }
         });
         let gateway = Gateway::new(&format!("AIOWA/{}", env!("CARGO_PKG_VERSION")), journal).map_err(|e| e.to_string())?;
-        Ok(Self { gateway, tests: Mutex::new(HashMap::new()), advice: Mutex::new(HashMap::new()) })
+        Ok(Self { gateway, tests: Mutex::new(HashMap::new()), advice: Mutex::new(HashMap::new()), refine: Mutex::new(None), refine_cache: Mutex::new(HashMap::new()) })
+    }
+
+    /// Новая доводка запроса: прежняя, если ещё идёт, отменяется.
+    pub(crate) fn start_refine(&self) -> Cancel {
+        let c = Cancel::new();
+        if let Some(old) = self.refine.lock().unwrap_or_else(|p| p.into_inner()).replace(c.clone()) {
+            old.cancel();
+        }
+        c
+    }
+
+    pub(crate) fn cancel_refine(&self) {
+        if let Some(c) = self.refine.lock().unwrap_or_else(|p| p.into_inner()).take() {
+            c.cancel();
+        }
+    }
+
+    pub(crate) fn refine_cached(&self, key: &str) -> Option<aiowa_ai::nlsearch::Parsed> {
+        self.refine_cache.lock().unwrap_or_else(|p| p.into_inner()).get(key).cloned()
+    }
+
+    pub(crate) fn refine_remember(&self, key: String, parsed: aiowa_ai::nlsearch::Parsed) {
+        let mut cache = self.refine_cache.lock().unwrap_or_else(|p| p.into_inner());
+        if cache.len() >= REFINE_CACHE_MAX {
+            cache.clear();
+        }
+        cache.insert(key, parsed);
     }
 
     /// Новый «Совет»: запомнить его отмену (прежний с тем же номером — отменить).
@@ -110,11 +145,11 @@ pub(crate) struct AiConfig {
     pub(crate) mode: PrivacyMode,
     pub(crate) profiles: Vec<Profile>,
     pub(crate) advice: Option<String>,
-    parse: Option<String>,
+    pub(crate) parse: Option<String>,
 }
 
 impl AiConfig {
-    fn from_lookup(get: impl Fn(&str) -> Option<String>) -> Self {
+    pub(crate) fn from_lookup(get: impl Fn(&str) -> Option<String>) -> Self {
         let profiles: Vec<Profile> = get(PROFILES_KEY).and_then(|j| serde_json::from_str(&j).ok()).unwrap_or_default();
         let known = |id: Option<String>| id.filter(|id| profiles.iter().any(|p| &p.id == id));
         Self {
@@ -409,6 +444,7 @@ pub(crate) async fn ai_profile_test(id: String, state: State<'_, AppState>, ai: 
         messages: vec![Message::user("Ты на связи? Ответь одним словом: «готов».")],
         max_tokens: 1024,
         effort: (profile.kind == ProviderKind::Anthropic).then_some(Effort::Low),
+        json_schema: None,
     };
     let started = Instant::now();
     let mut first: Option<u64> = None;

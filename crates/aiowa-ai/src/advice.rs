@@ -52,7 +52,7 @@ pub struct Person {
 }
 
 impl Person {
-    fn label(&self) -> String {
+    pub(crate) fn label(&self) -> String {
         match (self.name.as_deref().map(str::trim).filter(|s| !s.is_empty()), self.email.as_deref().map(str::trim).filter(|s| !s.is_empty())) {
             (Some(n), Some(e)) if !n.eq_ignore_ascii_case(e) => format!("{n} <{e}>"),
             (Some(n), _) => n.to_string(),
@@ -295,17 +295,17 @@ fn render(input: &AdviceInput, caps: &[usize], style_count: usize, dropped_older
 }
 
 /// Значение атрибута разметки: без кавычек и переводов строк.
-fn attr(s: &str) -> String {
+pub(crate) fn attr(s: &str) -> String {
     s.replace(['"', '\n', '\r'], " ").trim().to_string()
 }
 
 /// Текст письма не может закрыть разметку раньше времени.
-fn escape_close(s: &str) -> String {
+pub(crate) fn escape_close(s: &str) -> String {
     s.replace("</письмо>", "</ письмо>").replace("</беседа>", "</ беседа>").replace("<письмо", "< письмо")
 }
 
 /// Первые `max` символов.
-fn clip(s: &str, max: usize) -> String {
+pub(crate) fn clip(s: &str, max: usize) -> String {
     s.chars().take(max).collect()
 }
 

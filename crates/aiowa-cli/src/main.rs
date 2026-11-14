@@ -103,11 +103,22 @@ enum Cmd {
         limit: usize,
     },
     /// Поиск по локальной базе. Операторы: от:/from:, кому:/to:, тема:/subject:,
-    /// вложение:/has:attachment, папка:/in:, после:/до: (даты), остальное ищется по словам
+    /// вложение:/has:attachment, папка:/in:, после:/до: (даты), остальное ищется по словам;
+    /// запрос на обычном языке («письма от Иванова за октябрь») разбирается в те же условия
     Search {
         query: String,
         #[arg(long, default_value_t = 20)]
         limit: usize,
+        /// Только счётчики и время, без писем, имён и адресов: число писем, виды понятых условий
+        #[arg(long)]
+        stats: bool,
+    },
+    /// Доиндексировать начало текста писем для поиска (схема 15) — то, что приложение делает в
+    /// фоне после обновления. Печатает число писем и время
+    IndexPreviews {
+        /// Писем в одной транзакции
+        #[arg(long, default_value_t = 200)]
+        batch: usize,
     },
     /// Скачать вложения одного письма с сервера (проба пути скачивания) и показать извлечённый текст
     FetchAttachments {
@@ -3429,13 +3440,43 @@ async fn real_main() -> Result<()> {
                 println!("{}  {}  {:>5} {:>5}{}  {}{}", pad(&fmt_date(c.last_received_at), 16), pad(&who, 36), count, c.unread_count, marker, truncate(&c.topic.as_deref().unwrap_or("(без темы)").split_whitespace().collect::<Vec<_>>().join(" "), 70), clip);
             }
         }
-        Cmd::Search { query, limit } => {
+        Cmd::Search { query, limit, stats } => {
             let store = Store::open(&db_path)?;
             let account = store.account(&cli.host, &cli.user)?;
+            // Первый поиск строит кэш корреспондентов ящика; время самого поиска — на втором.
+            let warm = std::time::Instant::now();
+            store.people_index(account)?;
+            let warm_ms = warm.elapsed().as_millis();
             let started = std::time::Instant::now();
-            let hits = store.search(account, query, *limit)?;
-            println!("{} результатов за {} мс\n", hits.len(), started.elapsed().as_millis());
-            for h in hits {
+            let outcome = store.search_understood(account, query, *limit)?;
+            let ms = started.elapsed().as_millis();
+            let u = &outcome.understood;
+            if *stats {
+                let kinds: Vec<&str> = u.chips.iter().map(|c| c.kind.code()).collect();
+                println!(
+                    "писем={} по_запросу={} мс={} кэш_людей_мс={} условия=[{}] слов={} форм={} непонятых={} ослаблен={} match_символов={}",
+                    outcome.hits.len(),
+                    outcome.strict,
+                    ms,
+                    warm_ms,
+                    kinds.join(","),
+                    u.query.terms.len(),
+                    u.query.forms.values().map(Vec::len).sum::<usize>(),
+                    u.unknown.len(),
+                    outcome.relaxed_note.is_some(),
+                    u.query.fts_match().map(|m| m.chars().count()).unwrap_or(0)
+                );
+                return Ok(());
+            }
+            println!("{} результатов за {} мс\n", outcome.hits.len(), ms);
+            if !u.chips.is_empty() {
+                println!("понято: {}", u.chips.iter().map(|c| c.label.as_str()).collect::<Vec<_>>().join(" · "));
+                println!("в операторах: {}\n", u.canonical);
+            }
+            if let Some(note) = &outcome.relaxed_note {
+                println!("по запросу найдено {}, {note}\n", outcome.strict);
+            }
+            for h in outcome.hits {
                 let from = h.from_name.or(h.from_email).unwrap_or_default();
                 let snippet = h.snippet.replace('\n', " ");
                 let snippet = match &h.attachment_name {
@@ -3444,6 +3485,22 @@ async fn real_main() -> Result<()> {
                 };
                 println!("{}  {}  [{}]  #{}\n    {}\n    {}\n", fmt_date(h.received_at), pad(&from, 28), h.folder_name.unwrap_or_default(), h.item_pk, truncate(h.subject.as_deref().unwrap_or("(без темы)"), 90), snippet);
             }
+        }
+        Cmd::IndexPreviews { batch } => {
+            let store = Store::open(&db_path)?;
+            let pending = store.previews_pending()?;
+            let started = std::time::Instant::now();
+            let (mut total, mut longest) = (0usize, 0u128);
+            loop {
+                let t = std::time::Instant::now();
+                let n = store.index_previews(*batch)?;
+                longest = longest.max(t.elapsed().as_millis());
+                if n == 0 {
+                    break;
+                }
+                total += n;
+            }
+            println!("ждало писем: {pending}, обработано: {total} за {:.1} с, самая долгая пачка: {longest} мс", started.elapsed().as_secs_f32());
         }
         Cmd::FetchAttachments { item_pk, max_mb } => {
             let store = Arc::new(Store::open(&db_path)?);

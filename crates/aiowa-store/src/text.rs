@@ -110,12 +110,26 @@ pub fn fts_norm(s: &str) -> String {
     if !s.contains(['ё', 'Ё']) {
         return s.to_string();
     }
-    s.chars().map(|c| match c {
-        'ё' => 'е',
-        'Ё' => 'Е',
-        c => c,
-    })
-    .collect()
+    // Замена по байтам: «ё» (D1 91) и «е» (D0 B5), «Ё» (D0 81) и «Е» (D0 95) в UTF-8 одной
+    // длины, а первый байт буквы не бывает внутри другой буквы. Посимвольный разбор текста
+    // вложения в сотни тысяч знаков стоил поиску десятки миллисекунд на письмо.
+    let mut bytes = s.as_bytes().to_vec();
+    let mut i = 0;
+    while i + 1 < bytes.len() {
+        match (bytes[i], bytes[i + 1]) {
+            (0xD1, 0x91) => {
+                bytes[i] = 0xD0;
+                bytes[i + 1] = 0xB5;
+                i += 2;
+            }
+            (0xD0, 0x81) => {
+                bytes[i + 1] = 0x95;
+                i += 2;
+            }
+            _ => i += 1,
+        }
+    }
+    String::from_utf8(bytes).unwrap_or_else(|_| s.to_string())
 }
 
 /// Нормализация для сравнений: нижний регистр Юникода плюс ё→е.
@@ -175,6 +189,12 @@ mod tests {
     fn normalizes_yo() {
         assert_eq!(fts_norm("Счёт и ЁЛКА"), "Счет и ЕЛКА");
         assert_eq!(fts_norm("plain"), "plain");
+        // Соседние буквы с теми же байтами в другом порядке и другие алфавиты не задеты.
+        assert_eq!(fts_norm("ёЁёё ёж б👍ё ё"), "еЕее еж б👍е е");
+        assert_eq!(fts_norm("Сё ёС сёрьёзно ё"), "Се еС серьезно е");
+        assert_eq!(fts_norm("ё"), "е");
+        assert_eq!(fts_norm("Ё"), "Е");
+        assert_eq!(fts_norm("сђё ѐё Бё"), "сђе ѐе Бе", "буквы с первым байтом D1 и D0 рядом с ё");
         assert_eq!(norm_lower("Счёт №25"), "счет №25");
     }
 

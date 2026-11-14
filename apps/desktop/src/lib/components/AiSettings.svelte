@@ -227,7 +227,7 @@
       <input type="checkbox" checked={s.enabled} onchange={(e) => void update({ enabled: e.currentTarget.checked })} aria-describedby="{uid}-enabled-hint" />
       ИИ-функции
     </label>
-    <p class="hint" id="{uid}-enabled-hint">Включает «Совет» при ответе (кнопка в письме, которое пишешь); поиск на обычном языке появится в следующих выпусках. Пока выключено, AIOWA сама к моделям не обращается; «Проверить» работает только по кнопке.</p>
+    <p class="hint" id="{uid}-enabled-hint">Включает «Совет» при ответе (кнопка в письме, которое пишешь), «Кратко» над результатами поиска и доводку поискового запроса моделью. Запрос на обычном языке («письма от Иванова про ремонт за октябрь») поиск разбирает сам, без модели, и при выключенных ИИ-функциях. Пока выключено, AIOWA сама к моделям не обращается; «Проверить» работает только по кнопке.</p>
 
     <fieldset class="group">
       <legend class="label">Куда можно отправлять письма</legend>
@@ -375,12 +375,12 @@
       <section class="block" aria-labelledby="{uid}-assign">
         <h4 class="label" id="{uid}-assign">Какая модель для чего</h4>
         <div class="field">
-          <label class="label sub" for="{uid}-advice">«Совет» при ответе</label>
+          <label class="label sub" for="{uid}-advice">«Совет» при ответе и «Кратко» в поиске</label>
           <select id="{uid}-advice" value={s.advice_profile ?? ""} onchange={(e) => void update({ advice_profile: e.currentTarget.value || null })}>
             <option value="">— не назначено —</option>
             {#each s.profiles as p (p.id)}<option value={p.id}>{p.name}{p.model ? ` · ${p.model}` : ""}</option>{/each}
           </select>
-          <p class="hint">Сильная модель: читает всю беседу и пишет черновик ответа.</p>
+          <p class="hint">Сильная модель: читает всю беседу и пишет черновик ответа; в поиске читает до двадцати верхних писем выдачи и коротко отвечает на запрос.</p>
         </div>
         <div class="field">
           <label class="label sub" for="{uid}-parse">Разбор запросов поиска</label>
@@ -388,7 +388,7 @@
             <option value="">— не назначено —</option>
             {#each s.profiles as p (p.id)}<option value={p.id}>{p.name}{p.model ? ` · ${p.model}` : ""}</option>{/each}
           </select>
-          <p class="hint">Быстрая модель: доводит разбор запроса на обычном языке, когда разбор без модели не справился. Понадобится поиску на обычном языке — он ещё не выпущен.</p>
+          <p class="hint">Быстрая модель: доводит поисковый запрос, когда разбор без модели чего-то не понял или ничего не нашёл. Зовётся только по Enter в строке поиска; в модель уходит текст запроса и сегодняшняя дата — без писем и адресной книги.</p>
         </div>
       </section>
     {/if}

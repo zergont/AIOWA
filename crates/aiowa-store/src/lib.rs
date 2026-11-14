@@ -14,6 +14,10 @@ pub mod contacts;
 pub mod directory;
 pub mod drafts;
 pub mod identity;
+pub mod morph;
+pub mod names;
+pub mod nldate;
+pub mod nlquery;
 pub mod query;
 pub mod schema;
 pub mod text;
@@ -28,7 +32,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
@@ -83,6 +87,8 @@ struct RecipientCache {
     built_at: Instant,
     generation: u64,
     rows: Vec<CachedRecipient>,
+    /// Те же люди для разбора запроса на обычном языке («от Иванова», `nlquery`).
+    people: Arc<names::PeopleIndex>,
 }
 
 struct CachedRecipient {
@@ -148,6 +154,22 @@ pub struct SearchHit {
     /// У письма есть вложения (`items.has_attachments`): строка результата рисует скрепку (п. 29).
     pub has_attachments: bool,
 }
+
+/// Итог поиска: письма и то, как понят запрос (`nlquery`).
+#[derive(Debug, Clone)]
+pub struct SearchOutcome {
+    pub hits: Vec<SearchHit>,
+    pub understood: nlquery::Understood,
+    /// Столько первых писем найдено по самому запросу; остальные добавлены, потому что по
+    /// человеку нашлось слишком мало (`relaxed_note`).
+    pub strict: usize,
+    /// Пометка к добавленным письмам: «показаны и письма с упоминанием: …».
+    pub relaxed_note: Option<String>,
+}
+
+/// Меньше стольких писем по условию «от человека» — добавляются письма с его упоминанием
+/// (`docs/ai-layer-design.md` § 5.2).
+const RELAX_BELOW: usize = 3;
 
 /// Сводка по папке для `stats`.
 #[derive(Debug, Clone)]
@@ -1677,108 +1699,176 @@ impl Store {
 
     /// Поиск как в OWA: операторы (`от:`, `кому:`, `тема:`, `вложение:`, `папка:`, `после:`, `до:`)
     /// и префиксный поиск по словам; все условия обязательны. Если текстовых условий нет,
-    /// работает как фильтр по письмам, свежие первыми.
+    /// работает как фильтр по письмам, свежие первыми. Запрос на обычном языке («письма от
+    /// Иванова за октябрь») сводится к тем же условиям — как он понят, отдаёт `search_understood`.
     pub fn search(&self, account: AccountId, user_query: &str, limit: usize) -> Result<Vec<SearchHit>> {
-        let q = query::parse(user_query);
+        Ok(self.search_understood(account, user_query, limit)?.hits)
+    }
+
+    /// Поиск и то, как понят запрос; «сегодня» — по системным часам и поясу.
+    pub fn search_understood(&self, account: AccountId, user_query: &str, limit: usize) -> Result<SearchOutcome> {
+        let tz = jiff::tz::TimeZone::system();
+        let today = Timestamp::now().to_zoned(tz.clone()).date();
+        self.search_at(account, user_query, limit, today, tz)
+    }
+
+    /// Поиск с заданным «сегодня» (тесты и замеры не зависят от календаря).
+    pub fn search_at(&self, account: AccountId, user_query: &str, limit: usize, today: jiff::civil::Date, tz: jiff::tz::TimeZone) -> Result<SearchOutcome> {
+        let understood = self.understand_query(account, user_query, today, tz)?;
+        if understood.query.is_empty() {
+            return Ok(SearchOutcome { hits: Vec::new(), understood, strict: 0, relaxed_note: None });
+        }
+        let mut hits = self.search_query(account, &understood.query, limit)?;
+        let strict = hits.len();
+        let mut relaxed_note = None;
+        if strict < RELAX_BELOW
+            && let Some((relaxed, note)) = &understood.relaxed
+        {
+            let seen: HashSet<i64> = hits.iter().map(|h| h.item_pk).collect();
+            let more: Vec<SearchHit> = self.search_query(account, relaxed, limit)?.into_iter().filter(|h| !seen.contains(&h.item_pk)).collect();
+            if !more.is_empty() {
+                relaxed_note = Some(note.clone());
+                hits.extend(more);
+                hits.truncate(limit);
+            }
+        }
+        Ok(SearchOutcome { hits, understood, strict, relaxed_note })
+    }
+
+    /// Как понят запрос, без поиска: операторы, фразы и слова обычного языка (`nlquery`).
+    pub fn understand_query(&self, account: AccountId, user_query: &str, today: jiff::civil::Date, tz: jiff::tz::TimeZone) -> Result<nlquery::Understood> {
+        if user_query.trim().is_empty() {
+            return Ok(nlquery::Understood::literal(user_query));
+        }
+        // Свои адреса нужны только словам «я писал», «от меня», «мои письма»: их подсчёт по
+        // «Отправленным» — десятки миллисекунд, на каждый набранный символ он не нужен.
+        let about_me = text::norm_lower(user_query).split(|c: char| !c.is_alphanumeric()).any(|w| matches!(w, "я" | "меня" | "мои" | "мое" | "мою"));
+        self.with_query_context(account, about_me, today, tz, |ctx| nlquery::understand(user_query, ctx))
+    }
+
+    /// Условия поиска, названные моделью (доводка запроса), — запросом в операторах: люди
+    /// подбираются по корреспондентам ящика так же, как при разборе фразы.
+    pub fn compose_query(&self, account: AccountId, fields: &nlquery::ModelFields, today: jiff::civil::Date, tz: jiff::tz::TimeZone) -> Result<nlquery::Composed> {
+        self.with_query_context(account, fields.from_me, today, tz, |ctx| nlquery::compose(fields, ctx))
+    }
+
+    /// Что разбор запроса знает о ящике: корреспонденты, папки и, если нужно, свои адреса.
+    fn with_query_context<T>(&self, account: AccountId, about_me: bool, today: jiff::civil::Date, tz: jiff::tz::TimeZone, f: impl FnOnce(&nlquery::Context) -> T) -> Result<T> {
+        let own = if about_me { self.own_addresses(account)? } else { Vec::new() };
+        let folders: Vec<(String, Option<String>)> = self.with_conn(|c| {
+            let mut st = c.prepare_cached("SELECT display_name, distinguished FROM folders WHERE account_id = ?1 AND deleted = 0")?;
+            Ok(st.query_map(params![account.0], |r| Ok((r.get::<_, Option<String>>(0)?.unwrap_or_default(), r.get::<_, Option<String>>(1)?)))?.collect::<std::result::Result<Vec<_>, _>>()?)
+        })?;
+        let people = self.people_index(account)?;
+        Ok(f(&nlquery::Context { today, tz, people: &people, own: &own, folders: &folders }))
+    }
+
+    /// Доиндексация начала текста писем, записанных до схемы версии 15: до `batch` писем за вызов,
+    /// свежие первыми. У письма без загруженного текста строка индекса снимается по прежним
+    /// значениям и кладётся заново уже с началом текста; остальным только ставится признак. Вызывать
+    /// в фоне, пока не вернёт 0: каждая пачка — одна короткая транзакция, поиск между ними работает.
+    pub fn index_previews(&self, batch: usize) -> Result<usize> {
+        self.with_tx(|tx| {
+            let rows: Vec<(i64, bool, bool)> = tx.prepare_cached(schema::PREVIEW_PENDING_SQL)?.query_map(params![batch as i64], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<std::result::Result<Vec<_>, _>>()?;
+            for (item_pk, indexed, gains_text) in &rows {
+                if *indexed && *gains_text {
+                    fts_delete(tx, *item_pk)?;
+                    fts_insert(tx, *item_pk)?;
+                } else {
+                    tx.prepare_cached("UPDATE items SET fts_preview = 1 WHERE item_pk = ?1")?.execute(params![item_pk])?;
+                }
+            }
+            Ok(rows.len())
+        })
+    }
+
+    /// Сколько писем ещё ждёт доиндексации начала текста.
+    pub fn previews_pending(&self) -> Result<i64> {
+        self.with_conn(|c| Ok(c.query_row("SELECT COUNT(*) FROM items WHERE fts_preview = 0", [], |r| r.get(0))?))
+    }
+
+    /// Поиск по готовым условиям, свежие письма первыми.
+    ///
+    /// Два шага. Первый — номера писем: проход по индексу дат от свежих к старым (или по индексу
+    /// отправителя, если он задан) с проверкой условий; совпадения по словам — множество номеров из
+    /// FTS5. Проход останавливается, как только набралось `limit` писем, поэтому частое слово ищется
+    /// так же быстро, как редкое. Второй — строки результата и отрывки только для найденных писем.
+    /// Отрывок вырезается здесь же, из текста письма, а если слова в нём нет — из имён и текста
+    /// вложений (`SearchNeedles`): встроенный `snippet()` FTS5 считался для каждого совпадения
+    /// (тысячи писем у частого слова), ради одного письма вычитывал текст всех его вложений и
+    /// разбирал большой текст заново на каждое вхождение слова — почти всё время поиска.
+    pub fn search_query(&self, account: AccountId, q: &query::SearchQuery, limit: usize) -> Result<Vec<SearchHit>> {
         if q.is_empty() {
             return Ok(Vec::new());
         }
         let fts = q.fts_match();
-        const MARK_OPEN: &str = "\u{1}";
-        const MARK_CLOSE: &str = "\u{2}";
-
-        let mut sql = String::new();
-        let mut args: Vec<SqlValue> = Vec::new();
-        if fts.is_some() {
-            sql.push_str(
-                "SELECT i.item_pk, bm25(items_fts, 8.0, 4.0, 2.0, 1.0, 1.0, 0.5) AS rank,
-                        i.subject, i.from_name, i.from_email, i.received_at, f.display_name,
-                        snippet(items_fts, 4, ?1, ?2, '…', 14), snippet(items_fts, 5, ?1, ?2, '…', 14), i.conversation_pk, i.preview, i.has_attachments
-                 FROM items_fts JOIN items i ON i.item_pk = items_fts.rowid
-                 LEFT JOIN folders f ON f.folder_pk = i.folder_pk
-                 WHERE items_fts MATCH ?3 AND i.account_id = ?4 AND i.deleted = 0",
-            );
-            args.push(SqlValue::Text(MARK_OPEN.into()));
-            args.push(SqlValue::Text(MARK_CLOSE.into()));
-            args.push(SqlValue::Text(fts.clone().unwrap_or_default()));
-            args.push(SqlValue::Integer(account.0));
-        } else {
-            sql.push_str(
-                "SELECT i.item_pk, 0.0 AS rank, i.subject, i.from_name, i.from_email, i.received_at, f.display_name,
-                        COALESCE(i.preview, ''), '', i.conversation_pk, i.preview, i.has_attachments
-                 FROM items i LEFT JOIN folders f ON f.folder_pk = i.folder_pk
-                 WHERE i.account_id = ?1 AND i.deleted = 0",
-            );
-            args.push(SqlValue::Integer(account.0));
-        }
-        if q.has_attachment {
-            sql.push_str(" AND i.has_attachments = 1");
-        }
-        if let Some(a) = q.after_ms {
-            args.push(SqlValue::Integer(a));
-            sql.push_str(&format!(" AND COALESCE(i.received_at, i.sent_at) >= ?{}", args.len()));
-        }
-        if let Some(b) = q.before_ms {
-            args.push(SqlValue::Integer(b));
-            sql.push_str(&format!(" AND COALESCE(i.received_at, i.sent_at) < ?{}", args.len()));
-        }
-        if let Some(folder) = &q.folder {
-            args.push(SqlValue::Text(folder.clone()));
-            let n = args.len();
-            sql.push_str(&format!(" AND (f.distinguished = ?{n} OR norm_lower(f.display_name) = norm_lower(?{n}) OR norm_lower(f.display_name) LIKE norm_lower(?{n}) || '%')"));
-        }
-        // Точные адреса: по индексам `items_from_lower` и `recipients_email_lower`.
-        if !q.from_exact.is_empty() {
-            let mut marks = Vec::with_capacity(q.from_exact.len());
-            for e in &q.from_exact {
-                args.push(SqlValue::Text(e.clone()));
-                marks.push(format!("?{}", args.len()));
-            }
-            sql.push_str(&format!(" AND lower(i.from_email) IN ({})", marks.join(", ")));
-        }
-        // Каждый адрес в `кому:` обязателен, как и остальные условия. Подзапрос отдаёт письма адреса
-        // по индексу получателей; с EXISTS на каждое письмо запрос перебирал весь ящик (0,4 с).
-        for e in &q.to_exact {
-            args.push(SqlValue::Text(e.clone()));
-            sql.push_str(&format!(" AND i.item_pk IN (SELECT r.item_pk FROM recipients r WHERE lower(r.email) = ?{} AND r.kind IN (1, 2, 3))", args.len()));
-        }
-        args.push(SqlValue::Integer(limit as i64));
-        // Как в OWA: результаты от новых к старым; релевантность (bm25) только разводит письма
-        // с одинаковой датой и остаётся в `SearchHit::rank`.
-        sql.push_str(&format!(" ORDER BY COALESCE(i.received_at, i.sent_at) DESC, rank LIMIT ?{}", args.len()));
-
         self.with_conn(|c| {
-            let mut st = c.prepare_cached(&sql)?;
-            let rows = st.query_map(params_from_iter(args.iter()), |r| {
-                Ok((
-                    r.get::<_, i64>(0)?,
-                    r.get::<_, Option<String>>(2)?,
-                    r.get::<_, Option<String>>(3)?,
-                    r.get::<_, Option<String>>(4)?,
-                    r.get::<_, Option<i64>>(5)?,
-                    r.get::<_, Option<String>>(6)?,
-                    r.get::<_, String>(7)?,
-                    r.get::<_, String>(8)?,
-                    r.get::<_, Option<i64>>(9)?,
-                    r.get::<_, Option<String>>(10)?,
-                    r.get::<_, bool>(11)?,
-                ))
-            })?;
-            let raw = rows.collect::<std::result::Result<Vec<_>, _>>()?;
-            let mut hits = Vec::with_capacity(raw.len());
-            for (item_pk, subject, from_name, from_email, received_at, folder_name, body_snip, att_snip, conversation_pk, preview, has_attachments) in raw {
-                let body_hit = body_snip.contains(MARK_OPEN);
-                let att_hit = att_snip.contains(MARK_OPEN);
-                let (snippet, attachment_name) = if att_hit && !body_hit {
-                    let words = marked_words(&att_snip, MARK_OPEN, MARK_CLOSE);
-                    (att_snip, attachment_name_for(c, item_pk, &words)?)
-                } else {
-                    (body_snip, None)
-                };
-                let snippet = snippet.replace(MARK_OPEN, "[").replace(MARK_CLOSE, "]");
+            // Папка — по служебному имени, по имени или по его началу.
+            let folders: Option<Vec<i64>> = match &q.folder {
+                Some(name) => {
+                    let mut st = c.prepare_cached(
+                        "SELECT folder_pk FROM folders f WHERE f.account_id = ?1 AND f.deleted = 0
+                           AND (f.distinguished = ?2 OR norm_lower(f.display_name) = norm_lower(?2) OR norm_lower(f.display_name) LIKE norm_lower(?2) || '%')",
+                    )?;
+                    Some(st.query_map(params![account.0, name], |r| r.get::<_, i64>(0))?.collect::<std::result::Result<Vec<_>, _>>()?)
+                }
+                None => None,
+            };
+            if folders.as_ref().is_some_and(Vec::is_empty) {
+                return Ok(Vec::new());
+            }
+
+            let started = Instant::now();
+            let (sql, args) = search_ids_sql(account, q, fts.as_deref(), folders.as_deref(), limit);
+            let ids: Vec<i64> = c.prepare_cached(&sql)?.query_map(params_from_iter(args.iter()), |r| r.get::<_, i64>(0))?.collect::<std::result::Result<Vec<_>, _>>()?;
+            let ids_ms = started.elapsed().as_millis();
+            if ids.is_empty() {
+                return Ok(Vec::new());
+            }
+            let list = format!("[{}]", ids.iter().map(i64::to_string).collect::<Vec<_>>().join(","));
+
+            type Row = (i64, Option<String>, Option<String>, Option<String>, Option<i64>, Option<String>, String, Option<i64>, Option<String>, bool);
+            let raw: Vec<Row> = c
+                .prepare_cached(SEARCH_ROWS_SQL)?
+                .query_map(params![list], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?, r.get(8)?, r.get(9)?)))?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            let rows_ms = started.elapsed().as_millis() - ids_ms;
+            let mut by_pk: HashMap<i64, Row> = raw.into_iter().map(|r| (r.0, r)).collect();
+
+            // Отрывки из текста письма (того же, что в индексе: загруженный текст или начало письма).
+            let needles = SearchNeedles::of(q);
+            let mut found: Vec<(Row, Option<String>)> = Vec::with_capacity(ids.len());
+            for pk in &ids {
+                if let Some(row) = by_pk.remove(pk) {
+                    let snippet = needles.snippet(&row.6);
+                    found.push((row, snippet));
+                }
+            }
+            // Слова нет в тексте письма — оно может быть во вложениях. Какие из таких писем нашлись
+            // по вложениям, говорит индекс слов: читать тексты файлов всех писем подряд дорого.
+            let candidates: Vec<i64> = found.iter().filter(|(row, snippet)| snippet.is_none() && row.9).map(|(row, _)| row.0).collect();
+            let in_attachments: HashSet<i64> = match q.attachment_match().filter(|_| !candidates.is_empty()) {
+                Some(m) => {
+                    let list = format!("[{}]", candidates.iter().map(i64::to_string).collect::<Vec<_>>().join(","));
+                    c.prepare_cached(SEARCH_IN_ATTACHMENTS_SQL)?.query_map(params![m, list], |r| r.get::<_, i64>(0))?.collect::<std::result::Result<HashSet<_>, _>>()?
+                }
+                None => HashSet::new(),
+            };
+
+            let words = !needles.is_empty();
+            let mut hits = Vec::with_capacity(found.len());
+            for ((item_pk, subject, from_name, from_email, received_at, folder_name, _, conversation_pk, preview, has_attachments), body_snippet) in found {
                 let preview = preview.filter(|p| !p.trim().is_empty());
+                let (snippet, attachment_name) = match body_snippet {
+                    Some(snippet) => (snippet, None),
+                    None if in_attachments.contains(&item_pk) => attachment_snippet(c, item_pk, &needles)?.unwrap_or_default(),
+                    // Поиск одними условиями, без слов: вместо отрывка — начало письма.
+                    None if !words => (preview.clone().unwrap_or_default(), None),
+                    None => (String::new(), None),
+                };
                 hits.push(SearchHit { item_pk, subject, from_name, from_email, received_at: ms_ts(received_at), folder_name, snippet, attachment_name, conversation_pk, preview, has_attachments });
             }
+            debug!(hits = hits.len(), words = fts.is_some(), ids_ms, rows_ms, total_ms = started.elapsed().as_millis(), "поиск");
             Ok(hits)
         })
     }
@@ -1912,6 +2002,17 @@ impl Store {
     /// не предлагаются, один адрес в разном регистре — одна подсказка.
     pub fn suggest_recipients(&self, account: AccountId, prefix: &str, limit: usize) -> Result<Vec<RecipientSuggestion>> {
         let needle = text::norm_lower(prefix.trim());
+        self.with_recipient_cache(account, |cache| cache.rows.iter().filter(|r| needle.is_empty() || word_prefix_match(&r.email_norm, &needle) || word_prefix_match(&r.name_norm, &needle)).take(limit).map(|r| r.suggestion.clone()).collect())
+    }
+
+    /// Корреспонденты ящика для разбора запроса на обычном языке: те же адреса и веса, что в
+    /// подсказках получателей.
+    pub fn people_index(&self, account: AccountId) -> Result<Arc<names::PeopleIndex>> {
+        self.with_recipient_cache(account, |cache| cache.people.clone())
+    }
+
+    /// Кэш адресов ящика, перестроенный, если устарел.
+    fn with_recipient_cache<T>(&self, account: AccountId, f: impl FnOnce(&RecipientCache) -> T) -> Result<T> {
         let mut cache = self.recipient_cache.lock().map_err(|_| StoreError::Other("мьютекс кэша адресов отравлен".into()))?;
         let generation = self.write_generation.load(Ordering::Relaxed);
         let stale = match &*cache {
@@ -1921,8 +2022,7 @@ impl Store {
         if stale {
             *cache = Some(self.build_recipient_cache(account, generation)?);
         }
-        let rows = &cache.as_ref().expect("кэш только что построен").rows;
-        Ok(rows.iter().filter(|r| needle.is_empty() || word_prefix_match(&r.email_norm, &needle) || word_prefix_match(&r.name_norm, &needle)).take(limit).map(|r| r.suggestion.clone()).collect())
+        Ok(f(cache.as_ref().expect("кэш только что построен")))
     }
 
     /// Сбрасывает кэш подсказок получателей: следующий вызов `suggest_recipients` перестроит его.
@@ -1980,8 +2080,9 @@ impl Store {
         }
         let personal = rows.len();
         rows.extend(history.into_iter().filter(|r| !seen.contains(&r.email_norm)));
+        let people = Arc::new(names::PeopleIndex::new(rows.iter().map(|r| (r.suggestion.name.clone(), r.suggestion.email.clone(), r.suggestion.weight))));
         debug!(addresses = rows.len(), personal, ms = started.elapsed().as_millis(), "кэш подсказок получателей построен");
-        Ok(RecipientCache { account, built_at: Instant::now(), generation, rows })
+        Ok(RecipientCache { account, built_at: Instant::now(), generation, rows, people })
     }
 
     /// Собственные адреса пользователя: самые частые адреса отправителя в «Отправленных»
@@ -2050,6 +2151,93 @@ impl Store {
             Ok(())
         })
     }
+}
+
+/// Строки результата поиска. Номера писем — JSON-массивом; текст письма — тот же, что в индексе
+/// (`items_fts_src`): загруженный текст или начало письма.
+const SEARCH_ROWS_SQL: &str = "SELECT i.item_pk, i.subject, i.from_name, i.from_email, i.received_at, f.display_name,
+        COALESCE(NULLIF(b.unique_text, ''), i.preview, ''), i.conversation_pk, i.preview, i.has_attachments
+   FROM items i LEFT JOIN folders f ON f.folder_pk = i.folder_pk LEFT JOIN bodies b ON b.item_pk = i.item_pk
+  WHERE i.item_pk IN (SELECT value FROM json_each(?1))";
+
+/// Какие из писем списка нашлись по именам или тексту вложений. Унарный плюс не даёт искать
+/// каждое письмо отдельным запросом к индексу слов (запрос по началу слова выполнялся бы заново
+/// на каждое письмо): совпадения проходятся один раз.
+const SEARCH_IN_ATTACHMENTS_SQL: &str = "SELECT rowid FROM items_fts WHERE items_fts MATCH ?1 AND +rowid IN (SELECT value FROM json_each(?2))";
+
+/// Первый шаг поиска: номера писем от свежих к старым. Индекс назван явно (в базе нет статистики
+/// планировщика): по отправителю, если он задан, иначе по дате — тогда проход идёт в порядке
+/// выдачи и останавливается на `limit`.
+fn search_ids_sql(account: AccountId, q: &query::SearchQuery, fts: Option<&str>, folders: Option<&[i64]>, limit: usize) -> (String, Vec<SqlValue>) {
+    let mut args: Vec<SqlValue> = vec![SqlValue::Integer(account.0)];
+    let index = if q.from_exact.is_empty() { "items_account_date" } else { "items_from_lower" };
+    let mut sql = format!("SELECT i.item_pk FROM items i INDEXED BY {index} WHERE i.account_id = ?1 AND i.deleted = 0");
+    let marks_of = |args: &mut Vec<SqlValue>, group: &[String]| -> String {
+        let mut marks = Vec::with_capacity(group.len());
+        for e in group {
+            args.push(SqlValue::Text(e.clone()));
+            marks.push(format!("?{}", args.len()));
+        }
+        marks.join(", ")
+    };
+    // Точные адреса отправителя: по индексу `items_from_lower`.
+    if !q.from_exact.is_empty() {
+        let marks = marks_of(&mut args, &q.from_exact);
+        sql.push_str(&format!(" AND lower(i.from_email) IN ({marks})"));
+    }
+    if let Some(m) = fts {
+        args.push(SqlValue::Text(m.to_string()));
+        sql.push_str(&format!(" AND i.item_pk IN (SELECT rowid FROM items_fts WHERE items_fts MATCH ?{})", args.len()));
+    }
+    if q.has_attachment {
+        sql.push_str(" AND i.has_attachments = 1");
+    }
+    if let Some(a) = q.after_ms {
+        args.push(SqlValue::Integer(a));
+        sql.push_str(&format!(" AND COALESCE(i.received_at, i.sent_at) >= ?{}", args.len()));
+    }
+    if let Some(b) = q.before_ms {
+        args.push(SqlValue::Integer(b));
+        sql.push_str(&format!(" AND COALESCE(i.received_at, i.sent_at) < ?{}", args.len()));
+    }
+    if let Some(pks) = folders {
+        sql.push_str(&format!(" AND i.folder_pk IN ({})", pks.iter().map(i64::to_string).collect::<Vec<_>>().join(", ")));
+    }
+    // Каждый адрес в `кому:` обязателен, как и остальные условия; письма адреса — по индексу получателей.
+    for e in &q.to_exact {
+        args.push(SqlValue::Text(e.clone()));
+        sql.push_str(&format!(" AND i.item_pk IN (SELECT r.item_pk FROM recipients r WHERE lower(r.email) = ?{} AND r.kind IN (1, 2, 3))", args.len()));
+    }
+    // Группа адресов: любой из них (один человек с несколькими адресами, однофамильцы).
+    for group in q.to_any.iter().filter(|g| !g.is_empty()) {
+        let marks = marks_of(&mut args, group);
+        sql.push_str(&format!(" AND i.item_pk IN (SELECT r.item_pk FROM recipients r WHERE lower(r.email) IN ({marks}) AND r.kind IN (1, 2, 3))"));
+    }
+    // «Переписка с …»: человек — отправитель или среди получателей.
+    for group in q.with_any.iter().filter(|g| !g.is_empty()) {
+        let marks = marks_of(&mut args, group);
+        sql.push_str(&format!(" AND (lower(i.from_email) IN ({marks}) OR i.item_pk IN (SELECT r.item_pk FROM recipients r WHERE lower(r.email) IN ({marks}) AND r.kind IN (1, 2, 3)))"));
+    }
+    if let Some(unread) = q.unread {
+        sql.push_str(if unread { " AND i.is_read = 0" } else { " AND i.is_read = 1" });
+    }
+    if let Some(flagged) = q.flagged {
+        sql.push_str(&if flagged { format!(" AND i.flag_status = '{FLAGGED}'") } else { format!(" AND COALESCE(i.flag_status, '') != '{FLAGGED}'") });
+    }
+    if !q.attachment_kinds.is_empty() {
+        // Имена вложений известны только у писем с загруженным текстом: у остальных вид файла
+        // не проверить, и они остаются в выдаче — лучше лишнее письмо, чем пропущенное.
+        let mut likes = Vec::new();
+        for ext in q.attachment_kinds.iter().flat_map(|k| k.extensions()) {
+            args.push(SqlValue::Text(format!("%{ext}")));
+            likes.push(format!("lower(a.name) LIKE ?{}", args.len()));
+        }
+        sql.push_str(&format!(" AND i.has_attachments = 1 AND (i.body_state = 0 OR EXISTS (SELECT 1 FROM attachments a WHERE a.item_pk = i.item_pk AND a.is_inline = 0 AND ({})))", likes.join(" OR ")));
+    }
+    args.push(SqlValue::Integer(limit as i64));
+    // Как в OWA: от новых к старым; номер письма разводит одинаковые даты в порядке индекса.
+    sql.push_str(&format!(" ORDER BY COALESCE(i.received_at, i.sent_at) DESC, i.item_pk LIMIT ?{}", args.len()));
+    (sql, args)
 }
 
 /// Начинается ли строка или любое её слово с `needle` (границы слов — не буквы и не цифры:
@@ -2326,9 +2514,11 @@ fn fts_delete(tx: &Transaction, item_pk: i64) -> Result<()> {
     Ok(())
 }
 
+/// Кладёт строку в индекс. Признак `fts_preview` ставится до записи: с ним представление отдаёт
+/// начало текста письма, пока сам текст не загружен (схема версии 15).
 fn fts_insert(tx: &Transaction, item_pk: i64) -> Result<()> {
+    tx.prepare_cached("UPDATE items SET fts_indexed = 1, fts_preview = 1 WHERE item_pk = ?1")?.execute(params![item_pk])?;
     tx.prepare_cached(schema::FTS_INSERT_SQL)?.execute(params![item_pk])?;
-    tx.prepare_cached("UPDATE items SET fts_indexed = 1 WHERE item_pk = ?1")?.execute(params![item_pk])?;
     Ok(())
 }
 
@@ -2414,38 +2604,100 @@ fn upsert_meta(tx: &Transaction, account: AccountId, folder_pk: i64, m: &Message
     Ok(Upserted { item_pk, existed, adopted_from })
 }
 
-/// Слова между маркерами подсветки в сниппете.
-fn marked_words(snippet: &str, open: &str, close: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut rest = snippet;
-    while let Some(start) = rest.find(open) {
-        let after = &rest[start + open.len()..];
-        let Some(end) = after.find(close) else { break };
-        let w = after[..end].trim();
-        if !w.is_empty() {
-            out.push(text::norm_lower(w));
-        }
-        rest = &after[end + close.len()..];
-    }
-    out
+/// Слова запроса для поиска в тексте вложения, в нижнем регистре с ё → е: начала слов и точные
+/// формы — те же, что ушли в FTS5.
+struct SearchNeedles {
+    prefixes: Vec<String>,
+    exact: HashSet<String>,
 }
 
-/// Имя вложения письма, в чьём тексте или имени встречаются подсвеченные слова.
-fn attachment_name_for(c: &Connection, item_pk: i64, words: &[String]) -> Result<Option<String>> {
+impl SearchNeedles {
+    fn of(q: &query::SearchQuery) -> Self {
+        let mut n = SearchNeedles { prefixes: Vec::new(), exact: HashSet::new() };
+        for t in &q.terms {
+            for w in query::plain_words(&t.text) {
+                let key = text::norm_lower(w);
+                if t.phrase {
+                    n.exact.insert(key);
+                } else {
+                    if let Some(forms) = q.forms.get(&key) {
+                        n.exact.extend(forms.iter().cloned());
+                    }
+                    n.prefixes.push(key);
+                }
+            }
+        }
+        n
+    }
+
+    fn is_empty(&self) -> bool {
+        self.prefixes.is_empty() && self.exact.is_empty()
+    }
+
+    /// Отрывок текста вокруг первого найденного слова; `None` — слов запроса в тексте нет.
+    fn snippet(&self, source: &str) -> Option<String> {
+        if self.is_empty() || source.is_empty() {
+            return None;
+        }
+        let lower = text::norm_lower(source);
+        let (start, end) = self.find(&lower)?;
+        // Смена регистра почти никогда не меняет длину в байтах; если изменила — отрывок режется
+        // из текста в нижнем регистре, чтобы не попасть в середину буквы.
+        let same = lower.len() == source.len() && source.is_char_boundary(start) && source.is_char_boundary(end);
+        Some(cut_snippet(if same { source } else { &lower }, start, end))
+    }
+
+    /// Первое слово текста (в нижнем регистре), которое начинается с искомого начала или равно
+    /// искомой форме: байтовые начало и конец слова. Текст проходится один раз, по словам — как их
+    /// делит индекс (подряд идущие буквы и цифры).
+    fn find(&self, hay: &str) -> Option<(usize, usize)> {
+        let mut word_start: Option<usize> = None;
+        for (i, c) in hay.char_indices().chain(std::iter::once((hay.len(), ' '))) {
+            if c.is_alphanumeric() {
+                word_start.get_or_insert(i);
+            } else if let Some(start) = word_start.take() {
+                let word = &hay[start..i];
+                if self.exact.contains(word) || self.prefixes.iter().any(|p| word.starts_with(p.as_str())) {
+                    return Some((start, i));
+                }
+            }
+        }
+        None
+    }
+}
+
+/// Отрывок текста вокруг слова `start..end` с пометкой в квадратных скобках.
+fn cut_snippet(text: &str, start: usize, end: usize) -> String {
+    const BEFORE: usize = 60;
+    const AFTER: usize = 90;
+    let mut from = text[..start].char_indices().rev().nth(BEFORE).map(|(i, _)| i).unwrap_or(0);
+    if from > 0 {
+        // С начала слова, а не с его середины.
+        from = text[from..start].find(char::is_whitespace).map(|o| from + o).unwrap_or(start);
+    }
+    let mut to = text[end..].char_indices().nth(AFTER).map(|(i, _)| end + i).unwrap_or(text.len());
+    if to < text.len() {
+        to = text[end..to].rfind(char::is_whitespace).map(|o| end + o).unwrap_or(to);
+    }
+    let flat = |part: &str| part.split_whitespace().collect::<Vec<_>>().join(" ");
+    let (before, word, after) = (flat(&text[from..start]), &text[start..end], flat(&text[end..to]));
+    let lead = if text[from..start].ends_with(char::is_whitespace) && !before.is_empty() { " " } else { "" };
+    let tail = if text[end..to].starts_with(char::is_whitespace) && !after.is_empty() { " " } else { "" };
+    format!("{}{before}{lead}[{word}]{tail}{after}{}", if from > 0 { "…" } else { "" }, if to < text.len() { "…" } else { "" })
+}
+
+/// Отрывок и имя файла, если слова запроса встречаются в имени или тексте вложения письма.
+fn attachment_snippet(c: &Connection, item_pk: i64, needles: &SearchNeedles) -> Result<Option<(String, Option<String>)>> {
     let mut st = c.prepare_cached("SELECT name, text FROM attachments WHERE item_pk = ?1 AND is_inline = 0 ORDER BY attachment_pk")?;
     let rows: Vec<(Option<String>, Option<String>)> = st.query_map(params![item_pk], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<std::result::Result<Vec<_>, _>>()?;
-    let mut fallback: Option<String> = None;
-    for (name, text_opt) in rows {
-        let name_l = text::norm_lower(name.as_deref().unwrap_or(""));
-        let text_l = text_opt.as_deref().map(text::norm_lower).unwrap_or_default();
-        if words.iter().any(|w| text_l.contains(w.as_str()) || name_l.contains(w.as_str())) {
-            return Ok(name);
-        }
-        if fallback.is_none() && text_opt.is_some() {
-            fallback = name;
+    for (name, body) in rows {
+        for source in [name.as_deref(), body.as_deref()].into_iter().flatten() {
+            if let Some(snippet) = needles.snippet(source) {
+                return Ok(Some((snippet, name.clone())));
+            }
         }
     }
-    Ok(fallback)
+    Ok(None)
 }
 
 #[cfg(test)]
@@ -2953,6 +3205,176 @@ mod tests {
         assert!(s.search(acc, "", 10).unwrap().is_empty());
     }
 
+    #[test]
+    fn attachment_snippets() {
+        let mut q = query::parse("договора \"акт сверки\"");
+        q.forms.insert("договора".into(), vec!["договор".into(), "договору".into()]);
+        let n = SearchNeedles::of(&q);
+        assert_eq!(n.prefixes, ["договора"]);
+        let mut exact: Vec<&str> = n.exact.iter().map(String::as_str).collect();
+        exact.sort();
+        assert_eq!(exact, ["акт", "договор", "договору", "сверки"]);
+        // Начало слова — с границы слова; точная форма — слово целиком.
+        assert_eq!(n.find("передоговора нет, но по договору да"), Some(("передоговора нет, но по ".len(), "передоговора нет, но по договору".len())));
+        assert_eq!(n.find("договорной отдел и актив"), None, "«договор» — только целым словом, «акт» — не начало «актив»");
+        assert_eq!(n.find("наш договорной отдел не богат, подписан акт"), Some(("наш договорной отдел не богат, подписан ".len(), "наш договорной отдел не богат, подписан акт".len())));
+        assert_eq!(n.find("с договорами"), Some(("с ".len(), "с договорами".len())), "начало слова — как в индексе: «договора» находит и «договорами»");
+        assert_eq!(n.find("договора"), Some((0, "договора".len())));
+        assert_eq!(n.find(""), None);
+
+        assert_eq!(cut_snippet("Подписан Договор поставки", 17, 31), "Подписан [Договор] поставки");
+        let long = format!("{} нужное слово {}", "начало ".repeat(30), "хвост ".repeat(40));
+        let at = long.find("нужное").unwrap();
+        let cut = cut_snippet(&long, at, at + "нужное".len());
+        assert!(cut.starts_with("…начало ") && cut.contains(" [нужное] слово хвост ") && cut.ends_with("хвост…"), "{cut}");
+        assert!(cut.chars().count() < 180, "{cut}");
+        assert_eq!(cut_snippet("строка\nдругая  строка", 13, 25), "строка [другая] строка");
+    }
+
+    /// Планы поиска (в базе нет статистики, индексы названы явно): номера писем идут по индексу
+    /// дат без сортировки, по отправителю — по его индексу; отрывки считаются проходом совпадений.
+    #[test]
+    fn search_plans() {
+        let s = tmp_store("plans");
+        let acc = s.account("h", "u").unwrap();
+        let plan = |sql: &str, args: &[SqlValue]| -> Vec<String> {
+            s.with_conn(|c| {
+                let mut st = c.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))?;
+                Ok(st.query_map(params_from_iter(args.iter()), |r| r.get::<_, String>(3))?.collect::<std::result::Result<Vec<_>, _>>()?)
+            })
+            .unwrap()
+        };
+        let q = query::parse("ремонт вложение: после:2026-10-01");
+        let m = q.fts_match();
+        let (sql, args) = search_ids_sql(acc, &q, m.as_deref(), None, 100);
+        let p = plan(&sql, &args);
+        assert!(p.iter().any(|l| l.contains("items_account_date")), "{p:?}");
+        assert!(!p.iter().any(|l| l.contains("TEMP B-TREE FOR ORDER BY")), "порядок выдачи — из индекса: {p:?}");
+        let q = query::parse("ремонт от:a@x.ru папка:inbox");
+        let m = q.fts_match();
+        let (sql, args) = search_ids_sql(acc, &q, m.as_deref(), Some(&[1, 2]), 100);
+        let p = plan(&sql, &args);
+        assert!(p.iter().any(|l| l.contains("items_from_lower")), "{p:?}");
+        let p = plan(SEARCH_IN_ATTACHMENTS_SQL, &[SqlValue::Text("attachment_text: (\"ремонт\"*)".into()), SqlValue::Text("[1,2]".into())]);
+        assert!(p.iter().any(|l| l.contains("items_fts VIRTUAL TABLE INDEX 0:M")), "совпадения проходятся один раз, без поиска по номеру письма: {p:?}");
+        let p = plan(SEARCH_ROWS_SQL, &[SqlValue::Text("[1,2]".into())]);
+        assert!(p.iter().any(|l| l.contains("SEARCH i USING INTEGER PRIMARY KEY")), "{p:?}");
+    }
+
+    /// Начало текста письма ищется сразу у новых писем и после фоновой доиндексации — у старых.
+    #[test]
+    fn previews_are_searchable_and_backfilled() {
+        let s = tmp_store("previews");
+        let acc = s.account("h", "u").unwrap();
+        s.upsert_folders(acc, &[folder("Входящие", Some("inbox"))]).unwrap();
+        let (fpk, _) = s.folder_by_distinguished(acc, "inbox").unwrap().unwrap();
+        let with_preview = |id: &str, subject: &str, preview: &str| {
+            let mut m = meta(id, subject);
+            m.preview = Some(preview.into());
+            m
+        };
+        let a = with_preview("A", "Смета", "Просим согласовать замену трансформатора до пятницы");
+        let b = with_preview("B", "Акт", "Высылаем акт по подстанции");
+        s.apply_item_changes(acc, fpk, &[ItemChange::Create(a), ItemChange::Create(b.clone())]).unwrap();
+        // Новые письма: начало текста в индексе сразу, отрывок — из него.
+        let hits = s.search(acc, "трансформатор", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].snippet, "Просим согласовать замену [трансформатора] до пятницы");
+        assert_eq!(s.previews_pending().unwrap(), 0);
+        // Текст письма загружен: начало из индекса ушло, ищется текст.
+        s.store_full_messages(acc, fpk, &[full(b, "<p>Полный текст про выключатель</p>", vec![])]).unwrap();
+        assert_eq!((s.search(acc, "подстанции", 10).unwrap().len(), s.search(acc, "выключатель", 10).unwrap().len()), (0, 1));
+
+        // Письма, записанные до схемы 15: в индексе без начала текста и без признака.
+        s.with_tx(|tx| {
+            for pk in tx.prepare("SELECT item_pk FROM items")?.query_map([], |r| r.get::<_, i64>(0))?.collect::<std::result::Result<Vec<_>, _>>()? {
+                fts_delete(tx, pk)?;
+                tx.execute("UPDATE items SET fts_preview = 0, fts_indexed = 1 WHERE item_pk = ?1", params![pk])?;
+                tx.execute(schema::FTS_INSERT_SQL, params![pk])?;
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(s.previews_pending().unwrap(), 2);
+        assert_eq!((s.search(acc, "трансформатор", 10).unwrap().len(), s.search(acc, "выключатель", 10).unwrap().len()), (0, 1), "до доиндексации — как раньше");
+        // Доиндексация пачками по одному письму: поиск работает между пачками.
+        assert_eq!(s.index_previews(1).unwrap(), 1);
+        assert_eq!(s.previews_pending().unwrap(), 1);
+        assert_eq!(s.index_previews(1).unwrap(), 1);
+        assert_eq!((s.index_previews(1).unwrap(), s.previews_pending().unwrap()), (0, 0));
+        assert_eq!((s.search(acc, "трансформатор", 10).unwrap().len(), s.search(acc, "выключатель", 10).unwrap().len(), s.search(acc, "подстанции", 10).unwrap().len()), (1, 1, 0));
+        // Индекс согласован с источником.
+        s.with_conn(|c| Ok(c.execute("INSERT INTO items_fts(items_fts, rank) VALUES('integrity-check', 1)", [])?)).unwrap();
+    }
+
+    /// Запрос на обычном языке сводится к тем же условиям, что операторы (шаг И3).
+    #[test]
+    fn natural_language_search() {
+        let s = tmp_store("nl");
+        let acc = s.account("h", "u").unwrap();
+        s.upsert_folders(acc, &[folder("Входящие", Some("inbox")), folder("Отправленные", Some("sentitems"))]).unwrap();
+        let (inbox, _) = s.folder_by_distinguished(acc, "inbox").unwrap().unwrap();
+        let (sent, _) = s.folder_by_distinguished(acc, "sentitems").unwrap().unwrap();
+        let from = |m: &mut MessageMeta, name: &str, email: &str| m.from = Some(Participant { name: Some(name.into()), email: Some(email.into()), routing_type: None });
+        let mut a = meta_at("A", "Ремонт насоса", "2026-10-10T10:00:00Z", Some("c1"));
+        from(&mut a, "Диспетчерская служба", "ods@x.ru");
+        a.has_attachments = true;
+        let mut b = meta_at("B", "Ремонт крыши", "2026-09-10T10:00:00Z", Some("c2"));
+        from(&mut b, "Диспетчерская служба", "ods@x.ru");
+        let mut c = meta_at("C", "Договоры поставки", "2026-10-12T10:00:00Z", Some("c3"));
+        from(&mut c, "Сидоров Василий Ильич", "sidorov@y.ru");
+        let mut d = meta_at("D", "Планёрка", "2026-11-12T10:00:00Z", Some("c4"));
+        from(&mut d, "Сидоров Василий Ильич", "sidorov@y.ru");
+        // Непрочитанное — только последнее.
+        for m in [&mut a, &mut b, &mut c] {
+            m.is_read = true;
+        }
+        s.apply_item_changes(acc, inbox, &[ItemChange::Create(a), ItemChange::Create(b), ItemChange::Create(c), ItemChange::Create(d.clone())]).unwrap();
+        // Письмо с текстом: в нём упомянут диспетчер; моё письмо Сидорову.
+        s.store_full_messages(acc, inbox, &[full(d, "<p>Диспетчер просил перенести ремонт на пятницу.</p>", vec![])]).unwrap();
+        let mut mine = meta_at("E", "RE: Договоры поставки", "2026-10-13T10:00:00Z", Some("c3"));
+        mine.is_read = true;
+        s.store_full_messages(acc, sent, &[full(mine, "<p>Согласен</p>", vec![])]).unwrap();
+
+        let today = jiff::civil::date(2026, 11, 13);
+        let run = |q: &str| s.search_at(acc, q, 10, today, jiff::tz::TimeZone::UTC).unwrap();
+        let subjects = |o: &SearchOutcome| o.hits.iter().map(|h| h.subject.clone().unwrap_or_default()).collect::<Vec<_>>();
+
+        // Отправитель по слову имени, тема, период.
+        let o = run("письма от диспетчера про ремонт за октябрь");
+        assert_eq!(subjects(&o), ["Ремонт насоса"]);
+        assert_eq!(o.understood.canonical, "от:ods@x.ru ремонт дата:2026-10");
+        assert_eq!(o.understood.chips.len(), 2);
+        assert_eq!((o.strict, o.relaxed_note.as_deref()), (1, None), "в октябре диспетчера больше никто не упоминал");
+        // По отправителю нашлось меньше трёх писем — добавлены письма с упоминанием.
+        let o = run("от диспетчера про ремонт");
+        assert_eq!(subjects(&o), ["Ремонт насоса", "Ремонт крыши", "Планёрка"], "два письма диспетчера и одно с его упоминанием");
+        assert_eq!((o.strict, o.relaxed_note.as_deref()), (2, Some("показаны и письма с упоминанием: диспетчера")));
+        // Падежи: «договора» находит «Договоры», «ремонтом» — «Ремонт».
+        assert_eq!(run("договора").hits.len(), 2);
+        assert_eq!(run("с ремонтом насосов").hits.len(), 1);
+        // Личное имя, глагол, относительная дата.
+        let o = run("что прислал Вася вчера");
+        assert_eq!(subjects(&o), ["Планёрка"]);
+        // Состояние, папка, вложения.
+        assert_eq!(subjects(&run("непрочитанные во входящих")), ["Планёрка"]);
+        assert_eq!(subjects(&run("от диспетчера с вложением")), ["Ремонт насоса"]);
+        assert_eq!(run("прочитано:нет").hits.len(), 1);
+        assert_eq!(run("флаг:да").hits.len(), 0);
+        // Вид вложения: у письма без загруженного текста имена файлов неизвестны — оно остаётся.
+        assert_eq!(subjects(&run("ремонт с pdf")), ["Ремонт насоса"]);
+        // «Я писал …» и «переписка с …»: получатели известны у писем с текстом.
+        let o = run("я писал me про договоры");
+        assert!(o.understood.chips.iter().any(|c| c.label == "от: меня"), "{:?}", o.understood.chips);
+        let o = run("переписка с Сидоровым");
+        assert_eq!(o.hits.len(), 2, "{:?}", subjects(&o));
+        assert_eq!(o.understood.canonical, "переписка:sidorov@y.ru");
+        // Операторы работают как раньше и смешиваются с фразой.
+        assert_eq!(subjects(&run("от:ods@x.ru за сентябрь")), ["Ремонт крыши"]);
+        assert_eq!(run("переписка:sidorov@y.ru,ods@x.ru").hits.len(), 4);
+        assert!(run("").hits.is_empty() && run("   ").hits.is_empty());
+    }
+
     /// Вложенное письмо, скачанное до п. 30 (тема без `.eml`, `application/octet-stream`, текста
     /// нет): кандидат на проверку; после пометки — `.eml`, `message/rfc822`, текст в поиске, а
     /// письмо со скрепкой (п. 29).
@@ -3018,7 +3440,8 @@ mod tests {
         let hits = s.search(acc, "шлепанц", 10).unwrap();
         assert_eq!(hits.len(), 1, "{hits:?}");
         assert_eq!(hits[0].attachment_name.as_deref(), Some("Спецификация №156.pdf"));
-        assert!(hits[0].snippet.contains("[шлепанцев]"), "{}", hits[0].snippet);
+        // Отрывок из вложения — из его текста как есть (с «ё»), а не из нормализованного индекса.
+        assert_eq!(hits[0].snippet, "Поставка [шлёпанцев] в количестве 40 пар");
         // Совпадение в теле письма имеет приоритет над вложением.
         let hits = s.search(acc, "вложение", 10).unwrap();
         assert_eq!(hits.len(), 1);
