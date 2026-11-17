@@ -10,8 +10,14 @@
     /** Минимальная высота области текста, px. */
     minHeight?: number;
     label?: string;
+    /**
+     * Из буфера вставляют картинки (снимок экрана, «Копировать картинку»): что с ними делать, решает
+     * владелец редактора; `insert` ставит разметку туда, где была каретка в момент вставки. Без
+     * обработчика картинки из буфера не вставляются.
+     */
+    onimages?: (files: File[], insert: (html: string) => void) => void;
   }
-  let { value = $bindable(""), disabled = false, minHeight = 240, label = "Текст письма" }: Props = $props();
+  let { value = $bindable(""), disabled = false, minHeight = 240, label = "Текст письма", onimages }: Props = $props();
 
   const uid = $props.id();
   let el = $state<HTMLDivElement | null>(null);
@@ -86,13 +92,36 @@
     e.stopPropagation();
   }
 
-  // --- вставка: только текст или очищенный HTML ----------------------------------
+  // --- вставка: текст, очищенный HTML или картинка -----------------------------------
+
+  /** Разметка — туда, где каретка была в момент вставки (пока картинка готовилась, фокус мог уйти). */
+  function insertAt(range: Range | null, html: string) {
+    if (disabled || !el) return;
+    el.focus();
+    if (range) {
+      const sel = window.getSelection();
+      sel?.removeAllRanges();
+      sel?.addRange(range);
+    }
+    document.execCommand("insertHTML", false, html);
+    onInput();
+    refresh();
+  }
 
   function onPaste(e: ClipboardEvent) {
     if (disabled) return;
     const data = e.clipboardData;
     if (!data) return;
     e.preventDefault();
+    // Картинка в буфере без текста — снимок экрана или «Копировать картинку». Если текст есть
+    // (ячейки Excel и абзац Word кладут рядом свой снимок), вставляется текст, как раньше.
+    const images = Array.from(data.files ?? []).filter((f) => f.type.startsWith("image/"));
+    if (images.length && onimages && !data.getData("text/plain").trim()) {
+      const sel = window.getSelection();
+      const range = sel && sel.rangeCount > 0 && el?.contains(sel.anchorNode) ? sel.getRangeAt(0).cloneRange() : null;
+      onimages(images, (html) => insertAt(range, html));
+      return;
+    }
     const html = data.getData("text/html");
     if (html) {
       const clean = sanitizeHtml(html);

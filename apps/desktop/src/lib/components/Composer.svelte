@@ -3,7 +3,7 @@
   import { api, errorMessage, failNetwork, failOriginalGone, failRetryable, formatSize, fullDate, isInlinePicture, messageNeedsFetch, onSyncProgress, personLabel, type ComposeContext, type ComposeRecipient, type ComposeRequest, type DraftAttachment, type DraftRef, type Importance, type LocalDraft, type Message, type PickedFile, type SignatureDto, type UploadProgress } from "../api";
   import { COMPOSE_TITLE, ICON } from "../actions";
   import { isValidEmail, mergeRecipients } from "../addresses";
-  import { cleanDraftHtml, htmlToText, restoreDraftHtml } from "../html";
+  import { cleanDraftHtml, dropInlineImage, htmlToText, inlineImageHtml, restoreDraftHtml, showInlineImages } from "../html";
   import { recipientDrag } from "../recipientDrag.svelte";
   import { focusBack } from "../popover";
   import { hint, layerOpen } from "../hotkeys";
@@ -49,6 +49,7 @@
   onDestroy(() => {
     alive = false;
     settleClose(null);
+    for (const url of inlineUrls.values()) URL.revokeObjectURL(url);
   });
 
   // --- закрытие по просьбе родителя ------------------------------------------------------
@@ -159,7 +160,89 @@
   }
   const startBody = untrack(() => initialBody(ctx));
   let body = $state(startBody);
-  let attachments = $state<PickedFile[]>(untrack(() => ctx.restore?.attachments ?? []));
+  let attachments = $state<PickedFile[]>(untrack(() => (ctx.restore?.attachments ?? []).filter((a) => !a.cid)));
+
+  // --- картинки в тексте письма (п. 40 обкатки) ----------------------------------------------
+  // Картинка из буфера (снимок экрана, «Копировать картинку») встаёт в текст сразу, а её копия
+  // сохраняется в данных приложения, как брошенный файл (п. 37). В письмо она уходит встроенным
+  // вложением: тело ссылается на неё по `cid:`, в списке вложений у получателя её нет.
+
+  /** Вставленные картинки: копия на диске и Content-ID (`cid`). Убранные из текста просто не уходят. */
+  let inlineImages = $state<PickedFile[]>(untrack(() => (ctx.restore?.attachments ?? []).filter((a) => a.cid)));
+  /** Адреса показа в редакторе (cid → blob:): живут, пока жив композер. */
+  const inlineUrls = new Map<string, string>();
+  /** Копии, которые ещё сохраняются: отправка и сохранение их ждут. */
+  let inlineSaving: Promise<void>[] = [];
+  /** Content-ID картинок, уже загруженных в черновик на сервере. */
+  let uploadedCids = $state<string[]>([]);
+  /** Шире этого вставленная картинка показывается ужатой (снимок экрана на большом мониторе). */
+  const PICTURE_MAX_WIDTH = 800;
+
+  /** Картинки, на которые текст ещё ссылается. */
+  function referencedInline(): PickedFile[] {
+    return inlineImages.filter((a) => a.cid && body.includes(`cid:${a.cid}`));
+  }
+  /** Есть картинки текста, которых ещё нет в черновике на сервере: автосохранение загрузит их само. */
+  const pendingInline = $derived(inlineImages.some((a) => a.cid && !uploadedCids.includes(a.cid) && body.includes(`cid:${a.cid}`)));
+
+  async function pictureWidth(f: File): Promise<number | null> {
+    try {
+      const bmp = await createImageBitmap(f);
+      const w = bmp.width;
+      bmp.close();
+      return w > PICTURE_MAX_WIDTH ? PICTURE_MAX_WIDTH : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /** Картинки из буфера — в текст письма; `insert` ставит разметку туда, где была каретка. */
+  async function pasteImages(files: File[], insert: (html: string) => void) {
+    if (busy) return;
+    for (const f of files) {
+      const used = [...attachments, ...inlineImages].reduce((s, a) => s + a.size, 0);
+      const refused = f.size > FILE_MAX ? "она больше 25 МБ" : used + f.size > TOTAL_MAX ? "вложения вместе больше 35 МБ" : null;
+      if (refused) {
+        error = `Картинка не вставлена: ${refused}.`;
+        lastAction = null;
+        continue;
+      }
+      const cid = `${crypto.randomUUID()}@aiowa`;
+      const url = URL.createObjectURL(f);
+      inlineUrls.set(cid, url);
+      insert(inlineImageHtml(url, cid, await pictureWidth(f)));
+      const saving = api.attachmentDrop(f).then(
+        (picked) => {
+          if (alive) inlineImages = [...inlineImages, { ...picked, cid }];
+        },
+        (e) => {
+          if (!alive) return;
+          // Копии нет — уйти картинке не с чем: в тексте её быть не должно.
+          body = dropInlineImage(body, cid);
+          error = `Картинка не вставлена: ${errorMessage(e)}`;
+          lastAction = null;
+        },
+      );
+      inlineSaving = [...inlineSaving, saving];
+      void saving.finally(() => (inlineSaving = inlineSaving.filter((p) => p !== saving)));
+    }
+  }
+
+  /** Картинки восстановленного письма: адреса показа из копий на диске (прежние адреса жили в прежнем окне). */
+  async function showRestoredInline() {
+    for (const a of inlineImages) {
+      if (!a.cid || inlineUrls.has(a.cid)) continue;
+      try {
+        const bytes = await api.attachmentDroppedRead(a.path);
+        if (!alive) return;
+        inlineUrls.set(a.cid, URL.createObjectURL(new Blob([bytes])));
+      } catch (e) {
+        console.warn("attachment_dropped_read:", errorMessage(e));
+      }
+    }
+    if (alive) body = showInlineImages(body, inlineUrls);
+  }
+  onMount(() => void showRestoredInline());
   let signature = $state<SignatureDto>(untrack(() => ctx.signature));
   let original = $state<Message | null>(untrack(() => ctx.original));
   /**
@@ -452,7 +535,7 @@
     const bad = invalidOf(to, cc, bcc);
     if (bad) return `Неверный адрес: ${bad}`;
     if (forSend && to.length + cc.length + bcc.length === 0) return "Укажи хотя бы одного получателя.";
-    let total = 0;
+    let total = referencedInline().reduce((s, a) => s + a.size, 0);
     for (const a of attachments) {
       if (a.size > FILE_MAX) return `Файл «${a.name}» больше 25 МБ.`;
       total += a.size;
@@ -481,6 +564,7 @@
       local_draft_id: localId,
       without_quote: withoutQuote,
       importance,
+      inline_images: referencedInline().map((a) => ({ cid: a.cid ?? "", path: a.path })),
     };
   }
 
@@ -512,7 +596,7 @@
 
   /** Что именно сохраняется: тема, получатели, важность и разметка тела (форматирование тоже правка). */
   const snapshot = $derived(JSON.stringify([subject.trim(), keyOf(to), keyOf(cc), keyOf(bcc), body, importance]));
-  const nonEmpty = $derived(subject.trim() !== "" || to.length + cc.length + bcc.length > 0 || bodyText !== "");
+  const nonEmpty = $derived(subject.trim() !== "" || to.length + cc.length + bcc.length > 0 || bodyText !== "" || inlineImages.length > 0);
   /** Снимок, который лежит на сервере; у открытого черновика — его начальное состояние. */
   let lastSavedKey = $state<string | null>(untrack(() => (ctx.draft ? snapshot : null)));
   /** Снимок, на котором автосохранение отказало: повтор только после правки. */
@@ -560,8 +644,8 @@
 
   const LOCAL_SAVE_DELAY_MS = 1500;
   const localId = untrack(() => ctx.restore?.draft_id ?? localDraftId ?? crypto.randomUUID());
-  const localSnapshot = $derived(JSON.stringify([snapshot, attachments.map((a) => a.path), removedServerIds, draftRef?.server_id ?? null]));
-  let lastLocalKey = $state<string | null>(untrack(() => (ctx.restore ? JSON.stringify([snapshot, (ctx.restore.attachments ?? []).map((a) => a.path), ctx.restore.removed_attachment_ids ?? [], ctx.restore.draft_server_id ?? null]) : null)));
+  const localSnapshot = $derived(JSON.stringify([snapshot, attachments.map((a) => a.path), removedServerIds, draftRef?.server_id ?? null, inlineImages.map((a) => a.path)]));
+  let lastLocalKey = $state<string | null>(untrack(() => (ctx.restore ? JSON.stringify([snapshot, (ctx.restore.attachments ?? []).filter((a) => !a.cid).map((a) => a.path), ctx.restore.removed_attachment_ids ?? [], ctx.restore.draft_server_id ?? null, (ctx.restore.attachments ?? []).filter((a) => a.cid).map((a) => a.path)]) : null)));
 
   $effect(() => {
     const key = localSnapshot;
@@ -605,7 +689,7 @@
       cc: clean(cc),
       bcc: clean(bcc),
       body_html: restoreDraftHtml(body),
-      attachments: $state.snapshot(attachments),
+      attachments: [...$state.snapshot(attachments), ...$state.snapshot(inlineImages)],
       removed_attachment_ids: $state.snapshot(removedServerIds),
       importance,
       updated_ms: Date.now(),
@@ -633,15 +717,22 @@
   async function saveNow(withFiles = false): Promise<string | null> {
     const key = snapshot;
     const files = withFiles && pendingFiles;
-    if (draftRef && key === lastSavedKey && !files) return null;
+    // Картинки текста, которых ещё нет на сервере, загружает и автосохранение: иначе в черновике
+    // остались бы ссылки `cid:` на картинки, которых там нет. Файлы из списка оно по-прежнему не трогает.
+    const pictures = pendingInline;
+    if (draftRef && key === lastSavedKey && !files && !pictures) return null;
     autosaving = true;
     autosaveError = null;
     lastSaveAt = Date.now();
     try {
-      if (files) {
-        const rep = await api.composeSaveDraft(saveRequest(), onUpload);
+      if (files || pictures) {
+        const req = files ? saveRequest() : draftRequest();
+        const rep = await api.composeSaveDraft(req, onUpload);
         if (!alive) return null;
         if (rep.draft) draftRef = rep.draft;
+        // Сохранение с оговоркой (`message`) — вложения могли не загрузиться: картинки остаются в
+        // очереди, следующее сохранение сверится с сервером и догрузит недостающее.
+        if (rep.draft && !rep.message) uploadedCids = [...new Set([...uploadedCids, ...(req.inline_images ?? []).map((i) => i.cid)])];
         if (rep.attachments) applyServerFiles(rep.attachments);
         lastSavedKey = key;
         failedKey = null;
@@ -701,6 +792,7 @@
     try {
       // Идущее автосохранение должно закончиться: отправка пойдёт по его черновику.
       await autosavePromise;
+      await Promise.all(inlineSaving);
       const key = snapshot;
       const rep = await api.composeSend(request(), onUpload);
       if (!alive) return;
@@ -746,6 +838,7 @@
     lastAction = "draft";
     try {
       await autosavePromise;
+      await Promise.all(inlineSaving);
       const warn = await saveNow(true);
       if (alive) savedByAuthor = true;
       if (warn && alive) error = warn;
@@ -799,6 +892,7 @@
     try {
       // Идущее автосохранение должно закончиться: разворачивается его черновик, а не новый.
       await autosavePromise;
+      await Promise.all(inlineSaving);
       const key = snapshot;
       const rep = await api.composeExpandQuote(draftRequest());
       if (!alive) return;
@@ -809,7 +903,7 @@
         return;
       }
       applyServerFiles(rep.attachments);
-      body = cleanDraftHtml(rep.body_html, rep.inline_images) || "<div><br></div>";
+      body = showInlineImages(cleanDraftHtml(rep.body_html, rep.inline_images) || "<div><br></div>", inlineUrls);
       kind = "new";
       referencePk = null;
       quoteInText = true;
@@ -847,6 +941,7 @@
     droppingStray = true;
     try {
       await autosavePromise;
+      await Promise.all(inlineSaving);
       const id = draftRef?.server_id;
       if (id) await api.composeDiscardDraft(id);
     } catch (e) {
@@ -908,6 +1003,7 @@
     lastAction = null;
     try {
       await autosavePromise;
+      await Promise.all(inlineSaving);
       const warn = await saveNow(true);
       if (!alive) return;
       savedByAuthor = true;
@@ -951,6 +1047,7 @@
     lastAction = null;
     try {
       await autosavePromise;
+      await Promise.all(inlineSaving);
       const id = draftRef?.server_id ?? null;
       if (id) await api.composeDiscardDraft(id);
       if (alive) finish(id ? "discard" : "cancel");
@@ -978,6 +1075,7 @@
     error = null;
     try {
       await autosavePromise;
+      await Promise.all(inlineSaving);
       if (!alive) return;
       // Недонабранный адрес становится чипом: в локальный черновик идут только чипы.
       toField?.commit();
@@ -1272,7 +1370,7 @@
   {/if}
 
   <div class="editor-wrap">
-    <Editor bind:this={editor} bind:value={body} disabled={busy != null} minHeight={editorMinHeight} />
+    <Editor bind:this={editor} bind:value={body} disabled={busy != null} minHeight={editorMinHeight} onimages={pasteImages} />
   </div>
 
   <div class="foot caption" aria-live="polite">

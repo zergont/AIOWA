@@ -458,11 +458,14 @@ pub struct OutgoingAttachment {
     pub name: String,
     pub content_type: Option<String>,
     pub bytes: Vec<u8>,
+    /// Картинка в тексте письма: её `Content-ID` (тело ссылается на неё как `cid:…`). `None` —
+    /// обычный файл в списке вложений.
+    pub content_id: Option<String>,
 }
 
 impl fmt::Debug for OutgoingAttachment {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("OutgoingAttachment").field("name", &self.name).field("content_type", &self.content_type).field("bytes", &self.bytes.len()).finish()
+        f.debug_struct("OutgoingAttachment").field("name", &self.name).field("content_type", &self.content_type).field("bytes", &self.bytes.len()).field("content_id", &self.content_id).finish()
     }
 }
 

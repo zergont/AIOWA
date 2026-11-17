@@ -510,6 +510,8 @@ export interface ComposeRequest {
   without_quote?: boolean;
   /** Важность, выбранная в композере: уходит с письмом и пишется в черновик. */
   importance?: Importance;
+  /** Картинки, вставленные в текст письма: копия в данных приложения и Content-ID, которым на неё ссылается тело. */
+  inline_images?: { cid: string; path: string }[];
 }
 
 /**
@@ -798,6 +800,8 @@ export interface PickedFile {
   path: string;
   name: string;
   size: number;
+  /** Картинка, вставленная в текст письма (п. 40 обкатки): её Content-ID. У файла из списка вложений поля нет. */
+  cid?: string;
 }
 
 // --- календарь ------------------------------------------------------------------------------
@@ -1269,6 +1273,8 @@ export const api = {
    * телом вызова, а имя — заголовком (UTF-8 в base64: в заголовке допустим только ASCII). Бэкенд
    * кладёт копию в данные приложения и возвращает её как выбранный файл.
    */
+  /** Содержимое копии, сохранённой attachmentDrop: по нему окно показывает картинку текста после восстановления письма. */
+  attachmentDroppedRead: (path: string) => invoke<ArrayBuffer>("attachment_dropped_read", { path }),
   attachmentDrop: async (file: File) => {
     const name = btoa(String.fromCharCode(...new TextEncoder().encode(file.name)));
     return invoke<PickedFile>("attachment_drop", new Uint8Array(await file.arrayBuffer()), { headers: { "x-file-name": name } });

@@ -114,6 +114,43 @@ export function cleanDraftHtml(html: string, inline: Record<string, string> = {}
 }
 
 /**
+ * Картинка, вставленная в текст письма из буфера (п. 40 обкатки): в редакторе показывается по
+ * адресу `url`, а в письмо уйдёт ссылкой `cid:` на встроенное вложение (restoreDraftHtml).
+ * `width` — ширина для слишком широкой картинки (снимок экрана), иначе — как есть.
+ */
+export function inlineImageHtml(url: string, cid: string, width: number | null): string {
+  return `<img src="${escapeHtml(url)}" ${KEEP_SRC}="cid:${escapeHtml(cid)}" alt=""${width ? ` width="${width}"` : ""}>`;
+}
+
+/**
+ * Адреса показа для картинок текста, на которые тело ссылается по `cid:` (`urls`: cid → адрес):
+ * после восстановления письма или «Развернуть» у таких картинок остаётся только спрятанный `cid:`.
+ */
+export function showInlineImages(html: string, urls: Map<string, string>): string {
+  if (!urls.size || !html.includes(KEEP_SRC)) return html;
+  const doc = new DOMParser().parseFromString(html, "text/html");
+  let changed = false;
+  for (const img of Array.from(doc.body.querySelectorAll(`img[${KEEP_SRC}]`))) {
+    const url = urls.get(normalizeCid(img.getAttribute(KEEP_SRC) ?? ""));
+    if (url && img.getAttribute("src") !== url) {
+      img.setAttribute("src", url);
+      changed = true;
+    }
+  }
+  return changed ? doc.body.innerHTML : html;
+}
+
+/** Убрать из текста картинку с этим Content-ID: её копию не удалось сохранить, уйти ей не с чем. */
+export function dropInlineImage(html: string, cid: string): string {
+  if (!html.includes(KEEP_SRC)) return html;
+  const doc = new DOMParser().parseFromString(html, "text/html");
+  const key = normalizeCid(cid);
+  const found = Array.from(doc.body.querySelectorAll(`img[${KEEP_SRC}]`)).filter((img) => normalizeCid(img.getAttribute(KEEP_SRC) ?? "") === key);
+  for (const img of found) img.remove();
+  return found.length ? doc.body.innerHTML : html;
+}
+
+/**
  * HTML редактора для сохранения на сервере: картинкам возвращается исходный `src`, элементам —
  * исходный `style` (если стиль поменяли в редакторе, новые свойства идут после исходных и
  * перекрывают их). Без спрятанных атрибутов HTML возвращается как есть.

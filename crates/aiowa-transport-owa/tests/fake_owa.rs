@@ -453,8 +453,8 @@ async fn send_message_with_attachments() {
     assert!(updates.as_array().unwrap().iter().any(|u| u["__type"] == "DeleteItemField:#Exchange" && u["Path"]["FieldURI"] == "message:BccRecipients"), "{updates}");
 
     let files = vec![
-        OutgoingAttachment { name: "отчёт.txt".into(), content_type: Some("text/plain".into()), bytes: "Итоги квартала".as_bytes().to_vec() },
-        OutgoingAttachment { name: "data.bin".into(), content_type: None, bytes: vec![0, 1, 2, 3, 255] },
+        OutgoingAttachment { content_id: None, name: "отчёт.txt".into(), content_type: Some("text/plain".into()), bytes: "Итоги квартала".as_bytes().to_vec() },
+        OutgoingAttachment { content_id: None, name: "data.bin".into(), content_type: None, bytes: vec![0, 1, 2, 3, 255] },
     ];
     let stale = draft.clone();
     // Ход загрузки: тело запроса уходит с отчётом (и с Content-Length — иначе сервер его не прочёл бы),

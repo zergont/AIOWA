@@ -524,18 +524,24 @@ pub fn create_item_body(kind: &ComposeKind, msg: &OutgoingMessage) -> Value {
 }
 
 /// `CreateAttachment` одного файла к черновику: `FileAttachment:#Exchange`, содержимое в base64.
-/// Один файл на запрос: размер тела запроса ограничен размером одного файла (×4/3).
+/// Один файл на запрос: размер тела запроса ограничен размером одного файла (×4/3). Картинка
+/// текста письма (`content_id`) уходит с `IsInline: true` и `ContentId` — тело ссылается на неё
+/// как `cid:…`, и в списке вложений у получателя её нет.
 pub fn create_attachment_body(parent: &ItemId, file: &OutgoingAttachment) -> Value {
+    let mut attachment = json!({
+        "__type": "FileAttachment:#Exchange",
+        "Name": file.name,
+        "ContentType": file.content_type.as_deref().unwrap_or("application/octet-stream"),
+        "IsInline": file.content_id.is_some(),
+        "Content": BASE64_STANDARD.encode(&file.bytes),
+    });
+    if let Some(cid) = &file.content_id {
+        attachment["ContentId"] = json!(cid);
+    }
     json!({
         "__type": "CreateAttachmentRequest:#Exchange",
         "ParentItemId": item_id_json(parent),
-        "Attachments": [ {
-            "__type": "FileAttachment:#Exchange",
-            "Name": file.name,
-            "ContentType": file.content_type.as_deref().unwrap_or("application/octet-stream"),
-            "IsInline": false,
-            "Content": BASE64_STANDARD.encode(&file.bytes),
-        } ],
+        "Attachments": [ attachment ],
     })
 }
 
@@ -2897,13 +2903,16 @@ mod tests {
     #[test]
     fn create_attachment_body_exact() {
         let parent = ItemId { id: "D".into(), change_key: Some("dk".into()) };
-        let file = OutgoingAttachment { name: "счёт.txt".into(), content_type: Some("text/plain".into()), bytes: b"hello".to_vec() };
+        let file = OutgoingAttachment { content_id: None, name: "счёт.txt".into(), content_type: Some("text/plain".into()), bytes: b"hello".to_vec() };
         assert_eq!(
             serde_json::to_string(&create_attachment_body(&parent, &file)).unwrap(),
             r#"{"__type":"CreateAttachmentRequest:#Exchange","ParentItemId":{"__type":"ItemId:#Exchange","Id":"D","ChangeKey":"dk"},"Attachments":[{"__type":"FileAttachment:#Exchange","Name":"счёт.txt","ContentType":"text/plain","IsInline":false,"Content":"aGVsbG8="}]}"#
         );
-        let file = OutgoingAttachment { name: "x.bin".into(), content_type: None, bytes: vec![] };
+        let file = OutgoingAttachment { content_id: None, name: "x.bin".into(), content_type: None, bytes: vec![] };
         assert!(serde_json::to_string(&create_attachment_body(&parent, &file)).unwrap().contains(r#""ContentType":"application/octet-stream","IsInline":false,"Content":"""#));
+        // Картинка текста письма: встроенное вложение с Content-ID.
+        let picture = OutgoingAttachment { content_id: Some("pic1@aiowa".into()), name: "image.png".into(), content_type: Some("image/png".into()), bytes: b"hello".to_vec() };
+        assert!(serde_json::to_string(&create_attachment_body(&parent, &picture)).unwrap().ends_with(r#"{"__type":"FileAttachment:#Exchange","Name":"image.png","ContentType":"image/png","IsInline":true,"Content":"aGVsbG8=","ContentId":"pic1@aiowa"}]}"#));
     }
 
     #[test]

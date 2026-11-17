@@ -2163,7 +2163,7 @@ fn load_attachments(paths: &[PathBuf]) -> Result<Vec<OutgoingAttachment>> {
             bail!("вложения вместе больше {} МиБ", MAX_ATTACHMENTS_TOTAL_BYTES / 1024 / 1024);
         }
         let name = p.file_name().and_then(|n| n.to_str()).map(String::from).ok_or_else(|| anyhow!("у вложения {} нет имени файла", p.display()))?;
-        out.push(OutgoingAttachment { name, content_type: Some(content_type_for(p).to_string()), bytes });
+        out.push(OutgoingAttachment { content_id: None, name, content_type: Some(content_type_for(p).to_string()), bytes });
     }
     Ok(out)
 }
@@ -2435,7 +2435,7 @@ async fn item_attachment_check(t: &OwaTransport, owner: &str, send: bool) -> Res
 
 async fn draft_check_flow(t: &OwaTransport, store: &Arc<Store>, account: AccountId, owner: &str, sync_drafts: bool) -> Result<()> {
     let msg1 = OutgoingMessage { subject: DRAFT_CHECK_SUBJECT.into(), body_html: text_to_html(&format!("{DRAFT_CHECK_MARK_1}\n\nПервая версия тела.")), ..OutgoingMessage::default() };
-    let file = OutgoingAttachment { name: DRAFT_CHECK_ATTACHMENT.into(), content_type: Some("text/plain".into()), bytes: format!("AIOWA draft-check {}\n", jiff::Timestamp::now()).into_bytes() };
+    let file = OutgoingAttachment { content_id: None, name: DRAFT_CHECK_ATTACHMENT.into(), content_type: Some("text/plain".into()), bytes: format!("AIOWA draft-check {}\n", jiff::Timestamp::now()).into_bytes() };
     let started = std::time::Instant::now();
     let draft = t.create_draft(&ComposeKind::New, &msg1).await.map_err(|e| anyhow!("CreateItem: {e}"))?;
     println!("CreateItem (черновик без получателей): Ok за {} мс; ItemId {} символов, ChangeKey {}", started.elapsed().as_millis(), draft.id.len(), draft.change_key.as_ref().map(|c| format!("{} символов", c.len())).unwrap_or_else(|| "нет".into()));

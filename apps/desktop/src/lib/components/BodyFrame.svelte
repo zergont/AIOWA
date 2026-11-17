@@ -3,6 +3,7 @@
   import { api, errorMessage, isExternalLink } from "../api";
   import { DARK_SHEET_CSS, darkPaletteCss, isDarkTag } from "../darkmail.svelte";
   import { layerOpen } from "../hotkeys";
+  import ImageLightbox from "./ImageLightbox.svelte";
 
   interface Props {
     /** Тело письма (HTML уже с data:-картинками вместо cid). */
@@ -39,7 +40,8 @@
 <style>
   html,body{margin:0;background:#fff;color:#1f1f1f}
   body{font:14px/1.5 "Segoe UI Variable Text","Segoe UI",Inter,system-ui,sans-serif;padding:16px 20px;word-wrap:break-word;overflow-wrap:anywhere}
-  img{max-width:100%;height:auto}
+  img{max-width:100%;height:auto;cursor:zoom-in}
+  a img{cursor:pointer}
   table{max-width:100%}
   pre{white-space:pre-wrap}
   blockquote{border-left:3px solid #ddd;margin:8px 0;padding:0 12px;color:#555}
@@ -51,6 +53,10 @@ ${palette}
   let frame = $state<HTMLIFrameElement | null>(null);
   let height = $state(120);
   let linkNotice = $state<string | null>(null);
+  /** Картинка письма, открытая крупно по щелчку (п. 41 обкатки). */
+  let picture = $state<{ src: string; alt: string } | null>(null);
+  /** Мельче этого картинку не увеличиваем: значки, маркеры и пиксели-счётчики. */
+  const PICTURE_MIN = 32;
 
   function fit() {
     const doc = frame?.contentDocument;
@@ -127,7 +133,17 @@ ${palette}
     const node = e.target as Node | null;
     const el = node == null ? null : node.nodeType === 1 ? (node as Element) : node.parentElement;
     const link = el?.closest("a[href], area[href]");
-    if (!link) return;
+    if (!link) {
+      // Картинка без ссылки — показать крупно. Только загруженная (`data:`): внешняя, которую рамка
+      // не грузит, пуста, и увеличивать в ней нечего.
+      const img = el?.closest("img") as HTMLImageElement | null | undefined;
+      const src = img?.getAttribute("src") ?? "";
+      if (img && /^data:image\//i.test(src) && img.naturalWidth >= PICTURE_MIN && img.naturalHeight >= PICTURE_MIN && !layerOpen()) {
+        e.preventDefault();
+        picture = { src, alt: img.getAttribute("alt") ?? "" };
+      }
+      return;
+    }
     e.preventDefault();
     e.stopPropagation();
     const href = link.getAttribute("href") ?? "";
@@ -145,6 +161,16 @@ ${palette}
   </div>
 {/if}
 <iframe bind:this={frame} {title} sandbox="allow-same-origin" {srcdoc} class:dark={darkOn} style="height: {height}px" onload={onFrameLoad}></iframe>
+{#if picture}
+  <ImageLightbox
+    src={picture.src}
+    alt={picture.alt}
+    onclose={() => {
+      picture = null;
+      frame?.focus();
+    }}
+  />
+{/if}
 
 <style>
   iframe {

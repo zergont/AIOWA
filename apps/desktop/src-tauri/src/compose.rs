@@ -351,6 +351,10 @@ pub(crate) struct ComposeRequest {
     /// Важность, выбранная в композере: уходит с письмом и пишется в черновик.
     #[serde(default)]
     importance: Importance,
+    /// Картинки, вставленные в текст письма (п. 40 обкатки). На сервер уходят те, на которые тело
+    /// ещё ссылается (`cid:…`), и которых нет среди вложений черновика.
+    #[serde(default)]
+    inline_images: Vec<InlineImageDto>,
 }
 
 /// Локальный черновик композера для окна (`local_drafts` в базе): всё, что нужно, чтобы открыть
@@ -508,6 +512,17 @@ pub(crate) struct PickedFile {
     path: String,
     name: String,
     size: u64,
+    /// Картинка, вставленная в текст письма (п. 40 обкатки): её `Content-ID`. У файла из списка
+    /// вложений поля нет.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cid: Option<String>,
+}
+
+/// Картинка в тексте письма из запроса окна: копия в данных приложения и её `Content-ID`.
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct InlineImageDto {
+    cid: String,
+    path: String,
 }
 
 // --- чистые функции (без базы и сети) --------------------------------------------------------
@@ -659,7 +674,7 @@ pub(crate) fn load_attachments(paths: &[String]) -> CmdResult<Vec<OutgoingAttach
             warn!(error = %e, "вложение не прочитано");
             format!("Не удалось прочитать файл «{name}»")
         })?;
-        out.push(OutgoingAttachment { content_type: Some(content_type_for(&name).to_string()), name, bytes });
+        out.push(OutgoingAttachment { content_id: None, content_type: Some(content_type_for(&name).to_string()), name, bytes });
     }
     // Размер мог вырасти между `metadata` и `read`.
     check_sizes(&out.iter().map(|a| (a.name.clone(), a.bytes.len() as u64)).collect::<Vec<_>>())?;
@@ -711,12 +726,17 @@ fn removed_ids(req: &ComposeRequest) -> Vec<String> {
 }
 
 /// Файлы, которых ещё нет среди вложений черновика на сервере (имя без учёта регистра и размер
-/// совпадают — значит, файл уже приложен): повтор отправки после оборванной загрузки не
-/// прикладывает загруженное второй раз.
+/// совпадают — значит, файл уже приложен; у картинки текста письма — совпал `Content-ID`): повтор
+/// отправки после оборванной загрузки не прикладывает загруженное второй раз.
 fn filter_new_files(files: Vec<OutgoingAttachment>, on_server: &[AttachmentMeta]) -> Vec<OutgoingAttachment> {
     files
         .into_iter()
         .filter(|f| {
+            // Картинка текста письма уже на сервере, если там есть встроенное вложение с её Content-ID.
+            if let Some(cid) = &f.content_id {
+                let cid = crate::normalize_cid(cid);
+                return !on_server.iter().any(|a| a.content_id.as_deref().is_some_and(|c| crate::normalize_cid(c) == cid));
+            }
             let name = f.name.to_lowercase();
             !on_server.iter().any(|a| !a.is_inline && a.size == Some(f.bytes.len() as i64) && a.name.as_deref().is_some_and(|n| n.to_lowercase() == name))
         })
@@ -840,8 +860,37 @@ async fn prepare(state: &AppState, req: &ComposeRequest, require_recipient: bool
     let kind = compose_kind(&state.store, req.kind, req.reference_item_pk, draft_id_of(req).is_some())?;
     let msg = outgoing(req, require_recipient)?;
     let paths = req.attachments.clone();
-    let files = if paths.is_empty() { Vec::new() } else { tauri::async_runtime::spawn_blocking(move || load_attachments(&paths)).await.map_err(err)?? };
+    let inline = referenced_inline(req)?;
+    let files = if paths.is_empty() && inline.is_empty() { Vec::new() } else { tauri::async_runtime::spawn_blocking(move || load_outgoing(&paths, &inline)).await.map_err(err)?? };
     Ok((kind, msg, files))
+}
+
+/// Картинки текста письма, которые ещё есть в тексте: `(путь, Content-ID)`. Убранная из текста
+/// картинка на сервер не уходит. `Content-ID` — только из букв, цифр и `. _ @ -`: его придумывает
+/// окно, и в запрос он должен попасть как есть.
+fn referenced_inline(req: &ComposeRequest) -> CmdResult<Vec<(String, String)>> {
+    let mut out = Vec::new();
+    for i in &req.inline_images {
+        let cid = i.cid.trim();
+        if cid.is_empty() || cid.len() > 120 || !cid.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '@' | '-')) {
+            return Err("У картинки письма неверный идентификатор".into());
+        }
+        if req.body_html.contains(&format!("cid:{cid}")) && !out.iter().any(|(_, c): &(String, String)| c == cid) {
+            out.push((i.path.clone(), cid.to_string()));
+        }
+    }
+    Ok(out)
+}
+
+/// Файлы вложений и картинки текста письма одним списком (сначала файлы): размеры проверяются
+/// вместе, у картинок проставлен `Content-ID`.
+pub(crate) fn load_outgoing(paths: &[String], inline: &[(String, String)]) -> CmdResult<Vec<OutgoingAttachment>> {
+    let all: Vec<String> = paths.iter().cloned().chain(inline.iter().map(|(p, _)| p.clone())).collect();
+    let mut out = load_attachments(&all)?;
+    for (file, (_, cid)) in out[paths.len()..].iter_mut().zip(inline) {
+        file.content_id = Some(cid.clone());
+    }
+    Ok(out)
 }
 
 /// Черновик из локальной базы: заголовок, получатели, файлы и тело, если оно есть полностью.
@@ -1433,7 +1482,15 @@ pub(crate) async fn compose_send(req: ComposeRequest, on_progress: Channel<Uploa
     let (kind, msg, files) = prepare(&state, &req, true).await?;
     let existing = draft_id_of(&req);
     let attached = files.len();
-    let picked: Vec<PickedFile> = req.attachments.iter().zip(&files).map(|(path, f)| PickedFile { path: path.clone(), name: f.name.clone(), size: f.bytes.len() as u64 }).collect();
+    // Файлы и картинки текста — как их знает окно: уйдут в локальный черновик перед `SendItem`.
+    let picked: Vec<PickedFile> = req
+        .attachments
+        .iter()
+        .cloned()
+        .chain(req.inline_images.iter().map(|i| i.path.clone()))
+        .zip(&files)
+        .map(|(path, f)| PickedFile { path, name: f.name.clone(), size: f.bytes.len() as u64, cid: f.content_id.clone() })
+        .collect();
     let (to, cc, bcc) = (msg.to.len(), msg.cc.len(), msg.bcc.len());
     let started = Instant::now();
     let transport = sync.transport().await.map_err(|e| ComposeFail::connect(&e).prefixed(NOT_SENT))?;
@@ -1465,6 +1522,7 @@ pub(crate) async fn compose_send(req: ComposeRequest, on_progress: Channel<Uploa
             }
             forget_local_draft(&state.store, req.local_draft_id.as_deref());
             forget_dropped(&state.store, &req.attachments);
+            forget_dropped(&state.store, &req.inline_images.iter().map(|i| i.path.clone()).collect::<Vec<_>>());
             info!(kind = ?req.kind, to, cc, bcc, attachments = attached, existing_draft = existing.is_some(), ms = started.elapsed().as_millis() as u64, "письмо отправлено");
             Ok(SendReport { sent: true, ..SendReport::default() })
         }
@@ -1794,7 +1852,7 @@ pub(crate) async fn attachments_pick(app: AppHandle) -> CmdResult<Vec<PickedFile
             .filter_map(|p| {
                 let name = p.file_name().and_then(|n| n.to_str())?.to_string();
                 let size = std::fs::metadata(&p).ok().filter(|m| m.is_file())?.len();
-                Some(PickedFile { path: p.display().to_string(), name, size })
+                Some(PickedFile { path: p.display().to_string(), name, size, cid: None })
             })
             .collect())
     })
@@ -1875,12 +1933,49 @@ pub(crate) fn attachment_drop(request: tauri::ipc::Request<'_>, state: State<'_,
         format!("Не удалось сохранить файл «{name}»")
     })?;
     debug!(bytes = bytes.len(), "перетащенный файл сохранён для вложения");
-    Ok(PickedFile { path: path.display().to_string(), name, size: bytes.len() as u64 })
+    Ok(PickedFile { path: path.display().to_string(), name, size: bytes.len() as u64, cid: None })
+}
+
+/// Содержимое копии, сохранённой `attachment_drop`: окно показывает по нему картинку текста письма
+/// после восстановления письма или переноса в другое окно (прежний адрес картинки там уже не
+/// действует). Читается только из каталога копий.
+#[tauri::command(async)]
+pub(crate) fn attachment_dropped_read(path: String, state: State<'_, AppState>) -> CmdResult<tauri::ipc::Response> {
+    let file = Path::new(path.trim());
+    if file.parent().and_then(Path::parent) != Some(dropped_dir(&state.store).as_path()) {
+        return Err("Файл не из копий вложений письма".into());
+    }
+    let bytes = std::fs::read(file).map_err(|_| "Копия картинки письма не найдена".to_string())?;
+    check_sizes(&[("картинка".into(), bytes.len() as u64)])?;
+    Ok(tauri::ipc::Response::new(bytes))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inline_images_go_only_while_referenced_and_once() {
+        let req = |body: &str, inline: &[(&str, &str)]| ComposeRequest {
+            body_html: body.into(),
+            inline_images: inline.iter().map(|(cid, path)| InlineImageDto { cid: (*cid).into(), path: (*path).into() }).collect(),
+            ..request(r#"{"kind":"new","reference_item_pk":null}"#)
+        };
+        // Уходит картинка, на которую текст ссылается; убранная из текста и повтор — нет.
+        let r = req(r#"<p>Снимок: <img src="cid:a1@aiowa"></p>"#, &[("a1@aiowa", "C:/d/1/image.png"), ("b2@aiowa", "C:/d/2/image.png"), ("a1@aiowa", "C:/d/3/image.png")]);
+        assert_eq!(referenced_inline(&r).unwrap(), vec![("C:/d/1/image.png".to_string(), "a1@aiowa".to_string())]);
+        // Идентификатор придумывает окно: посторонние знаки в запрос не попадают.
+        assert!(referenced_inline(&req("<p>x</p>", &[("a\"b", "C:/d/1/image.png")])).is_err());
+        assert!(referenced_inline(&req("<p>x</p>", &[("", "C:/d/1/image.png")])).is_err());
+
+        // Сверка с сервером: картинка с тем же Content-ID уже приложена — второй раз не грузится,
+        // даже если имя и размер у файла из списка вложений совпали бы.
+        let file = |name: &str, cid: Option<&str>| OutgoingAttachment { content_id: cid.map(String::from), name: name.into(), content_type: None, bytes: vec![0; 5] };
+        let meta = |name: &str, inline: bool, cid: Option<&str>| AttachmentMeta { id: format!("id-{name}"), name: Some(name.into()), content_type: None, size: Some(5), is_inline: inline, content_id: cid.map(String::from) };
+        let on_server = [meta("image.png", true, Some("<A1@aiowa>"))];
+        let left = filter_new_files(vec![file("image.png", Some("a1@aiowa")), file("image.png", Some("c3@aiowa")), file("image.png", None)], &on_server);
+        assert_eq!(left.iter().map(|f| f.content_id.as_deref()).collect::<Vec<_>>(), vec![Some("c3@aiowa"), None]);
+    }
 
     #[test]
     fn dropped_file_name_is_safe_for_disk() {
@@ -2033,6 +2128,7 @@ mod tests {
             local_draft_id: None,
             without_quote: false,
             importance: Importance::High,
+            inline_images: vec![],
         };
         let msg = outgoing(&req, true).unwrap();
         assert_eq!(msg.importance, Importance::High, "важность из окна уходит в письмо");
@@ -2250,7 +2346,7 @@ mod tests {
     fn local_draft_before_send_keeps_the_server_draft() {
         let req = request(r#"{"kind":"reply","reference_item_pk":5,"to":[{"name":"Анна","email":"a@y.ru"}],"subject":" RE: Смета ","body_html":"<p>ок</p>","attachments":["C:/a.pdf"],"draft_server_id":null,"removed_attachment_ids":["att1"],"local_draft_id":" L1 "}"#);
         assert_eq!(local_id_of(&req), Some("L1"));
-        let picked = vec![PickedFile { path: "C:/a.pdf".into(), name: "a.pdf".into(), size: 3 }];
+        let picked = vec![PickedFile { path: "C:/a.pdf".into(), name: "a.pdf".into(), size: 3, cid: None }];
         let row = LocalDraftDto::sending("L1", &req, "SRV", picked).to_row().unwrap();
         assert_eq!((row.draft_id.as_str(), row.kind.as_str(), row.reference_item_pk, row.draft_server_id.as_deref(), row.subject.as_str()), ("L1", "reply", Some(5), Some("SRV"), "RE: Смета"));
         assert!(row.to_json.contains("a@y.ru") && row.body_html == "<p>ок</p>" && row.attachments_json.contains("a.pdf") && row.removed_json.contains("att1"));
@@ -2346,7 +2442,7 @@ mod tests {
 
     #[test]
     fn files_already_on_the_draft_are_not_uploaded_again() {
-        let file = |name: &str, len: usize| OutgoingAttachment { name: name.into(), content_type: None, bytes: vec![0; len] };
+        let file = |name: &str, len: usize| OutgoingAttachment { content_id: None, name: name.into(), content_type: None, bytes: vec![0; len] };
         let meta = |id: &str, name: &str, size: i64, inline: bool| AttachmentMeta { id: id.into(), name: Some(name.into()), content_type: None, size: Some(size), is_inline: inline, content_id: None };
         let on_server = [meta("a1", "Отчёт.PDF", 10, false), meta("a2", "картинка.png", 5, true)];
         let names = |v: Vec<OutgoingAttachment>| v.into_iter().map(|f| f.name).collect::<Vec<_>>();
@@ -2358,7 +2454,7 @@ mod tests {
 
     #[test]
     fn reconcile_skips_uploaded_files_and_already_removed_attachments() {
-        let file = |name: &str, len: usize| OutgoingAttachment { name: name.into(), content_type: None, bytes: vec![0; len] };
+        let file = |name: &str, len: usize| OutgoingAttachment { content_id: None, name: name.into(), content_type: None, bytes: vec![0; len] };
         let meta = |id: &str, name: &str, size: i64| AttachmentMeta { id: id.into(), name: Some(name.into()), content_type: None, size: Some(size), is_inline: false, content_id: None };
         let names = |v: Vec<OutgoingAttachment>| v.into_iter().map(|f| f.name).collect::<Vec<_>>();
         let on_server = [meta("a1", "отчёт.pdf", 10), meta("a2", "старый.pdf", 7)];
