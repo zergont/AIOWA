@@ -355,6 +355,11 @@ pub(crate) struct ComposeRequest {
     /// ещё ссылается (`cid:…`), и которых нет среди вложений черновика.
     #[serde(default)]
     inline_images: Vec<InlineImageDto>,
+    /// Вложения исходного письма, убранные из пересылки (п. 42 обкатки): номера вложений в базе.
+    /// Сервер копирует вложения оригинала в черновик сам, поэтому убираются они после его создания
+    /// (`removed_originals`).
+    #[serde(default)]
+    removed_original: Vec<i64>,
 }
 
 /// Локальный черновик композера для окна (`local_drafts` в базе): всё, что нужно, чтобы открыть
@@ -382,6 +387,8 @@ pub(crate) struct LocalDraftDto {
     #[serde(default)]
     importance: Importance,
     #[serde(default)]
+    removed_original: Vec<i64>,
+    #[serde(default)]
     updated_ms: i64,
 }
 
@@ -407,6 +414,7 @@ impl LocalDraftDto {
             attachments_json: json(&self.attachments)?,
             removed_json: json(&self.removed_attachment_ids)?,
             importance: self.importance.as_str().to_string(),
+            removed_original_json: json(&self.removed_original)?,
             created_at: 0,
             updated_at: 0,
         })
@@ -434,6 +442,7 @@ impl LocalDraftDto {
             attachments: list(&d.attachments_json),
             removed_attachment_ids: list(&d.removed_json),
             importance: Importance::parse(&d.importance),
+            removed_original: list(&d.removed_original_json),
             updated_ms: d.updated_at,
         }
     }
@@ -456,6 +465,7 @@ impl LocalDraftDto {
             attachments,
             removed_attachment_ids: req.removed_attachment_ids.clone(),
             importance: req.importance,
+            removed_original: req.removed_original.clone(),
             updated_ms: 0,
         }
     }
@@ -744,11 +754,51 @@ fn filter_new_files(files: Vec<OutgoingAttachment>, on_server: &[AttachmentMeta]
 }
 
 /// Сверка с вложениями черновика на сервере (см. `reconcile`): файлы, которых там ещё нет (убираемые
-/// вложения не в счёт), и убранные вложения, которые там ещё есть.
-fn reconcile_with(on_server: &[AttachmentMeta], removed: Vec<String>, files: Vec<OutgoingAttachment>) -> (Vec<OutgoingAttachment>, Vec<String>) {
+/// вложения не в счёт), и убранные вложения, которые там ещё есть. `originals` — убранные из
+/// пересылки вложения исходного письма (имя и размер): их `AttachmentId` находится здесь же.
+fn reconcile_with(on_server: &[AttachmentMeta], mut removed: Vec<String>, originals: &[(String, Option<i64>)], files: Vec<OutgoingAttachment>) -> (Vec<OutgoingAttachment>, Vec<String>) {
+    for id in original_ids(on_server, originals) {
+        if !removed.contains(&id) {
+            removed.push(id);
+        }
+    }
     let kept: Vec<AttachmentMeta> = on_server.iter().filter(|a| !removed.contains(&a.id)).cloned().collect();
     let removed = removed.into_iter().filter(|id| on_server.iter().any(|a| &a.id == id)).collect();
     (filter_new_files(files, &kept), removed)
+}
+
+/// Вложения черновика пересылки, совпавшие с убранными вложениями исходного письма (п. 42 обкатки):
+/// имя без учёта регистра и размер, а если размер не совпал — по одному имени, когда вложение с
+/// таким именем одно. Каждое вложение черновика — не больше одного раза. Не нашлось — его в
+/// черновике уже нет (убрано раньше или в OWA).
+fn original_ids(on_server: &[AttachmentMeta], originals: &[(String, Option<i64>)]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for (name, size) in originals {
+        let name = name.to_lowercase();
+        let free: Vec<&AttachmentMeta> = on_server.iter().filter(|a| !a.is_inline && !out.contains(&a.id) && a.name.as_deref().is_some_and(|n| n.to_lowercase() == name)).collect();
+        let hit = free.iter().find(|a| size.is_some() && a.size == *size).or(if free.len() == 1 { free.first() } else { None });
+        if let Some(a) = hit {
+            out.push(a.id.clone());
+        }
+    }
+    out
+}
+
+/// Вложения исходного письма, убранные из пересылки (п. 42 обкатки): имя и размер по базе. Только
+/// у пересылки и только вложения самого исходного письма, без картинок его текста.
+fn removed_originals(store: &Store, req: &ComposeRequest) -> Vec<(String, Option<i64>)> {
+    let (ComposeKindDto::Forward, Some(reference)) = (req.kind, req.reference_item_pk) else { return Vec::new() };
+    req.removed_original
+        .iter()
+        .filter_map(|pk| match store.attachment(*pk) {
+            Ok(Some(a)) if a.item_pk == reference && !a.is_inline => a.name.map(|n| (n, a.size)),
+            Ok(_) => None,
+            Err(e) => {
+                warn!(error = %e, "убранное вложение исходного письма не прочитано из базы");
+                None
+            }
+        })
+        .collect()
 }
 
 fn esc(s: &str) -> String {
@@ -1156,14 +1206,22 @@ async fn write_draft(state: &AppState, sync: &SyncState, transport: &impl MailTr
         Some(sid) => DraftTarget::Existing(cs.item_id(sid)),
         None => create_draft_fresh(state, sync, transport, cs, kind, &msg, req).await.map_err(DraftFailure::Before)?,
     };
+    // Убранные из пересылки вложения оригинала (п. 42): сервер только что скопировал их в черновик,
+    // поэтому и новый черновик сверяется с сервером.
+    let originals = removed_originals(&state.store, req);
     let (mut current, files, removed) = match target {
-        DraftTarget::Created(draft) => {
+        DraftTarget::Created(draft) if originals.is_empty() => {
             cs.remember(&draft);
             (draft, files, Vec::new())
         }
+        DraftTarget::Created(draft) => {
+            cs.remember(&draft);
+            let (files, removed) = reconcile(sync, transport, &draft, removed_ids(req), &originals, files).await.map_err(|why| DraftFailure::After { id: draft.clone(), why, touched: false })?;
+            (draft, files, removed)
+        }
         DraftTarget::Existing(item) => {
             let current = rewrite_draft(state, sync, transport, cs, req, &mut msg, &item).await.map_err(DraftFailure::Before)?;
-            let (files, removed) = reconcile(sync, transport, &current, removed_ids(req), files).await;
+            let (files, removed) = reconcile(sync, transport, &current, removed_ids(req), &originals, files).await.map_err(|why| DraftFailure::After { id: current.clone(), why, touched: false })?;
             (current, files, removed)
         }
     };
@@ -1456,16 +1514,22 @@ pub(crate) async fn compose_context(kind: ComposeKindDto, item_pk: Option<i64>, 
 /// Сверка с черновиком на сервере перед загрузкой и удалением вложений (`reconcile_with`): повтор
 /// после оборванной загрузки не прикладывает загруженное второй раз, а повтор после удачного
 /// `DeleteAttachment` (или вложение, убранное в OWA) не упирается в отказ по уже несуществующему
-/// вложению. Черновик прочитать не удалось — всё как есть.
-async fn reconcile(sync: &SyncState, transport: &impl MailTransport, item: &ItemId, removed: Vec<String>, files: Vec<OutgoingAttachment>) -> (Vec<OutgoingAttachment>, Vec<String>) {
-    if files.is_empty() && removed.is_empty() {
-        return (files, removed);
+/// вложению; убранные из пересылки вложения оригинала (`originals`) находятся по черновику.
+/// Черновик прочитать не удалось — всё как есть; но если из пересылки что-то убрано — ошибка:
+/// письмо не должно уйти с файлом, который автор убрал.
+async fn reconcile(sync: &SyncState, transport: &impl MailTransport, item: &ItemId, removed: Vec<String>, originals: &[(String, Option<i64>)], files: Vec<OutgoingAttachment>) -> Result<(Vec<OutgoingAttachment>, Vec<String>), String> {
+    if files.is_empty() && removed.is_empty() && originals.is_empty() {
+        return Ok((files, removed));
     }
     match step(sync, "GetItem", CREATE_TIMEOUT, transport.get_draft(item)).await {
-        Ok(draft) => reconcile_with(&draft.attachments, removed, files),
-        Err(why) => {
+        Ok(draft) => Ok(reconcile_with(&draft.attachments, removed, originals, files)),
+        Err(why) if originals.is_empty() => {
             warn!(why = %why.message, "черновик не прочитан перед изменением вложений, они меняются без сверки");
-            (files, removed)
+            Ok((files, removed))
+        }
+        Err(why) => {
+            warn!(why = %why.message, originals = originals.len(), "черновик пересылки не прочитан: убранные вложения оригинала не найти");
+            Err(format!("Вложения исходного письма не убраны: {}", why.message))
         }
     }
 }
@@ -1936,6 +2000,39 @@ pub(crate) fn attachment_drop(request: tauri::ipc::Request<'_>, state: State<'_,
     Ok(PickedFile { path: path.display().to_string(), name, size: bytes.len() as u64, cid: None })
 }
 
+/// Вложение письма, перетащенное в письмо, которое пишется (п. 43 обкатки): файл из кэша вложений,
+/// а если его там нет — с сервера (`ensure_cached`, как у «Открыть» и «Сохранить как…»), копией в
+/// `dropped`, как брошенный файл. Вложенное письмо без `.eml` в имени получает это расширение, как
+/// при «Сохранить как…».
+#[tauri::command]
+pub(crate) async fn attachment_to_compose(attachment_pk: i64, state: State<'_, AppState>, sync: State<'_, Arc<SyncState>>, od: State<'_, crate::ondemand::OnDemand>) -> CmdResult<PickedFile> {
+    let row = state.store.attachment_of_account(state.account, attachment_pk).map_err(err)?.ok_or_else(|| "Вложения уже нет в базе".to_string())?;
+    if let Some(size) = row.size {
+        check_sizes(&[(row.name.clone().unwrap_or_else(|| "вложение".into()), size.max(0) as u64)])?;
+    }
+    let cached = crate::ondemand::ensure_cached(&state, &sync, &od, attachment_pk).await?;
+    let dir = dropped_dir(&state.store).join(uuid::Uuid::new_v4().simple().to_string());
+    let (name, declared) = (row.name, row.content_type);
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut file_name = dropped_file_name(name.as_deref().unwrap_or(""));
+        if !file_name.to_ascii_lowercase().ends_with(".eml") && crate::embedded::is_message_file(name.as_deref(), declared.as_deref(), &cached) {
+            file_name.push_str(".eml");
+        }
+        let size = std::fs::metadata(&cached).map(|m| m.len()).map_err(|_| "Файл вложения недоступен".to_string())?;
+        check_sizes(&[(file_name.clone(), size)])?;
+        let path = dir.join(&file_name);
+        std::fs::create_dir_all(&dir).and_then(|()| std::fs::copy(&cached, &path)).map_err(|e| {
+            warn!(error = %e, bytes = size, "вложение письма не скопировано для нового письма");
+            let _ = std::fs::remove_dir_all(&dir);
+            format!("Не удалось подготовить файл «{file_name}»")
+        })?;
+        debug!(bytes = size, "вложение письма подготовлено для нового письма");
+        Ok(PickedFile { path: path.display().to_string(), name: file_name, size, cid: None })
+    })
+    .await
+    .map_err(err)?
+}
+
 /// Содержимое копии, сохранённой `attachment_drop`: окно показывает по нему картинку текста письма
 /// после восстановления письма или переноса в другое окно (прежний адрес картинки там уже не
 /// действует). Читается только из каталога копий.
@@ -2129,6 +2226,7 @@ mod tests {
             without_quote: false,
             importance: Importance::High,
             inline_images: vec![],
+            removed_original: vec![],
         };
         let msg = outgoing(&req, true).unwrap();
         assert_eq!(msg.importance, Importance::High, "важность из окна уходит в письмо");
@@ -2459,15 +2557,32 @@ mod tests {
         let names = |v: Vec<OutgoingAttachment>| v.into_iter().map(|f| f.name).collect::<Vec<_>>();
         let on_server = [meta("a1", "отчёт.pdf", 10), meta("a2", "старый.pdf", 7)];
         // Уже загруженный файл не грузится второй раз; уже удалённое вложение не удаляется снова.
-        let (files, removed) = reconcile_with(&on_server, vec!["a2".into(), "gone".into()], vec![file("отчёт.pdf", 10), file("новый.pdf", 3)]);
+        let (files, removed) = reconcile_with(&on_server, vec!["a2".into(), "gone".into()], &[], vec![file("отчёт.pdf", 10), file("новый.pdf", 3)]);
         assert_eq!(names(files), vec!["новый.pdf"]);
         assert_eq!(removed, vec!["a2".to_string()]);
         // Файл с тем же именем и размером, что у убираемого вложения, грузится: то вложение уйдёт.
-        let (files, removed) = reconcile_with(&on_server, vec!["a2".into()], vec![file("старый.pdf", 7)]);
+        let (files, removed) = reconcile_with(&on_server, vec!["a2".into()], &[], vec![file("старый.pdf", 7)]);
         assert_eq!((files.len(), removed), (1, vec!["a2".to_string()]));
         // Повтор после удачного DeleteAttachment (или вложение убрано в OWA): удалять нечего.
-        let (files, removed) = reconcile_with(&on_server[..1], vec!["a2".into()], vec![]);
+        let (files, removed) = reconcile_with(&on_server[..1], vec!["a2".into()], &[], vec![]);
         assert!(files.is_empty() && removed.is_empty());
+    }
+
+    #[test]
+    fn forwarded_originals_are_found_on_the_draft() {
+        let meta = |id: &str, name: &str, size: i64, inline: bool| AttachmentMeta { id: id.into(), name: Some(name.into()), content_type: None, size: Some(size), is_inline: inline, content_id: None };
+        let on_server = [meta("s1", "Отчёт.PDF", 100, false), meta("s2", "смета.xlsx", 50, false), meta("s3", "смета.xlsx", 70, false), meta("s4", "лого.png", 5, true), meta("s5", "акт.docx", 30, false)];
+        let orig = |name: &str, size: Option<i64>| (name.to_string(), size);
+        // Имя без учёта регистра и размер; из двух одноимённых — с тем же размером; картинка текста — нет.
+        assert_eq!(original_ids(&on_server, &[orig("отчёт.pdf", Some(100)), orig("смета.xlsx", Some(70)), orig("лого.png", Some(5))]), vec!["s1".to_string(), "s3".to_string()]);
+        // Размер на сервере другой: по имени, если вложение с таким именем одно; одноимённых два — не угадываем.
+        assert_eq!(original_ids(&on_server, &[orig("акт.docx", Some(31)), orig("смета.xlsx", Some(60))]), vec!["s5".to_string()]);
+        // Уже убранное (его нет в черновике) не находится; одно вложение — не дважды.
+        assert_eq!(original_ids(&on_server, &[orig("нет.txt", None), orig("акт.docx", None), orig("акт.docx", None)]), vec!["s5".to_string()]);
+        // Сверка целиком: найденные оригиналы добавляются к убираемым, файл автора с тем же именем грузится.
+        let file = |name: &str, len: usize| OutgoingAttachment { content_id: None, name: name.into(), content_type: None, bytes: vec![0; len] };
+        let (files, removed) = reconcile_with(&on_server, vec!["s2".into()], &[orig("отчёт.pdf", Some(100))], vec![file("Отчёт.PDF", 100)]);
+        assert_eq!((files.len(), removed), (1, vec!["s2".to_string(), "s1".to_string()]));
     }
 
     #[test]

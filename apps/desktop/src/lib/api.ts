@@ -512,6 +512,11 @@ export interface ComposeRequest {
   importance?: Importance;
   /** Картинки, вставленные в текст письма: копия в данных приложения и Content-ID, которым на неё ссылается тело. */
   inline_images?: { cid: string; path: string }[];
+  /**
+   * Вложения исходного письма, убранные из пересылки (п. 42 обкатки): номера вложений в базе. Сервер
+   * копирует их в черновик сам, бэкенд убирает их после создания черновика.
+   */
+  removed_original?: number[];
 }
 
 /**
@@ -532,6 +537,8 @@ export interface LocalDraft {
   removed_attachment_ids: string[];
   /** Важность письма; у черновика, записанного до 0.2.11, поля нет — обычная. */
   importance?: Importance;
+  /** Вложения исходного письма, убранные из пересылки (п. 42); у старых записей поля нет. */
+  removed_original?: number[];
   updated_ms: number;
 }
 
@@ -1273,6 +1280,11 @@ export const api = {
    * телом вызова, а имя — заголовком (UTF-8 в base64: в заголовке допустим только ASCII). Бэкенд
    * кладёт копию в данные приложения и возвращает её как выбранный файл.
    */
+  /**
+   * Вложение письма, перетащенное в письмо, которое пишется (п. 43 обкатки): бэкенд берёт файл из кэша
+   * (или скачивает) и отдаёт копию как выбранный файл.
+   */
+  attachmentToCompose: (attachmentPk: number) => invoke<PickedFile>("attachment_to_compose", { attachmentPk }),
   /** Содержимое копии, сохранённой attachmentDrop: по нему окно показывает картинку текста после восстановления письма. */
   attachmentDroppedRead: (path: string) => invoke<ArrayBuffer>("attachment_dropped_read", { path }),
   attachmentDrop: async (file: File) => {

@@ -110,6 +110,16 @@ export const DND_CONVERSATIONS = "application/x-aiowa-conversations";
 /** Перетаскивание своей папки в дереве (п. 17 обкатки): в данных — её ключ. */
 export const DND_FOLDER = "application/x-aiowa-folder";
 
+/** Вложение письма, которое тянут в письмо, которое пишется (п. 43 обкатки): в данных — `DraggedAttachment` как JSON. */
+export const DND_ATTACHMENT = "application/x-aiowa-attachment";
+
+/** Что несёт перетаскивание вложения письма: номер вложения в базе, имя и размер для проверок до загрузки. */
+export interface DraggedAttachment {
+  attachment_pk: number;
+  name: string;
+  size: number | null;
+}
+
 export interface DragPayload {
   conversation_pks: number[];
   /** Папка, из которой тащат: на неё бросить нельзя. */

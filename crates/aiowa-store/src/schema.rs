@@ -10,7 +10,7 @@ use rusqlite::types::ValueRef;
 use rusqlite::Connection;
 use tracing::info;
 
-pub const CURRENT_VERSION: i64 = 15;
+pub const CURRENT_VERSION: i64 = 16;
 
 /// Состояния текста вложения (`attachments.text_state`).
 pub const TEXT_PENDING: i64 = 0;
@@ -671,6 +671,12 @@ pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
             }
         }
         info!("схема базы обновлена до версии 15: начало текста писем в поиске (доиндексация в фоне), индекс писем по дате");
+    }
+    if version < 16 {
+        // Вложения исходного письма, убранные из пересылки (п. 42 обкатки): локальный черновик помнит их.
+        add_column_if_missing(conn, "local_drafts", "removed_original_json", "TEXT NOT NULL DEFAULT '[]'")?;
+        conn.pragma_update(None, "user_version", 16)?;
+        info!("схема базы обновлена до версии 16: убранные вложения пересылки в локальном черновике");
     }
     Ok(())
 }

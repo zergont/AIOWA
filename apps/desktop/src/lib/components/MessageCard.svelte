@@ -6,7 +6,7 @@
 <script lang="ts">
   import { onDestroy, untrack } from "svelte";
   import { api, errorMessage, formatSize, fullDate, isInlinePicture, isPreviewable, listDate, meetingKindOf, messageNeedsFetch, personLabel, senderResponseOf, type Attachment, type ComposeKind, type Folder, type MeetingInfo, type MeetingResponse, type Message, type ResponseType, LAST_VERB, lastVerbText, itemKindLabel, itemKindOf, isNonMail} from "../api";
-  import { COMPOSE_ACTIONS, ICON, type ItemAction } from "../actions";
+  import { COMPOSE_ACTIONS, DND_ATTACHMENT, ICON, type DraggedAttachment, type ItemAction } from "../actions";
   import { requestPhoto } from "../photos.svelte";
   import Avatar from "./Avatar.svelte";
   import { meetingWhen } from "../calendar";
@@ -128,6 +128,14 @@
   const inArchive = $derived(archiveFolderPk != null && message.folder_pk === archiveFolderPk);
   // В списке файлов всё, кроме инлайновых картинок: те уже стоят в теле письма.
   const files = $derived(message.attachments.filter((a) => !isInlinePicture(a)));
+
+  /** Вложение тянут мышью — в письмо, которое пишется, оно встанет вложением (п. 43 обкатки). */
+  function onFileDragStart(e: DragEvent, a: Attachment) {
+    if (!e.dataTransfer) return;
+    const payload: DraggedAttachment = { attachment_pk: a.attachment_pk, name: a.name ?? "вложение", size: a.size ?? null };
+    e.dataTransfer.setData(DND_ATTACHMENT, JSON.stringify(payload));
+    e.dataTransfer.effectAllowed = "copy";
+  }
   const hasBody = $derived(message.body_html != null);
 
   // --- внешние картинки (п. 18 обкатки): по кнопке, от доверенных отправителей — сразу ---------
@@ -768,7 +776,7 @@
           {@const cached = a.cached || cachedHere.has(a.attachment_pk)}
           {@const name = a.name ?? "вложение"}
           {@const previewable = isPreviewable(a)}
-          <div class="file" class:cached class:busy={st.busy != null} class:failed={st.error != null} title={[a.content_type ?? "", previewable ? "Клик — открыть в окне просмотра" : "Клик — открыть в приложении", cached ? "Файл в кэше" : "Файл будет скачан при открытии"].filter(Boolean).join("\n")}>
+          <div class="file" class:cached class:busy={st.busy != null} class:failed={st.error != null} role="group" draggable="true" ondragstart={(e) => onFileDragStart(e, a)} title={[a.content_type ?? "", previewable ? "Клик — открыть в окне просмотра" : "Клик — открыть в приложении", cached ? "Файл в кэше" : "Файл будет скачан при открытии"].filter(Boolean).join("\n")}>
             <button class="file-open" onclick={() => void clickAttachment(a)} disabled={st.busy != null} aria-label={previewable ? `Предпросмотр вложения ${name}` : `Открыть вложение ${name}`} aria-busy={st.busy === "open"}>
               {#if st.busy === "open"}
                 <span class="spinner" aria-hidden="true"></span>

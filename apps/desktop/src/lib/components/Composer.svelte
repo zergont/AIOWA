@@ -5,6 +5,7 @@
   import { isValidEmail, mergeRecipients } from "../addresses";
   import { cleanDraftHtml, dropInlineImage, htmlToText, inlineImageHtml, restoreDraftHtml, showInlineImages } from "../html";
   import { recipientDrag } from "../recipientDrag.svelte";
+  import { DND_ATTACHMENT, type DraggedAttachment } from "../actions";
   import { focusBack } from "../popover";
   import { hint, layerOpen } from "../hotkeys";
   import RecipientsInput from "./RecipientsInput.svelte";
@@ -282,8 +283,37 @@
   const keptServerFiles = $derived(serverFiles.filter((f) => !removedServerIds.includes(f.server_id)));
   /** Список вложений черновика известен с сервера (открытый черновик или после сохранения с файлами). */
   let serverListed = $state(untrack(() => ctx.draft != null || ctx.restore_files != null));
+  /**
+   * Вложения исходного письма, убранные из пересылки (п. 42 обкатки), — пока список вложений черновика
+   * с сервера неизвестен: их `AttachmentId` появится только в черновике, бэкенд находит их сам.
+   */
+  let removedOriginal = $state<number[]>(untrack(() => ctx.restore?.removed_original ?? []));
+  /**
+   * `AttachmentId` вложений черновика, совпавших с убранными вложениями оригинала: имя без учёта
+   * регистра и размер, а если размер не совпал — по имени, когда вложение с таким именем одно
+   * (так же сверяет бэкенд, `original_ids`).
+   */
+  function originalIdsIn(list: DraftAttachment[]): string[] {
+    const out: string[] = [];
+    for (const pk of removedOriginal) {
+      const a = original?.attachments.find((x) => x.attachment_pk === pk);
+      if (!a) continue;
+      const name = (a.name ?? "").toLowerCase();
+      const free = list.filter((f) => !out.includes(f.server_id) && (f.name ?? "").toLowerCase() === name);
+      const hit = free.find((f) => a.size != null && f.size === a.size) ?? (free.length === 1 ? free[0] : undefined);
+      if (hit) out.push(hit.server_id);
+    }
+    return out;
+  }
+  // Письмо перенесено в окно, а черновик уже на сервере и его вложения известны: убранные вложения
+  // оригинала — это уже его серверные вложения.
+  untrack(() => {
+    if (!serverListed || !removedOriginal.length) return;
+    removedServerIds = [...new Set([...removedServerIds, ...originalIdsIn(serverFiles)])];
+    removedOriginal = [];
+  });
   /** Есть изменения вложений, которых ещё нет на сервере (автосохранение их не пишет). */
-  const pendingFiles = $derived(attachments.length > 0 || removedServerIds.length > 0);
+  const pendingFiles = $derived(attachments.length > 0 || removedServerIds.length > 0 || removedOriginal.length > 0);
   /**
    * Вложения черновика на сервере после сохранения или неудачной отправки: серверный список
    * заменяет свой, загруженные файлы (то же имя без учёта регистра и размер, как сверяет бэкенд)
@@ -291,7 +321,11 @@
    */
   function applyServerFiles(list: DraftAttachment[]) {
     const ids = new Set(list.map((f) => f.server_id));
-    const stillRemoved = removedServerIds.filter((id) => ids.has(id));
+    // Убранные вложения оригинала, которые ещё в черновике (не удалились или список пришёл после
+    // «Развернуть»), становятся убранными серверными вложениями.
+    const fromOriginal = originalIdsIn(list);
+    removedOriginal = [];
+    const stillRemoved = [...new Set([...removedServerIds, ...fromOriginal])].filter((id) => ids.has(id));
     const uploaded = (a: PickedFile) => list.some((f) => !stillRemoved.includes(f.server_id) && f.size === a.size && (f.name ?? "").toLowerCase() === a.name.toLowerCase());
     serverFiles = list;
     removedServerIds = stillRemoved;
@@ -400,7 +434,7 @@
   const init = untrack(() => (ctx.restore ? { subject: "", bodyText: "", bodyHtml: normHtml("<div><br></div>"), to: "", cc: "", bcc: "", importance: "Normal" } : { subject: ctx.subject, bodyText: htmlToText(startBody), bodyHtml: normHtml(startBody), to: keyOf(to), cc: keyOf(cc), bcc: keyOf(bcc), importance }));
   /** Текст тела без разметки: считается раз на правку, нужен и «есть правки», и «письмо непустое». */
   const bodyText = $derived(htmlToText(body));
-  const isDirty = $derived(subject !== init.subject || keyOf(to) !== init.to || keyOf(cc) !== init.cc || keyOf(bcc) !== init.bcc || importance !== init.importance || attachments.length > 0 || removedServerIds.length > 0 || bodyText !== init.bodyText || (body !== startBody && normHtml(body) !== init.bodyHtml));
+  const isDirty = $derived(subject !== init.subject || keyOf(to) !== init.to || keyOf(cc) !== init.cc || keyOf(bcc) !== init.bcc || importance !== init.importance || attachments.length > 0 || removedServerIds.length > 0 || removedOriginal.length > 0 || bodyText !== init.bodyText || (body !== startBody && normHtml(body) !== init.bodyHtml));
   /**
    * Черновик, который создал сам композер и автор не сохранял (п. 33): при нетронутом письме он
    * лишний и при закрытии убирается. Для родителя письмо с ним — «с правками»: закрытие окна,
@@ -415,7 +449,7 @@
   });
 
   /** Файлы исходного письма при пересылке: их добавит сервер, здесь только показываем (пока список с сервера не известен — там они уже есть). */
-  const originalFiles = $derived(ctx.kind === "forward" && original && !serverListed ? original.attachments.filter((a) => !isInlinePicture(a)) : []);
+  const originalFiles = $derived(ctx.kind === "forward" && original && !serverListed ? original.attachments.filter((a) => !isInlinePicture(a) && !removedOriginal.includes(a.attachment_pk)) : []);
   /** Подпись свёрнутой цитаты: от кого и когда. */
   const originalSummary = $derived(original ? [personLabel(original.from_name, original.from_email), fullDate(original.received_ms ?? original.sent_ms)].filter(Boolean).join(", ") : "");
   /**
@@ -565,6 +599,7 @@
       without_quote: withoutQuote,
       importance,
       inline_images: referencedInline().map((a) => ({ cid: a.cid ?? "", path: a.path })),
+      removed_original: removedOriginal,
     };
   }
 
@@ -575,12 +610,12 @@
    */
   function draftRequest(): ComposeRequest {
     const valid = (rs: ComposeRecipient[]) => clean(rs).filter((r) => isValidEmail(r.email));
-    return { ...request(), to: valid(to), cc: valid(cc), bcc: valid(bcc), attachments: [], removed_attachment_ids: [] };
+    return { ...request(), to: valid(to), cc: valid(cc), bcc: valid(bcc), attachments: [], removed_attachment_ids: [], removed_original: [] };
   }
 
   /** Запрос ручного сохранения: как у автосохранения, но с новыми файлами и убранными вложениями. */
   function saveRequest(): ComposeRequest {
-    return { ...draftRequest(), attachments: attachments.map((a) => a.path), removed_attachment_ids: removedServerIds };
+    return { ...draftRequest(), attachments: attachments.map((a) => a.path), removed_attachment_ids: removedServerIds, removed_original: removedOriginal };
   }
 
   // --- автосохранение черновика ------------------------------------------------------------
@@ -644,8 +679,8 @@
 
   const LOCAL_SAVE_DELAY_MS = 1500;
   const localId = untrack(() => ctx.restore?.draft_id ?? localDraftId ?? crypto.randomUUID());
-  const localSnapshot = $derived(JSON.stringify([snapshot, attachments.map((a) => a.path), removedServerIds, draftRef?.server_id ?? null, inlineImages.map((a) => a.path)]));
-  let lastLocalKey = $state<string | null>(untrack(() => (ctx.restore ? JSON.stringify([snapshot, (ctx.restore.attachments ?? []).filter((a) => !a.cid).map((a) => a.path), ctx.restore.removed_attachment_ids ?? [], ctx.restore.draft_server_id ?? null, (ctx.restore.attachments ?? []).filter((a) => a.cid).map((a) => a.path)]) : null)));
+  const localSnapshot = $derived(JSON.stringify([snapshot, attachments.map((a) => a.path), removedServerIds, draftRef?.server_id ?? null, inlineImages.map((a) => a.path), removedOriginal]));
+  let lastLocalKey = $state<string | null>(untrack(() => (ctx.restore ? JSON.stringify([snapshot, (ctx.restore.attachments ?? []).filter((a) => !a.cid).map((a) => a.path), ctx.restore.removed_attachment_ids ?? [], ctx.restore.draft_server_id ?? null, (ctx.restore.attachments ?? []).filter((a) => a.cid).map((a) => a.path), ctx.restore.removed_original ?? []]) : null)));
 
   $effect(() => {
     const key = localSnapshot;
@@ -691,6 +726,7 @@
       body_html: restoreDraftHtml(body),
       attachments: [...$state.snapshot(attachments), ...$state.snapshot(inlineImages)],
       removed_attachment_ids: $state.snapshot(removedServerIds),
+      removed_original: $state.snapshot(removedOriginal),
       importance,
       updated_ms: Date.now(),
     };
@@ -1124,7 +1160,11 @@
   let dropActive = $state(false);
   /** Сколько брошенных файлов ещё сохраняется. */
   let dropSaving = $state(0);
-  const carriesFiles = (e: DragEvent) => Array.from(e.dataTransfer?.types ?? []).includes("Files");
+  /** Тянут файлы из Проводника или вложение письма (п. 43): и то и другое станет вложением. */
+  const carriesFiles = (e: DragEvent) => {
+    const types = Array.from(e.dataTransfer?.types ?? []);
+    return types.includes("Files") || types.includes(DND_ATTACHMENT);
+  };
 
   function onFilesEnter(e: DragEvent) {
     if (!carriesFiles(e)) return;
@@ -1149,6 +1189,11 @@
     dropDepth = 0;
     dropActive = false;
     if (busy) return;
+    const dragged = e.dataTransfer?.getData(DND_ATTACHMENT);
+    if (dragged) {
+      void attachFromMail(dragged);
+      return;
+    }
     // Файлы берутся из события сразу: после первого await список в нём уже пуст.
     const files: File[] = [];
     let folders = 0;
@@ -1161,6 +1206,42 @@
       }
     }
     void attachDropped(files, folders);
+  }
+
+  /** Вложения писем, уже перенесённые в это письмо: номер вложения → путь копии (второй бросок того же — без копии). */
+  const fromMail = new Map<number, string>();
+
+  /** Вложение письма, брошенное в это письмо (п. 43 обкатки): копию готовит бэкенд, при надобности скачав файл. */
+  async function attachFromMail(raw: string) {
+    let a: DraggedAttachment;
+    try {
+      a = JSON.parse(raw) as DraggedAttachment;
+    } catch {
+      return;
+    }
+    if (typeof a?.attachment_pk !== "number") return;
+    const already = fromMail.get(a.attachment_pk);
+    if (already && attachments.some((x) => x.path === already)) return;
+    const total = attachments.reduce((s, x) => s + x.size, 0);
+    const refused = a.size != null && a.size > FILE_MAX ? "он больше 25 МБ" : a.size != null && total + a.size > TOTAL_MAX ? "вложения вместе больше 35 МБ" : null;
+    if (refused) {
+      error = `Не всё вложено: «${a.name}» — ${refused}.`;
+      lastAction = null;
+      return;
+    }
+    dropSaving++;
+    try {
+      const picked = await api.attachmentToCompose(a.attachment_pk);
+      if (!alive) return;
+      attachments = [...attachments, picked];
+      fromMail.set(a.attachment_pk, picked.path);
+    } catch (e) {
+      if (!alive) return;
+      error = `Не всё вложено: «${a.name}»: ${errorMessage(e)}.`;
+      lastAction = null;
+    } finally {
+      dropSaving--;
+    }
   }
 
   async function attachDropped(files: File[], folders: number) {
@@ -1206,6 +1287,10 @@
   });
   function removeServerFile(serverId: string) {
     if (!removedServerIds.includes(serverId)) removedServerIds = [...removedServerIds, serverId];
+  }
+  /** Вложение исходного письма не пересылать (п. 42 обкатки). */
+  function removeOriginalFile(attachmentPk: number) {
+    if (!removedOriginal.includes(attachmentPk)) removedOriginal = [...removedOriginal, attachmentPk];
   }
 
   // --- клавиши: Ctrl+Enter — отправить, Ctrl+S — сохранить черновик, Esc — отменить ----------
@@ -1356,10 +1441,11 @@
         </span>
       {/if}
       {#each originalFiles as a (a.attachment_pk)}
-        <span class="file inherited" title="Вложение исходного письма: сервер добавит его к пересылке сам">
+        <span class="file inherited" title="Вложение исходного письма: уйдёт с пересылкой. Крестик — не пересылать">
           <svg width="14" height="14" viewBox="0 0 16 16" aria-hidden="true"><path d={ICON.attach} fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" /></svg>
           <span class="file-name">{a.name ?? "вложение"}</span>
           <span class="caption file-size">{formatSize(a.size)}</span>
+          <button class="file-x" onclick={() => removeOriginalFile(a.attachment_pk)} disabled={busy != null} aria-label="Не пересылать вложение {a.name ?? 'без имени'}">×</button>
         </span>
       {/each}
     </div>

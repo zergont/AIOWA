@@ -29,11 +29,13 @@ pub struct LocalDraft {
     pub removed_json: String,
     /// Важность письма: `Low`, `Normal` или `High` (`aiowa_core::Importance::as_str`).
     pub importance: String,
+    /// Вложения исходного письма, убранные из пересылки (номера вложений в базе), как JSON.
+    pub removed_original_json: String,
     pub created_at: i64,
     pub updated_at: i64,
 }
 
-const COLUMNS: &str = "draft_id, kind, reference_item_pk, draft_server_id, subject, to_json, cc_json, bcc_json, body_html, attachments_json, removed_json, created_at, updated_at, importance";
+const COLUMNS: &str = "draft_id, kind, reference_item_pk, draft_server_id, subject, to_json, cc_json, bcc_json, body_html, attachments_json, removed_json, created_at, updated_at, importance, removed_original_json";
 
 fn row(r: &rusqlite::Row<'_>) -> rusqlite::Result<LocalDraft> {
     Ok(LocalDraft {
@@ -51,6 +53,7 @@ fn row(r: &rusqlite::Row<'_>) -> rusqlite::Result<LocalDraft> {
         created_at: r.get(11)?,
         updated_at: r.get(12)?,
         importance: r.get(13)?,
+        removed_original_json: r.get(14)?,
     })
 }
 
@@ -62,12 +65,12 @@ impl Store {
         let now = now_ms();
         self.with_conn(|c| {
             c.execute(
-                "INSERT INTO local_drafts(account_id, draft_id, kind, reference_item_pk, draft_server_id, subject, to_json, cc_json, bcc_json, body_html, attachments_json, removed_json, created_at, updated_at, importance)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?13, ?14)
+                "INSERT INTO local_drafts(account_id, draft_id, kind, reference_item_pk, draft_server_id, subject, to_json, cc_json, bcc_json, body_html, attachments_json, removed_json, created_at, updated_at, importance, removed_original_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?13, ?14, ?15)
                  ON CONFLICT(draft_id) DO UPDATE SET kind = excluded.kind, reference_item_pk = excluded.reference_item_pk, draft_server_id = COALESCE(excluded.draft_server_id, local_drafts.draft_server_id),
                    subject = excluded.subject, to_json = excluded.to_json, cc_json = excluded.cc_json, bcc_json = excluded.bcc_json, body_html = excluded.body_html,
-                   attachments_json = excluded.attachments_json, removed_json = excluded.removed_json, updated_at = excluded.updated_at, importance = excluded.importance",
-                params![account.0, d.draft_id, d.kind, d.reference_item_pk, d.draft_server_id, d.subject, d.to_json, d.cc_json, d.bcc_json, d.body_html, d.attachments_json, d.removed_json, now, d.importance],
+                   attachments_json = excluded.attachments_json, removed_json = excluded.removed_json, updated_at = excluded.updated_at, importance = excluded.importance, removed_original_json = excluded.removed_original_json",
+                params![account.0, d.draft_id, d.kind, d.reference_item_pk, d.draft_server_id, d.subject, d.to_json, d.cc_json, d.bcc_json, d.body_html, d.attachments_json, d.removed_json, now, d.importance, d.removed_original_json],
             )?;
             Ok(())
         })
@@ -127,6 +130,7 @@ mod tests {
             attachments_json: "[]".into(),
             removed_json: "[]".into(),
             importance: "Normal".into(),
+            removed_original_json: "[]".into(),
             created_at: 0,
             updated_at: 0,
         }
@@ -146,6 +150,7 @@ mod tests {
         let mut d1 = draft("d1", "первый, правка");
         d1.draft_server_id = Some("SRV".into());
         d1.importance = "High".into();
+        d1.removed_original_json = "[41,42]".into();
         d1.attachments_json = r#"[{"path":"C:/a.pdf","name":"a.pdf","size":3}]"#.into();
         s.local_draft_save(acc, &d1).unwrap();
         let again = s.local_draft("d1").unwrap().unwrap();
@@ -153,6 +158,7 @@ mod tests {
         assert!(again.updated_at >= first.updated_at);
         assert_eq!((again.subject.as_str(), again.draft_server_id.as_deref()), ("первый, правка", Some("SRV")));
         assert_eq!((first.importance.as_str(), again.importance.as_str()), ("Normal", "High"));
+        assert_eq!((first.removed_original_json.as_str(), again.removed_original_json.as_str()), ("[]", "[41,42]"));
         assert!(again.attachments_json.contains("a.pdf"));
 
         let all = s.local_drafts(acc).unwrap();

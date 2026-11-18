@@ -924,6 +924,7 @@ pub fn run() {
             compose::attachments_pick,
             compose::attachment_drop,
             compose::attachment_dropped_read,
+            compose::attachment_to_compose,
             directory::directory_search,
             directory::contact_card,
             directory::contact_photos,
