@@ -873,6 +873,7 @@ pub fn run() {
             ondemand::message_fetch,
             ondemand::attachment_open,
             ondemand::attachment_save_as,
+            ondemand::reveal_saved,
             preview::attachment_preview_url,
             embedded::attachment_message,
             embedded::attachment_message_part,

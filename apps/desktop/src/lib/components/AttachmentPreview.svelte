@@ -24,8 +24,12 @@
     /** Скрыть ошибку действия. */
     onclearerror?: (a: Attachment) => void;
     onclose: () => void;
+    /** Щелчок по пути «Сохранено: …» — показать файл в Проводнике (п. 44 обкатки). */
+    onreveal?: (a: Attachment, path: string) => void;
+    /** Указатель или фокус над строкой «Сохранено» (`true`) и ушёл (`false`): пока он там, строка не исчезает. */
+    onholdsaved?: (a: Attachment, hold: boolean) => void;
   }
-  let { files, index = $bindable(0), onopen, onsave, status, onclearerror, onclose }: Props = $props();
+  let { files, index = $bindable(0), onopen, onsave, status, onclearerror, onclose, onreveal, onholdsaved }: Props = $props();
 
   const uid = $props.id();
   /** Текст больше этого в окно не грузится: предлагается открыть файл. */
@@ -48,7 +52,8 @@
   let message = $state<EmbeddedMessage | null>(null);
   /** Вложение вложенного письма, с которым идёт действие, и итог действия. */
   let partBusy = $state<number | null>(null);
-  let partNote = $state<{ text: string; failed: boolean } | null>(null);
+  /** Итог действия с вложением вложенного письма; `path` — сохранённый файл, его можно показать в папке. */
+  let partNote = $state<{ text: string; failed: boolean; path?: string } | null>(null);
   let loading = $state(false);
   let error = $state<string | null>(null);
   let dialogEl = $state<HTMLDivElement | null>(null);
@@ -79,11 +84,20 @@
     partNote = null;
     try {
       const path = await api.attachmentMessagePart(p, index, save);
-      if (p === pk && path) partNote = { text: `Сохранено: ${path}`, failed: false };
+      if (p === pk && path) partNote = { text: "Сохранено:", failed: false, path };
     } catch (e) {
       if (p === pk) partNote = { text: errorMessage(e), failed: true };
     } finally {
       partBusy = null;
+    }
+  }
+
+  /** Сохранённое вложение вложенного письма — в Проводнике (п. 44). */
+  async function revealPart(path: string) {
+    try {
+      await api.revealSaved(path);
+    } catch (e) {
+      partNote = { text: errorMessage(e), failed: true };
     }
   }
 
@@ -230,7 +244,10 @@
         <button class="btn small" onclick={() => file && onclearerror?.(file)}>Скрыть</button>
       </div>
     {:else if status?.saved}
-      <div class="action-note" role="status"><span class="note-text">Сохранено: {status.saved}</span></div>
+      {@const saved = status.saved}
+      <div class="action-note" role="status" onmouseenter={() => file && onholdsaved?.(file, true)} onmouseleave={() => file && onholdsaved?.(file, false)} onfocusin={() => file && onholdsaved?.(file, true)} onfocusout={() => file && onholdsaved?.(file, false)}>
+        <span class="note-text">Сохранено: <button class="path-link" onclick={() => file && onreveal?.(file, saved)} title="Показать в папке">{saved}</button></span>
+      </div>
     {/if}
 
     <div class="stage" class:paper={mode === "text" || mode === "pdf" || mode === "message"} class:navs={files.length > 1}>
@@ -294,7 +311,13 @@
               </div>
             {/if}
             {#if partNote}
-              <div class="eml-note caption" class:failed={partNote.failed} role={partNote.failed ? "alert" : "status"}>{partNote.text}</div>
+              <div class="eml-note caption" class:failed={partNote.failed} role={partNote.failed ? "alert" : "status"}>
+                {partNote.text}
+                {#if partNote.path}
+                  {@const saved = partNote.path}
+                  <button class="path-link" onclick={() => void revealPart(saved)} title="Показать в папке">{saved}</button>
+                {/if}
+              </div>
             {/if}
           </header>
           <div class="eml-body">
@@ -592,6 +615,21 @@
   .note-text {
     min-width: 0;
     user-select: text;
+  }
+  /* Путь сохранённого файла — ссылка «Показать в папке» (п. 44). */
+  .path-link {
+    padding: 0;
+    color: inherit;
+    font: inherit;
+    text-decoration: underline;
+    text-decoration-style: dotted;
+    text-underline-offset: 2px;
+    cursor: pointer;
+    text-align: left;
+    overflow-wrap: anywhere;
+  }
+  .path-link:hover {
+    text-decoration-style: solid;
   }
   .spinner {
     flex: none;

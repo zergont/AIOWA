@@ -326,12 +326,66 @@ pub(crate) async fn attachment_save_as(attachment_pk: i64, app: AppHandle, state
     .await
     .map_err(err)?;
     match copied {
-        Ok(p) => Ok(Some(p.display().to_string())),
+        Ok(p) => {
+            remember_saved(&p);
+            Ok(Some(p.display().to_string()))
+        }
         Err(e) => {
             warn!(attachment_pk, error = %e, "не удалось сохранить вложение");
             Err("Не удалось записать файл: проверьте путь и права доступа".into())
         }
     }
+}
+
+// --- «Показать в папке» для сохранённого файла (п. 44 обкатки) --------------------------------
+
+/// Сколько последних путей «Сохранить как…» помнить.
+const SAVED_KEEP: usize = 32;
+
+/// Файлы, которые приложение само сохранило по «Сохранить как…» (путь из ответа диалога): только
+/// их `reveal_saved` показывает в Проводнике, а не любой путь, присланный окном.
+static SAVED: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+/// Запомнить путь, сохранённый «Сохранить как…» (вложение письма или вложение вложенного письма).
+pub(crate) fn remember_saved(path: &Path) {
+    let mut saved = SAVED.lock().unwrap_or_else(|p| p.into_inner());
+    saved.retain(|p| p != path);
+    saved.push(path.to_path_buf());
+    let excess = saved.len().saturating_sub(SAVED_KEEP);
+    saved.drain(..excess);
+}
+
+fn was_saved(path: &Path) -> bool {
+    SAVED.lock().unwrap_or_else(|p| p.into_inner()).iter().any(|p| p == path)
+}
+
+/// Показать в Проводнике файл, только что сохранённый «Сохранить как…»: папка открывается с
+/// выделенным файлом. Файла уже нет — открывается его папка; нет и папки — ошибка.
+#[tauri::command]
+pub(crate) async fn reveal_saved(path: String) -> CmdResult<()> {
+    let target = PathBuf::from(path.trim());
+    if !was_saved(&target) {
+        return Err("Этот файл сохраняла не AIOWA — показать его нельзя".into());
+    }
+    tauri::async_runtime::spawn_blocking(move || reveal_in_explorer(&target)).await.map_err(err)?
+}
+
+fn reveal_in_explorer(target: &Path) -> CmdResult<()> {
+    #[cfg(windows)]
+    if target.is_file() {
+        use std::os::windows::process::CommandExt as _;
+        // `/select,"путь"` Проводник разбирает сам: аргумент уходит как есть, без кавычек вокруг
+        // всего (их ставил бы `arg`); кавычек в пути Windows не допускает.
+        match std::process::Command::new("explorer.exe").raw_arg(format!("/select,\"{}\"", target.display())).spawn() {
+            Ok(_) => return Ok(()),
+            Err(e) => warn!(error = %e, "Проводник не открылся с выделенным файлом, открываю папку"),
+        }
+    }
+    let dir = target.parent().filter(|d| d.is_dir()).ok_or_else(|| "Папки с этим файлом уже нет".to_string())?;
+    open::that_detached(dir).map_err(|e| {
+        warn!(error = %e, "папка сохранённого файла не открылась");
+        "Не удалось открыть папку".to_string()
+    })
 }
 
 /// Открыть ссылку из письма во внешнем приложении. Схема проверяется по разобранному URL
@@ -352,6 +406,19 @@ pub(crate) async fn open_external(url: String) -> CmdResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_recently_saved_paths_can_be_revealed() {
+        let path = |i: usize| PathBuf::from(format!("C:/aiowa-test-saved/{i}.txt"));
+        assert!(!was_saved(&path(0)));
+        for i in 0..SAVED_KEEP + 8 {
+            remember_saved(&path(i));
+        }
+        // Помнятся последние SAVED_KEEP; повторное сохранение того же пути не плодит копий.
+        assert!(!was_saved(&path(7)) && was_saved(&path(8)) && was_saved(&path(SAVED_KEEP + 7)));
+        remember_saved(&path(8));
+        assert_eq!(SAVED.lock().unwrap().iter().filter(|p| **p == path(8)).count(), 1);
+    }
 
     #[test]
     fn unsafe_extensions_are_blocked_case_insensitively() {

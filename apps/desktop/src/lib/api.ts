@@ -1171,6 +1171,8 @@ export const api = {
   attachmentMessagePart: (attachmentPk: number, index: number, save: boolean) => invoke<string | null>("attachment_message_part", { attachmentPk, index, save }),
   /** Скачать при необходимости и показать диалог «Сохранить как»; null — пользователь отменил. */
   attachmentSaveAs: (attachmentPk: number) => invoke<string | null>("attachment_save_as", { attachmentPk }),
+  /** Показать в Проводнике файл, только что сохранённый «Сохранить как…» (п. 44 обкатки): папка с выделенным файлом. */
+  revealSaved: (path: string) => invoke<void>("reveal_saved", { path }),
   /** Скачать при необходимости и вернуть адрес файла в кэше по протоколу aiowa-att для предпросмотра. */
   attachmentPreviewUrl: (attachmentPk: number) => invoke<PreviewDto>("attachment_preview_url", { attachmentPk }),
   /** Открыть ссылку (http, https, mailto) во внешнем приложении. */

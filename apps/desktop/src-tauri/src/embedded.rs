@@ -169,6 +169,7 @@ pub(crate) async fn attachment_message_part(attachment_pk: i64, index: usize, sa
         "Не удалось записать файл: проверьте путь и права доступа".to_string()
     })?;
     if save {
+        crate::ondemand::remember_saved(&target);
         return Ok(Some(target.display().to_string()));
     }
     tauri::async_runtime::spawn_blocking(move || open::that_detached(&target)).await.map_err(err)?.map_err(|e| {

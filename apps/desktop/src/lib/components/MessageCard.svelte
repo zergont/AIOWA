@@ -358,16 +358,34 @@
       if (path != null) {
         markCached(pk);
         setStatus(pk, { saved: path });
-        clearTimeout(savedTimers.get(pk));
-        savedTimers.set(
-          pk,
-          setTimeout(() => setStatus(pk, { saved: null }), 8000),
-        );
+        hideSavedLater(pk);
       }
     } catch (e) {
       setStatus(pk, { error: errorMessage(e) });
     } finally {
       setStatus(pk, { busy: null });
+    }
+  }
+
+  // Строка «Сохранено: путь» (п. 44 обкатки): путь щелчком открывает Проводник с выделенным файлом;
+  // строка уходит через 8 секунд, но не пока указатель над ней или фокус на пути.
+  const SAVED_NOTE_MS = 8000;
+  function hideSavedLater(pk: number) {
+    clearTimeout(savedTimers.get(pk));
+    savedTimers.set(
+      pk,
+      setTimeout(() => setStatus(pk, { saved: null }), SAVED_NOTE_MS),
+    );
+  }
+  function holdSaved(pk: number) {
+    clearTimeout(savedTimers.get(pk));
+    savedTimers.delete(pk);
+  }
+  async function revealSaved(pk: number, path: string) {
+    try {
+      await api.revealSaved(path);
+    } catch (e) {
+      setStatus(pk, { saved: null, error: errorMessage(e) });
     }
   }
 
@@ -807,8 +825,9 @@
             <button class="btn" onclick={() => setStatus(a.attachment_pk, { error: null })} aria-label="Скрыть сообщение об ошибке">Скрыть</button>
           </div>
         {:else if st.saved}
-          <div class="file-msg ok" role="status">
-            <span class="file-msg-text">Сохранено: <span class="path">{st.saved}</span></span>
+          {@const saved = st.saved}
+          <div class="file-msg ok" role="status" onmouseenter={() => holdSaved(a.attachment_pk)} onmouseleave={() => hideSavedLater(a.attachment_pk)} onfocusin={() => holdSaved(a.attachment_pk)} onfocusout={() => hideSavedLater(a.attachment_pk)}>
+            <span class="file-msg-text">Сохранено: <button class="path-link" onclick={() => void revealSaved(a.attachment_pk, saved)} title="Показать в папке">{saved}</button></span>
           </div>
         {/if}
       {/each}
@@ -1365,6 +1384,19 @@
   }
   .file-msg-name {
     color: var(--fg-2);
+  }
+  /* Путь сохранённого файла — ссылка «Показать в папке» (п. 44). */
+  .path-link {
+    padding: 0;
+    color: inherit;
+    font: inherit;
+    text-decoration: underline;
+    text-decoration-style: dotted;
+    text-underline-offset: 2px;
+    cursor: pointer;
+  }
+  .path-link:hover {
+    text-decoration-style: solid;
   }
 
   /* --- тело --- */

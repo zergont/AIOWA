@@ -77,6 +77,29 @@
     }
   }
 
+  // Строка «Сохранено: путь» (п. 44 обкатки): уходит через 8 секунд, но не пока указатель над ней.
+  const SAVED_NOTE_MS = 8000;
+  function hideSavedLater(pk: number) {
+    clearTimeout(savedTimers.get(pk));
+    savedTimers.set(
+      pk,
+      setTimeout(() => setStatus(pk, { saved: null }), SAVED_NOTE_MS),
+    );
+  }
+  function holdSaved(a: Attachment, hold: boolean) {
+    if (hold) {
+      clearTimeout(savedTimers.get(a.attachment_pk));
+      savedTimers.delete(a.attachment_pk);
+    } else hideSavedLater(a.attachment_pk);
+  }
+  async function revealSaved(a: Attachment, path: string) {
+    try {
+      await api.revealSaved(path);
+    } catch (e) {
+      setStatus(a.attachment_pk, { saved: null, error: errorMessage(e) });
+    }
+  }
+
   async function saveFile(a: Attachment) {
     const pk = a.attachment_pk;
     if (status(pk).busy) return;
@@ -85,11 +108,7 @@
       const path = await api.attachmentSaveAs(pk);
       if (path != null) {
         setStatus(pk, { saved: path });
-        clearTimeout(savedTimers.get(pk));
-        savedTimers.set(
-          pk,
-          setTimeout(() => setStatus(pk, { saved: null }), 8000),
-        );
+        hideSavedLater(pk);
       }
     } catch (e) {
       setStatus(pk, { error: errorMessage(e) });
@@ -100,7 +119,7 @@
 </script>
 
 {#if files.length}
-  <AttachmentPreview {files} bind:index onopen={openFile} onsave={saveFile} status={status(files[index]?.attachment_pk ?? -1)} onclearerror={(a) => setStatus(a.attachment_pk, { error: null })} onclose={close} />
+  <AttachmentPreview {files} bind:index onopen={openFile} onsave={saveFile} status={status(files[index]?.attachment_pk ?? -1)} onclearerror={(a) => setStatus(a.attachment_pk, { error: null })} onreveal={(a, path) => void revealSaved(a, path)} onholdsaved={holdSaved} onclose={close} />
 {:else}
   <main class="empty">
     <p class="caption">{loadError ?? "Загружаю вложения…"}</p>
