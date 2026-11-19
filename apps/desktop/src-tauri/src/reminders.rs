@@ -14,7 +14,7 @@
 //!
 //! В журнал попадают только счётчики: ни тем, ни мест.
 
-use crate::notify::NotifyState;
+use crate::notify::{post_toast, NotifyState, ToastOpen};
 use crate::{err, now_ms, CmdResult};
 use aiowa_core::AccountId;
 use aiowa_store::{ReminderMark, ReminderRow, ReminderState, Store};
@@ -26,7 +26,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tauri::{AppHandle, Emitter, Manager, State};
-use tauri_plugin_notification::NotificationExt;
 use tokio::sync::Notify;
 use tracing::{debug, info, warn};
 
@@ -329,12 +328,14 @@ fn show_toast(app: &AppHandle, fresh: &[&ReminderRow], now_ms: i64) {
         return;
     }
     let tz = TimeZone::system();
-    let (title, body) = match fresh {
-        [one] => ("Напоминание".to_string(), toast_body(one, now_ms, &tz)),
-        many => ("Напоминания".to_string(), summary_body(many, &tz)),
+    // Щелчок по тосту одного напоминания открывает событие в календаре; по сводке — только окно
+    // (полоса напоминаний и так показывает их все).
+    let (title, body, open) = match fresh {
+        [one] => ("Напоминание".to_string(), toast_body(one, now_ms, &tz), Some(ToastOpen::Reminder { calendar_pk: one.calendar_pk, start_ms: one.start_at })),
+        many => ("Напоминания".to_string(), summary_body(many, &tz), None),
     };
     debug!(count = fresh.len(), "напоминания: тост");
-    if let Err(e) = app.notification().builder().title(title).body(body).show() {
+    if let Err(e) = post_toast(app, title, body, open) {
         warn!(error = %e, "тост напоминания не показан");
     }
 }

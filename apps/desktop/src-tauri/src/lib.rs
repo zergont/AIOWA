@@ -59,6 +59,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 use tauri::{Emitter, Manager, State};
+use tauri_plugin_notification::NotificationExt;
 use tracing::{error, info, warn};
 
 mod advice;
@@ -737,7 +738,8 @@ pub fn run() {
         }))
         // Окно не уходит со страницы приложения: внешние адреса открываются в браузере.
         .plugin(navigation::guard())
-        // Тосты Windows о новых письмах показывает канал уведомлений из Rust; команд плагина окно не зовёт.
+        // Тосты Windows о новых письмах и напоминаниях показывает Rust; команд плагина окно не зовёт.
+        // Щелчок по тосту ловит обработчик из `setup` (`notify::on_toast_action`).
         .plugin(tauri_plugin_notification::init())
         // Обновление приложения: окно зовёт команды `updates_*` (`updates.rs`), не команды плагина.
         .plugin(tauri_plugin_updater::Builder::new().build())
@@ -793,6 +795,14 @@ pub fn run() {
             move |app| {
                 #[cfg(windows)]
                 disable_browser_accelerator_keys(app.handle());
+                // Щелчок по тосту поднимает окно и открывает письмо или событие. Обработчик — до
+                // первого тоста: тост, показанный без него, о щелчке не сообщит.
+                {
+                    let handle = app.handle().clone();
+                    if let Err(e) = app.notification().on_action(move |p| notify::on_toast_action(&handle, p)) {
+                        warn!(error = %e, "обработчик щелчка по тосту не подключён");
+                    }
+                }
                 if let Some(s) = &services {
                     s.notify.refresh_unread(app.handle());
                     s.reminders.start(app.handle().clone());
@@ -950,6 +960,7 @@ pub fn run() {
             reminders::reminder_snooze,
             notify::notify_status,
             notify::notify_set_toasts,
+            notify::mail_item_pk,
             window_close_guard,
             window_close_confirmed,
             window_chrome::window_snap_layouts,

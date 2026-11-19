@@ -15,11 +15,15 @@
 //! конца); новая почта — тост (не чаще раза в 5 с, при четырёх и более письмах за минуту — одна
 //! сводка) и событие окну `new-mail`; календарь — событие `calendar-changed`.
 //!
+//! Тост несёт, что открыть по щелчку (`ToastOpen` в `extra`): щелчок, пока тост на экране,
+//! поднимает главное окно и отдаёт ему событие `toast-open` (`on_toast_action`). Из Центра
+//! уведомлений Windows щелчок до приложения не доходит: показ без COM-активатора.
+//!
 //! В журнал попадают только виды событий, счётчики и длительности: ни тем, ни адресов.
 
 use crate::ondemand::{describe_transport, timed_out};
 use crate::sync::SyncState;
-use crate::{now_ms, CmdResult};
+use crate::{err, now_ms, AppState, CmdResult};
 use aiowa_core::{AccountId, FolderId, ItemId, Participant};
 use aiowa_store::Store;
 use aiowa_transport::{new_guid, MailTransport, NotificationEvent, NotificationKind, SubscriptionRequest, TransportError};
@@ -29,7 +33,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager, State};
-use tauri_plugin_notification::NotificationExt;
+use tauri_plugin_notification::{ActionPerformed, NotificationExt};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::sync::Notify;
 use tracing::{debug, info, warn};
@@ -59,6 +63,10 @@ const TOAST_BODY_CHARS: usize = 140;
 /// Страховка от неожиданно большого дерева: больше подписок на строки папок не создаём.
 const MAX_FOLDER_SUBSCRIPTIONS: usize = 100;
 const WINDOW_LABEL: &str = "main";
+/// Ключ в `extra` тоста: что открыть по щелчку (`ToastOpen`).
+const TOAST_OPEN_KEY: &str = "aiowa_open";
+/// Событие главному окну после щелчка по тосту.
+const TOAST_OPEN_EVENT: &str = "toast-open";
 const APP_TITLE: &str = "AIOWA";
 /// Сторона значка-наклейки на панели задач (Windows сам уменьшит до размера наложения).
 const BADGE_SIZE: u32 = 32;
@@ -91,6 +99,47 @@ pub struct NewMailDto {
     pub item_id: Option<ItemId>,
     pub item_pk: Option<i64>,
     pub folder_pk: Option<i64>,
+}
+
+/// Что открыть по щелчку на тосте: едет в самом тосте и возвращается окну событием
+/// `toast-open`. Содержимое письма здесь есть, в журнал оно не пишется.
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub(crate) enum ToastOpen {
+    /// Одно письмо: окно открывает его беседу, как по строке «Новое письмо».
+    Mail { mail: NewMailDto },
+    /// Сводка «N новых писем»: окно открывает папку последнего письма (нет её — «Входящие»).
+    Folder { folder_pk: Option<i64> },
+    /// Одно напоминание: окно открывает событие в календаре.
+    Reminder { calendar_pk: i64, start_ms: i64 },
+}
+
+/// Показать тост; `open` — что открыть по щелчку на нём.
+pub(crate) fn post_toast(app: &AppHandle, title: String, body: String, open: Option<ToastOpen>) -> tauri_plugin_notification::Result<()> {
+    let mut toast = app.notification().builder().title(title).body(body);
+    if let Some(open) = open {
+        toast = toast.extra(TOAST_OPEN_KEY, open);
+    }
+    toast.show()
+}
+
+/// Щелчок по тосту, пока он на экране: поднять главное окно и, если тост знает, что открыть,
+/// отдать это окну событием `toast-open`. Кнопок у тостов нет — другие действия не ждём.
+pub(crate) fn on_toast_action(app: &AppHandle, performed: &ActionPerformed) {
+    if performed.action_id() != "tap" {
+        return;
+    }
+    let Some(w) = app.get_webview_window(WINDOW_LABEL) else { return };
+    let _ = w.unminimize();
+    let _ = w.show();
+    let _ = w.set_focus();
+    let open = performed.notification().and_then(|n| n.extra().get(TOAST_OPEN_KEY)).cloned();
+    debug!(kind = open.as_ref().and_then(|o| o.get("kind")).and_then(|k| k.as_str()).unwrap_or("-"), "тост: щелчок");
+    if let Some(open) = open
+        && let Err(e) = app.emit_to(WINDOW_LABEL, TOAST_OPEN_EVENT, open)
+    {
+        warn!(error = %e, "не удалось отправить событие toast-open");
+    }
 }
 
 // --- состояние ------------------------------------------------------------------------------
@@ -494,8 +543,9 @@ struct Dispatcher<'a> {
     targets: HashMap<String, i64>,
     debounce: Debounce,
     toasts: ToastPolicy,
-    /// Текст последнего письма без тоста: показывается, когда политика разрешит одиночный тост.
-    last_mail: Option<ToastText>,
+    /// Текст последнего письма без тоста и само письмо (что открыть по щелчку): показывается,
+    /// когда политика разрешит одиночный тост.
+    last_mail: Option<(ToastText, NewMailDto)>,
 }
 
 /// Ждёт до момента или вечно, если момента нет (ветка `select!`, которой нечего ждать).
@@ -567,7 +617,7 @@ impl<'a> Dispatcher<'a> {
                 }
                 let dto = NewMailDto { from, subject, preview, item_id, item_pk: None, folder_pk };
                 if self.state.toasts_enabled() {
-                    self.last_mail = Some(ToastText::for_mail(dto.from.as_ref(), dto.subject.as_deref(), dto.preview.as_deref()));
+                    self.last_mail = Some((ToastText::for_mail(dto.from.as_ref(), dto.subject.as_deref(), dto.preview.as_deref()), dto.clone()));
                     if let Some(t) = self.toasts.on_mail(now) {
                         self.show_toast(t);
                     }
@@ -627,15 +677,15 @@ impl<'a> Dispatcher<'a> {
         if !self.state.toasts_enabled() {
             return;
         }
-        let text = match toast {
+        let (text, open) = match toast {
             Toast::Single => match &self.last_mail {
-                Some(t) => t.clone(),
+                Some((t, mail)) => (t.clone(), ToastOpen::Mail { mail: mail.clone() }),
                 None => return,
             },
-            Toast::Summary(n) => ToastText { title: APP_TITLE.to_string(), body: summary_text(n) },
+            Toast::Summary(n) => (ToastText { title: APP_TITLE.to_string(), body: summary_text(n) }, ToastOpen::Folder { folder_pk: self.last_mail.as_ref().and_then(|(_, m)| m.folder_pk) }),
         };
         debug!(summary = matches!(toast, Toast::Summary(_)), "канал: тост");
-        if let Err(e) = self.app.notification().builder().title(text.title).body(text.body).show() {
+        if let Err(e) = post_toast(self.app, text.title, text.body, Some(open)) {
             warn!(error = %e, "тост не показан");
         }
     }
@@ -945,6 +995,13 @@ pub fn notify_set_toasts(app: AppHandle, state: State<'_, Arc<NotifyState>>, ena
     state.set_toasts(&app, enabled)
 }
 
+/// Ключ письма из события `new-mail` по его серверному идентификатору; `None` — синхронизация
+/// письмо ещё не дотянула (или оно уже удалено).
+#[tauri::command(async)]
+pub fn mail_item_pk(server_id: String, state: State<'_, AppState>) -> CmdResult<Option<i64>> {
+    Ok(state.store.item_pk_by_server_id(state.account, &server_id).map_err(err)?.and_then(|(pk, deleted)| (!deleted).then_some(pk)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1012,6 +1069,18 @@ mod tests {
         // Лавина утихла: через минуту тишины одиночные тосты возвращаются.
         let quiet = t + BURST_WINDOW * 2 + Duration::from_secs(1);
         assert_eq!(p.on_mail(quiet), Some(Toast::Single));
+    }
+
+    #[test]
+    fn toast_open_payload_matches_window_type() {
+        // Окно разбирает событие `toast-open` по полю `kind` (ToastOpen в api.ts).
+        let mail = NewMailDto { from: None, subject: Some("Тема".into()), preview: None, item_id: None, item_pk: None, folder_pk: Some(4) };
+        let v = serde_json::to_value(ToastOpen::Mail { mail }).unwrap();
+        assert_eq!(v["kind"], "mail");
+        assert_eq!(v["mail"]["subject"], "Тема");
+        assert_eq!(v["mail"]["folder_pk"], 4);
+        assert_eq!(serde_json::to_value(ToastOpen::Folder { folder_pk: None }).unwrap(), serde_json::json!({ "kind": "folder", "folder_pk": null }));
+        assert_eq!(serde_json::to_value(ToastOpen::Reminder { calendar_pk: 7, start_ms: 1_000 }).unwrap(), serde_json::json!({ "kind": "reminder", "calendar_pk": 7, "start_ms": 1_000 }));
     }
 
     #[test]

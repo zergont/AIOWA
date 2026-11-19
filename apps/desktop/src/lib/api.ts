@@ -1335,6 +1335,8 @@ export const api = {
   notifyStatus: () => invoke<NotifyStatus>("notify_status"),
   /** Включить или выключить тосты Windows о новых письмах; новое состояние придёт событием `notify-status`. */
   notifySetToasts: (enabled: boolean) => invoke<void>("notify_set_toasts", { enabled }),
+  /** Ключ письма из события `new-mail` по серверному id; null — синхронизация его ещё не дотянула. */
+  mailItemPk: (serverId: string) => invoke<number | null>("mail_item_pk", { serverId }),
 
   // --- режим, мастер первого запуска (работают в обоих режимах) ----------------------------
   /** Старый бэкенд без этой команды — считать режимом "mail". */
@@ -1610,6 +1612,16 @@ export function onNotifyStatus(cb: (status: NotifyStatus) => void): Promise<Unli
 /** Подписка на новые письма по уведомлению сервера. Возвращает функцию отписки. */
 export function onNewMail(cb: (mail: NewMail) => void): Promise<UnlistenFn> {
   return listen<NewMail>("new-mail", (e) => cb(e.payload));
+}
+
+/** Событие `toast-open`: по тосту щёлкнули, окно бэкенд уже поднял; что открыть. */
+export type ToastOpen =
+  | { kind: "mail"; mail: NewMail }
+  | { kind: "folder"; folder_pk: number | null }
+  | { kind: "reminder"; calendar_pk: number; start_ms: number };
+
+export function onToastOpen(cb: (t: ToastOpen) => void): Promise<UnlistenFn> {
+  return listen<ToastOpen>("toast-open", (e) => cb(e.payload));
 }
 
 /** Подписка на изменения в календаре на сервере (без подробностей: окно перечитывает текущий период). */

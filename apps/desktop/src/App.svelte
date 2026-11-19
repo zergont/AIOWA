@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount, tick, untrack } from "svelte";
-  import { api, contextFromLocal, conversationKeyOf, conversationsText, errorMessage, itemKindOf, messageNeedsFetch, messagesKey, newMailSender, onCalendarChanged, onCloseRequested, onComposeFinished, onFoldersChanged, onItemsChanged, onLocalDraftsChanged, onNewMail, onNotifyStatus, onReminder, onSyncProgress, onWriteFailed, type AccountInfo, type ComposeContext, type ComposeKind, type ComposeRecipient, type ContactForm, type Conversation, type Folder, type ItemsChanged, type Message, type NewMail, type NotifyStatus, type ReminderDto, type SearchAiStatus, type SearchHit, type SearchInfo, type SearchRefineState, type SearchResult, type StageAction, type StagedDto, type SyncStatus, type WriteReport } from "./lib/api";
+  import { api, contextFromLocal, conversationKeyOf, conversationsText, errorMessage, itemKindOf, messageNeedsFetch, messagesKey, newMailSender, onCalendarChanged, onCloseRequested, onComposeFinished, onFoldersChanged, onItemsChanged, onLocalDraftsChanged, onNewMail, onNotifyStatus, onReminder, onSyncProgress, onToastOpen, onWriteFailed, type AccountInfo, type ComposeContext, type ComposeKind, type ComposeRecipient, type ContactForm, type Conversation, type Folder, type ItemsChanged, type Message, type NewMail, type NotifyStatus, type ReminderDto, type SearchAiStatus, type SearchHit, type SearchInfo, type SearchRefineState, type SearchResult, type StageAction, type StagedDto, type SyncStatus, type ToastOpen, type WriteReport } from "./lib/api";
   import { onSyncLive, type SyncLive } from "./lib/api";
   import { ICON, failureText, findArchiveFolder, type DragPayload, type ItemAction } from "./lib/actions";
   import { focusBack, type Anchor } from "./lib/popover";
@@ -1589,7 +1589,8 @@
 
   // --- канал уведомлений: новое письмо, тосты ---------------------------------------------
   // Бэкенд по событиям сервера сам синхронизирует затронутые папки; окно показывает строку
-  // «Новое письмо: <отправитель>» на 5 с и по клику ведёт к письму во «Входящих».
+  // «Новое письмо: <отправитель>» на 5 с и по клику ведёт к письму во «Входящих». Так же ведёт
+  // щелчок по тосту Windows (событие `toast-open`, окно бэкенд уже поднял).
 
   /** Последнее уведомление о новом письме, пока строка на экране. */
   let newMail = $state<NewMail | null>(null);
@@ -1642,8 +1643,39 @@
     if (!m) return;
     clearTimeout(newMailTimer);
     newMail = null;
+    await openMail(m);
+  }
+
+  /** Почтовая папка из события, а если её нет среди папок — «Входящие». */
+  function mailFolderOr(folderPk: number | null): Folder | null {
+    return folders.find((f) => f.folder_pk === folderPk && f.is_mail) ?? folders.find((f) => f.distinguished === "inbox") ?? null;
+  }
+
+  /** Щелчок по тосту: письмо — к его беседе, сводка «N новых писем» — в папку, напоминание — к событию в календаре. */
+  function openFromToast(t: ToastOpen) {
+    if (t.kind === "mail") {
+      clearTimeout(newMailTimer);
+      newMail = null;
+      void openMail(t.mail);
+    } else if (t.kind === "folder") {
+      section = "mail";
+      const target = mailFolderOr(t.folder_pk);
+      if (!target) return;
+      pendingNewMail = null;
+      clearSearch();
+      openFolder(target).catch((e) => (error = errorMessage(e)));
+    } else if (t.kind === "reminder") {
+      calendarAnchor = startOfDay(new Date(t.start_ms));
+      calendarKind = "day";
+      calendarSelectedPk = t.calendar_pk;
+      section = "calendar";
+    }
+  }
+
+  /** Перейти к новому письму: в его папку (или «Входящие») и, когда письмо в базе, к его беседе. */
+  async function openMail(m: NewMail) {
     section = "mail";
-    const target = folders.find((f) => f.folder_pk === m.folder_pk && f.is_mail) ?? folders.find((f) => f.distinguished === "inbox") ?? null;
+    const target = mailFolderOr(m.folder_pk);
     if (!target) return;
     try {
       clearSearch();
@@ -1655,9 +1687,25 @@
     }
   }
 
+  /**
+   * Ключ письма по серверному id, если событие его не принесло, а синхронизация письмо уже дотянула:
+   * тогда беседа находится по самому письму, а не по теме.
+   */
+  async function withItemPk(m: NewMail): Promise<NewMail> {
+    if (m.item_pk != null) return m;
+    const id = typeof m.item_id === "string" ? m.item_id : (m.item_id?.id ?? null);
+    if (!id) return m;
+    try {
+      const pk = await api.mailItemPk(id);
+      return pk != null ? { ...m, item_pk: pk } : m;
+    } catch {
+      return m; // в старом бэкенде команды нет — ищем по теме
+    }
+  }
+
   /** Найти беседу нового письма в показанном списке и открыть её; false — письма в списке ещё нет. */
   async function locateNewMail(m: NewMail, folderPk: number): Promise<boolean> {
-    const c = await findNewMailConversation(m, conversations.slice(0, 20), folderPk);
+    const c = await findNewMailConversation(await withItemPk(m), conversations.slice(0, 20), folderPk);
     if (!c) return false;
     // Пока искали, пользователь мог уйти в другую папку или открыть беседу сам: тогда не вмешиваемся.
     if (selectedFolder?.folder_pk === folderPk && selected === null) await openConversation(c);
@@ -2011,6 +2059,7 @@
     let unlistenClose: (() => void) | undefined;
     let unlistenNotify: (() => void) | undefined;
     let unlistenNewMail: (() => void) | undefined;
+    let unlistenToast: (() => void) | undefined;
     let unlistenReminder: (() => void) | undefined;
     let unlistenCalendar: (() => void) | undefined;
     let unlistenFolders: (() => void) | undefined;
@@ -2031,6 +2080,7 @@
       try {
         unlistenNotify = await onNotifyStatus((s) => (notify = s));
         unlistenNewMail = await onNewMail(showNewMail);
+        unlistenToast = await onToastOpen(openFromToast);
         unlistenReminder = await onReminder((ev) => setReminders(ev.items));
         unlistenCalendar = await onCalendarChanged(() => void refreshNearWindow());
         // Напоминания, которые пора показать, пока окна не было; команды может не быть в старом бэкенде.
@@ -2103,6 +2153,7 @@
       unlistenLocalDrafts?.();
       unlistenNotify?.();
       unlistenNewMail?.();
+      unlistenToast?.();
       unlistenReminder?.();
       unlistenCalendar?.();
     };
