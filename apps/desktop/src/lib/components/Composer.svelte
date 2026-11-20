@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onDestroy, onMount, tick, untrack } from "svelte";
-  import { api, errorMessage, failNetwork, failOriginalGone, failRetryable, formatSize, fullDate, isInlinePicture, messageNeedsFetch, onSyncProgress, personLabel, type ComposeContext, type ComposeRecipient, type ComposeRequest, type DraftAttachment, type DraftRef, type Importance, type LocalDraft, type Message, type PickedFile, type SignatureDto, type UploadProgress } from "../api";
+  import { api, draftAgent, errorMessage, failNetwork, failOriginalGone, failRetryable, formatSize, fullDate, isInlinePicture, messageNeedsFetch, onSyncProgress, personLabel, type ComposeContext, type ComposeRecipient, type ComposeRequest, type DraftAttachment, type DraftRef, type Importance, type LocalDraft, type Message, type PickedFile, type SignatureDto, type UploadProgress } from "../api";
   import { COMPOSE_TITLE, ICON } from "../actions";
   import { isValidEmail, mergeRecipients } from "../addresses";
   import { cleanDraftHtml, dropInlineImage, htmlToText, inlineImageHtml, restoreDraftHtml, showInlineImages } from "../html";
@@ -245,6 +245,8 @@
   }
   onMount(() => void showRestoredInline());
   let signature = $state<SignatureDto>(untrack(() => ctx.signature));
+  /** Письмо подготовил агент через MCP-сервер: его имя — в полосе над полями, пока письмо открыто. */
+  const agent = untrack(() => draftAgent(ctx.restore));
   let original = $state<Message | null>(untrack(() => ctx.original));
   /**
    * Вид письма и исходное письмо для запросов. После «Развернуть» (expandQuote) письмо — черновик на
@@ -728,6 +730,7 @@
       removed_attachment_ids: $state.snapshot(removedServerIds),
       removed_original: $state.snapshot(removedOriginal),
       importance,
+      origin: ctx.restore?.origin ?? "",
       updated_ms: Date.now(),
     };
     try {
@@ -1389,6 +1392,10 @@
     </div>
   {/if}
 
+  {#if agent}
+    <div class="agent-note" role="note">Письмо подготовил агент «{agent}». Проверь адресатов, текст и вложения: отправишь его ты, от своего имени.</div>
+  {/if}
+
   <div class="fields">
     <div class="row">
       <label class="lbl" for="{uid}-to">Кому</label>
@@ -1709,6 +1716,14 @@
   .error-text {
     flex: 1;
     min-width: 0;
+    user-select: text;
+  }
+
+  .agent-note {
+    padding: var(--space-2) var(--space-3);
+    color: var(--fg-2);
+    background: var(--bg-layer-alt);
+    border-bottom: 1px solid var(--stroke-1);
     user-select: text;
   }
 

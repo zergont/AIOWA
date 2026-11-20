@@ -10,7 +10,7 @@ use rusqlite::types::ValueRef;
 use rusqlite::Connection;
 use tracing::info;
 
-pub const CURRENT_VERSION: i64 = 17;
+pub const CURRENT_VERSION: i64 = 18;
 
 /// Состояния текста вложения (`attachments.text_state`).
 pub const TEXT_PENDING: i64 = 0;
@@ -682,6 +682,13 @@ pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
         conn.execute_batch(V17_TABLES)?;
         conn.pragma_update(None, "user_version", 17)?;
         info!("схема базы обновлена до версии 17: журнал обращений агентов через MCP-сервер");
+    }
+    if version < 18 {
+        // Кто подготовил локальный черновик: пусто — сам автор в окне, `mcp-new:<клиент>` — агент
+        // через MCP-сервер (ещё не открывался в окне), `mcp:<клиент>` — он же после открытия.
+        add_column_if_missing(conn, "local_drafts", "origin", "TEXT NOT NULL DEFAULT ''")?;
+        conn.pragma_update(None, "user_version", 18)?;
+        info!("схема базы обновлена до версии 18: черновики, подготовленные агентом через MCP-сервер");
     }
     Ok(())
 }

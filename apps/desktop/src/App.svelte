@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount, tick, untrack } from "svelte";
-  import { api, contextFromLocal, conversationKeyOf, conversationsText, errorMessage, itemKindOf, messageNeedsFetch, messagesKey, newMailSender, onCalendarChanged, onCloseRequested, onComposeFinished, onFoldersChanged, onItemsChanged, onLocalDraftsChanged, onNewMail, onNotifyStatus, onReminder, onSyncProgress, onToastOpen, onWriteFailed, type AccountInfo, type ComposeContext, type ComposeKind, type ComposeRecipient, type ContactForm, type Conversation, type Folder, type ItemsChanged, type Message, type NewMail, type NotifyStatus, type ReminderDto, type SearchAiStatus, type SearchHit, type SearchInfo, type SearchRefineState, type SearchResult, type StageAction, type StagedDto, type SyncStatus, type ToastOpen, type WriteReport } from "./lib/api";
+  import { api, contextFromLocal, conversationKeyOf, conversationsText, draftAgent, errorMessage, itemKindOf, messageNeedsFetch, messagesKey, newMailSender, onCalendarChanged, onCloseRequested, onComposeFinished, onFoldersChanged, onItemsChanged, onLocalDraftsChanged, onNewMail, onNotifyStatus, onReminder, onSyncProgress, onToastOpen, onWriteFailed, type AccountInfo, type ComposeContext, type ComposeKind, type ComposeRecipient, type ContactForm, type Conversation, type Folder, type ItemsChanged, type Message, type NewMail, type NotifyStatus, type ReminderDto, type SearchAiStatus, type SearchHit, type SearchInfo, type SearchRefineState, type SearchResult, type StageAction, type StagedDto, type SyncStatus, type ToastOpen, type WriteReport } from "./lib/api";
   import { onSyncLive, type SyncLive } from "./lib/api";
   import { ICON, failureText, findArchiveFolder, type DragPayload, type ItemAction } from "./lib/actions";
   import { focusBack, type Anchor } from "./lib/popover";
@@ -2298,7 +2298,7 @@
 
   {#if unsavedDrafts.length && !compose}
     <div class="restore-bar" role="status">
-      <span class="restore-text">Несохранённое письмо{unsavedDrafts.length > 1 ? ` (${unsavedDrafts.length})` : ""}: «{unsavedDrafts[0].subject || "без темы"}»</span>
+      <span class="restore-text">{draftAgent(unsavedDrafts[0]) ? "Черновик от агента" : "Несохранённое письмо"}{unsavedDrafts.length > 1 ? ` (${unsavedDrafts.length})` : ""}: «{unsavedDrafts[0].subject || "без темы"}»</span>
       <button class="restore-btn" onclick={() => void restoreDraft(unsavedDrafts[0])}>Открыть</button>
       <button class="restore-btn" onclick={() => void dropLocalDraft(unsavedDrafts[0])}>Удалить</button>
     </div>

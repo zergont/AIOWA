@@ -816,6 +816,8 @@ pub fn run() {
                     s.reminders.start(app.handle().clone());
                     // Фоновая проверка обновлений: через минуту и раз в сутки, если не выключена.
                     updates::start(app.handle().clone());
+                    // Письмо, подготовленное агентом через MCP-сервер, появляется в окне само.
+                    mcp::watch_agent_drafts(app.handle().clone());
                 }
                 Ok(())
             }

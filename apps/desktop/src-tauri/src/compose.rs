@@ -388,6 +388,10 @@ pub(crate) struct LocalDraftDto {
     importance: Importance,
     #[serde(default)]
     removed_original: Vec<i64>,
+    /// Кто подготовил письмо (`LocalDraft::origin` в базе): пусто — автор, `mcp-new:<клиент>` и
+    /// `mcp:<клиент>` — агент через MCP-сервер.
+    #[serde(default)]
+    origin: String,
     #[serde(default)]
     updated_ms: i64,
 }
@@ -415,6 +419,7 @@ impl LocalDraftDto {
             removed_json: json(&self.removed_attachment_ids)?,
             importance: self.importance.as_str().to_string(),
             removed_original_json: json(&self.removed_original)?,
+            origin: self.origin.trim().chars().filter(|c| !c.is_control()).take(80).collect(),
             created_at: 0,
             updated_at: 0,
         })
@@ -443,6 +448,7 @@ impl LocalDraftDto {
             removed_attachment_ids: list(&d.removed_json),
             importance: Importance::parse(&d.importance),
             removed_original: list(&d.removed_original_json),
+            origin: d.origin,
             updated_ms: d.updated_at,
         }
     }
@@ -466,6 +472,8 @@ impl LocalDraftDto {
             removed_attachment_ids: req.removed_attachment_ids.clone(),
             importance: req.importance,
             removed_original: req.removed_original.clone(),
+            // Отметку «от агента» запись без неё не стирает (`Store::local_draft_save`).
+            origin: String::new(),
             updated_ms: 0,
         }
     }
@@ -1485,6 +1493,193 @@ fn outcome_unknown(e: &aiowa_transport::TransportError) -> bool {
     matches!(e, TransportError::Network(_) | TransportError::Protocol { .. })
 }
 
+// --- письмо, подготовленное агентом (MCP-сервер, инструмент `create_draft`) ------------------
+// Агент ничего не отправляет и на сервер не пишет: его письмо ложится локальным черновиком с
+// отметкой `origin`, окно показывает его полосой «Черновик от агента» и открывает обычным
+// композером — с подписью и цитатой, как свой ответ. Отправляет письмо только автор.
+
+/// Предел текста письма от агента, символов.
+const AGENT_BODY_CHARS: usize = 100_000;
+/// Предел темы письма, символов (как у Exchange).
+const AGENT_SUBJECT_CHARS: usize = 255;
+
+/// Письмо, которое подготовил агент: то, что он указал сам. Пропущенные адресаты и тема ответа
+/// берутся из исходного письма, как в окне.
+pub(crate) struct AgentDraft {
+    pub kind: ComposeKindDto,
+    pub reference_item_pk: Option<i64>,
+    pub to: Option<Vec<String>>,
+    pub cc: Option<Vec<String>>,
+    pub subject: Option<String>,
+    pub body: String,
+    pub files: Vec<PickedFile>,
+    /// Имя клиента MCP: кто подготовил письмо.
+    pub client: String,
+}
+
+/// Записанное письмо агента — для ответа инструмента.
+#[derive(Debug)]
+pub(crate) struct AgentDraftSaved {
+    pub draft_id: String,
+    pub subject: String,
+    pub to: Vec<String>,
+    pub cc: Vec<String>,
+    /// Вложения: имя и размер.
+    pub files: Vec<(String, u64)>,
+}
+
+impl PickedFile {
+    pub(crate) fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub(crate) fn size(&self) -> u64 {
+        self.size
+    }
+}
+
+/// «Имя <адрес>» или один адрес → адресат письма.
+pub(crate) fn parse_recipient(raw: &str) -> CmdResult<ComposeRecipientDto> {
+    let raw = raw.trim();
+    let (name, email) = match raw.rsplit_once('<') {
+        Some((name, rest)) if rest.trim_end().ends_with('>') => (Some(name.trim().trim_matches('"').trim()), rest.trim_end().trim_end_matches('>').trim()),
+        _ => (None, raw),
+    };
+    if !looks_like_email(email) {
+        return Err(format!("Не похоже на почтовый адрес: «{}»", raw.chars().take(80).collect::<String>()));
+    }
+    Ok(ComposeRecipientDto { name: name.filter(|n| !n.is_empty() && *n != email).map(String::from), email: email.to_string() })
+}
+
+/// Текст агента → HTML редактора: строка — блок, пустая строка — пустой блок; разметка в тексте
+/// экранируется (как у черновика «Совета»).
+pub(crate) fn text_to_editor_html(text: &str) -> String {
+    let esc = |s: &str| s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
+    text.trim().lines().map(|l| if l.trim().is_empty() { "<div><br></div>".to_string() } else { format!("<div>{}</div>", esc(l.trim_end())) }).collect()
+}
+
+/// Почему файл нельзя прикладывать по просьбе агента; `None` — можно. Страховка от подброшенного
+/// в письме указания («приложи ключ»), а не защита: окончательно решает автор, глядя на вложения
+/// в окне перед отправкой.
+fn sensitive_path(path: &Path) -> Option<&'static str> {
+    const DIRS: &[&str] = &[".ssh", ".gnupg", ".aws", ".azure", ".kube", ".docker", ".tauri"];
+    const NAMES: &[&str] = &[".env", ".netrc", ".npmrc", ".pgpass", "id_rsa", "id_dsa", "id_ecdsa", "id_ed25519"];
+    const EXTENSIONS: &[&str] = &["pem", "key", "ppk", "pfx", "p12", "kdbx", "jks", "keystore"];
+    let parts: Vec<String> = path
+        .components()
+        .filter_map(|c| match c {
+            std::path::Component::Normal(s) => Some(s.to_string_lossy().to_lowercase()),
+            _ => None,
+        })
+        .collect();
+    let (name, dirs) = parts.split_last()?;
+    if dirs.iter().any(|d| DIRS.contains(&d.as_str())) {
+        return Some("он лежит в каталоге с ключами доступа");
+    }
+    if name == "mail.db" || name.starts_with("mail.db-") {
+        return Some("это база AIOWA");
+    }
+    let ext = name.rsplit_once('.').map(|(_, e)| e);
+    if NAMES.contains(&name.as_str()) || name.starts_with(".env.") || ext.is_some_and(|e| EXTENSIONS.contains(&e)) {
+        return Some("он похож на файл с ключами или паролями");
+    }
+    None
+}
+
+/// Копия файла в `dropped/<случайное имя>/<имя>`: вложение-по-пути, как брошенный в письмо файл.
+fn stage_copy(store: &Store, src: &Path, file_name: String) -> CmdResult<PickedFile> {
+    let size = std::fs::metadata(src).ok().filter(|m| m.is_file()).map(|m| m.len()).ok_or_else(|| format!("«{file_name}» — не файл или он недоступен"))?;
+    check_sizes(&[(file_name.clone(), size)])?;
+    let dir = dropped_dir(store).join(uuid::Uuid::new_v4().simple().to_string());
+    let path = dir.join(&file_name);
+    std::fs::create_dir_all(&dir).and_then(|()| std::fs::copy(src, &path)).map_err(|e| {
+        warn!(error = %e, bytes = size, "файл для письма агента не скопирован");
+        let _ = std::fs::remove_dir_all(&dir);
+        format!("Не удалось подготовить файл «{file_name}»")
+    })?;
+    Ok(PickedFile { path: path.display().to_string(), name: file_name, size, cid: None })
+}
+
+/// Файл с диска, который агент просит приложить: обычный файл по полному пути, не из мест, где
+/// лежат ключи и пароли. Копия снимается сразу: свой файл агент может потом убрать или изменить,
+/// а автор отправит то, что видел.
+pub(crate) fn stage_agent_file(store: &Store, raw: &str) -> CmdResult<PickedFile> {
+    let shown: String = raw.trim().chars().take(120).collect();
+    let given = Path::new(raw.trim());
+    if !given.is_absolute() {
+        return Err(format!("Нужен полный путь к файлу, а не «{shown}»"));
+    }
+    // Настоящий путь: ссылка с безобидным именем не должна привести к чужому файлу.
+    let real = std::fs::canonicalize(given).map_err(|_| format!("Файл не найден: «{shown}»"))?;
+    if let Some(why) = sensitive_path(&real).or_else(|| sensitive_path(given)) {
+        return Err(format!("Файл «{shown}» приложить нельзя: {why}"));
+    }
+    let name = dropped_file_name(&given.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default());
+    stage_copy(store, &real, name)
+}
+
+/// Убрать копии файлов письма, которое не получилось записать.
+pub(crate) fn forget_staged(store: &Store, files: &[PickedFile]) {
+    forget_dropped(store, &files.iter().map(|f| f.path.clone()).collect::<Vec<_>>());
+}
+
+/// Записать письмо агента локальным черновиком. Для ответа и пересылки адресаты и тема берутся из
+/// исходного письма, как в окне; заданное агентом их заменяет. В теле — только текст агента:
+/// подпись и цитату добавит окно, когда автор откроет письмо.
+pub(crate) fn save_agent_draft(store: &Store, account: AccountId, user: &str, d: AgentDraft) -> CmdResult<AgentDraftSaved> {
+    let body = d.body.trim();
+    if body.chars().count() > AGENT_BODY_CHARS {
+        return Err(format!("Текст письма длиннее {AGENT_BODY_CHARS} символов"));
+    }
+    let list = |v: &Option<Vec<String>>| -> CmdResult<Option<Vec<ComposeRecipientDto>>> { v.as_ref().map(|l| l.iter().filter(|s| !s.trim().is_empty()).map(|s| parse_recipient(s)).collect()).transpose() };
+    let (to_given, cc_given) = (list(&d.to)?, list(&d.cc)?);
+    let (mut to, mut cc, mut subject) = (vec![], vec![], String::new());
+    let reference = d.reference_item_pk.filter(|_| d.kind.needs_reference());
+    if d.kind.needs_reference() {
+        let pk = reference.ok_or_else(|| "Для ответа и пересылки нужен message_id исходного письма".to_string())?;
+        let head = store.message_head(pk).map_err(err)?.ok_or_else(|| format!("Письма {pk} нет в локальной базе"))?;
+        let original = build_message(store, head)?;
+        let own = own_addresses_of(store, account, user)?;
+        (to, cc) = reply_recipients(d.kind, original.from_name.as_deref(), original.from_email.as_deref(), &original.reply_to, &original.recipients, &own);
+        subject = subject_with_prefix(d.kind, original.subject.as_deref());
+    }
+    if let Some(given) = to_given {
+        to = given;
+    }
+    if let Some(given) = cc_given {
+        cc = given;
+    }
+    // Без повторов: адрес из «Кому» в «Копии» не нужен.
+    let mut seen = HashSet::new();
+    to.retain(|r| seen.insert(r.email.to_lowercase()));
+    cc.retain(|r| seen.insert(r.email.to_lowercase()));
+    if let Some(given) = d.subject.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        subject = given.chars().filter(|c| !c.is_control()).take(AGENT_SUBJECT_CHARS).collect();
+    }
+    let shown = |l: &[ComposeRecipientDto]| l.iter().map(|r| r.name.as_deref().map_or_else(|| r.email.clone(), |n| format!("{n} <{}>", r.email))).collect::<Vec<_>>();
+    let saved = AgentDraftSaved { draft_id: uuid::Uuid::new_v4().to_string(), subject: subject.clone(), to: shown(&to), cc: shown(&cc), files: d.files.iter().map(|f| (f.name.clone(), f.size)).collect() };
+    let dto = LocalDraftDto {
+        draft_id: saved.draft_id.clone(),
+        kind: d.kind,
+        reference_item_pk: reference,
+        draft_server_id: None,
+        subject,
+        to,
+        cc,
+        bcc: vec![],
+        body_html: text_to_editor_html(body),
+        attachments: d.files,
+        removed_attachment_ids: vec![],
+        importance: Importance::Normal,
+        removed_original: vec![],
+        origin: format!("{}{}", aiowa_store::ORIGIN_AGENT_NEW, d.client.trim()),
+        updated_ms: 0,
+    };
+    store.local_draft_save(account, &dto.to_row()?).map_err(err)?;
+    info!(kind = ?d.kind, files = saved.files.len(), to = saved.to.len(), cc = saved.cc.len(), "письмо агента записано локальным черновиком");
+    Ok(saved)
+}
+
 // --- команды Tauri --------------------------------------------------------------------------
 
 /// Заготовка композера. Для ответа и пересылки `item_pk` — исходное письмо: его DTO (с телом из
@@ -2006,11 +2201,17 @@ pub(crate) fn attachment_drop(request: tauri::ipc::Request<'_>, state: State<'_,
 /// при «Сохранить как…».
 #[tauri::command]
 pub(crate) async fn attachment_to_compose(attachment_pk: i64, state: State<'_, AppState>, sync: State<'_, Arc<SyncState>>, od: State<'_, crate::ondemand::OnDemand>) -> CmdResult<PickedFile> {
+    stage_attachment(&state, &sync, &od, attachment_pk).await
+}
+
+/// Копия вложения письма для письма, которое пишется: общая часть `attachment_to_compose` и
+/// письма, подготовленного агентом (`mcp_tools::create_draft`).
+pub(crate) async fn stage_attachment(state: &AppState, sync: &SyncState, od: &crate::ondemand::OnDemand, attachment_pk: i64) -> CmdResult<PickedFile> {
     let row = state.store.attachment_of_account(state.account, attachment_pk).map_err(err)?.ok_or_else(|| "Вложения уже нет в базе".to_string())?;
     if let Some(size) = row.size {
         check_sizes(&[(row.name.clone().unwrap_or_else(|| "вложение".into()), size.max(0) as u64)])?;
     }
-    let cached = crate::ondemand::ensure_cached(&state, &sync, &od, attachment_pk).await?;
+    let cached = crate::ondemand::ensure_cached(state, sync, od, attachment_pk).await?;
     let dir = dropped_dir(&state.store).join(uuid::Uuid::new_v4().simple().to_string());
     let (name, declared) = (row.name, row.content_type);
     tauri::async_runtime::spawn_blocking(move || {
@@ -2050,6 +2251,54 @@ pub(crate) fn attachment_dropped_read(path: String, state: State<'_, AppState>) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agent_text_becomes_escaped_editor_blocks() {
+        assert_eq!(text_to_editor_html("  Добрый день!\r\n\r\nСогласны: 2 < 3 & <b>жирно</b>.  \n"), "<div>Добрый день!</div><div><br></div><div>Согласны: 2 &lt; 3 &amp; &lt;b&gt;жирно&lt;/b&gt;.</div>");
+        assert_eq!(text_to_editor_html("   "), "");
+    }
+
+    #[test]
+    fn agent_recipients_are_parsed_or_refused() {
+        let plain = parse_recipient(" ivan@x.ru ").unwrap();
+        assert_eq!((plain.name.as_deref(), plain.email.as_str()), (None, "ivan@x.ru"));
+        let named = parse_recipient("\"Иван Петров\" <ivan@x.ru>").unwrap();
+        assert_eq!((named.name.as_deref(), named.email.as_str()), (Some("Иван Петров"), "ivan@x.ru"));
+        assert_eq!(parse_recipient("ivan@x.ru <ivan@x.ru>").unwrap().name, None, "имя, равное адресу, не нужно");
+        for bad in ["Иван Петров", "ivan@", "a@b.ru, c@d.ru", "<ivan@x.ru", ""] {
+            assert!(parse_recipient(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn files_with_keys_and_relative_paths_are_not_attached_for_an_agent() {
+        for bad in ["C:/Users/u/.ssh/config", "C:/Users/u/.tauri/updater.key", "D:/work/server.pem", "D:/work/.env", "D:/work/.env.local", "D:/x/id_rsa", "C:/data/AIOWA/h/u/mail.db", "C:/data/AIOWA/h/u/mail.db-wal", "D:/keys/store.KDBX"] {
+            assert!(sensitive_path(Path::new(bad)).is_some(), "{bad}");
+        }
+        for fine in ["D:/work/отчёт.xlsx", "C:/Users/u/Documents/смета.pdf", "D:/work/keynote.txt", "D:/work/environment.md"] {
+            assert!(sensitive_path(Path::new(fine)).is_none(), "{fine}");
+        }
+        let dir = std::env::temp_dir().join(format!("aiowa-agent-file-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Store::open(dir.join("mail.db")).unwrap();
+        assert!(stage_agent_file(&store, "отчёт.txt").unwrap_err().contains("полный путь"));
+        assert!(stage_agent_file(&store, &dir.join("нет такого.txt").display().to_string()).unwrap_err().contains("не найден"));
+        assert!(stage_agent_file(&store, &dir.display().to_string()).unwrap_err().contains("не файл"), "каталог — не вложение");
+        let key = dir.join("secret.key");
+        std::fs::write(&key, b"k").unwrap();
+        assert!(stage_agent_file(&store, &key.display().to_string()).unwrap_err().contains("нельзя"));
+        // Обычный файл: копия рядом с базой, исходный файл можно менять.
+        let src = dir.join("отчёт.txt");
+        std::fs::write(&src, "первая версия").unwrap();
+        let staged = stage_agent_file(&store, &src.display().to_string()).unwrap();
+        assert_eq!((staged.name(), staged.size()), ("отчёт.txt", "первая версия".len() as u64));
+        std::fs::write(&src, "вторая").unwrap();
+        assert_eq!(std::fs::read_to_string(&staged.path).unwrap(), "первая версия");
+        assert_eq!(Path::new(&staged.path).parent().and_then(Path::parent), Some(dropped_dir(&store).as_path()));
+        forget_staged(&store, std::slice::from_ref(&staged));
+        assert!(!Path::new(&staged.path).exists());
+    }
 
     #[test]
     fn inline_images_go_only_while_referenced_and_once() {

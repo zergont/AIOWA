@@ -31,11 +31,18 @@ pub struct LocalDraft {
     pub importance: String,
     /// Вложения исходного письма, убранные из пересылки (номера вложений в базе), как JSON.
     pub removed_original_json: String,
+    /// Кто подготовил письмо: пусто — автор в окне; `mcp-new:<клиент>` — агент через MCP-сервер,
+    /// в окне письмо ещё не открывали (тело — один текст агента, без подписи); `mcp:<клиент>` —
+    /// оно же после открытия в окне. Пустое значение при обновлении прежнюю отметку не стирает.
+    pub origin: String,
     pub created_at: i64,
     pub updated_at: i64,
 }
 
-const COLUMNS: &str = "draft_id, kind, reference_item_pk, draft_server_id, subject, to_json, cc_json, bcc_json, body_html, attachments_json, removed_json, created_at, updated_at, importance, removed_original_json";
+/// Начало отметки `origin` у черновика агента, который в окне ещё не открывали.
+pub const ORIGIN_AGENT_NEW: &str = "mcp-new:";
+
+const COLUMNS: &str = "draft_id, kind, reference_item_pk, draft_server_id, subject, to_json, cc_json, bcc_json, body_html, attachments_json, removed_json, created_at, updated_at, importance, removed_original_json, origin";
 
 fn row(r: &rusqlite::Row<'_>) -> rusqlite::Result<LocalDraft> {
     Ok(LocalDraft {
@@ -54,6 +61,7 @@ fn row(r: &rusqlite::Row<'_>) -> rusqlite::Result<LocalDraft> {
         updated_at: r.get(12)?,
         importance: r.get(13)?,
         removed_original_json: r.get(14)?,
+        origin: r.get(15)?,
     })
 }
 
@@ -65,12 +73,13 @@ impl Store {
         let now = now_ms();
         self.with_conn(|c| {
             c.execute(
-                "INSERT INTO local_drafts(account_id, draft_id, kind, reference_item_pk, draft_server_id, subject, to_json, cc_json, bcc_json, body_html, attachments_json, removed_json, created_at, updated_at, importance, removed_original_json)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?13, ?14, ?15)
+                "INSERT INTO local_drafts(account_id, draft_id, kind, reference_item_pk, draft_server_id, subject, to_json, cc_json, bcc_json, body_html, attachments_json, removed_json, created_at, updated_at, importance, removed_original_json, origin)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?13, ?14, ?15, ?16)
                  ON CONFLICT(draft_id) DO UPDATE SET kind = excluded.kind, reference_item_pk = excluded.reference_item_pk, draft_server_id = COALESCE(excluded.draft_server_id, local_drafts.draft_server_id),
                    subject = excluded.subject, to_json = excluded.to_json, cc_json = excluded.cc_json, bcc_json = excluded.bcc_json, body_html = excluded.body_html,
-                   attachments_json = excluded.attachments_json, removed_json = excluded.removed_json, updated_at = excluded.updated_at, importance = excluded.importance, removed_original_json = excluded.removed_original_json",
-                params![account.0, d.draft_id, d.kind, d.reference_item_pk, d.draft_server_id, d.subject, d.to_json, d.cc_json, d.bcc_json, d.body_html, d.attachments_json, d.removed_json, now, d.importance, d.removed_original_json],
+                   attachments_json = excluded.attachments_json, removed_json = excluded.removed_json, updated_at = excluded.updated_at, importance = excluded.importance, removed_original_json = excluded.removed_original_json,
+                   origin = CASE WHEN excluded.origin = '' THEN local_drafts.origin ELSE excluded.origin END",
+                params![account.0, d.draft_id, d.kind, d.reference_item_pk, d.draft_server_id, d.subject, d.to_json, d.cc_json, d.bcc_json, d.body_html, d.attachments_json, d.removed_json, now, d.importance, d.removed_original_json, d.origin],
             )?;
             Ok(())
         })
@@ -92,6 +101,13 @@ impl Store {
             let rows = st.query_map(params![account.0], row)?;
             rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
         })
+    }
+
+    /// Сколько у учётной записи черновиков агента, ещё не открытых в окне, и когда записан
+    /// последний: окно по этой паре замечает письмо, которое другой процесс (MCP-сервер) положил
+    /// в базу, пока оно работает.
+    pub fn agent_drafts_stamp(&self, account: AccountId) -> Result<(i64, i64)> {
+        self.with_conn(|c| Ok(c.query_row("SELECT count(*), COALESCE(max(created_at), 0) FROM local_drafts WHERE account_id = ?1 AND substr(origin, 1, 8) = ?2", params![account.0, ORIGIN_AGENT_NEW], |r| Ok((r.get(0)?, r.get(1)?)))?))
     }
 
     /// Черновики на сервере, на которые ссылаются локальные черновики учётной записи, кроме
@@ -131,9 +147,32 @@ mod tests {
             removed_json: "[]".into(),
             importance: "Normal".into(),
             removed_original_json: "[]".into(),
+            origin: String::new(),
             created_at: 0,
             updated_at: 0,
         }
+    }
+
+    #[test]
+    fn agent_origin_survives_saves_without_it_and_is_counted() {
+        let s = store("origin");
+        let acc = s.account("h", "u").unwrap();
+        assert_eq!(s.agent_drafts_stamp(acc).unwrap(), (0, 0));
+        s.local_draft_save(acc, &draft("own", "своё")).unwrap();
+        let agent = LocalDraft { origin: format!("{ORIGIN_AGENT_NEW}Claude Code"), ..draft("a1", "от агента") };
+        s.local_draft_save(acc, &agent).unwrap();
+        let saved = s.local_draft("a1").unwrap().unwrap();
+        assert_eq!(saved.origin, "mcp-new:Claude Code");
+        assert_eq!(s.agent_drafts_stamp(acc).unwrap(), (1, saved.created_at));
+        assert_eq!(s.local_draft("own").unwrap().unwrap().origin, "");
+
+        // Запись без отметки (отправка, перенос в окно) её не стирает.
+        s.local_draft_save(acc, &draft("a1", "от агента, правка")).unwrap();
+        assert_eq!(s.local_draft("a1").unwrap().unwrap().origin, "mcp-new:Claude Code");
+        // Окно открыло письмо: отметка меняется, в счёт новых оно больше не идёт.
+        s.local_draft_save(acc, &LocalDraft { origin: "mcp:Claude Code".into(), ..draft("a1", "от агента, правка") }).unwrap();
+        assert_eq!(s.local_draft("a1").unwrap().unwrap().origin, "mcp:Claude Code");
+        assert_eq!(s.agent_drafts_stamp(acc).unwrap().0, 0);
     }
 
     #[test]

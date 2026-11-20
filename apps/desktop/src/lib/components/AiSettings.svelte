@@ -6,8 +6,9 @@
    * обращений без содержимого. Ключ уходит в бэкенд только при сохранении; обратно окно получает
    * лишь «ключ задан».
    *
-   * Раздел «Доступ для агентов (MCP)» (§ 11): выключатель, виды данных, строки подключения для
-   * Claude Code и Claude Desktop и журнал обращений агентов — что и сколько отдано.
+   * Раздел «Доступ для агентов (MCP)» (§ 11): выключатель, виды данных, отдельное разрешение
+   * готовить письма, строки подключения для Claude Code и Claude Desktop и журнал обращений
+   * агентов — что и сколько отдано.
    */
   import { onMount } from "svelte";
   import { api, errorMessage, type AiJournal, type AiMode, type AiPlace, type AiProfile, type AiProviderKind, type AiSettings, type AiSettingsPatch, type AiTest, type McpGroup, type McpSettings } from "../api";
@@ -237,11 +238,12 @@
     calendar_events: "календарь",
     get_event: "событие",
     find_contacts: "люди",
+    create_draft: "письмо от агента",
   };
   const MCP_OUTCOME: Record<string, string> = {
     ok: "готово",
     disabled: "доступ выключен",
-    denied: "вид данных закрыт",
+    denied: "не разрешено",
     invalid: "неверный запрос",
     not_found: "не найдено",
     error: "ошибка",
@@ -281,7 +283,9 @@
 
   function toggleMcpGroup(id: McpGroup, on: boolean) {
     if (!mcp) return;
-    void setMcp({ groups: MCP_GROUPS.map((g) => g.id).filter((g) => (g === id ? on : mcp!.groups.includes(g))) });
+    // «drafts» — не вид данных, а разрешение готовить письма: в списке видов его нет, флажок свой.
+    const all: McpGroup[] = [...MCP_GROUPS.map((g) => g.id), "drafts"];
+    void setMcp({ groups: all.filter((g) => (g === id ? on : mcp!.groups.includes(g))) });
   }
 
   async function copyMcp(text: string) {
@@ -478,7 +482,7 @@
         <h4 class="label" id="{uid}-mcp">Доступ для агентов (MCP)</h4>
         <button class="btn small" onclick={() => void loadMcp()}>Обновить</button>
       </div>
-      <p class="hint">ИИ-агент на этом компьютере — Claude Desktop, Claude Code — сможет сам искать и читать почту через AIOWA: письма, вложения, календарь, контакты. Только чтение: отправить, удалить или изменить агент ничего не может. Сеть AIOWA для этого не открывает — агент сам запускает её с ключом <span class="mono">--mcp</span>.</p>
+      <p class="hint">ИИ-агент на этом компьютере — Claude Desktop, Claude Code — сможет сам искать и читать почту через AIOWA: письма, вложения, календарь, контакты. Почту агент только читает: отправить, удалить или изменить письмо он не может. По отдельному разрешению он готовит письма — отправляешь их ты. Сеть AIOWA для этого не открывает — агент сам запускает её с ключом <span class="mono">--mcp</span>.</p>
       {#if mcpError}
         <p class="err">{mcpError}</p>
       {:else if mcp}
@@ -504,6 +508,11 @@
               {/each}
             </div>
           </fieldset>
+          <label class="check">
+            <input type="checkbox" checked={m.groups.includes("drafts")} onchange={(e) => toggleMcpGroup("drafts", e.currentTarget.checked)} aria-describedby="{uid}-mcp-drafts" />
+            Разрешить агентам готовить письма
+          </label>
+          <p class="hint" id="{uid}-mcp-drafts">Агент сможет подготовить письмо — новое, ответ или пересылку, с файлами с этого компьютера и вложениями из других писем. Оно появится в AIOWA полосой «Черновик от агента»; отправить его можешь только ты. На сервер агент ничего не пишет.</p>
           <div class="field">
             <span class="label sub">Как подключить</span>
             <p class="hint">Claude Code — выполнить в терминале один раз:</p>

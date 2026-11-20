@@ -40,7 +40,7 @@ use tracing::{debug, info, warn};
 pub use calendar::{reminder_state_key, CachedTimeZone, CalendarRow, ReminderMark, ReminderRow, ReminderState, OWA_TIME_ZONE_KEY, OWA_TIME_ZONE_TTL_MS};
 pub use contacts::{ContactApplyStats, ContactFolderInfo, ContactRecipient, ContactRow, SKYPE_CONTACTS_FOLDER};
 pub use directory::ContactLocalStats;
-pub use drafts::LocalDraft;
+pub use drafts::{LocalDraft, ORIGIN_AGENT_NEW};
 pub use identity::{login_key, read_summary, DbAccount, DbSummary, MailboxIdentity};
 pub use mcp_log::{McpCall, McpUsage};
 pub use schema::{FETCH_FAILED, TEXT_FAILED, TEXT_OK, TEXT_PENDING, TEXT_UNSUPPORTED};
@@ -498,7 +498,8 @@ impl Store {
     }
 
     /// Открывает существующую базу, не создавая её и не трогая схему: для второго процесса рядом с
-    /// окном (MCP-сервер). Миграции делает только окно; база другой версии — `SchemaMismatch`.
+    /// окном (MCP-сервер). Миграции делает только окно; база старее этой сборки — `SchemaMismatch`.
+    /// База новее открывается, как её открывает и окно прежней версии: миграции только добавляют.
     pub fn open_existing(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
         let attachments_dir = identity::attachments_dir_for(&path);
@@ -511,8 +512,11 @@ impl Store {
              PRAGMA cache_size = -65536;",
         )?;
         let found: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        if found != schema::CURRENT_VERSION {
+        if found < schema::CURRENT_VERSION {
             return Err(StoreError::SchemaMismatch { found, expected: schema::CURRENT_VERSION });
+        }
+        if found > schema::CURRENT_VERSION {
+            warn!(found, expected = schema::CURRENT_VERSION, "база новее этой сборки: открыта без миграций как есть");
         }
         conn.set_prepared_statement_cache_capacity(128);
         schema::register_functions(&conn)?;
@@ -2770,6 +2774,11 @@ mod tests {
         let c = Connection::open(&path).unwrap();
         let v: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
         assert_eq!(v, schema::CURRENT_VERSION - 1);
+        // База новее сборки (её обновило окно следующей версии) открывается как есть.
+        c.pragma_update(None, "user_version", schema::CURRENT_VERSION + 1).unwrap();
+        drop(c);
+        let newer = Store::open_existing(&path).unwrap();
+        assert_eq!(newer.get_state(acc, "k2").unwrap().as_deref(), Some("w"));
     }
 
     fn folder(name: &str, dist: Option<&str>) -> Folder {

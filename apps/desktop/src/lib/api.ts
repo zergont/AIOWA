@@ -539,7 +539,20 @@ export interface LocalDraft {
   importance?: Importance;
   /** Вложения исходного письма, убранные из пересылки (п. 42); у старых записей поля нет. */
   removed_original?: number[];
+  /**
+   * Кто подготовил письмо: нет или пусто — автор; `mcp-new:<клиент>` — агент через MCP-сервер,
+   * в окне письмо ещё не открывали (в теле один его текст); `mcp:<клиент>` — оно же после открытия.
+   */
+  origin?: string;
   updated_ms: number;
+}
+
+const AGENT_NEW = "mcp-new:";
+
+/** Имя агента, подготовившего письмо через MCP-сервер; null — письмо своё. */
+export function draftAgent(d: { origin?: string | null } | null | undefined): string | null {
+  const m = /^mcp(?:-new)?:(.*)$/.exec(d?.origin ?? "");
+  return m ? m[1].trim() || "без имени" : null;
 }
 
 /** Отказ команд композера (compose_send, compose_save_draft, compose_autosave): текст и подсказки окну. */
@@ -1528,8 +1541,8 @@ export interface AiJournal {
   month: AiUsage[];
 }
 
-/** Вид данных, который можно открыть агентам. */
-export type McpGroup = "mail" | "attachments" | "calendar" | "contacts";
+/** Вид данных, который можно открыть агентам; `drafts` — не чтение, а разрешение готовить письма. */
+export type McpGroup = "mail" | "attachments" | "calendar" | "contacts" | "drafts";
 
 /** Обращение агента: инструмент, клиент и сколько отдано — без запроса и без текста писем. */
 export interface McpCall {
@@ -1602,6 +1615,15 @@ export async function contextFromLocal(d: LocalDraft): Promise<ComposeContext> {
     // Ответ или пересылка уже на сервере: вид и оригинал остаются, чтобы сохранение не заменило
     // тело с цитатой одним новым текстом, а сказало, что цитату не собрать.
     if (d.draft_server_id && d.kind !== "new") ctx = { ...ctx, kind: d.kind, reference_item_pk: d.reference_item_pk };
+  }
+  // Письмо агента открывается впервые: в базе один его текст. Подпись добавляется здесь, как у
+  // своего письма, а отметка меняется: следующее сохранение запишет тело уже целиком.
+  if (d.origin?.startsWith(AGENT_NEW)) {
+    const s = ctx.signature.auto_add ? ctx.signature.html.trim() : "";
+    const text = d.body_html.trim() || "<div><br></div>";
+    const body = s ? `${text}<div><br></div><div><br></div>${s}` : text;
+    const opened: LocalDraft = { ...d, origin: `mcp:${d.origin.slice(AGENT_NEW.length)}`, body_html: body, to: d.to.length ? d.to : ctx.to, cc: d.cc.length ? d.cc : ctx.cc, subject: d.subject || ctx.subject };
+    return { ...ctx, to: opened.to, cc: opened.cc, bcc: opened.bcc, subject: opened.subject, body_html: body, importance: opened.importance ?? "Normal", restore: opened };
   }
   return { ...ctx, to: d.to, cc: d.cc, bcc: d.bcc, subject: d.subject, body_html: d.body_html, importance: d.importance ?? "Normal", restore: d };
 }
