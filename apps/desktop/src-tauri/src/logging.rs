@@ -14,6 +14,7 @@ use std::path::PathBuf;
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
+use tracing_subscriber::fmt::writer::BoxMakeWriter;
 use tracing_subscriber::{fmt, EnvFilter};
 
 /// Сколько дневных файлов журнала хранить.
@@ -29,14 +30,28 @@ fn file_appender(dir: &std::path::Path) -> Option<RollingFileAppender> {
     RollingFileAppender::builder().rotation(Rotation::DAILY).filename_prefix("aiowa").filename_suffix("log").max_log_files(KEEP_FILES).build(dir).ok()
 }
 
+/// Куда пишет консольная часть журнала.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Console {
+    /// Обычный запуск: stdout (виден в `tauri dev`).
+    Stdout,
+    /// Режим MCP-сервера: stdout занят протоколом, журнал — в stderr.
+    Stderr,
+}
+
 /// Поднять журнал. Возвращает каталог файлов, если файловый журнал открылся (иначе — только
 /// консоль: приложение без журнала на диске всё равно работает).
-pub(crate) fn init() -> Option<PathBuf> {
+pub(crate) fn init(console: Console) -> Option<PathBuf> {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     let dir = log_dir();
     let file = dir.as_deref().and_then(file_appender);
     let opened = file.is_some();
     let file_layer = file.map(|w| fmt::layer().with_writer(w).with_ansi(false));
-    let _ = tracing_subscriber::registry().with(filter).with(fmt::layer()).with(file_layer).try_init();
+    let console_writer = match console {
+        Console::Stdout => BoxMakeWriter::new(std::io::stdout),
+        Console::Stderr => BoxMakeWriter::new(std::io::stderr),
+    };
+    let console_layer = fmt::layer().with_writer(console_writer).with_ansi(console == Console::Stdout);
+    let _ = tracing_subscriber::registry().with(filter).with(console_layer).with(file_layer).try_init();
     dir.filter(|_| opened)
 }

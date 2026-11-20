@@ -10,7 +10,7 @@ use rusqlite::types::ValueRef;
 use rusqlite::Connection;
 use tracing::info;
 
-pub const CURRENT_VERSION: i64 = 16;
+pub const CURRENT_VERSION: i64 = 17;
 
 /// Состояния текста вложения (`attachments.text_state`).
 pub const TEXT_PENDING: i64 = 0;
@@ -678,8 +678,30 @@ pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
         conn.pragma_update(None, "user_version", 16)?;
         info!("схема базы обновлена до версии 16: убранные вложения пересылки в локальном черновике");
     }
+    if version < 17 {
+        conn.execute_batch(V17_TABLES)?;
+        conn.pragma_update(None, "user_version", 17)?;
+        info!("схема базы обновлена до версии 17: журнал обращений агентов через MCP-сервер");
+    }
     Ok(())
 }
+
+/// Версия 17: журнал обращений внешних агентов через MCP-сервер (`mcp_log.rs`) — что и сколько
+/// отдано, без запросов агента и без содержимого писем.
+const V17_TABLES: &str = r#"
+CREATE TABLE IF NOT EXISTS mcp_calls (
+  call_pk     INTEGER PRIMARY KEY,
+  account_id  INTEGER NOT NULL REFERENCES accounts(account_id),
+  at          INTEGER NOT NULL,
+  tool        TEXT NOT NULL,
+  client      TEXT NOT NULL,
+  items       INTEGER NOT NULL DEFAULT 0,
+  chars       INTEGER NOT NULL DEFAULT 0,
+  duration_ms INTEGER NOT NULL,
+  outcome     TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS mcp_calls_at ON mcp_calls(account_id, at);
+"#;
 
 /// Письма окна, у которых последнее действие ещё не запрашивалось у сервера (`Store::items_to_check_verbs`).
 /// Условие повторяет частичный индекс `items_verb_unchecked` слово в слово — иначе планировщик его не возьмёт.

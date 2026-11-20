@@ -80,6 +80,8 @@ mod logging;
 mod mailbox;
 mod mail_dark;
 mod navigation;
+mod mcp;
+mod mcp_tools;
 mod notify;
 mod ondemand;
 mod people;
@@ -701,7 +703,13 @@ fn disable_browser_accelerator_keys(app: &tauri::AppHandle) {
 }
 
 pub fn run() {
-    let log_dir = logging::init();
+    // Режим MCP-сервера для внешних агентов (`mcp.rs`): без окна и без Tauri, до журнала в stdout
+    // и до замка единственного экземпляра — окно AIOWA может быть открыто одновременно.
+    if std::env::args().skip(1).any(|a| a == mcp::FLAG) {
+        mcp::run_stdio();
+        return;
+    }
+    let log_dir = logging::init(logging::Console::Stdout);
     info!(version = env!("CARGO_PKG_VERSION"), logs = ?log_dir, "AIOWA запущен");
     let config_dir = config::config_dir();
     let env = config::EnvAccount::from_env();
@@ -960,6 +968,8 @@ pub fn run() {
             reminders::reminder_snooze,
             notify::notify_status,
             notify::notify_set_toasts,
+            mcp::mcp_settings,
+            mcp::mcp_settings_set,
             notify::mail_item_pk,
             window_close_guard,
             window_close_confirmed,

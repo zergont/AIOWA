@@ -327,7 +327,7 @@ fn visible_text(store: &Store, h: &MessageHead) -> CmdResult<String> {
 }
 
 /// Без лишних пустых строк и пробелов по краям строк.
-fn tidy(s: &str) -> String {
+pub(crate) fn tidy(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut blank = 0;
     for line in s.lines() {

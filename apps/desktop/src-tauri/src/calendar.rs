@@ -14,7 +14,7 @@
 use crate::ondemand::{describe_transport, timed_out, KeyedLocks};
 use crate::sync::SyncState;
 use crate::{err, now_ms, sanitize_html, AppState, CmdResult, InlineMap};
-use aiowa_core::{AccountId, Attendee, CalendarEvent, CalendarEventDetails, CalendarItemType, FreeBusy, ItemId, Participant, ResponseType};
+use aiowa_core::{Attendee, CalendarEvent, CalendarEventDetails, CalendarItemType, FreeBusy, ItemId, Participant, ResponseType};
 use aiowa_store::{CalendarRow, Store};
 use aiowa_transport::{MailTransport, TransportError};
 use jiff::Timestamp;
@@ -175,14 +175,6 @@ fn window_bounds(start_ms: i64, end_ms: i64) -> CmdResult<(Timestamp, Timestamp)
     Ok((Timestamp::from_millisecond(start_ms).map_err(bad)?, Timestamp::from_millisecond(end_ms).map_err(bad)?))
 }
 
-/// Кэш окна в DTO. `age_ms` — возраст покрытия (`None` — не покрыто), `error` — почему сервер
-/// в этот раз не спрошен или не ответил.
-fn cached_range(store: &Store, account: AccountId, start_ms: i64, end_ms: i64, age_ms: Option<i64>, error: Option<String>) -> CmdResult<CalendarRangeDto> {
-    let rows = store.calendar_events(account, start_ms, end_ms).map_err(err)?;
-    let fetched_ms = age_ms.map(|a| now_ms() - a);
-    Ok(CalendarRangeDto { events: rows.into_iter().map(CalendarEventDto::from).collect(), from_cache: true, fetched_ms, error })
-}
-
 /// Подробности события из кэша в DTO: тело чистится как у писем, но без подстановки `cid:`
 /// (вложения событий не кэшируются, карта пустая — такие картинки теряют `src`).
 fn details_dto(store: &Store, row: CalendarRow, from_cache: bool, error: Option<String>) -> CmdResult<CalendarEventDetailsDto> {
@@ -243,6 +235,23 @@ async fn fetch_details(sync: &SyncState, id: &ItemId) -> CmdResult<CalendarEvent
 /// (что есть) плюс `error`; ошибка локальной базы — `Err`.
 #[tauri::command]
 pub(crate) async fn calendar_events(start_ms: i64, end_ms: i64, refresh: bool, state: State<'_, AppState>, sync: State<'_, Arc<SyncState>>, cal: State<'_, CalendarState>) -> CmdResult<CalendarRangeDto> {
+    let w = load_window(&state, sync.inner(), &cal, start_ms, end_ms, refresh).await?;
+    Ok(CalendarRangeDto { events: w.rows.into_iter().map(CalendarEventDto::from).collect(), from_cache: w.from_cache, fetched_ms: w.fetched_ms, error: w.error })
+}
+
+/// Итог загрузки окна календаря (`load_window`).
+pub(crate) struct WindowLoad {
+    pub rows: Vec<CalendarRow>,
+    pub from_cache: bool,
+    /// Когда окно забирали с сервера; `None` — кэш окно не покрывает.
+    pub fetched_ms: Option<i64>,
+    /// Почему сервер в этот раз не ответил (строки тогда — из кэша).
+    pub error: Option<String>,
+}
+
+/// Окно `[start_ms, end_ms)`: без `refresh` — кэш как есть, с `refresh` — с сервера в кэш. Общая
+/// часть команды окна и MCP-сервера.
+pub(crate) async fn load_window(state: &AppState, sync: &Arc<SyncState>, cal: &CalendarState, start_ms: i64, end_ms: i64, refresh: bool) -> CmdResult<WindowLoad> {
     check_window(start_ms, end_ms)?;
     let lock = cal.windows.get((start_ms, end_ms));
     let _busy = lock.lock().await;
@@ -250,21 +259,25 @@ pub(crate) async fn calendar_events(start_ms: i64, end_ms: i64, refresh: bool, s
     let account = state.account;
     // Пока ждали замок, окно мог забрать первый вызывающий: кэш в ответе — уже после него.
     let age = store.calendar_range_age(account, start_ms, end_ms).map_err(err)?;
+    let cached = |error: Option<String>| -> CmdResult<WindowLoad> {
+        let rows = store.calendar_events(account, start_ms, end_ms).map_err(err)?;
+        Ok(WindowLoad { rows, from_cache: true, fetched_ms: age.map(|a| now_ms() - a), error })
+    };
     if !refresh {
-        return cached_range(&store, account, start_ms, end_ms, age, None);
+        return cached(None);
     }
-    let events = match fetch_window(&sync, start_ms, end_ms).await {
+    let events = match fetch_window(sync, start_ms, end_ms).await {
         Ok(events) => events,
-        Err(e) => return cached_range(&store, account, start_ms, end_ms, age, Some(e)),
+        Err(e) => return cached(Some(e)),
     };
     let fetched = events.len();
     let st = store.clone();
     tauri::async_runtime::spawn_blocking(move || st.replace_calendar_range(account, start_ms, end_ms, &events)).await.map_err(err)?.map_err(|e| format!("Ошибка локальной базы: {e}"))?;
     info!(start_ms, end_ms, events = fetched, refresh, "окно календаря загружено с сервера");
     // Пояс пользователя в кэш (или обновить устаревший), чтобы запись его не ждала.
-    crate::calendar_write::prefetch_time_zone(sync.inner().clone(), store.clone(), account);
+    crate::calendar_write::prefetch_time_zone(sync.clone(), store.clone(), account);
     let rows = store.calendar_events(account, start_ms, end_ms).map_err(err)?;
-    Ok(CalendarRangeDto { events: rows.into_iter().map(CalendarEventDto::from).collect(), from_cache: false, fetched_ms: Some(now_ms()), error: None })
+    Ok(WindowLoad { rows, from_cache: false, fetched_ms: Some(now_ms()), error: None })
 }
 
 /// Подробности события: из кэша, если они уже загружены и обновление не запрошено; иначе
@@ -272,27 +285,33 @@ pub(crate) async fn calendar_events(start_ms: i64, end_ms: i64, refresh: bool, s
 /// есть — они и `error`; если нет — `Err` с тем же текстом.
 #[tauri::command]
 pub(crate) async fn calendar_event_details(calendar_pk: i64, refresh: bool, state: State<'_, AppState>, sync: State<'_, Arc<SyncState>>, cal: State<'_, CalendarState>) -> CmdResult<CalendarEventDetailsDto> {
+    let (row, from_cache, error) = load_details(&state, &sync, &cal, calendar_pk, refresh).await?;
+    let store = state.store.clone();
+    // Чтение и очистка тела — в блокирующем потоке, как у писем.
+    tauri::async_runtime::spawn_blocking(move || details_dto(&store, row, from_cache, error)).await.map_err(err)?
+}
+
+/// Событие с подробностями в кэше: (строка, из кэша ли, почему сервер не ответил). Общая часть
+/// команды окна и MCP-сервера; сами подробности читает `Store::calendar_details`.
+pub(crate) async fn load_details(state: &AppState, sync: &SyncState, cal: &CalendarState, calendar_pk: i64, refresh: bool) -> CmdResult<(CalendarRow, bool, Option<String>)> {
     let lock = cal.items.get(calendar_pk);
     let _busy = lock.lock().await;
     let store = state.store.clone();
     let row = store.calendar_event(calendar_pk).map_err(err)?.ok_or_else(|| "Событие не найдено в кэше календаря".to_string())?;
-    let (row, from_cache, error) = if !refresh && row.has_details {
-        (row, true, None)
-    } else {
-        match fetch_details(&sync, &row.id).await {
-            Ok(details) => {
-                let st = store.clone();
-                tauri::async_runtime::spawn_blocking(move || st.store_calendar_details(calendar_pk, &details)).await.map_err(err)?.map_err(|e| format!("Ошибка локальной базы: {e}"))?;
-                info!(calendar_pk, refresh, "подробности события загружены с сервера");
-                let fresh = store.calendar_event(calendar_pk).map_err(err)?.ok_or_else(|| "Событие исчезло из кэша календаря".to_string())?;
-                (fresh, false, None)
-            }
-            Err(e) if row.has_details => (row, true, Some(e)),
-            Err(e) => return Err(e),
+    if !refresh && row.has_details {
+        return Ok((row, true, None));
+    }
+    match fetch_details(sync, &row.id).await {
+        Ok(details) => {
+            let st = store.clone();
+            tauri::async_runtime::spawn_blocking(move || st.store_calendar_details(calendar_pk, &details)).await.map_err(err)?.map_err(|e| format!("Ошибка локальной базы: {e}"))?;
+            info!(calendar_pk, refresh, "подробности события загружены с сервера");
+            let fresh = store.calendar_event(calendar_pk).map_err(err)?.ok_or_else(|| "Событие исчезло из кэша календаря".to_string())?;
+            Ok((fresh, false, None))
         }
-    };
-    // Чтение и очистка тела — в блокирующем потоке, как у писем.
-    tauri::async_runtime::spawn_blocking(move || details_dto(&store, row, from_cache, error)).await.map_err(err)?
+        Err(e) if row.has_details => Ok((row, true, Some(e))),
+        Err(e) => Err(e),
+    }
 }
 
 #[cfg(test)]

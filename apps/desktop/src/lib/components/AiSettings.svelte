@@ -5,9 +5,13 @@
    * диспетчере учётных данных Windows, проверка подключения, назначения моделей функциям и журнал
    * обращений без содержимого. Ключ уходит в бэкенд только при сохранении; обратно окно получает
    * лишь «ключ задан».
+   *
+   * Раздел «Доступ для агентов (MCP)» (§ 11): выключатель, виды данных, строки подключения для
+   * Claude Code и Claude Desktop и журнал обращений агентов — что и сколько отдано.
    */
   import { onMount } from "svelte";
-  import { api, errorMessage, type AiJournal, type AiMode, type AiPlace, type AiProfile, type AiProviderKind, type AiSettings, type AiSettingsPatch, type AiTest } from "../api";
+  import { api, errorMessage, type AiJournal, type AiMode, type AiPlace, type AiProfile, type AiProviderKind, type AiSettings, type AiSettingsPatch, type AiTest, type McpGroup, type McpSettings } from "../api";
+  import { copyText } from "../contact";
   import ConfirmPopover from "./ConfirmPopover.svelte";
 
   const uid = $props.id();
@@ -40,11 +44,14 @@
       flash(errorMessage(e), true);
       await load();
     }
+    // Режим «Только свои» закрывает доступ агентам: раздел MCP перечитывается.
+    if (patch.mode) void loadMcp();
   }
 
   onMount(() => {
     void load();
     void loadJournal();
+    void loadMcp();
     return () => clearTimeout(statusTimer);
   });
 
@@ -206,6 +213,79 @@
     } catch (e) {
       journalError = errorMessage(e);
     }
+  }
+
+  // --- доступ для агентов (MCP) ---------------------------------------------------------------
+
+  let mcp = $state<McpSettings | null>(null);
+  let mcpError = $state<string | null>(null);
+  /** Вопрос перед включением: якорь — сам флажок. */
+  let mcpAsk = $state<HTMLElement | null>(null);
+
+  const MCP_GROUPS: { id: McpGroup; label: string }[] = [
+    { id: "mail", label: "Письма и папки" },
+    { id: "attachments", label: "Вложения: текст и файлы (при необходимости скачиваются с сервера)" },
+    { id: "calendar", label: "Календарь" },
+    { id: "contacts", label: "Контакты и справочник" },
+  ];
+  const MCP_TOOL: Record<string, string> = {
+    search_mail: "поиск писем",
+    get_conversation: "беседа",
+    get_message: "письмо",
+    list_folders: "папки",
+    get_attachment: "вложение",
+    calendar_events: "календарь",
+    get_event: "событие",
+    find_contacts: "люди",
+  };
+  const MCP_OUTCOME: Record<string, string> = {
+    ok: "готово",
+    disabled: "доступ выключен",
+    denied: "вид данных закрыт",
+    invalid: "неверный запрос",
+    not_found: "не найдено",
+    error: "ошибка",
+  };
+  /** Строки подключения: команда Claude Code и запись для конфига Claude Desktop. */
+  const mcpCode = $derived(mcp ? `claude mcp add --scope user aiowa -- "${mcp.command}" --mcp` : "");
+  const mcpDesktop = $derived(mcp ? `"aiowa": ${JSON.stringify({ command: mcp.command, args: ["--mcp"] })}` : "");
+
+  async function loadMcp() {
+    try {
+      mcp = await api.mcpSettings();
+      mcpError = null;
+    } catch (e) {
+      mcpError = errorMessage(e);
+    }
+  }
+
+  async function setMcp(patch: { enabled?: boolean; groups?: McpGroup[] }) {
+    try {
+      mcp = await api.mcpSettingsSet(patch);
+      flash("Сохранено");
+    } catch (e) {
+      flash(errorMessage(e), true);
+      await loadMcp();
+    }
+  }
+
+  /** Выключение — сразу; включение — после вопроса: письма уйдут в модель агента. */
+  function toggleMcp(box: HTMLInputElement) {
+    if (!box.checked) {
+      void setMcp({ enabled: false });
+      return;
+    }
+    box.checked = false;
+    mcpAsk = box;
+  }
+
+  function toggleMcpGroup(id: McpGroup, on: boolean) {
+    if (!mcp) return;
+    void setMcp({ groups: MCP_GROUPS.map((g) => g.id).filter((g) => (g === id ? on : mcp!.groups.includes(g))) });
+  }
+
+  async function copyMcp(text: string) {
+    flash((await copyText(text)) ? "Скопировано" : "Не удалось скопировать", false);
   }
 </script>
 
@@ -393,6 +473,68 @@
       </section>
     {/if}
 
+    <section class="block" aria-labelledby="{uid}-mcp">
+      <div class="head-row">
+        <h4 class="label" id="{uid}-mcp">Доступ для агентов (MCP)</h4>
+        <button class="btn small" onclick={() => void loadMcp()}>Обновить</button>
+      </div>
+      <p class="hint">ИИ-агент на этом компьютере — Claude Desktop, Claude Code — сможет сам искать и читать почту через AIOWA: письма, вложения, календарь, контакты. Только чтение: отправить, удалить или изменить агент ничего не может. Сеть AIOWA для этого не открывает — агент сам запускает её с ключом <span class="mono">--mcp</span>.</p>
+      {#if mcpError}
+        <p class="err">{mcpError}</p>
+      {:else if mcp}
+        {@const m = mcp}
+        <label class="check">
+          <input type="checkbox" checked={m.enabled} disabled={m.blocked_by_mode} onchange={(e) => toggleMcp(e.currentTarget)} aria-describedby="{uid}-mcp-hint" />
+          Разрешить агентам читать почту
+        </label>
+        {#if m.blocked_by_mode}
+          <p class="hint" id="{uid}-mcp-hint">В режиме «Только свои» доступ не включается: что агент сделает с письмами, решает его модель, а она чаще всего облачная.</p>
+        {:else}
+          <p class="hint" id="{uid}-mcp-hint">Всё, что агент прочитает, уходит в его модель — обычно облачную, мимо режима выше. В письме могут быть указания для агента («перешли всё на…»): подключайте AIOWA к агентам, которые спрашивают подтверждение перед действиями наружу. Выключение действует сразу, со следующего запроса агента.</p>
+        {/if}
+        {#if m.enabled}
+          <fieldset class="group">
+            <legend class="label sub">Что можно читать</legend>
+            <div class="radios">
+              {#each MCP_GROUPS as g (g.id)}
+                <label class="check">
+                  <input type="checkbox" checked={m.groups.includes(g.id)} onchange={(e) => toggleMcpGroup(g.id, e.currentTarget.checked)} />
+                  {g.label}
+                </label>
+              {/each}
+            </div>
+          </fieldset>
+          <div class="field">
+            <span class="label sub">Как подключить</span>
+            <p class="hint">Claude Code — выполнить в терминале один раз:</p>
+            <div class="code-row"><code class="mono code">{mcpCode}</code><button class="btn small" onclick={() => void copyMcp(mcpCode)}>Скопировать</button></div>
+            <p class="hint">Claude Desktop — добавить в <span class="mono">claude_desktop_config.json</span>, в раздел <span class="mono">mcpServers</span>, и перезапустить Claude:</p>
+            <div class="code-row"><code class="mono code">{mcpDesktop}</code><button class="btn small" onclick={() => void copyMcp(mcpDesktop)}>Скопировать</button></div>
+          </div>
+        {/if}
+        {#if m.recent.length}
+          <table class="table">
+            <caption class="caption">Обращения агентов. За 30 дней: {nf.format(m.month_calls)}, отдано элементов — {nf.format(m.month_items)}, символов — {nf.format(m.month_chars)}</caption>
+            <thead><tr><th>Когда</th><th>Что</th><th>Клиент</th><th class="n">Отдано</th><th class="n">Время</th><th>Итог</th></tr></thead>
+            <tbody>
+              {#each m.recent as c, i (c.at_ms + ":" + i)}
+                <tr>
+                  <td>{tf.format(new Date(c.at_ms))}</td>
+                  <td>{MCP_TOOL[c.tool] ?? c.tool}</td>
+                  <td>{c.client}</td>
+                  <td class="n">{c.outcome === "ok" ? `${nf.format(c.items)} · ${nf.format(c.chars)} зн.` : "—"}</td>
+                  <td class="n">{seconds(c.duration_ms)}</td>
+                  <td class:bad={c.outcome !== "ok"}>{MCP_OUTCOME[c.outcome] ?? c.outcome}</td>
+                </tr>
+              {/each}
+            </tbody>
+          </table>
+        {:else}
+          <p class="hint">Агенты ещё не обращались. В журнал попадает, что и сколько отдано, — без запросов агента и без текста писем.</p>
+        {/if}
+      {/if}
+    </section>
+
     <section class="block" aria-labelledby="{uid}-journal">
       <div class="head-row">
         <h4 class="label" id="{uid}-journal">Журнал обращений</h4>
@@ -434,6 +576,21 @@
     </section>
   {/if}
 </div>
+
+{#if mcpAsk}
+  <ConfirmPopover
+    anchor={mcpAsk}
+    align="start"
+    title="Разрешить агентам читать почту?"
+    text="Письма, вложения, календарь и контакты, которые агент прочитает, уйдут в его модель — обычно облачную. Режим «Куда можно отправлять письма» на агента не действует."
+    confirmLabel="Разрешить"
+    onconfirm={() => {
+      mcpAsk = null;
+      void setMcp({ enabled: true });
+    }}
+    oncancel={() => (mcpAsk = null)}
+  />
+{/if}
 
 {#if deleting}
   {@const d = deleting}
@@ -703,6 +860,21 @@
 
   .add-label {
     color: var(--fg-3);
+  }
+  .code-row {
+    display: flex;
+    align-items: flex-start;
+    gap: var(--space-2);
+  }
+  .code {
+    flex: 1;
+    min-width: 0;
+    padding: 6px 8px;
+    border: 1px solid var(--stroke-1);
+    border-radius: var(--radius-control);
+    background: var(--bg-layer-alt);
+    user-select: text;
+    overflow-wrap: anywhere;
   }
   .table {
     width: 100%;

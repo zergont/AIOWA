@@ -14,6 +14,7 @@ pub mod contacts;
 pub mod directory;
 pub mod drafts;
 pub mod identity;
+pub mod mcp_log;
 pub mod morph;
 pub mod names;
 pub mod nldate;
@@ -41,6 +42,7 @@ pub use contacts::{ContactApplyStats, ContactFolderInfo, ContactRecipient, Conta
 pub use directory::ContactLocalStats;
 pub use drafts::LocalDraft;
 pub use identity::{login_key, read_summary, DbAccount, DbSummary, MailboxIdentity};
+pub use mcp_log::{McpCall, McpUsage};
 pub use schema::{FETCH_FAILED, TEXT_FAILED, TEXT_OK, TEXT_PENDING, TEXT_UNSUPPORTED};
 
 #[derive(Debug, thiserror::Error)]
@@ -51,6 +53,9 @@ pub enum StoreError {
     Io(#[from] std::io::Error),
     #[error("сжатие: {0}")]
     Compression(String),
+    /// База другой версии схемы, а миграции этому открытию запрещены (`Store::open_existing`).
+    #[error("схема базы версии {found}, программе нужна {expected}")]
+    SchemaMismatch { found: i64, expected: i64 },
     #[error("{0}")]
     Other(String),
 }
@@ -489,6 +494,29 @@ impl Store {
         schema::register_functions(&conn)?;
         schema::migrate(&conn)?;
         info!(path = %path.display(), "хранилище открыто");
+        Ok(Self { path, attachments_dir, conn: Mutex::new(conn), write_generation: AtomicU64::new(0), recipient_cache: Mutex::new(None) })
+    }
+
+    /// Открывает существующую базу, не создавая её и не трогая схему: для второго процесса рядом с
+    /// окном (MCP-сервер). Миграции делает только окно; база другой версии — `SchemaMismatch`.
+    pub fn open_existing(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref().to_path_buf();
+        let attachments_dir = identity::attachments_dir_for(&path);
+        let conn = Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_URI | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX)?;
+        conn.execute_batch(
+            "PRAGMA synchronous = NORMAL;
+             PRAGMA foreign_keys = ON;
+             PRAGMA temp_store = MEMORY;
+             PRAGMA busy_timeout = 5000;
+             PRAGMA cache_size = -65536;",
+        )?;
+        let found: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        if found != schema::CURRENT_VERSION {
+            return Err(StoreError::SchemaMismatch { found, expected: schema::CURRENT_VERSION });
+        }
+        conn.set_prepared_statement_cache_capacity(128);
+        schema::register_functions(&conn)?;
+        info!(path = %path.display(), "хранилище открыто без миграций");
         Ok(Self { path, attachments_dir, conn: Mutex::new(conn), write_generation: AtomicU64::new(0), recipient_cache: Mutex::new(None) })
     }
 
@@ -2709,6 +2737,39 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("aiowa-store-test-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         Store::open(dir.join("mail.db")).unwrap()
+    }
+
+    #[test]
+    fn open_existing_neither_creates_nor_migrates() {
+        let dir = std::env::temp_dir().join(format!("aiowa-store-test-existing-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("mail.db");
+        assert!(Store::open_existing(&path).is_err(), "базы нет — не создаётся");
+        assert!(!path.exists());
+        let acc = {
+            let s = Store::open(&path).unwrap();
+            let acc = s.account("h", "u").unwrap();
+            s.set_state(acc, "k", Some("v")).unwrap();
+            acc
+        };
+        // Тот же файл вторым соединением: читает и пишет, функции поиска зарегистрированы.
+        let second = Store::open_existing(&path).unwrap();
+        assert_eq!(second.get_state(acc, "k").unwrap().as_deref(), Some("v"));
+        second.set_state(acc, "k2", Some("w")).unwrap();
+        assert!(second.search(acc, "что-нибудь", 5).unwrap().is_empty());
+        drop(second);
+        // База старой версии: открытие без миграций отказывает и схему не трогает.
+        {
+            let c = Connection::open(&path).unwrap();
+            c.pragma_update(None, "user_version", schema::CURRENT_VERSION - 1).unwrap();
+        }
+        match Store::open_existing(&path) {
+            Err(StoreError::SchemaMismatch { found, expected }) => assert_eq!((found, expected), (schema::CURRENT_VERSION - 1, schema::CURRENT_VERSION)),
+            other => panic!("ждали SchemaMismatch, получили {:?}", other.map(|_| ())),
+        }
+        let c = Connection::open(&path).unwrap();
+        let v: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(v, schema::CURRENT_VERSION - 1);
     }
 
     fn folder(name: &str, dist: Option<&str>) -> Folder {

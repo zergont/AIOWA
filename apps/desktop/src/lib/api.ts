@@ -1373,6 +1373,9 @@ export const api = {
   /** «Проверить»: список моделей и короткий ответ выбранной модели. */
   aiProfileTest: (id: string) => invoke<AiTest>("ai_profile_test", { id }),
   aiJournal: () => invoke<AiJournal>("ai_journal"),
+  /** Доступ внешних агентов к почте через MCP-сервер AIOWA: настройки и журнал обращений. */
+  mcpSettings: () => invoke<McpSettings>("mcp_settings"),
+  mcpSettingsSet: (patch: McpSettingsPatch) => invoke<McpSettings>("mcp_settings_set", { patch }),
   /** Доступен ли «Совет» (ИИ включён, модель назначена) и какая модель его даёт. */
   aiAdviceStatus: () => invoke<AiAdviceStatus>("ai_advice_status"),
   /** «Что уйдёт в модель»: собранный промпт без отправки. */
@@ -1523,6 +1526,39 @@ export interface AiJournal {
   recent: AiCall[];
   /** Итоги за 30 дней по подключению и модели. */
   month: AiUsage[];
+}
+
+/** Вид данных, который можно открыть агентам. */
+export type McpGroup = "mail" | "attachments" | "calendar" | "contacts";
+
+/** Обращение агента: инструмент, клиент и сколько отдано — без запроса и без текста писем. */
+export interface McpCall {
+  at_ms: number;
+  tool: string;
+  client: string;
+  items: number;
+  chars: number;
+  duration_ms: number;
+  /** ok | disabled | denied | invalid | not_found | error */
+  outcome: string;
+}
+
+export interface McpSettings {
+  enabled: boolean;
+  groups: McpGroup[];
+  /** Режим «Только свои»: включить доступ нельзя. */
+  blocked_by_mode: boolean;
+  /** Путь к исполняемому файлу AIOWA для конфига клиента (запуск с ключом --mcp). */
+  command: string;
+  recent: McpCall[];
+  month_calls: number;
+  month_items: number;
+  month_chars: number;
+}
+
+export interface McpSettingsPatch {
+  enabled?: boolean;
+  groups?: McpGroup[];
 }
 
 /**

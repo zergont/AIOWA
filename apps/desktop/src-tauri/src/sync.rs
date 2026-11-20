@@ -456,6 +456,20 @@ impl SyncState {
         self.invalidate_on_generation(e, None).await;
     }
 
+    /// Закрывает сессию процесса на сервере, если она есть (MCP-сервер после простоя): следующее
+    /// обращение войдёт заново. `true` — сессия была и закрыта.
+    pub(crate) async fn release_transport(&self) -> bool {
+        let _connecting = self.connect_lock.lock().await;
+        let old = self.lock().transport.take();
+        match old {
+            Some(t) => {
+                let _ = tokio::time::timeout(LOGOFF_TIMEOUT, t.logoff()).await;
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Сбрасывает транспорт процесса безусловно (пароль сменился): сессия закрывается на сервере,
     /// следующее обращение войдёт заново уже с новым паролем. Синхронизация, идущая на старой
     /// сессии, закончится ошибкой; следующий запуск войдёт заново.

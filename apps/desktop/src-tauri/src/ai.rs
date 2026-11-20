@@ -23,7 +23,7 @@ use tauri::State;
 use tracing::{info, warn};
 
 const ENABLED_KEY: &str = "ai.enabled";
-const MODE_KEY: &str = "ai.mode";
+pub(crate) const MODE_KEY: &str = "ai.mode";
 const PROFILES_KEY: &str = "ai.profiles";
 const ADVICE_KEY: &str = "ai.assign.advice";
 const PARSE_KEY: &str = "ai.assign.parse";
