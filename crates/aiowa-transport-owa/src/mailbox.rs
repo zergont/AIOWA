@@ -3,7 +3,7 @@
 //! Основной путь — `POST /owa/sessiondata.ashx` (первый запрос страницы OWA после входа): раздел
 //! `owaUserConfig.SessionSettings`. Запасной — операция `GetOwaUserConfiguration` в `service.svc`
 //! (тот же `SessionSettings` в ответе). По этим сведениям окно находит базу ящика при любой форме
-//! логина (`savvidi`, `savvidi@ngenergo`, `NGENERGO\savvidi`) и не синхронизирует ящик в базу
+//! логина (`sokolov`, `sokolov@northwind`, `NORTHWIND\sokolov`) и не синхронизирует ящик в базу
 //! другого ящика.
 //!
 //! Политика журналов: адрес и имя в журнал не пишутся — только наличие и длины.

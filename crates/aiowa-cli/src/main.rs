@@ -4610,8 +4610,8 @@ mod tests {
         assert_eq!(target(&["aiowa", "--db", r"D:\x\mail.db", "db-summary"]), SummaryTarget::One(db.clone()));
         assert_eq!(target(&["aiowa", "--host", "mail.x.ru", "--user", "u", "--db", r"D:\x\mail.db", "db-summary"]), SummaryTarget::One(db), "--db важнее учётной записи");
         assert_eq!(
-            target(&["aiowa", "--host", "mail.x.ru", "--user", r"NGENERGO\savvidi", "db-summary"]),
-            SummaryTarget::One(default_db_path("mail.x.ru", r"NGENERGO\savvidi")),
+            target(&["aiowa", "--host", "mail.x.ru", "--user", r"NORTHWIND\sokolov", "db-summary"]),
+            SummaryTarget::One(default_db_path("mail.x.ru", r"NORTHWIND\sokolov")),
             "по учётной записи — тот же путь, что у окна"
         );
     }

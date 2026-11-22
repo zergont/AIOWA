@@ -6,7 +6,8 @@ $ErrorActionPreference = 'Stop'
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
 $exe = Join-Path $here 'target\debug\owa-probe.exe'
 if (-not (Test-Path $exe)) { throw "owa-probe.exe not found: $exe (run cargo build first)" }
-$owaHost = 'mail.ngenergo.ru'
+$owaHost = Read-Host 'OWA host as in the browser address, for example mail.example.com'
+if ([string]::IsNullOrWhiteSpace($owaHost)) { throw 'empty host' }
 $user = Read-Host 'OWA login exactly as in the logon form (DOMAIN\user or user@domain)'
 if ([string]::IsNullOrWhiteSpace($user)) { throw 'empty login' }
 "AIOWA_HOST=$owaHost`r`nAIOWA_USER=$user" | Set-Content -Encoding UTF8 (Join-Path $here '.env.local')

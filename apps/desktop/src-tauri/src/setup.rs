@@ -488,16 +488,16 @@ mod tests {
 
     #[test]
     fn db_choice_is_limited_to_found_databases() {
-        let choices = DbChoices { host: "mail.x.ru".into(), user: "savvidi".into(), existing: vec![PathBuf::from(r"C:\A\mail.x.ru\savvidi_ngenergo\mail.db")], new_path: PathBuf::from(r"C:\A\mail.x.ru\savvidi_x.ru\mail.db") };
+        let choices = DbChoices { host: "mail.x.ru".into(), user: "sokolov".into(), existing: vec![PathBuf::from(r"C:\A\mail.x.ru\sokolov_northwind\mail.db")], new_path: PathBuf::from(r"C:\A\mail.x.ru\sokolov_x.ru\mail.db") };
         let c = Some(&choices);
-        assert_eq!(chosen_db_path(c, "mail.x.ru", "savvidi", Some(r"C:\A\mail.x.ru\savvidi_ngenergo\mail.db")).unwrap(), choices.existing[0]);
-        assert_eq!(chosen_db_path(c, "mail.x.ru", "savvidi", Some(r"c:\a\MAIL.X.RU\savvidi_ngenergo\mail.db")).unwrap(), choices.existing[0], "регистр пути не важен");
-        assert_eq!(chosen_db_path(c, "mail.x.ru", "savvidi", None).unwrap(), choices.new_path, "новая база — по адресу ящика");
-        assert!(chosen_db_path(c, "mail.x.ru", "savvidi", Some(r"C:\Windows\mail.db")).is_err(), "произвольный путь не принимается");
+        assert_eq!(chosen_db_path(c, "mail.x.ru", "sokolov", Some(r"C:\A\mail.x.ru\sokolov_northwind\mail.db")).unwrap(), choices.existing[0]);
+        assert_eq!(chosen_db_path(c, "mail.x.ru", "sokolov", Some(r"c:\a\MAIL.X.RU\sokolov_northwind\mail.db")).unwrap(), choices.existing[0], "регистр пути не важен");
+        assert_eq!(chosen_db_path(c, "mail.x.ru", "sokolov", None).unwrap(), choices.new_path, "новая база — по адресу ящика");
+        assert!(chosen_db_path(c, "mail.x.ru", "sokolov", Some(r"C:\Windows\mail.db")).is_err(), "произвольный путь не принимается");
         // Проверка была с другим логином — выбор не годится.
-        assert!(chosen_db_path(c, "mail.x.ru", "petrov", Some(r"C:\A\mail.x.ru\savvidi_ngenergo\mail.db")).is_err());
+        assert!(chosen_db_path(c, "mail.x.ru", "petrov", Some(r"C:\A\mail.x.ru\sokolov_northwind\mail.db")).is_err());
         assert_eq!(chosen_db_path(c, "mail.x.ru", "petrov", None).unwrap(), config::default_db_path("mail.x.ru", "petrov"));
-        assert_eq!(chosen_db_path(None, "mail.x.ru", "savvidi", None).unwrap(), config::default_db_path("mail.x.ru", "savvidi"));
+        assert_eq!(chosen_db_path(None, "mail.x.ru", "sokolov", None).unwrap(), config::default_db_path("mail.x.ru", "sokolov"));
     }
 
     #[test]

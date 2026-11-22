@@ -324,8 +324,8 @@ mod tests {
         let root = root("list");
         let current = root.join("mail.x.ru").join("new").join("mail.db");
         let old = root.join("mail.x.ru").join("old").join("mail.db");
-        make_db(&current, "savvidi");
-        make_db(&old, "savvidi@ngenergo");
+        make_db(&current, "sokolov");
+        make_db(&old, "sokolov@northwind");
         std::fs::create_dir_all(identity::attachments_dir_for(&old)).unwrap();
         std::fs::write(identity::attachments_dir_for(&old).join("1-a.bin"), [0u8; 10]).unwrap();
         // Не база — в списке с ошибкой, а не пропадает.
@@ -334,8 +334,8 @@ mod tests {
         std::fs::write(&junk, b"not a database, just some text here").unwrap();
         let list = list_stores(&root, &current);
         assert_eq!(list.len(), 3);
-        assert!(list[0].current && list[0].logins == vec!["savvidi".to_string()]);
-        let old_dto = list.iter().find(|s| s.logins == vec!["savvidi@ngenergo".to_string()]).unwrap();
+        assert!(list[0].current && list[0].logins == vec!["sokolov".to_string()]);
+        let old_dto = list.iter().find(|s| s.logins == vec!["sokolov@northwind".to_string()]).unwrap();
         assert!(!old_dto.current);
         assert_eq!(old_dto.cache_bytes, 10);
         assert_eq!(old_dto.total_bytes, old_dto.db_bytes + 10);
@@ -354,8 +354,8 @@ mod tests {
         let root = root("delete");
         let current = root.join("mail.x.ru").join("new").join("mail.db");
         let old = root.join("mail.x.ru").join("old").join("mail.db");
-        make_db(&current, "savvidi");
-        make_db(&old, "savvidi@ngenergo");
+        make_db(&current, "sokolov");
+        make_db(&old, "sokolov@northwind");
         std::fs::create_dir_all(identity::attachments_dir_for(&old).join("sub")).unwrap();
         std::fs::write(identity::attachments_dir_for(&old).join("sub").join("2-b.bin"), [0u8; 7]).unwrap();
         let outside = root.parent().unwrap().join("dev").join("mail.db");
@@ -385,10 +385,10 @@ mod tests {
     fn leftovers_of_deletion_are_listed_and_deleted_again() {
         let root = root("leftover");
         let current = root.join("mail.x.ru").join("new").join("mail.db");
-        make_db(&current, "savvidi");
+        make_db(&current, "sokolov");
         // Остаток с файлом базы (его держали) и остаток, где осталось только вложение.
         let with_db = root.join("mail.x.ru").join(format!("old{DELETING_MARK}1761390000000"));
-        make_db(&with_db.join("mail.db"), "savvidi@ngenergo");
+        make_db(&with_db.join("mail.db"), "sokolov@northwind");
         std::fs::create_dir_all(with_db.join("attachments")).unwrap();
         std::fs::write(with_db.join("attachments").join("1-a.bin"), [0u8; 5]).unwrap();
         let bare = root.join("mail.y.ru").join(format!("a{DELETING_MARK}1"));
@@ -441,7 +441,7 @@ mod tests {
         // сбрасывается); удаления при этом не срываются: список и удаление не пересекаются.
         let root = root("race");
         let current = root.join("mail.x.ru").join("new").join("mail.db");
-        make_db(&current, "savvidi");
+        make_db(&current, "sokolov");
         let dbs: Vec<PathBuf> = (0..2).map(|i| root.join("mail.x.ru").join(format!("old{i}")).join("mail.db")).collect();
         for db in &dbs {
             make_db(db, "u");

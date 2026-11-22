@@ -9,7 +9,7 @@
 //!
 //! Мастер ищет базы этого сервера (`%LOCALAPPDATA%\AIOWA\<сервер>\*\mail.db`): совпал GUID — та
 //! же база; у старых баз GUID нет — кандидат, если совпал записанный адрес ящика или логин без
-//! домена (`savvidi` = `savvidi@ngenergo` = `NGENERGO\savvidi`). По умолчанию мастер предлагает
+//! домена (`sokolov` = `sokolov@northwind` = `NORTHWIND\sokolov`). По умолчанию мастер предлагает
 //! базу, совпавшую по GUID или адресу; совпавшие только по логину показываются ниже и выбираются
 //! по умолчанию, лишь когда других нет. Новая база заводится в каталоге по адресу ящика, а не по
 //! введённому логину.
@@ -227,46 +227,46 @@ mod tests {
 
     #[test]
     fn candidates_by_guid_email_and_login() {
-        let server = info(Some("savvidi@ngenergo.ru"), Some(GUID));
-        let h = "mail.ngenergo.ru";
+        let server = info(Some("sokolov@northwind.ru"), Some(GUID));
+        let h = "mail.northwind.ru";
         // GUID совпал — та же база при любом логине.
-        assert_eq!(classify(&summary(h, "kto-to", Some(GUID), None, 1), h, "savvidi", &server), Some(MatchKind::Guid));
+        assert_eq!(classify(&summary(h, "kto-to", Some(GUID), None, 1), h, "sokolov", &server), Some(MatchKind::Guid));
         // GUID другой — не подходит, даже с тем же логином.
-        assert_eq!(classify(&summary(h, "savvidi", Some(OTHER_GUID), None, 1), h, "savvidi", &server), None);
+        assert_eq!(classify(&summary(h, "sokolov", Some(OTHER_GUID), None, 1), h, "sokolov", &server), None);
         // Старая база без личности: логин без домена в любой форме, без учёта регистра.
-        for stored in ["savvidi@ngenergo", "NGENERGO\\Savvidi", "SAVVIDI"] {
-            for typed in ["savvidi", "savvidi@ngenergo", "ngenergo\\savvidi"] {
+        for stored in ["sokolov@northwind", "NORTHWIND\\Sokolov", "SOKOLOV"] {
+            for typed in ["sokolov", "sokolov@northwind", "northwind\\sokolov"] {
                 assert_eq!(classify(&summary(h, stored, None, None, 1), h, typed, &server), Some(MatchKind::Login), "{stored} / {typed}");
             }
         }
         // Логин непохож, но совпадает с адресом ящика до @.
-        assert_eq!(classify(&summary(h, "NGENERGO\\savvidi", None, None, 1), h, "s.avvidi@corp.local", &server), Some(MatchKind::Login));
+        assert_eq!(classify(&summary(h, "NORTHWIND\\sokolov", None, None, 1), h, "s.okolov@corp.local", &server), Some(MatchKind::Login));
         // Записанный адрес ящика.
-        assert_eq!(classify(&summary(h, "ktoto", None, Some("savvidi@ngenergo.ru"), 1), h, "x", &server), Some(MatchKind::Email));
-        assert_eq!(classify(&summary(h, "savvidi", None, Some("drugoi@ngenergo.ru"), 1), h, "savvidi", &server), None, "записан другой адрес");
+        assert_eq!(classify(&summary(h, "ktoto", None, Some("sokolov@northwind.ru"), 1), h, "x", &server), Some(MatchKind::Email));
+        assert_eq!(classify(&summary(h, "sokolov", None, Some("drugoi@northwind.ru"), 1), h, "sokolov", &server), None, "записан другой адрес");
         // Чужой логин и другой сервер — нет.
-        assert_eq!(classify(&summary(h, "petrov", None, None, 1), h, "savvidi", &server), None);
-        assert_eq!(classify(&summary("mail.other.ru", "savvidi", None, None, 1), h, "savvidi", &server), None);
+        assert_eq!(classify(&summary(h, "petrov", None, None, 1), h, "sokolov", &server), None);
+        assert_eq!(classify(&summary("mail.other.ru", "sokolov", None, None, 1), h, "sokolov", &server), None);
         // Сервер не сообщил сведений — только по логину.
-        assert_eq!(classify(&summary(h, "savvidi@ngenergo", Some(GUID), None, 1), h, "savvidi", &MailboxInfo::default()), Some(MatchKind::Login));
-        assert_eq!(classify(&DbSummary::default(), h, "savvidi", &server), None, "база без учётных записей");
+        assert_eq!(classify(&summary(h, "sokolov@northwind", Some(GUID), None, 1), h, "sokolov", &MailboxInfo::default()), Some(MatchKind::Login));
+        assert_eq!(classify(&DbSummary::default(), h, "sokolov", &server), None, "база без учётных записей");
     }
 
     #[test]
     fn new_database_dir_comes_from_mailbox_address() {
         let root = std::env::temp_dir().join(format!("aiowa-desktop-newdb-{}", std::process::id())).join("AIOWA");
         let _ = std::fs::remove_dir_all(&root);
-        let server = info(Some("savvidi@ngenergo.ru"), Some(GUID));
-        let p = new_db_path(&root, "mail.ngenergo.ru", "savvidi", &server);
-        assert_eq!(p, root.join("mail.ngenergo.ru").join("savvidi_ngenergo.ru").join("mail.db"));
+        let server = info(Some("sokolov@northwind.ru"), Some(GUID));
+        let p = new_db_path(&root, "mail.northwind.ru", "sokolov", &server);
+        assert_eq!(p, root.join("mail.northwind.ru").join("sokolov_northwind.ru").join("mail.db"));
         // Тот же ящик под другой формой логина — тот же каталог.
-        assert_eq!(new_db_path(&root, "mail.ngenergo.ru", "NGENERGO\\savvidi", &server), p);
+        assert_eq!(new_db_path(&root, "mail.northwind.ru", "NORTHWIND\\sokolov", &server), p);
         // Адреса нет — из логина, как раньше.
-        assert_eq!(new_db_path(&root, "mail.ngenergo.ru", "savvidi", &MailboxInfo::default()), root.join("mail.ngenergo.ru").join("savvidi").join("mail.db"));
+        assert_eq!(new_db_path(&root, "mail.northwind.ru", "sokolov", &MailboxInfo::default()), root.join("mail.northwind.ru").join("sokolov").join("mail.db"));
         // Каталог занят базой — следующее свободное имя.
         std::fs::create_dir_all(p.parent().unwrap()).unwrap();
         std::fs::write(&p, b"").unwrap();
-        assert_eq!(new_db_path(&root, "mail.ngenergo.ru", "savvidi", &server), root.join("mail.ngenergo.ru").join("savvidi_ngenergo.ru_2").join("mail.db"));
+        assert_eq!(new_db_path(&root, "mail.northwind.ru", "sokolov", &server), root.join("mail.northwind.ru").join("sokolov_northwind.ru_2").join("mail.db"));
         let _ = std::fs::remove_dir_all(root.parent().unwrap());
     }
 
@@ -286,15 +286,15 @@ mod tests {
             store.apply_item_changes(acc, fpk, &changes).unwrap();
             path
         };
-        let fresh = make("savvidi", "savvidi", Some(GUID), None, 1);
-        let by_email = make("s.savvidi", "CORP\\s.savvidi", None, Some("savvidi@x.ru"), 2);
-        let full = make("savvidi_ngenergo", "savvidi@ngenergo", None, None, 3);
-        let older = make("ngenergo_savvidi", "NGENERGO\\savvidi", None, None, 2);
-        let foreign = make("petrov", "savvidi", Some(OTHER_GUID), None, 5);
+        let fresh = make("sokolov", "sokolov", Some(GUID), None, 1);
+        let by_email = make("s.sokolov", "CORP\\s.sokolov", None, Some("sokolov@x.ru"), 2);
+        let full = make("sokolov_northwind", "sokolov@northwind", None, None, 3);
+        let older = make("northwind_sokolov", "NORTHWIND\\sokolov", None, None, 2);
+        let foreign = make("petrov", "sokolov", Some(OTHER_GUID), None, 5);
         let paths = host_databases(&root, host);
         assert_eq!(paths.len(), 5);
-        let server = info(Some("savvidi@x.ru"), Some(GUID));
-        let found = find_candidates(&paths, host, "savvidi", &server);
+        let server = info(Some("sokolov@x.ru"), Some(GUID));
+        let found = find_candidates(&paths, host, "sokolov", &server);
         let got: Vec<(&Path, MatchKind)> = found.iter().map(|c| (c.path.as_path(), c.kind)).collect();
         assert_eq!(
             got,
@@ -303,7 +303,7 @@ mod tests {
         );
         assert!(!found.iter().any(|c| c.path == foreign));
         // Надёжных совпадений нет — по умолчанию, как раньше, самая полная.
-        let found = find_candidates(&[older.clone(), full.clone()], host, "savvidi", &server);
+        let found = find_candidates(&[older.clone(), full.clone()], host, "sokolov", &server);
         let got: Vec<(&Path, MatchKind)> = found.iter().map(|c| (c.path.as_path(), c.kind)).collect();
         assert_eq!(got, vec![(full.as_path(), MatchKind::Login), (older.as_path(), MatchKind::Login)]);
         assert!(MatchKind::Guid.is_reliable() && MatchKind::Email.is_reliable() && !MatchKind::Login.is_reliable());

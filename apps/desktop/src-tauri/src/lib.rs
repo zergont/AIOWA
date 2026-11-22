@@ -617,7 +617,7 @@ impl MailServices {
 /// стартует мастером с этим текстом (иначе негодный путь в конфиге ронял бы каждый запуск).
 fn open_mail(boot: &config::MailBoot, config_dir: &Path) -> Result<MailParts, String> {
     let store = Arc::new(Store::open(&boot.db_path).map_err(|e| format!("Не удалось открыть локальную базу {}: {e}", boot.db_path.display()))?);
-    // Логин в базе мог быть записан в другой форме того же ящика (`savvidi@ngenergo` вместо `savvidi`).
+    // Логин в базе мог быть записан в другой форме того же ящика (`sokolov@northwind` вместо `sokolov`).
     let account = store.resolve_account(&boot.host, &boot.user).map_err(|e| format!("Не удалось прочитать учётную запись в базе {}: {e}", boot.db_path.display()))?;
     if let Some(initial) = boot.initial {
         settings::apply_initial(&store, account, config_dir, initial);

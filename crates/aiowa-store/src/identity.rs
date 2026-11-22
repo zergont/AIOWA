@@ -1,7 +1,7 @@
 //! Чей ящик в базе и сводка базы по пути.
 //!
-//! Один ящик — одна база при любой форме логина (`savvidi`, `savvidi@ngenergo`,
-//! `NGENERGO\savvidi`). После входа сервер сообщает адрес ящика и `MailboxGuid`
+//! Один ящик — одна база при любой форме логина (`sokolov`, `sokolov@northwind`,
+//! `NORTHWIND\sokolov`). После входа сервер сообщает адрес ящика и `MailboxGuid`
 //! (`sessiondata.ashx`); окно записывает их в `sync_state` учётной записи
 //! (`desktop.mailbox_guid`, `desktop.mailbox_email`) и по ним узнаёт базу ящика на диске и не
 //! синхронизирует ящик в чужую базу. У баз, заведённых до этого, личности нет: их узнают по
@@ -30,8 +30,8 @@ pub struct MailboxIdentity {
     pub email: Option<String>,
 }
 
-/// Логин без домена в нижнем регистре: `savvidi`, `savvidi@ngenergo`, `NGENERGO\savvidi` и
-/// `Savvidi@NGENERGO.RU` дают `savvidi`. По нему узнаётся база, заведённая под другой формой
+/// Логин без домена в нижнем регистре: `sokolov`, `sokolov@northwind`, `NORTHWIND\sokolov` и
+/// `Sokolov@NORTHWIND.RU` дают `sokolov`. По нему узнаётся база, заведённая под другой формой
 /// логина того же ящика.
 pub fn login_key(login: &str) -> String {
     let s = login.trim();
@@ -244,7 +244,7 @@ impl Store {
     }
 
     /// Учётная запись базы для входа с этим логином. Логин в базе мог быть записан в другой форме
-    /// (`savvidi@ngenergo` вместо `savvidi`), и тогда простой `account` завёл бы рядом пустую
+    /// (`sokolov@northwind` вместо `sokolov`), и тогда простой `account` завёл бы рядом пустую
     /// учётную запись. Порядок:
     /// 1. записи этого сервера с тем же логином без домена (`login_key`) или с записанным адресом
     ///    ящика, у которого часть до `@` совпадает с ним; из нескольких — та, где больше папок
@@ -311,11 +311,11 @@ mod tests {
 
     #[test]
     fn login_forms_of_one_mailbox_share_a_key() {
-        for login in ["savvidi", "savvidi@ngenergo", "NGENERGO\\savvidi", " Savvidi@NGENERGO.RU ", "ngenergo\\SAVVIDI"] {
-            assert_eq!(login_key(login), "savvidi", "{login}");
+        for login in ["sokolov", "sokolov@northwind", "NORTHWIND\\sokolov", " Sokolov@NORTHWIND.RU ", "northwind\\SOKOLOV"] {
+            assert_eq!(login_key(login), "sokolov", "{login}");
         }
-        assert_ne!(login_key("savvidi2@ngenergo"), "savvidi");
-        assert_eq!(email_local_part("S.Avvidi@ngenergo.ru"), "s.avvidi");
+        assert_ne!(login_key("sokolov2@northwind"), "sokolov");
+        assert_eq!(email_local_part("S.Okolov@northwind.ru"), "s.okolov");
         assert_eq!(login_key(""), "");
     }
 
@@ -392,16 +392,16 @@ mod tests {
     fn account_is_resolved_across_login_forms() {
         let dir = tmp_dir("resolve");
         let store = Store::open(dir.join("mail.db")).unwrap();
-        let old = store.account("mail.x.ru", "savvidi@ngenergo").unwrap();
+        let old = store.account("mail.x.ru", "sokolov@northwind").unwrap();
         seed(&store, old, 2, 0);
         // Другая форма логина — та же запись, новой не заводится.
-        assert_eq!(store.resolve_account("mail.x.ru", "savvidi").unwrap(), old);
-        assert_eq!(store.resolve_account("MAIL.X.RU", "NGENERGO\\Savvidi").unwrap(), old);
-        assert_eq!(store.resolve_account("mail.x.ru", "savvidi@ngenergo").unwrap(), old);
+        assert_eq!(store.resolve_account("mail.x.ru", "sokolov").unwrap(), old);
+        assert_eq!(store.resolve_account("MAIL.X.RU", "NORTHWIND\\Sokolov").unwrap(), old);
+        assert_eq!(store.resolve_account("mail.x.ru", "sokolov@northwind").unwrap(), old);
         // Пустая запись с тем же логином без домена (заведена раньше по ошибке) проигрывает заполненной.
-        let empty = store.account("mail.x.ru", "savvidi").unwrap();
+        let empty = store.account("mail.x.ru", "sokolov").unwrap();
         assert_ne!(empty, old);
-        assert_eq!(store.resolve_account("mail.x.ru", "savvidi").unwrap(), old);
+        assert_eq!(store.resolve_account("mail.x.ru", "sokolov").unwrap(), old);
         // Совсем другой логин при нескольких записях — новая запись.
         let other = store.resolve_account("mail.x.ru", "petrov").unwrap();
         assert!(other != old && other != empty);
