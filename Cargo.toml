@@ -18,6 +18,7 @@ aiowa-store = { path = "crates/aiowa-store" }
 aiowa-sync = { path = "crates/aiowa-sync" }
 aiowa-extract = { path = "crates/aiowa-extract" }
 aiowa-ai = { path = "crates/aiowa-ai" }
+aiowa-ocr = { path = "crates/aiowa-ocr" }
 
 # общие
 anyhow = "1"

@@ -71,6 +71,7 @@ crates/aiowa-transport      trait транспорта и модель ошиб�
 crates/aiowa-transport-owa  реализация поверх OWA JSON (reqwest, системный TLS)
 crates/aiowa-store          SQLite: схема, миграции, FTS5, беседы, кэш вложений
 crates/aiowa-extract        текст из вложений: PDF, DOCX, XLSX, TXT/CSV
+crates/aiowa-ocr            распознавание сканов средствами Windows
 crates/aiowa-sync           движок синхронизации
 crates/aiowa-ai             шлюз моделей, «Совет», подготовка текста писем для моделей
 crates/aiowa-cli            консольная утилита `aiowa` для проб и полных прогонов
@@ -117,6 +118,7 @@ cargo build -p aiowa-cli
 - [docs/releases/](docs/releases/) — «что нового» по версиям.
 - [docs/obkatka.md](docs/obkatka.md) — замечания обкатки и что с ними сделано.
 - [docs/ai-layer-design.md](docs/ai-layer-design.md) — ИИ-слой: шлюз моделей, «Совет», поиск на обычном языке, MCP-сервер.
+- [docs/mcp-attachments.md](docs/mcp-attachments.md) — чтение вложений агентом: распознавание сканов, выгрузка файлов, страницы картинками.
 - [docs/protocol-owa-json.md](docs/protocol-owa-json.md) — протокол OWA JSON по наблюдениям со спайка и клиента.
 - [docs/stage1-core-design.md](docs/stage1-core-design.md) и [docs/stage1-core-design-review.md](docs/stage1-core-design-review.md) — проект ядра и его разбор.
 - [docs/pseudonymization-design.md](docs/pseudonymization-design.md) — схема обезличивания для ИИ-слоя.

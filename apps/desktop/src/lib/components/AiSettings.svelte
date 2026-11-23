@@ -261,7 +261,7 @@
     }
   }
 
-  async function setMcp(patch: { enabled?: boolean; groups?: McpGroup[] }) {
+  async function setMcp(patch: { enabled?: boolean; groups?: McpGroup[]; ocr?: boolean }) {
     try {
       mcp = await api.mcpSettingsSet(patch);
       flash("Сохранено");
@@ -508,6 +508,17 @@
               {/each}
             </div>
           </fieldset>
+          <label class="check">
+            <input type="checkbox" checked={m.ocr && !!m.ocr_language} disabled={!m.groups.includes("attachments") || !m.ocr_language} onchange={(e) => void setMcp({ ocr: e.currentTarget.checked })} aria-describedby="{uid}-mcp-ocr" />
+            Распознавать сканы во вложениях
+          </label>
+          <p class="hint" id="{uid}-mcp-ocr">
+            {#if m.ocr_language}
+              Страницы PDF без текста и фотографии документов читаются на этом компьютере средствами Windows (языки: {m.ocr_language}), наружу ничего не уходит. Распознанный текст запоминается и попадает в поиск. В числах, таблицах и под печатями возможны ошибки.
+            {:else}
+              В Windows не установлено распознавание текста: Параметры → Время и язык → Язык и регион → языковые компоненты.
+            {/if}
+          </p>
           <label class="check">
             <input type="checkbox" checked={m.groups.includes("drafts")} onchange={(e) => toggleMcpGroup("drafts", e.currentTarget.checked)} aria-describedby="{uid}-mcp-drafts" />
             Разрешить агентам готовить письма

@@ -1563,6 +1563,10 @@ export interface McpSettings {
   blocked_by_mode: boolean;
   /** Путь к исполняемому файлу AIOWA для конфига клиента (запуск с ключом --mcp). */
   command: string;
+  /** Распознавать ли сканы во вложениях (страницы PDF без текста, фотографии документов). */
+  ocr: boolean;
+  /** Языки распознавания Windows (`ru+en-US`); null — распознавать на этом компьютере нечем. */
+  ocr_language: string | null;
   recent: McpCall[];
   month_calls: number;
   month_items: number;
@@ -1572,6 +1576,7 @@ export interface McpSettings {
 export interface McpSettingsPatch {
   enabled?: boolean;
   groups?: McpGroup[];
+  ocr?: boolean;
 }
 
 /**

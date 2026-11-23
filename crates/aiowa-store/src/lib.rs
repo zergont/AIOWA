@@ -19,6 +19,7 @@ pub mod morph;
 pub mod names;
 pub mod nldate;
 pub mod nlquery;
+pub mod pages;
 pub mod query;
 pub mod schema;
 pub mod text;
@@ -43,6 +44,7 @@ pub use directory::ContactLocalStats;
 pub use drafts::{LocalDraft, ORIGIN_AGENT_NEW};
 pub use identity::{login_key, read_summary, DbAccount, DbSummary, MailboxIdentity};
 pub use mcp_log::{McpCall, McpUsage};
+pub use pages::{AttachmentPage, PAGE_EXTRACTED, PAGE_OCR};
 pub use schema::{FETCH_FAILED, TEXT_FAILED, TEXT_OK, TEXT_PENDING, TEXT_UNSUPPORTED};
 
 #[derive(Debug, thiserror::Error)]
@@ -1354,7 +1356,11 @@ impl Store {
             fts_delete(tx, todo.item_pk)?;
             let now = now_ms();
             tx.execute(
-                "UPDATE attachments SET local_path = ?2, sha256 = ?3, text = ?4, text_state = ?5, fetched_at = ?6, last_access_at = ?6,
+                // Текст, собранный из распознанных страниц, повторное скачивание файла не стирает:
+                // из самого скана извлечь нечего, и письмо перестало бы находиться поиском.
+                "UPDATE attachments SET local_path = ?2, sha256 = ?3, fetched_at = ?6, last_access_at = ?6,
+                   text = CASE WHEN EXISTS (SELECT 1 FROM attachment_pages p WHERE p.attachment_pk = ?1 AND p.source = 2) THEN text ELSE ?4 END,
+                   text_state = CASE WHEN EXISTS (SELECT 1 FROM attachment_pages p WHERE p.attachment_pk = ?1 AND p.source = 2) THEN text_state ELSE ?5 END,
                    size = ?7, content_type = COALESCE(?8, content_type)
                  WHERE attachment_pk = ?1",
                 params![todo.attachment_pk, path_str, sha, text_value, text_state, now, bytes.len() as i64, content_type],

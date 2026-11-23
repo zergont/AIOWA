@@ -13,6 +13,7 @@
 
 use crate::compose::{self, ComposeKindDto, PickedFile};
 use crate::mcp::{Core, Group};
+use crate::pages::{OcrMode, PagesError};
 use aiowa_ai::mailtext::{strip_hidden_html, strip_invisible};
 use aiowa_core::{AccountId, BodyType, Folder};
 use aiowa_store::ui::MessageHead;
@@ -119,13 +120,15 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
         group: Group::Attachments,
         read_only: true,
         title: "Вложение: текст и файл",
-        description: "Вложение по attachment_id (из get_message или get_conversation): извлечённый текст (PDF, Word, Excel, текстовые файлы) и путь к файлу на этом компьютере. Если файла ещё нет на диске, он скачивается с почтового сервера (download: false — не скачивать). Файл по пути path можно читать своими средствами; менять и удалять его нельзя — это кэш AIOWA.",
+        description: "Вложение по attachment_id (из get_message или get_conversation): текст (PDF, Word, Excel, текстовые файлы) и путь к файлу на этом компьютере. Сканы читаются тоже: страницы PDF без текстового слоя и картинки (JPG, PNG, TIFF, BMP) распознаются на этом компьютере, text_source говорит, откуда текст (extracted, ocr, mixed, none), а распознанный текст может содержать ошибки — особенно в числах, таблицах и под печатями. У PDF и картинок текст идёт по страницам, перед каждой строка «--- стр. N ---»; длинный файл читай частями через pages. Если файла ещё нет на диске, он скачивается с почтового сервера (download: false — не скачивать). Файл по пути path можно читать своими средствами; менять и удалять его нельзя — это кэш AIOWA.",
         schema: || {
             json!({
                 "type": "object",
                 "properties": {
                     "attachment_id": { "type": "integer" },
                     "download": { "type": "boolean", "description": "Скачать с сервера, если файла нет на диске; по умолчанию да" },
+                    "ocr": { "type": "string", "enum": ["auto", "off", "force"], "description": "Распознавание сканов: auto (по умолчанию) — только страницы без текста; off — не распознавать; force — распознать все запрошенные страницы" },
+                    "pages": { "type": "string", "description": "Страницы PDF или многостраничной картинки: «3», «1-5», «1-3,7»; по умолчанию все. За один вызов распознаётся не больше 20 страниц" },
                     "max_chars": { "type": "integer", "minimum": 0, "maximum": 200_000, "description": "Предел извлечённого текста, по умолчанию 30000; 0 — без текста" }
                 },
                 "required": ["attachment_id"]
@@ -654,6 +657,15 @@ async fn get_attachment(core: &Core, args: &Value) -> ToolResult {
     let download = arg_bool(args, "download", true)?;
     let max_chars = arg_usize(args, "max_chars", MESSAGE_CHARS, 0, 200_000)?;
     let ctx = Ctx::of(core);
+    let (ocr_enabled, min_chars) = crate::mcp::ocr_settings(&ctx.store, ctx.account);
+    let mode = match (arg_str(args, "ocr")?.map(str::trim), ocr_enabled) {
+        (Some("force"), false) => return Err(ToolError::invalid("Распознавание сканов выключено в настройках AIOWA: вкладка «ИИ» → «Доступ для агентов (MCP)».")),
+        (Some("off"), _) | (_, false) => OcrMode::Off,
+        (None | Some("") | Some("auto"), true) => OcrMode::Auto,
+        (Some("force"), true) => OcrMode::Force,
+        (Some(_), true) => return Err(ToolError::invalid("Параметр ocr — auto, off или force")),
+    };
+    let wanted = arg_str(args, "pages")?.map(crate::pages::parse_pages).transpose().map_err(ToolError::invalid)?;
     let missing = move || ToolError::not_found(format!("Вложения {attachment_pk} нет в локальной базе"));
     let row = {
         let ctx = ctx.clone();
@@ -674,10 +686,21 @@ async fn get_attachment(core: &Core, args: &Value) -> ToolResult {
             }
         }
     };
+    // Страницы: текстовый слой, а где его нет — распознавание. Одно вложение — один вызов за раз.
+    let paged = {
+        let (store, row, file) = (ctx.store.clone(), row.clone(), path.clone());
+        let lock = core.ocr_locks.get(attachment_pk);
+        let _busy = lock.lock().await;
+        blocking(move || match crate::pages::paged_text(&store, &row, file.as_deref(), mode, wanted.as_deref(), min_chars) {
+            Ok(paged) => Ok(paged),
+            Err(PagesError::Invalid(why)) => Err(ToolError::invalid(why)),
+            Err(PagesError::Failed(why)) => Err(ToolError::failed(why)),
+        })
+        .await?
+    };
     blocking(move || {
-        // После скачивания у вложения мог появиться извлечённый текст.
+        // После скачивания и распознавания у вложения мог появиться текст.
         let row = db(ctx.store.attachment_of_account(ctx.account, attachment_pk))?.ok_or_else(missing)?;
-        let has_text = row.text_state == TEXT_OK && row.text_len > 0;
         let mut out = vec![
             ("attachment_id", json!(attachment_pk)),
             ("message_id", json!(row.item_pk)),
@@ -692,15 +715,44 @@ async fn get_attachment(core: &Core, args: &Value) -> ToolResult {
         if crate::ondemand::is_unsafe_to_open(row.name.as_deref()) {
             out.push(("warning_unsafe", json!("Исполняемый файл или сценарий: не запускать")));
         }
-        if has_text && max_chars > 0 {
-            let (text, cut) = clip(&db(ctx.store.attachment_text(attachment_pk))?.unwrap_or_default(), max_chars);
-            out.push(("text", json!(strip_invisible(&text))));
-            if cut {
-                out.push(("text_truncated", json!(true)));
-                out.push(("text_chars_total", json!(row.text_len)));
+        let no_text = if path.is_some() { "Текст из файла не извлечён (вид файла не поддерживается или текста в нём нет): читайте файл по path" } else { "Текста нет: файл ещё не скачан" };
+        match paged {
+            Some(paged) => {
+                out.push(("pages_total", json!(paged.pages_total)));
+                out.push(("text_source", json!(paged.text_source())));
+                out.push(("ocr_pages", json!(paged.ocr_pages())));
+                let full = paged.text();
+                if full.is_empty() {
+                    out.push(("text_note", json!(no_text)));
+                } else if max_chars > 0 {
+                    let (text, cut) = clip(&full, max_chars);
+                    out.push(("text", json!(strip_invisible(&text))));
+                    if cut {
+                        out.push(("text_truncated", json!(true)));
+                        out.push(("text_chars_total", json!(full.chars().count())));
+                    }
+                }
+                let note = match (paged.note, ocr_enabled) {
+                    (Some(note), _) => Some(note),
+                    (None, false) if full.is_empty() => Some("Распознавание сканов выключено в настройках AIOWA: вкладка «ИИ» → «Доступ для агентов (MCP)».".to_string()),
+                    _ => None,
+                };
+                out.push(("ocr_note", json!(note)));
             }
-        } else if !has_text {
-            out.push(("text_note", json!(if path.is_some() { "Текст из файла не извлечён (вид файла не поддерживается или текста в нём нет): читайте файл по path" } else { "Текста нет: файл ещё не скачан" })));
+            None => {
+                let has_text = row.text_state == TEXT_OK && row.text_len > 0;
+                out.push(("text_source", json!(if has_text { "extracted" } else { "none" })));
+                if has_text && max_chars > 0 {
+                    let (text, cut) = clip(&db(ctx.store.attachment_text(attachment_pk))?.unwrap_or_default(), max_chars);
+                    out.push(("text", json!(strip_invisible(&text))));
+                    if cut {
+                        out.push(("text_truncated", json!(true)));
+                        out.push(("text_chars_total", json!(row.text_len)));
+                    }
+                } else if !has_text {
+                    out.push(("text_note", json!(no_text)));
+                }
+            }
         }
         if let Some(w) = warning {
             out.push(("warning", json!(w)));

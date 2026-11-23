@@ -1,5 +1,5 @@
 //! Извлечение текста из вложений для поискового индекса. Чистые функции над байтами,
-//! без ввода-вывода и без OCR: PDF с текстовым слоем, DOCX, XLSX/XLS, TXT/CSV, вложенные письма .eml.
+//! без ввода-вывода и без OCR (распознавание сканов — отдельный крейт `aiowa-ocr`): PDF с текстовым слоем, DOCX, XLSX/XLS, TXT/CSV, вложенные письма .eml.
 //! Остальные типы (картинки, архивы, сканы) считаются неподдерживаемыми и пропускаются.
 
 use std::io::{Cursor, Read};
@@ -88,6 +88,16 @@ pub fn extract_text(name: Option<&str>, content_type: Option<&str>, bytes: &[u8]
         k => k,
     };
     extract(kind, bytes, max_chars)
+}
+
+/// Текст PDF по страницам: по нему видно, на каких страницах есть текстовый слой, а какие — скан
+/// (пустая строка). `max_chars` — предел на страницу. Ошибка — файл не разобрался.
+pub fn pdf_pages(bytes: &[u8], max_chars: usize) -> Result<Vec<String>, String> {
+    match catch_unwind(AssertUnwindSafe(|| pdf_extract::extract_text_from_mem_by_pages(bytes).map_err(|e| format!("pdf: {e}")))) {
+        Ok(Ok(pages)) => Ok(pages.into_iter().map(|p| limit_chars(normalize_ws(&p), max_chars)).collect()),
+        Ok(Err(e)) => Err(e),
+        Err(_) => Err("паника в библиотеке разбора".into()),
+    }
 }
 
 fn limit_chars(s: String, max: usize) -> String {

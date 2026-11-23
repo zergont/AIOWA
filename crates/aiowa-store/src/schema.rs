@@ -10,7 +10,7 @@ use rusqlite::types::ValueRef;
 use rusqlite::Connection;
 use tracing::info;
 
-pub const CURRENT_VERSION: i64 = 18;
+pub const CURRENT_VERSION: i64 = 19;
 
 /// Состояния текста вложения (`attachments.text_state`).
 pub const TEXT_PENDING: i64 = 0;
@@ -690,11 +690,29 @@ pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
         conn.pragma_update(None, "user_version", 18)?;
         info!("схема базы обновлена до версии 18: черновики, подготовленные агентом через MCP-сервер");
     }
+    if version < 19 {
+        conn.execute_batch(V19_TABLES)?;
+        add_column_if_missing(conn, "attachments", "pages_total", "INTEGER")?;
+        conn.pragma_update(None, "user_version", 19)?;
+        info!("схема базы обновлена до версии 19: текст вложений по страницам, распознавание сканов");
+    }
     Ok(())
 }
 
 /// Версия 17: журнал обращений внешних агентов через MCP-сервер (`mcp_log.rs`) — что и сколько
 /// отдано, без запросов агента и без содержимого писем.
+/// Текст вложения по страницам: извлечённый из файла (`source` 1) и распознанный по изображению
+/// страницы (`source` 2). Письма и вложения эта таблица не меняет: это кэш того, что уже прочитано.
+const V19_TABLES: &str = r#"
+CREATE TABLE IF NOT EXISTS attachment_pages (
+  attachment_pk INTEGER NOT NULL REFERENCES attachments(attachment_pk) ON DELETE CASCADE,
+  page          INTEGER NOT NULL,
+  source        INTEGER NOT NULL,
+  text          TEXT NOT NULL,
+  PRIMARY KEY (attachment_pk, page, source)
+) WITHOUT ROWID;
+"#;
+
 const V17_TABLES: &str = r#"
 CREATE TABLE IF NOT EXISTS mcp_calls (
   call_pk     INTEGER PRIMARY KEY,

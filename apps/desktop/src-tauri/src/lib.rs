@@ -82,6 +82,7 @@ mod mail_dark;
 mod navigation;
 mod mcp;
 mod mcp_tools;
+mod pages;
 mod notify;
 mod ondemand;
 mod people;

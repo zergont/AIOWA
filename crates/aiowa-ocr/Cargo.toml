@@ -1,0 +1,13 @@
+[package]
+name = "aiowa-ocr"
+description = "Распознавание текста на сканах: страницы PDF без текстового слоя и картинки, встроенными средствами Windows"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+tracing.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = ["Data_Pdf", "Foundation", "Foundation_Collections", "Globalization", "Graphics_Imaging", "Media_Ocr", "Storage_Streams"] }

@@ -36,6 +36,10 @@ use tracing::{debug, info, warn};
 pub(crate) const FLAG: &str = "--mcp";
 const ENABLED_KEY: &str = "mcp.enabled";
 const GROUPS_KEY: &str = "mcp.groups";
+/// Распознавать ли сканы во вложениях (`0` — нет); по умолчанию да: это то же чтение вложений.
+const OCR_KEY: &str = "mcp.ocr";
+/// Порог «на странице нет текста», символов; ключа нет — `pages::PAGE_MIN_CHARS`.
+const OCR_MIN_CHARS_KEY: &str = "mcp.ocr_min_chars";
 /// Версии протокола, которые сервер понимает; первая — предпочитаемая.
 const PROTOCOLS: [&str; 3] = ["2025-06-18", "2025-03-26", "2024-11-05"];
 /// Сессия на почтовом сервере закрывается после такого простоя без обращений к сети: клиент может
@@ -126,6 +130,15 @@ impl McpConfig {
     }
 }
 
+/// Настройки распознавания сканов: включено ли и сколько символов текстового слоя делают
+/// страницу «не сканом».
+pub(crate) fn ocr_settings(store: &Store, account: AccountId) -> (bool, usize) {
+    let get = |key: &str| store.get_state(account, key).ok().flatten();
+    let enabled = get(OCR_KEY).as_deref() != Some("0");
+    let min_chars = get(OCR_MIN_CHARS_KEY).and_then(|v| v.trim().parse::<usize>().ok()).filter(|n| (1..=5000).contains(n)).unwrap_or(crate::pages::PAGE_MIN_CHARS);
+    (enabled, min_chars)
+}
+
 // --- состояние сервера -----------------------------------------------------------------------
 
 /// Всё, что нужно инструментам: база, вход на сервер по требованию, замки повторных обращений.
@@ -134,6 +147,8 @@ pub(crate) struct Core {
     pub(crate) sync: Arc<SyncState>,
     pub(crate) od: OnDemand,
     pub(crate) cal: CalendarState,
+    /// Одно вложение распознаётся одним вызовом за раз: второй ждёт и берёт готовое из базы.
+    pub(crate) ocr_locks: crate::ondemand::KeyedLocks,
     /// Сколько инструментов сейчас ходит в сеть.
     net_busy: AtomicUsize,
     /// Когда закончилось последнее обращение к сети.
@@ -152,7 +167,7 @@ impl Drop for NetGuard<'_> {
 
 impl Core {
     pub(crate) fn new(state: AppState, sync: Arc<SyncState>) -> Self {
-        Self { state, sync, od: OnDemand::default(), cal: CalendarState::default(), net_busy: AtomicUsize::new(0), last_net: Mutex::new(None) }
+        Self { state, sync, od: OnDemand::default(), cal: CalendarState::default(), ocr_locks: Default::default(), net_busy: AtomicUsize::new(0), last_net: Mutex::new(None) }
     }
 
     pub(crate) fn net(&self) -> NetGuard<'_> {
@@ -433,6 +448,10 @@ pub(crate) struct McpSettingsDto {
     blocked_by_mode: bool,
     /// Путь к исполняемому файлу для конфига клиента (запускать с ключом `--mcp`).
     command: String,
+    /// Распознавать ли сканы во вложениях.
+    ocr: bool,
+    /// Язык распознавания Windows (`ru`); `None` — распознавать на этом компьютере нечем.
+    ocr_language: Option<String>,
     recent: Vec<McpCallDto>,
     month_calls: i64,
     month_items: i64,
@@ -448,6 +467,8 @@ fn settings_dto(state: &AppState) -> CmdResult<McpSettingsDto> {
         groups: cfg.groups,
         blocked_by_mode: cfg.own_only,
         command: std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_default(),
+        ocr: ocr_settings(&state.store, state.account).0,
+        ocr_language: aiowa_ocr::language().ok().filter(|l| !l.is_empty()),
         recent: recent.into_iter().map(|c| McpCallDto { at_ms: c.at, tool: c.tool, client: c.client, items: c.items, chars: c.chars, duration_ms: c.duration_ms, outcome: c.outcome }).collect(),
         month_calls: month.calls,
         month_items: month.items,
@@ -464,6 +485,7 @@ pub(crate) fn mcp_settings(state: State<'_, AppState>) -> CmdResult<McpSettingsD
 pub(crate) struct McpPatch {
     enabled: Option<bool>,
     groups: Option<Vec<Group>>,
+    ocr: Option<bool>,
 }
 
 /// Включить или выключить доступ агентов, выбрать виды данных. Действует со следующего вызова
@@ -482,6 +504,10 @@ pub(crate) fn mcp_settings_set(patch: McpPatch, state: State<'_, AppState>) -> C
         let groups: Vec<Group> = Group::ALL.into_iter().filter(|g| groups.contains(g)).collect();
         state.store.set_state(state.account, GROUPS_KEY, Some(&serde_json::to_string(&groups).map_err(err)?)).map_err(err)?;
         info!(groups = groups.len(), "виды данных для агентов (MCP) изменены");
+    }
+    if let Some(ocr) = patch.ocr {
+        state.store.set_state(state.account, OCR_KEY, Some(if ocr { "1" } else { "0" })).map_err(err)?;
+        info!(ocr, "распознавание сканов для агентов (MCP) переключено");
     }
     settings_dto(&state)
 }
@@ -836,6 +862,121 @@ mod tests {
         let log = store.mcp_calls_recent(acc, 30).unwrap();
         assert_eq!(log.iter().filter(|c| c.tool == "create_draft" && c.outcome == "ok").map(|c| c.items).collect::<Vec<_>>(), [1, 1, 1]);
         assert!(log.iter().all(|c| c.client == "Claude Code 2.1"));
+    }
+
+    /// PDF с надписями встроенным шрифтом, по одной на страницу: у страницы есть текстовый слой,
+    /// а нарисованная, она читается распознаванием — как скан.
+    fn text_pdf(pages: &[&str]) -> Vec<u8> {
+        let mut objs: Vec<String> = vec!["<< /Type /Catalog /Pages 2 0 R >>".into()];
+        let kids: String = (0..pages.len()).map(|i| format!("{} 0 R ", 4 + i * 2)).collect();
+        objs.push(format!("<< /Type /Pages /Kids [{kids}] /Count {} >>", pages.len()));
+        objs.push("<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>".into());
+        for (i, text) in pages.iter().enumerate() {
+            objs.push(format!("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 3 0 R >> >> /Contents {} 0 R >>", 5 + i * 2));
+            let content = format!("BT /F1 22 Tf 40 700 Td ({text}) Tj ET");
+            objs.push(format!("<< /Length {} >>\nstream\n{content}\nendstream", content.len()));
+        }
+        let mut out = String::from("%PDF-1.4\n");
+        let mut offsets = Vec::new();
+        for (i, o) in objs.iter().enumerate() {
+            offsets.push(out.len());
+            out.push_str(&format!("{} 0 obj\n{o}\nendobj\n", i + 1));
+        }
+        let xref = out.len();
+        out.push_str(&format!("xref\n0 {}\n0000000000 65535 f \n", objs.len() + 1));
+        for off in offsets {
+            out.push_str(&format!("{off:010} 00000 n \n"));
+        }
+        out.push_str(&format!("trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n", objs.len() + 1));
+        out.into_bytes()
+    }
+
+    #[tokio::test]
+    async fn scanned_pages_are_recognized_once_and_modes_are_respected() {
+        let (s, store, acc) = server("ocr");
+        enable(&store, acc);
+        // Вложение «смета.pdf» получает файл: на первой странице текстовый слой длиннее порога,
+        // на второй — короткая надпись, как у скана с номером страницы.
+        const LONG: &str = "This first page has a real text layer that is longer than fifty characters";
+        let pdf = text_pdf(&[LONG, "SCAN PAGE 2025"]);
+        let found = ok(&s, "search_mail", json!({ "query": "насосы" })).await;
+        let with_file = found["messages"].as_array().unwrap().iter().find(|m| m["has_attachments"] == true).unwrap()["message_id"].as_i64().unwrap();
+        let row = store.attachments_of_item(with_file).unwrap().remove(0);
+        store.save_attachment(&row.todo(), &pdf, Some("application/pdf"), aiowa_store::AttachmentText::Extracted(format!("{LONG} SCAN PAGE 2025"))).unwrap();
+        let id = row.attachment_pk;
+        let can_read = aiowa_ocr::language().is_ok();
+
+        let first = ok(&s, "get_attachment", json!({ "attachment_id": id })).await;
+        assert_eq!(first["pages_total"], 2);
+        let text = first["text"].as_str().unwrap();
+        assert!(text.starts_with("--- стр. 1 ---\n") && text.contains(LONG) && text.contains("\n\n--- стр. 2 ---\n"), "{text}");
+        if can_read {
+            assert_eq!((first["text_source"].as_str(), &first["ocr_pages"]), (Some("mixed"), &json!([2])), "{first}");
+            assert!(text.to_uppercase().contains("SCAN") && first.get("ocr_note").is_none(), "{text}");
+            // Распознанное лежит в базе: повторный вызов отвечает тем же, не распознавая заново.
+            let (total, pages) = store.attachment_pages(id).unwrap();
+            assert_eq!((total, pages.iter().map(|p| (p.page, p.source)).collect::<Vec<_>>()), (Some(2), vec![(1, aiowa_store::PAGE_EXTRACTED), (2, aiowa_store::PAGE_EXTRACTED), (2, aiowa_store::PAGE_OCR)]));
+            assert_eq!(ok(&s, "get_attachment", json!({ "attachment_id": id })).await, first);
+            // Принудительно — и страница с текстовым слоем читается распознаванием.
+            let forced = ok(&s, "get_attachment", json!({ "attachment_id": id, "ocr": "force", "pages": "1" })).await;
+            assert_eq!((forced["text_source"].as_str(), &forced["ocr_pages"]), (Some("ocr"), &json!([1])));
+            assert!(forced["text"].as_str().unwrap().to_uppercase().contains("FIRST PAGE"), "{forced}");
+        } else {
+            assert_eq!(first["text_source"], "extracted");
+            assert!(first["ocr_note"].as_str().unwrap().contains("недоступно"), "{first}");
+        }
+
+        // Без распознавания — только текст из файла, как раньше.
+        let off = ok(&s, "get_attachment", json!({ "attachment_id": id, "ocr": "off" })).await;
+        assert_eq!((off["text_source"].as_str(), off.get("ocr_pages")), (Some("extracted"), None));
+        assert!(off["text"].as_str().unwrap().ends_with("--- стр. 2 ---\nSCAN PAGE 2025"), "{off}");
+        // Одна страница по номеру; страницы, которой нет, и неверные параметры — отказ.
+        let second = ok(&s, "get_attachment", json!({ "attachment_id": id, "pages": "2", "ocr": "off" })).await;
+        assert_eq!(second["text"], "--- стр. 2 ---\nSCAN PAGE 2025");
+        for (args, part) in [(json!({ "attachment_id": id, "pages": "5" }), "всего 2 стр"), (json!({ "attachment_id": id, "pages": "два" }), "pages"), (json!({ "attachment_id": id, "ocr": "да" }), "ocr")] {
+            let (is_error, text) = call(&s, "get_attachment", args).await;
+            assert!(is_error && text.contains(part), "{part}: {text}");
+        }
+
+        // Распознавание выключено в настройках: как `off`, а принудительное — отказ.
+        store.set_state(acc, OCR_KEY, Some("0")).unwrap();
+        assert_eq!(ok(&s, "get_attachment", json!({ "attachment_id": id })).await["text_source"], "extracted");
+        let (is_error, text) = call(&s, "get_attachment", json!({ "attachment_id": id, "ocr": "force" })).await;
+        assert!(is_error && text.contains("выключено"), "{text}");
+        assert_eq!(ocr_settings(&store, acc), (false, crate::pages::PAGE_MIN_CHARS));
+        store.set_state(acc, OCR_MIN_CHARS_KEY, Some("120")).unwrap();
+        store.set_state(acc, OCR_KEY, None).unwrap();
+        assert_eq!(ocr_settings(&store, acc), (true, 120));
+    }
+
+    #[tokio::test]
+    async fn long_scan_is_recognized_in_portions() {
+        if aiowa_ocr::language().is_err() {
+            eprintln!("распознавание недоступно, тест пропущен");
+            return;
+        }
+        let (s, store, acc) = server("ocr-long");
+        enable(&store, acc);
+        // Скан в 23 страницы: на каждой только короткая надпись.
+        let labels: Vec<String> = (1..=23).map(|n| format!("SHEET {n}")).collect();
+        let pdf = text_pdf(&labels.iter().map(String::as_str).collect::<Vec<_>>());
+        let found = ok(&s, "search_mail", json!({ "query": "насосы" })).await;
+        let with_file = found["messages"].as_array().unwrap().iter().find(|m| m["has_attachments"] == true).unwrap()["message_id"].as_i64().unwrap();
+        let row = store.attachments_of_item(with_file).unwrap().remove(0);
+        store.save_attachment(&row.todo(), &pdf, Some("application/pdf"), aiowa_store::AttachmentText::Extracted(labels.join(" "))).unwrap();
+        let id = row.attachment_pk;
+
+        // За вызов — не больше двадцати страниц; про остальные сказано, как их запросить.
+        let first = ok(&s, "get_attachment", json!({ "attachment_id": id })).await;
+        assert_eq!((first["pages_total"].as_i64(), first["ocr_pages"].as_array().map(Vec::len)), (Some(23), Some(crate::pages::OCR_PAGES_PER_CALL)));
+        let note = first["ocr_note"].as_str().unwrap();
+        assert!(note.contains("21–23") && note.contains("pages"), "{note}");
+        let rest = ok(&s, "get_attachment", json!({ "attachment_id": id, "pages": "21-23" })).await;
+        assert_eq!((&rest["ocr_pages"], rest["text_source"].as_str(), rest.get("ocr_note")), (&json!([21, 22, 23]), Some("ocr"), None));
+        assert!(rest["text"].as_str().unwrap().starts_with("--- стр. 21 ---"));
+        // Теперь весь файл читается из базы без пояснений.
+        let whole = ok(&s, "get_attachment", json!({ "attachment_id": id })).await;
+        assert_eq!((whole["ocr_pages"].as_array().map(Vec::len), whole.get("ocr_note")), (Some(23), None));
     }
 
     #[test]

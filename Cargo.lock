@@ -99,6 +99,7 @@ dependencies = [
  "aiowa-ai",
  "aiowa-core",
  "aiowa-extract",
+ "aiowa-ocr",
  "aiowa-store",
  "aiowa-sync",
  "aiowa-transport",
@@ -141,6 +142,15 @@ dependencies = [
  "quick-xml 0.42.0",
  "tracing",
  "zip 9.0.4",
+]
+
+[[package]]
+name = "aiowa-ocr"
+version = "0.2.19"
+dependencies = [
+ "thiserror 2.0.21",
+ "tracing",
+ "windows",
 ]
 
 [[package]]
