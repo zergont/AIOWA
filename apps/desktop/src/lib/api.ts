@@ -1588,6 +1588,8 @@ export interface McpSettings {
   export_keep_days: number;
   /** Последние выгрузки, свежие первыми. */
   exports: McpExport[];
+  /** Показывать ли агенту страницы вложений картинками. */
+  page_pictures: boolean;
   recent: McpCall[];
   month_calls: number;
   month_items: number;
@@ -1599,6 +1601,7 @@ export interface McpSettingsPatch {
   groups?: McpGroup[];
   ocr?: boolean;
   export_keep_days?: number;
+  page_pictures?: boolean;
 }
 
 /**

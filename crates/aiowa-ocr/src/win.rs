@@ -5,11 +5,12 @@
 
 use crate::{reading_order, refine_latin, Line, OcrError, SourceKind, Word, MAX_SIDE, RENDER_DPI};
 use windows::core::{Error, HSTRING};
+use windows::Foundation::{PropertyType, PropertyValue};
 use windows::Data::Pdf::{PdfDocument, PdfPageRenderOptions};
 use windows::Globalization::Language;
-use windows::Graphics::Imaging::{BitmapAlphaMode, BitmapDecoder, BitmapEncoder, BitmapFrame, BitmapInterpolationMode, BitmapPixelFormat, BitmapTransform, ColorManagementMode, ExifOrientationMode, SoftwareBitmap};
+use windows::Graphics::Imaging::{BitmapAlphaMode, BitmapDecoder, BitmapEncoder, BitmapFrame, BitmapInterpolationMode, BitmapPixelFormat, BitmapPropertySet, BitmapTransform, BitmapTypedValue, ColorManagementMode, ExifOrientationMode, SoftwareBitmap};
 use windows::Media::Ocr::{OcrEngine, OcrResult};
-use windows::Storage::Streams::{DataWriter, InMemoryRandomAccessStream};
+use windows::Storage::Streams::{DataReader, DataWriter, InMemoryRandomAccessStream};
 
 type WinResult<T> = windows::core::Result<T>;
 
@@ -81,11 +82,11 @@ pub(crate) struct Document {
     pages: u32,
 }
 
-/// Кадр картинки в виде, который принимает распознавание: BGRA, длинная сторона не больше
-/// `MAX_SIDE`; у фотографий учитывается поворот из EXIF.
-fn bitmap(frame: &BitmapFrame, exif: ExifOrientationMode) -> WinResult<SoftwareBitmap> {
+/// Кадр картинки в виде, который принимают распознавание и сжатие: BGRA, длинная сторона не
+/// больше `max_side`; у фотографий учитывается поворот из EXIF.
+fn bitmap(frame: &BitmapFrame, exif: ExifOrientationMode, max_side: u32) -> WinResult<SoftwareBitmap> {
     let (width, height) = (frame.PixelWidth()?.max(1), frame.PixelHeight()?.max(1));
-    let k = (f64::from(MAX_SIDE) / f64::from(width.max(height))).min(1.0);
+    let k = (f64::from(max_side.max(1)) / f64::from(width.max(height))).min(1.0);
     let transform = BitmapTransform::new()?;
     transform.SetScaledWidth(((f64::from(width) * k).round() as u32).max(1))?;
     transform.SetScaledHeight(((f64::from(height) * k).round() as u32).max(1))?;
@@ -93,40 +94,116 @@ fn bitmap(frame: &BitmapFrame, exif: ExifOrientationMode) -> WinResult<SoftwareB
     frame.GetSoftwareBitmapTransformedAsync(BitmapPixelFormat::Bgra8, BitmapAlphaMode::Premultiplied, &transform, exif, ColorManagementMode::DoNotColorManage)?.join()
 }
 
-/// Страница PDF картинкой в `RENDER_DPI` (большие форматы — мельче, чтобы уложиться в `MAX_SIDE`).
-fn render(doc: &PdfDocument, index: u32) -> WinResult<SoftwareBitmap> {
+/// Во сколько раз система увеличивает запрошенный размер отрисовки: он задаётся в единицах,
+/// не зависящих от экрана, и на экране с масштабом 175 % картинка выходит в 1,75 раза больше.
+/// Измеряется первой отрисовкой; дальше запрос делится на это число, чтобы не рисовать лишнего.
+static RENDER_SCALE: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+
+/// Страница PDF картинкой в `dpi` (большие форматы — мельче, чтобы уложиться в `max_side`):
+/// ровно того размера в пикселях, который из этого следует.
+fn render(doc: &PdfDocument, index: u32, dpi: u32, max_side: u32) -> WinResult<SoftwareBitmap> {
     let page = doc.GetPage(index)?;
     // Размер страницы — в 1/96 дюйма.
     let size = page.Size()?;
-    let scale = (RENDER_DPI as f32 / 96.0).min(MAX_SIDE as f32 / size.Width.max(size.Height).max(1.0));
+    let scale = (dpi.max(1) as f32 / 96.0).min(max_side.max(1) as f32 / size.Width.max(size.Height).max(1.0));
+    let (width, height) = (((size.Width * scale).round() as u32).max(1), ((size.Height * scale).round() as u32).max(1));
+    let system = RENDER_SCALE.get().copied().unwrap_or(1.0);
+    let asked = ((width as f32 / system).round() as u32).max(1);
     let options = PdfPageRenderOptions::new()?;
-    options.SetDestinationWidth(((size.Width * scale).round() as u32).max(1))?;
-    options.SetDestinationHeight(((size.Height * scale).round() as u32).max(1))?;
-    // Без сжатия: картинка нужна только движку распознавания.
+    options.SetDestinationWidth(asked)?;
+    options.SetDestinationHeight(((height as f32 / system).round() as u32).max(1))?;
+    // Без сжатия: дальше картинку читает распознавание или сжимает свой кодировщик.
     options.SetBitmapEncoderId(BitmapEncoder::BmpEncoderId()?)?;
     let out = InMemoryRandomAccessStream::new()?;
     page.RenderWithOptionsToStreamAsync(&out, &options)?.join()?;
     out.Seek(0)?;
-    let decoder = BitmapDecoder::CreateAsync(&out)?.join()?;
-    bitmap(&decoder.GetFrameAsync(0)?.join()?, ExifOrientationMode::IgnoreExifOrientation)
+    let frame = BitmapDecoder::CreateAsync(&out)?.join()?.GetFrameAsync(0)?.join()?;
+    if RENDER_SCALE.get().is_none() {
+        let measured = frame.PixelWidth()? as f32 / asked as f32;
+        let _ = RENDER_SCALE.set(if (0.5..=4.0).contains(&measured) { measured } else { 1.0 });
+    }
+    // Что бы ни нарисовала система, наружу идёт запрошенный размер.
+    let transform = BitmapTransform::new()?;
+    transform.SetScaledWidth(width)?;
+    transform.SetScaledHeight(height)?;
+    transform.SetInterpolationMode(BitmapInterpolationMode::Fant)?;
+    frame.GetSoftwareBitmapTransformedAsync(BitmapPixelFormat::Bgra8, BitmapAlphaMode::Premultiplied, &transform, ExifOrientationMode::IgnoreExifOrientation, ColorManagementMode::DoNotColorManage)?.join()
+}
+
+/// Файл из памяти: PDF или картинка, и сколько в нём страниц (кадров).
+fn open_source(kind: SourceKind, bytes: &[u8]) -> Result<(Source, u32), OcrError> {
+    let stream = stream_of(bytes).map_err(|e| failed("файл не прочитан", e))?;
+    Ok(match kind {
+        SourceKind::Pdf => {
+            let doc = PdfDocument::LoadFromStreamAsync(&stream).and_then(|op| op.join()).map_err(|e| failed("PDF не открылся", e))?;
+            let pages = doc.PageCount().map_err(|e| failed("PDF не открылся", e))?;
+            (Source::Pdf(doc), pages)
+        }
+        SourceKind::Image => {
+            let decoder = BitmapDecoder::CreateAsync(&stream).and_then(|op| op.join()).map_err(|e| failed("картинка не открылась", e))?;
+            let frames = decoder.FrameCount().map_err(|e| failed("картинка не открылась", e))?;
+            (Source::Image(decoder), frames.max(1))
+        }
+    })
+}
+
+/// Страница источника картинкой: у PDF — отрисовка в `dpi`, у картинки — её кадр.
+fn page_bitmap(source: &Source, index: u32, dpi: u32, max_side: u32) -> Result<SoftwareBitmap, OcrError> {
+    match source {
+        Source::Pdf(doc) => render(doc, index, dpi, max_side).map_err(|e| failed("страница не отрисована", e)),
+        Source::Image(decoder) => decoder.GetFrameAsync(index).and_then(|op| op.join()).and_then(|frame| bitmap(&frame, ExifOrientationMode::RespectExifOrientation, max_side)).map_err(|e| failed("картинка не прочитана", e)),
+    }
+}
+
+/// Картинка в JPEG с качеством `quality` (1–100).
+fn encode_jpeg(picture: &SoftwareBitmap, quality: u8) -> WinResult<Vec<u8>> {
+    let stream = InMemoryRandomAccessStream::new()?;
+    let options = BitmapPropertySet::new()?;
+    let value = BitmapTypedValue::Create(&PropertyValue::CreateSingle(f32::from(quality.clamp(1, 100)) / 100.0)?, PropertyType::Single)?;
+    options.Insert(&HSTRING::from("ImageQuality"), &value)?;
+    let encoder = BitmapEncoder::CreateWithEncodingOptionsAsync(BitmapEncoder::JpegEncoderId()?, &stream, &options)?.join()?;
+    // JPEG прозрачности не знает.
+    encoder.SetSoftwareBitmap(&SoftwareBitmap::ConvertWithAlpha(picture, BitmapPixelFormat::Bgra8, BitmapAlphaMode::Ignore)?)?;
+    encoder.FlushAsync()?.join()?;
+    let size = u32::try_from(stream.Size()?).unwrap_or(u32::MAX);
+    let reader = DataReader::CreateDataReader(&stream.GetInputStreamAt(0)?)?;
+    reader.LoadAsync(size)?.join()?;
+    let mut bytes = vec![0u8; size as usize];
+    reader.ReadBytes(&mut bytes)?;
+    Ok(bytes)
+}
+
+/// Файл, открытый для показа страниц картинками (без распознавания).
+pub(crate) struct Pictures {
+    source: Source,
+    pages: u32,
+}
+
+impl Pictures {
+    pub(crate) fn open(kind: SourceKind, bytes: &[u8]) -> Result<Self, OcrError> {
+        let (source, pages) = open_source(kind, bytes)?;
+        Ok(Self { source, pages })
+    }
+
+    pub(crate) fn page_count(&self) -> u32 {
+        self.pages
+    }
+
+    pub(crate) fn jpeg(&self, page: u32, dpi: u32, max_side: u32, quality: u8) -> Result<crate::Picture, OcrError> {
+        if page == 0 || page > self.pages {
+            return Err(OcrError::Failed(format!("страницы {page} нет: всего страниц {}", self.pages)));
+        }
+        let picture = page_bitmap(&self.source, page - 1, dpi, max_side)?;
+        let (width, height) = (picture.PixelWidth().unwrap_or(0).max(0) as u32, picture.PixelHeight().unwrap_or(0).max(0) as u32);
+        let jpeg = encode_jpeg(&picture, quality).map_err(|e| failed("картинка не сжата", e))?;
+        Ok(crate::Picture { jpeg, width, height })
+    }
 }
 
 impl Document {
     pub(crate) fn open(kind: SourceKind, bytes: &[u8]) -> Result<Self, OcrError> {
         let engines = engines()?;
-        let stream = stream_of(bytes).map_err(|e| failed("файл не прочитан", e))?;
-        let (source, pages) = match kind {
-            SourceKind::Pdf => {
-                let doc = PdfDocument::LoadFromStreamAsync(&stream).and_then(|op| op.join()).map_err(|e| failed("PDF не открылся", e))?;
-                let pages = doc.PageCount().map_err(|e| failed("PDF не открылся", e))?;
-                (Source::Pdf(doc), pages)
-            }
-            SourceKind::Image => {
-                let decoder = BitmapDecoder::CreateAsync(&stream).and_then(|op| op.join()).map_err(|e| failed("картинка не открылась", e))?;
-                let frames = decoder.FrameCount().map_err(|e| failed("картинка не открылась", e))?;
-                (Source::Image(decoder), frames.max(1))
-            }
-        };
+        let (source, pages) = open_source(kind, bytes)?;
         Ok(Self { source, engines, pages })
     }
 
@@ -142,10 +219,7 @@ impl Document {
         if page == 0 || page > self.pages {
             return Err(OcrError::Failed(format!("страницы {page} нет: всего страниц {}", self.pages)));
         }
-        let picture = match &self.source {
-            Source::Pdf(doc) => render(doc, page - 1).map_err(|e| failed("страница не отрисована", e))?,
-            Source::Image(decoder) => decoder.GetFrameAsync(page - 1).and_then(|op| op.join()).and_then(|frame| bitmap(&frame, ExifOrientationMode::RespectExifOrientation)).map_err(|e| failed("картинка не прочитана", e))?,
-        };
+        let picture = page_bitmap(&self.source, page - 1, RENDER_DPI, MAX_SIDE)?;
         let read = |engine: &OcrEngine| engine.RecognizeAsync(&picture).and_then(|op| op.join()).and_then(|result| words_of(&result));
         let found = read(&self.engines.main).map_err(|e| failed("распознавание не удалось", e))?;
         // Второй проход — английским движком, если на странице есть латиница; не вышел — без него.

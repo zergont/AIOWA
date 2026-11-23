@@ -247,6 +247,60 @@ impl Document {
     }
 }
 
+/// Страница картинкой: JPEG и его размер в пикселях.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Picture {
+    pub jpeg: Vec<u8>,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// Файл, открытый для показа страниц картинками — как есть, с печатями, подписями и таблицами.
+/// Распознавание для этого не нужно: работает и там, где языки распознавания не установлены.
+pub struct Pictures {
+    #[cfg(windows)]
+    inner: win::Pictures,
+}
+
+impl Pictures {
+    pub fn open(kind: SourceKind, bytes: &[u8]) -> Result<Self, OcrError> {
+        #[cfg(windows)]
+        {
+            win::Pictures::open(kind, bytes).map(|inner| Self { inner })
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = (kind, bytes);
+            Err(OcrError::Unavailable("только в Windows".into()))
+        }
+    }
+
+    pub fn page_count(&self) -> u32 {
+        #[cfg(windows)]
+        {
+            self.inner.page_count()
+        }
+        #[cfg(not(windows))]
+        {
+            0
+        }
+    }
+
+    /// Страница `page` (с единицы) в JPEG с качеством `quality` (1–100). Страница PDF рисуется в
+    /// `dpi`; длинная сторона картинки — не больше `max_side` пикселей (большее уменьшается).
+    pub fn jpeg(&self, page: u32, dpi: u32, max_side: u32, quality: u8) -> Result<Picture, OcrError> {
+        #[cfg(windows)]
+        {
+            self.inner.jpeg(page, dpi, max_side, quality)
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = (page, dpi, max_side, quality);
+            Err(OcrError::Unavailable("только в Windows".into()))
+        }
+    }
+}
+
 /// Язык, на котором будет читать распознавание (`ru`, `en-US`…); `Unavailable` — читать нечем.
 pub fn language() -> Result<String, OcrError> {
     #[cfg(windows)]
@@ -424,6 +478,38 @@ mod tests {
         assert!(second.contains("SECOND") && !second.contains("HELLO"), "{second}");
         assert!(matches!(doc.recognize(3), Err(OcrError::Failed(_))), "страницы 3 нет");
         assert!(matches!(doc.recognize(0), Err(OcrError::Failed(_))));
+    }
+
+    #[test]
+    fn pages_become_jpeg_pictures_within_the_size_limit() {
+        let pdf = text_pdf(&["HELLO WORLD 2025", "SECOND PAGE 77"]);
+        let pictures = match Pictures::open(SourceKind::Pdf, &pdf) {
+            Ok(p) => p,
+            // На сборочном сервере средств Windows для PDF может не быть.
+            Err(e) if std::env::var_os("CI").is_some() => {
+                eprintln!("отрисовка страниц недоступна, тест пропущен: {e}");
+                return;
+            }
+            Err(e) => panic!("PDF не открылся: {e}"),
+        };
+        assert_eq!(pictures.page_count(), 2);
+        // Лист A4 в 150 dpi — 1240×1754; предел 1600 по длинной стороне уменьшает его.
+        let page = pictures.jpeg(1, 150, 1600, 80).unwrap();
+        assert_eq!(&page.jpeg[..3], [0xFF, 0xD8, 0xFF], "это JPEG");
+        assert!(page.height == 1600 && (1125..=1137).contains(&page.width), "{}x{}", page.width, page.height);
+        let full = pictures.jpeg(2, 150, 4000, 80).unwrap();
+        assert!((1235..=1245).contains(&full.width) && (1750..=1758).contains(&full.height), "{}x{}", full.width, full.height);
+        let small = pictures.jpeg(1, 72, 4000, 80).unwrap();
+        assert!((590..=600).contains(&small.width) && small.jpeg.len() < full.jpeg.len());
+        assert!(pictures.jpeg(1, 150, 1600, 30).unwrap().jpeg.len() < page.jpeg.len(), "качество ниже — файл меньше");
+        assert!(matches!(pictures.jpeg(3, 150, 1600, 80), Err(OcrError::Failed(_))));
+        // Картинка-вложение отдаётся она сама, уменьшенная до того же предела.
+        let image = Pictures::open(SourceKind::Image, &page.jpeg).unwrap();
+        assert_eq!(image.page_count(), 1);
+        let reduced = image.jpeg(1, 150, 800, 80).unwrap();
+        assert!(reduced.height == 800 && (560..=570).contains(&reduced.width), "{}x{}", reduced.width, reduced.height);
+        let same = image.jpeg(1, 150, 4000, 80).unwrap();
+        assert_eq!((same.width, same.height), (page.width, page.height), "меньше предела — размер тот же");
     }
 
     #[test]

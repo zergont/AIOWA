@@ -149,6 +149,17 @@ pub(crate) fn export_file(root: &Path, subfolder: Option<&str>, name: &str, cach
     Ok(Exported { name: name.to_string(), path: plain(&target), size, already: false })
 }
 
+/// Записать в папку выгрузки (`root` — её настоящий путь) файл, который сделала сама AIOWA, —
+/// страницу вложения картинкой. Имя — уже безопасное (`export_name`); прежний файл заменяется.
+pub(crate) fn write_file(root: &Path, name: &str, bytes: &[u8]) -> Result<Exported, ExportError> {
+    let target = root.join(name);
+    if std::fs::symlink_metadata(&target).is_ok_and(|meta| meta.file_type().is_symlink() || meta.is_dir()) {
+        return Err(ExportError::Invalid(format!("На месте файла «{name}» в папке выгрузки — ссылка или папка")));
+    }
+    std::fs::write(&target, bytes).map_err(|e| ExportError::Failed(format!("Файл не записан в папку выгрузки: {e}")))?;
+    Ok(Exported { name: name.to_string(), path: plain(&target), size: bytes.len() as u64, already: false })
+}
+
 /// Удалить выгруженные файлы старше срока хранения. Удаляется только записанное в журнале, только
 /// внутри нынешней папки выгрузки (`root` — её настоящий путь) и только не изменённое после
 /// выгрузки (тот же размер); запись о файле, который изменили, перенесли или которого уже нет,
@@ -267,6 +278,16 @@ mod tests {
         }
         assert_eq!(export_file(&root, Some("лазейка"), "1-файл.txt", &cached, false), Err(ExportError::Invalid("Подпапка ведёт за пределы папки выгрузки".into())));
         assert!(std::fs::read_dir(&outside).unwrap().next().is_none(), "наружу ничего не записано");
+    }
+
+    #[test]
+    fn own_files_are_written_into_the_folder() {
+        let (root, _) = dirs("write");
+        let done = write_file(&root, "7-скан-стр1.jpg", b"jpeg-1").unwrap();
+        assert_eq!((done.size, done.already, std::fs::read(&done.path).unwrap()), (6, false, b"jpeg-1".to_vec()));
+        assert_eq!(std::fs::read(write_file(&root, "7-скан-стр1.jpg", b"new").unwrap().path).unwrap(), b"new", "прежний файл заменён");
+        std::fs::create_dir_all(root.join("8-папка.jpg")).unwrap();
+        assert!(matches!(write_file(&root, "8-папка.jpg", b"x"), Err(ExportError::Invalid(_))));
     }
 
     #[test]

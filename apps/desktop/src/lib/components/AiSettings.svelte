@@ -261,7 +261,7 @@
     }
   }
 
-  async function setMcp(patch: { enabled?: boolean; groups?: McpGroup[]; ocr?: boolean; export_keep_days?: number }) {
+  async function setMcp(patch: { enabled?: boolean; groups?: McpGroup[]; ocr?: boolean; export_keep_days?: number; page_pictures?: boolean }) {
     try {
       mcp = await api.mcpSettingsSet(patch);
       flash("Сохранено");
@@ -555,6 +555,11 @@
               В Windows не установлено распознавание текста: Параметры → Время и язык → Язык и регион → языковые компоненты.
             {/if}
           </p>
+          <label class="check">
+            <input type="checkbox" checked={m.page_pictures} disabled={!m.groups.includes("attachments")} onchange={(e) => void setMcp({ page_pictures: e.currentTarget.checked })} aria-describedby="{uid}-mcp-pictures" />
+            Показывать агенту страницы вложений картинками
+          </label>
+          <p class="hint" id="{uid}-mcp-pictures">Агент видит страницу PDF или картинку как есть — с печатями, подписями и таблицами, где распознавание ошибается. Картинки уходят в модель агента, как и текст.</p>
           <label class="check">
             <input type="checkbox" checked={m.groups.includes("drafts")} onchange={(e) => toggleMcpGroup("drafts", e.currentTarget.checked)} aria-describedby="{uid}-mcp-drafts" />
             Разрешить агентам готовить письма

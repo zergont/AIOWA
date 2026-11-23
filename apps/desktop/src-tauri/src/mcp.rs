@@ -44,6 +44,8 @@ const OCR_MIN_CHARS_KEY: &str = "mcp.ocr_min_chars";
 const EXPORT_DIR_KEY: &str = "mcp.export_dir";
 /// Сколько дней хранятся выгруженные файлы; ключа нет — `export::KEEP_DAYS`.
 const EXPORT_KEEP_KEY: &str = "mcp.export_keep_days";
+/// Показывать ли агенту страницы вложений картинками (`0` — нет); по умолчанию да.
+const PICTURES_KEY: &str = "mcp.page_pictures";
 /// Версии протокола, которые сервер понимает; первая — предпочитаемая.
 const PROTOCOLS: [&str; 3] = ["2025-06-18", "2025-03-26", "2024-11-05"];
 /// Сессия на почтовом сервере закрывается после такого простоя без обращений к сети: клиент может
@@ -143,6 +145,11 @@ pub(crate) fn ocr_settings(store: &Store, account: AccountId) -> (bool, usize) {
     (enabled, min_chars)
 }
 
+/// Можно ли показывать агенту страницы вложений картинками (`get_attachment_pages`).
+pub(crate) fn pictures_enabled(store: &Store, account: AccountId) -> bool {
+    store.get_state(account, PICTURES_KEY).ok().flatten().as_deref() != Some("0")
+}
+
 /// Папка выгрузки для агента (`None` — не выбрана) и срок хранения выгруженного, дней.
 pub(crate) fn export_settings(store: &Store, account: AccountId) -> (Option<String>, u32) {
     let get = |key: &str| store.get_state(account, key).ok().flatten();
@@ -224,6 +231,13 @@ fn reply_error(id: &Value, code: i64, message: &str) -> String {
 /// Итог вызова инструмента в виде MCP: текст и признак ошибки.
 fn tool_result(text: &str, is_error: bool) -> Value {
     json!({ "content": [{ "type": "text", "text": text }], "isError": is_error })
+}
+
+/// Итог с картинками: текст, затем по блоку `image` на страницу.
+fn tool_result_with(text: &str, images: &[mcp_tools::ToolImage]) -> Value {
+    let mut content = vec![json!({ "type": "text", "text": text })];
+    content.extend(images.iter().map(|i| json!({ "type": "image", "data": i.data, "mimeType": i.mime })));
+    json!({ "content": content, "isError": false })
 }
 
 impl Server {
@@ -314,9 +328,9 @@ impl Server {
             Some(refused) => Err(refused),
             None => mcp_tools::run(core, spec.name, args, &self.client()).await,
         };
-        let (text, is_error, items, outcome) = match result {
-            Ok(out) => (out.value.to_string(), false, out.items, "ok"),
-            Err(e) => (e.message, true, 0, e.outcome),
+        let (text, is_error, items, outcome, images) = match result {
+            Ok(rich) => (rich.output.value.to_string(), false, rich.output.items, "ok", rich.images),
+            Err(e) => (e.message, true, 0, e.outcome, Vec::new()),
         };
         let chars = if is_error { 0 } else { text.chars().count() };
         let duration_ms = started.elapsed().as_millis() as i64;
@@ -324,8 +338,8 @@ impl Server {
         if let Err(e) = core.state.store.mcp_call_add(core.state.account, &call) {
             warn!(error = %e, "MCP: обращение не записано в журнал");
         }
-        info!(tool = spec.name, outcome, items, chars, ms = duration_ms, "MCP: вызов инструмента");
-        tool_result(&text, is_error)
+        info!(tool = spec.name, outcome, items, chars, images = images.len(), ms = duration_ms, "MCP: вызов инструмента");
+        if is_error { tool_result(&text, true) } else { tool_result_with(&text, &images) }
     }
 }
 
@@ -492,6 +506,8 @@ pub(crate) struct McpSettingsDto {
     export_keep_days: u32,
     /// Последние выгрузки, свежие первыми.
     exports: Vec<McpExportDto>,
+    /// Показывать ли агенту страницы вложений картинками.
+    page_pictures: bool,
     recent: Vec<McpCallDto>,
     month_calls: i64,
     month_items: i64,
@@ -514,6 +530,7 @@ fn settings_dto(state: &AppState) -> CmdResult<McpSettingsDto> {
         export_dir,
         export_keep_days,
         exports: exports.into_iter().map(|e| McpExportDto { at_ms: e.at, name: e.name, path: e.path, size: e.size, client: e.client }).collect(),
+        page_pictures: pictures_enabled(&state.store, state.account),
         recent: recent.into_iter().map(|c| McpCallDto { at_ms: c.at, tool: c.tool, client: c.client, items: c.items, chars: c.chars, duration_ms: c.duration_ms, outcome: c.outcome }).collect(),
         month_calls: month.calls,
         month_items: month.items,
@@ -532,6 +549,7 @@ pub(crate) struct McpPatch {
     groups: Option<Vec<Group>>,
     ocr: Option<bool>,
     export_keep_days: Option<u32>,
+    page_pictures: Option<bool>,
 }
 
 /// Включить или выключить доступ агентов, выбрать виды данных. Действует со следующего вызова
@@ -554,6 +572,10 @@ pub(crate) fn mcp_settings_set(patch: McpPatch, state: State<'_, AppState>) -> C
     if let Some(ocr) = patch.ocr {
         state.store.set_state(state.account, OCR_KEY, Some(if ocr { "1" } else { "0" })).map_err(err)?;
         info!(ocr, "распознавание сканов для агентов (MCP) переключено");
+    }
+    if let Some(on) = patch.page_pictures {
+        state.store.set_state(state.account, PICTURES_KEY, Some(if on { "1" } else { "0" })).map_err(err)?;
+        info!(on, "показ страниц вложений картинками для агентов (MCP) переключён");
     }
     if let Some(days) = patch.export_keep_days {
         if !(1..=365).contains(&days) {
@@ -1144,6 +1166,88 @@ mod tests {
         assert!(!std::path::Path::new(&old.path).exists() && path.is_file());
         assert_eq!(store.mcp_exports_recent(acc, 10).unwrap().len(), 1);
         assert_eq!(export_settings(&store, acc), (Some(out.display().to_string()), crate::export::KEEP_DAYS));
+    }
+
+    #[tokio::test]
+    async fn pages_are_shown_as_pictures_or_saved_to_the_export_folder() {
+        use base64::Engine as _;
+        let (s, store, acc) = server("pictures");
+        enable(&store, acc);
+        // Вложение «смета.pdf» — файл в 12 страниц; второе письмо несёт таблицу (не PDF и не картинку).
+        let labels: Vec<String> = (1..=12).map(|n| format!("SHEET {n}")).collect();
+        let pdf = text_pdf(&labels.iter().map(String::as_str).collect::<Vec<_>>());
+        if let Err(e) = aiowa_ocr::Pictures::open(aiowa_ocr::SourceKind::Pdf, &pdf) {
+            // На сборочном сервере средств Windows для PDF может не быть.
+            assert!(std::env::var_os("CI").is_some(), "страницы не рисуются: {e}");
+            eprintln!("отрисовка страниц недоступна, тест пропущен: {e}");
+            return;
+        }
+        let found = ok(&s, "search_mail", json!({ "query": "насосы" })).await;
+        let with_file = found["messages"].as_array().unwrap().iter().find(|m| m["has_attachments"] == true).unwrap()["message_id"].as_i64().unwrap();
+        let row = store.attachments_of_item(with_file).unwrap().remove(0);
+        store.save_attachment(&row.todo(), &pdf, Some("application/pdf"), aiowa_store::AttachmentText::Extracted(labels.join(" "))).unwrap();
+        let id = row.attachment_pk;
+        let (inbox, _) = store.folder_by_distinguished(acc, "inbox").unwrap().unwrap();
+        let sheet = AttachmentMeta { id: "att-xlsx".into(), name: Some("таблица.xlsx".into()), content_type: None, size: Some(500), is_inline: false, content_id: None };
+        store.store_full_messages(acc, inbox, &[message("X", "Таблица расчёта", "2026-11-19T12:00:00Z", "<p>См. вложение.</p>", vec![sheet])]).unwrap();
+        let sheet_message = ok(&s, "search_mail", json!({ "query": "таблица расчёта" })).await["messages"][0]["message_id"].as_i64().unwrap();
+        let sheet_id = store.attachments_of_item(sheet_message).unwrap()[0].attachment_pk;
+        // Ответ инструмента как он есть: текст и картинки.
+        let pages = |args: Value| {
+            let s = &s;
+            async move {
+                let r = rpc(s, "tools/call", json!({ "name": "get_attachment_pages", "arguments": args })).await;
+                let content = r["result"]["content"].as_array().unwrap().clone();
+                let meta: Value = serde_json::from_str(content[0]["text"].as_str().unwrap()).unwrap_or(Value::Null);
+                (r["result"]["isError"].as_bool().unwrap(), content, meta)
+            }
+        };
+
+        // По умолчанию — первая страница: блок текста и блок image с настоящим JPEG.
+        let (is_error, content, meta) = pages(json!({ "attachment_id": id })).await;
+        assert!(!is_error && content.len() == 2, "{content:?}");
+        assert_eq!((meta["pages_total"].as_i64(), &meta["pages"], meta["name"].as_str()), (Some(12), &json!([1]), Some("смета.pdf")));
+        assert_eq!((content[1]["type"].as_str(), content[1]["mimeType"].as_str()), (Some("image"), Some("image/jpeg")));
+        let jpeg = base64::engine::general_purpose::STANDARD.decode(content[1]["data"].as_str().unwrap()).unwrap();
+        assert_eq!(&jpeg[..3], [0xFF, 0xD8, 0xFF]);
+        assert_eq!((meta["pictures"][0]["height"].as_i64(), meta.get("note"), meta.get("files")), (Some(1600), None, None), "{meta}");
+
+        // Двенадцать страниц — отдаются пять, про остальные сказано.
+        let (_, content, meta) = pages(json!({ "attachment_id": id, "pages": "1-12", "dpi": 72 })).await;
+        assert_eq!((content.len(), &meta["pages"]), (6, &json!([1, 2, 3, 4, 5])));
+        assert!(meta["note"].as_str().unwrap().contains("6–12"), "{meta}");
+        assert_eq!(meta["pictures"][0]["width"], 595, "72 dpi — страница в натуральную величину");
+        // Страницы, которых нет; файл без страниц; неверные параметры.
+        for (args, part) in [(json!({ "attachment_id": id, "pages": "40" }), "всего 12 стр"), (json!({ "attachment_id": sheet_id }), "только у PDF и изображений"), (json!({ "attachment_id": id, "pages": "x" }), "pages"), (json!({ "attachment_id": id, "dpi": "много" }), "dpi"), (json!({ "attachment_id": 999_999 }), "нет в локальной базе")] {
+            let (is_error, content, _) = pages(args).await;
+            assert!(is_error && content[0]["text"].as_str().unwrap().contains(part), "{part}: {content:?}");
+        }
+
+        // Сохранение файлами: без папки — отказ, с папкой — пути вместо картинок и записи в журнале.
+        let (is_error, content, _) = pages(json!({ "attachment_id": id, "save_to_export": true })).await;
+        assert!(is_error && content[0]["text"].as_str().unwrap().contains("Папка выгрузки не задана"));
+        let out = std::env::temp_dir().join(format!("aiowa-mcp-pictures-out-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&out);
+        std::fs::create_dir_all(&out).unwrap();
+        store.set_state(acc, EXPORT_DIR_KEY, Some(&out.display().to_string())).unwrap();
+        let (is_error, content, meta) = pages(json!({ "attachment_id": id, "pages": "2-3", "save_to_export": true })).await;
+        assert!(!is_error && content.len() == 1, "картинок в ответе нет: {content:?}");
+        let files = meta["files"].as_array().unwrap();
+        assert_eq!(files.iter().map(|f| f["page"].as_i64().unwrap()).collect::<Vec<_>>(), [2, 3]);
+        for f in files {
+            let path = std::path::Path::new(f["path"].as_str().unwrap());
+            assert!(path.is_file() && path.extension().and_then(|e| e.to_str()) == Some("jpg") && std::fs::read(path).unwrap().starts_with(&[0xFF, 0xD8, 0xFF]));
+            assert!(path.file_name().unwrap().to_str().unwrap().starts_with(&format!("{id}-смета-стр")), "{}", path.display());
+        }
+        assert_eq!(store.mcp_exports_recent(acc, 10).unwrap().len(), 2);
+
+        // Выключатель в настройках.
+        store.set_state(acc, PICTURES_KEY, Some("0")).unwrap();
+        let (is_error, content, _) = pages(json!({ "attachment_id": id })).await;
+        assert!(is_error && content[0]["text"].as_str().unwrap().contains("выключен"));
+        assert!(!pictures_enabled(&store, acc));
+        let log = store.mcp_calls_recent(acc, 30).unwrap();
+        assert!(log.iter().any(|c| c.tool == "get_attachment_pages" && c.outcome == "ok" && c.items == 5) && log.iter().any(|c| c.tool == "get_attachment_pages" && c.outcome == "denied"));
     }
 
     #[test]

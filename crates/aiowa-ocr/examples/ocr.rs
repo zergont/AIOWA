@@ -1,14 +1,14 @@
-//! Проба распознавания на файле: `cargo run -p aiowa-ocr --example ocr -- <файл> [--stats]`.
+//! Проба распознавания на файле: `cargo run -p aiowa-ocr --example ocr -- <файл> [--stats | --jpeg <куда>]`.
 //! Печатает текст страниц; с `--stats` — только число страниц, символов и время (для чужих
 //! документов, содержимое которых в консоль попадать не должно).
 
-use aiowa_ocr::{source_kind, Document};
+use aiowa_ocr::{source_kind, Document, Pictures};
 use std::time::Instant;
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let stats = args.iter().any(|a| a == "--stats");
-    let Some(path) = args.iter().find(|a| !a.starts_with("--")) else {
+    let Some(path) = args.first().filter(|a| !a.starts_with("--")) else {
         eprintln!("нужен путь к файлу PDF или картинки");
         std::process::exit(2);
     };
@@ -17,6 +17,16 @@ fn main() {
         std::process::exit(2);
     };
     let bytes = std::fs::read(path).expect("файл не прочитан");
+    // `--jpeg <куда>`: первая страница картинкой, как её получит агент (150 dpi, до 1600 пикселей).
+    if let Some(out) = args.iter().position(|a| a == "--jpeg").and_then(|i| args.get(i + 1)) {
+        let page = Pictures::open(kind, &bytes).and_then(|p| p.jpeg(1, 150, 1600, 80)).unwrap_or_else(|e| {
+            eprintln!("{e}");
+            std::process::exit(1);
+        });
+        std::fs::write(out, &page.jpeg).expect("картинка не записана");
+        eprintln!("стр. 1: {}x{}, {} байт", page.width, page.height, page.jpeg.len());
+        return;
+    }
     let started = Instant::now();
     let doc = Document::open(kind, &bytes).unwrap_or_else(|e| {
         eprintln!("{e}");
