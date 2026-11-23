@@ -10,7 +10,7 @@ use rusqlite::types::ValueRef;
 use rusqlite::Connection;
 use tracing::info;
 
-pub const CURRENT_VERSION: i64 = 19;
+pub const CURRENT_VERSION: i64 = 20;
 
 /// Состояния текста вложения (`attachments.text_state`).
 pub const TEXT_PENDING: i64 = 0;
@@ -696,11 +696,33 @@ pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
         conn.pragma_update(None, "user_version", 19)?;
         info!("схема базы обновлена до версии 19: текст вложений по страницам, распознавание сканов");
     }
+    if version < 20 {
+        conn.execute_batch(V20_TABLES)?;
+        conn.pragma_update(None, "user_version", 20)?;
+        info!("схема базы обновлена до версии 20: журнал выгрузок вложений для агентов");
+    }
     Ok(())
 }
 
 /// Версия 17: журнал обращений внешних агентов через MCP-сервер (`mcp_log.rs`) — что и сколько
 /// отдано, без запросов агента и без содержимого писем.
+/// Что AIOWA выгрузила агенту в папку выгрузки: по этим записям пользователь видит, какие файлы и
+/// куда ушли, а старые выгруженные файлы удаляются — только те, что записаны здесь.
+const V20_TABLES: &str = r#"
+CREATE TABLE IF NOT EXISTS mcp_exports (
+  export_pk     INTEGER PRIMARY KEY,
+  account_id    INTEGER NOT NULL REFERENCES accounts(account_id),
+  at            INTEGER NOT NULL,
+  attachment_pk INTEGER NOT NULL,
+  name          TEXT NOT NULL,
+  path          TEXT NOT NULL,
+  size          INTEGER NOT NULL,
+  client        TEXT NOT NULL,
+  UNIQUE (account_id, path)
+);
+CREATE INDEX IF NOT EXISTS mcp_exports_at ON mcp_exports(account_id, at DESC);
+"#;
+
 /// Текст вложения по страницам: извлечённый из файла (`source` 1) и распознанный по изображению
 /// страницы (`source` 2). Письма и вложения эта таблица не меняет: это кэш того, что уже прочитано.
 const V19_TABLES: &str = r#"

@@ -25,6 +25,21 @@ pub struct McpCall {
     pub outcome: String,
 }
 
+/// Вложение, выгруженное агенту файлом в папку выгрузки (`mcp_exports`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpExport {
+    /// Ключ записи; при добавлении не нужен.
+    pub export_pk: i64,
+    pub at: i64,
+    pub attachment_pk: i64,
+    /// Имя файла в папке выгрузки.
+    pub name: String,
+    /// Полный путь к выгруженному файлу.
+    pub path: String,
+    pub size: i64,
+    pub client: String,
+}
+
 /// Итог за период: обращения, элементы и символы.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct McpUsage {
@@ -42,6 +57,53 @@ impl Store {
                 params![account.0, c.at, c.tool, c.client, c.items, c.chars, c.duration_ms, c.outcome],
             )?;
             conn.execute("DELETE FROM mcp_calls WHERE account_id = ?1 AND at < ?2", params![account.0, cutoff])?;
+            Ok(())
+        })
+    }
+
+    /// Записать выгрузку; повторная выгрузка по тому же пути обновляет прежнюю запись.
+    pub fn mcp_export_add(&self, account: AccountId, e: &McpExport) -> Result<()> {
+        self.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO mcp_exports(account_id, at, attachment_pk, name, path, size, client) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 ON CONFLICT(account_id, path) DO UPDATE SET at = excluded.at, attachment_pk = excluded.attachment_pk, name = excluded.name, size = excluded.size, client = excluded.client",
+                params![account.0, e.at, e.attachment_pk, e.name, e.path, e.size, e.client],
+            )?;
+            Ok(())
+        })
+    }
+
+    fn mcp_exports_where(&self, account: AccountId, filter: &str, value: i64) -> Result<Vec<McpExport>> {
+        self.with_conn(|conn| {
+            let mut st = conn.prepare(&format!("SELECT export_pk, at, attachment_pk, name, path, size, client FROM mcp_exports WHERE account_id = ?1 AND {filter}"))?;
+            let rows = st.query_map(params![account.0, value], |r| Ok(McpExport { export_pk: r.get(0)?, at: r.get(1)?, attachment_pk: r.get(2)?, name: r.get(3)?, path: r.get(4)?, size: r.get(5)?, client: r.get(6)? }))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+        })
+    }
+
+    /// Последние выгрузки, свежие первыми.
+    pub fn mcp_exports_recent(&self, account: AccountId, limit: usize) -> Result<Vec<McpExport>> {
+        self.mcp_exports_where(account, "1 = 1 ORDER BY at DESC, export_pk DESC LIMIT ?2", limit as i64)
+    }
+
+    /// Выгрузки старше `before` (мс): кандидаты на удаление файла по сроку хранения.
+    pub fn mcp_exports_before(&self, account: AccountId, before: i64) -> Result<Vec<McpExport>> {
+        self.mcp_exports_where(account, "at < ?2 ORDER BY at", before)
+    }
+
+    /// Запись о выгрузке по пути файла: показать в Проводнике можно только то, что выгружено.
+    pub fn mcp_export_by_path(&self, account: AccountId, path: &str) -> Result<Option<McpExport>> {
+        self.with_conn(|conn| {
+            let mut st = conn.prepare_cached("SELECT export_pk, at, attachment_pk, name, path, size, client FROM mcp_exports WHERE account_id = ?1 AND path = ?2")?;
+            let mut rows = st.query_map(params![account.0, path], |r| Ok(McpExport { export_pk: r.get(0)?, at: r.get(1)?, attachment_pk: r.get(2)?, name: r.get(3)?, path: r.get(4)?, size: r.get(5)?, client: r.get(6)? }))?;
+            rows.next().transpose().map_err(Into::into)
+        })
+    }
+
+    /// Забыть выгрузку (файл удалён по сроку или его уже нет).
+    pub fn mcp_export_forget(&self, export_pk: i64) -> Result<()> {
+        self.with_conn(|conn| {
+            conn.execute("DELETE FROM mcp_exports WHERE export_pk = ?1", params![export_pk])?;
             Ok(())
         })
     }
@@ -70,6 +132,28 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exports_are_listed_updated_and_forgotten() {
+        let path = std::env::temp_dir().join(format!("aiowa-mcp-exports-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let s = Store::open(&path).unwrap();
+        let acc = s.account("h", "u").unwrap();
+        let export = |at: i64, pk: i64, path: &str, size: i64| McpExport { export_pk: 0, at, attachment_pk: pk, name: path.rsplit('/').next().unwrap().into(), path: path.into(), size, client: "Claude".into() };
+        s.mcp_export_add(acc, &export(1_000, 7, "D:/out/7-смета.pdf", 10)).unwrap();
+        s.mcp_export_add(acc, &export(2_000, 8, "D:/out/8-скан.pdf", 20)).unwrap();
+        // Повторная выгрузка по тому же пути — та же запись с новым временем и размером.
+        s.mcp_export_add(acc, &export(3_000, 7, "D:/out/7-смета.pdf", 11)).unwrap();
+        let recent = s.mcp_exports_recent(acc, 10).unwrap();
+        assert_eq!(recent.iter().map(|e| (e.attachment_pk, e.at, e.size)).collect::<Vec<_>>(), [(7, 3_000, 11), (8, 2_000, 20)]);
+        assert_eq!(s.mcp_exports_recent(acc, 1).unwrap().len(), 1);
+        let old = s.mcp_exports_before(acc, 2_500).unwrap();
+        assert_eq!(old.iter().map(|e| e.path.as_str()).collect::<Vec<_>>(), ["D:/out/8-скан.pdf"]);
+        assert_eq!(s.mcp_export_by_path(acc, "D:/out/8-скан.pdf").unwrap().map(|e| e.attachment_pk), Some(8));
+        assert!(s.mcp_export_by_path(acc, "D:/out/чужой.pdf").unwrap().is_none());
+        s.mcp_export_forget(old[0].export_pk).unwrap();
+        assert_eq!(s.mcp_exports_recent(acc, 10).unwrap().len(), 1);
+    }
 
     fn call(at: i64, tool: &str, outcome: &str, items: i64, chars: i64) -> McpCall {
         McpCall { at, tool: tool.into(), client: "тест".into(), items, chars, duration_ms: 12, outcome: outcome.into() }

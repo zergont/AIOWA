@@ -40,6 +40,10 @@ const GROUPS_KEY: &str = "mcp.groups";
 const OCR_KEY: &str = "mcp.ocr";
 /// Порог «на странице нет текста», символов; ключа нет — `pages::PAGE_MIN_CHARS`.
 const OCR_MIN_CHARS_KEY: &str = "mcp.ocr_min_chars";
+/// Папка выгрузки вложений для агента; пусто — выгрузка не настроена.
+const EXPORT_DIR_KEY: &str = "mcp.export_dir";
+/// Сколько дней хранятся выгруженные файлы; ключа нет — `export::KEEP_DAYS`.
+const EXPORT_KEEP_KEY: &str = "mcp.export_keep_days";
 /// Версии протокола, которые сервер понимает; первая — предпочитаемая.
 const PROTOCOLS: [&str; 3] = ["2025-06-18", "2025-03-26", "2024-11-05"];
 /// Сессия на почтовом сервере закрывается после такого простоя без обращений к сети: клиент может
@@ -137,6 +141,21 @@ pub(crate) fn ocr_settings(store: &Store, account: AccountId) -> (bool, usize) {
     let enabled = get(OCR_KEY).as_deref() != Some("0");
     let min_chars = get(OCR_MIN_CHARS_KEY).and_then(|v| v.trim().parse::<usize>().ok()).filter(|n| (1..=5000).contains(n)).unwrap_or(crate::pages::PAGE_MIN_CHARS);
     (enabled, min_chars)
+}
+
+/// Папка выгрузки для агента (`None` — не выбрана) и срок хранения выгруженного, дней.
+pub(crate) fn export_settings(store: &Store, account: AccountId) -> (Option<String>, u32) {
+    let get = |key: &str| store.get_state(account, key).ok().flatten();
+    let dir = get(EXPORT_DIR_KEY).map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
+    let keep = get(EXPORT_KEEP_KEY).and_then(|v| v.trim().parse::<u32>().ok()).filter(|n| (1..=365).contains(n)).unwrap_or(crate::export::KEEP_DAYS);
+    (dir, keep)
+}
+
+/// Убрать выгруженные файлы старше срока хранения (см. `export::sweep`).
+pub(crate) fn sweep_exports(store: &Store, account: AccountId) -> usize {
+    let (dir, keep) = export_settings(store, account);
+    let root = dir.and_then(|d| crate::export::open_root(&d).ok());
+    crate::export::sweep(store, account, root.as_deref(), keep, now_ms())
 }
 
 // --- состояние сервера -----------------------------------------------------------------------
@@ -411,6 +430,11 @@ const DRAFT_WATCH: Duration = Duration::from_secs(3);
 pub(crate) fn watch_agent_drafts(app: tauri::AppHandle) {
     use tauri::{Emitter, Manager};
     tauri::async_runtime::spawn(async move {
+        // Заодно при старте окна: выгруженные агенту файлы, у которых вышел срок хранения.
+        if let Some(state) = app.try_state::<AppState>() {
+            let (store, account) = (state.store.clone(), state.account);
+            let _ = tauri::async_runtime::spawn_blocking(move || sweep_exports(&store, account)).await;
+        }
         let mut last: Option<(i64, i64)> = None;
         loop {
             tokio::time::sleep(DRAFT_WATCH).await;
@@ -439,6 +463,16 @@ pub(crate) struct McpCallDto {
     outcome: String,
 }
 
+/// Вложение, выгруженное агенту файлом: строка журнала выгрузок.
+#[derive(Debug, Serialize)]
+pub(crate) struct McpExportDto {
+    at_ms: i64,
+    name: String,
+    path: String,
+    size: i64,
+    client: String,
+}
+
 /// Вкладка «ИИ», раздел «Доступ для агентов (MCP)».
 #[derive(Debug, Serialize)]
 pub(crate) struct McpSettingsDto {
@@ -452,6 +486,12 @@ pub(crate) struct McpSettingsDto {
     ocr: bool,
     /// Язык распознавания Windows (`ru`); `None` — распознавать на этом компьютере нечем.
     ocr_language: Option<String>,
+    /// Папка выгрузки вложений для агента; `None` — не выбрана, выгрузка не работает.
+    export_dir: Option<String>,
+    /// Сколько дней хранятся выгруженные файлы.
+    export_keep_days: u32,
+    /// Последние выгрузки, свежие первыми.
+    exports: Vec<McpExportDto>,
     recent: Vec<McpCallDto>,
     month_calls: i64,
     month_items: i64,
@@ -462,6 +502,8 @@ fn settings_dto(state: &AppState) -> CmdResult<McpSettingsDto> {
     let cfg = McpConfig::load(&state.store, state.account);
     let recent = state.store.mcp_calls_recent(state.account, 30).map_err(err)?;
     let month = state.store.mcp_usage_since(state.account, now_ms() - 30 * 24 * 3600 * 1000).map_err(err)?;
+    let (export_dir, export_keep_days) = export_settings(&state.store, state.account);
+    let exports = state.store.mcp_exports_recent(state.account, 15).map_err(err)?;
     Ok(McpSettingsDto {
         enabled: cfg.enabled && !cfg.own_only,
         groups: cfg.groups,
@@ -469,6 +511,9 @@ fn settings_dto(state: &AppState) -> CmdResult<McpSettingsDto> {
         command: std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_default(),
         ocr: ocr_settings(&state.store, state.account).0,
         ocr_language: aiowa_ocr::language().ok().filter(|l| !l.is_empty()),
+        export_dir,
+        export_keep_days,
+        exports: exports.into_iter().map(|e| McpExportDto { at_ms: e.at, name: e.name, path: e.path, size: e.size, client: e.client }).collect(),
         recent: recent.into_iter().map(|c| McpCallDto { at_ms: c.at, tool: c.tool, client: c.client, items: c.items, chars: c.chars, duration_ms: c.duration_ms, outcome: c.outcome }).collect(),
         month_calls: month.calls,
         month_items: month.items,
@@ -486,6 +531,7 @@ pub(crate) struct McpPatch {
     enabled: Option<bool>,
     groups: Option<Vec<Group>>,
     ocr: Option<bool>,
+    export_keep_days: Option<u32>,
 }
 
 /// Включить или выключить доступ агентов, выбрать виды данных. Действует со следующего вызова
@@ -509,7 +555,53 @@ pub(crate) fn mcp_settings_set(patch: McpPatch, state: State<'_, AppState>) -> C
         state.store.set_state(state.account, OCR_KEY, Some(if ocr { "1" } else { "0" })).map_err(err)?;
         info!(ocr, "распознавание сканов для агентов (MCP) переключено");
     }
+    if let Some(days) = patch.export_keep_days {
+        if !(1..=365).contains(&days) {
+            return Err("Срок хранения выгруженных файлов — от 1 до 365 дней".into());
+        }
+        state.store.set_state(state.account, EXPORT_KEEP_KEY, Some(&days.to_string())).map_err(err)?;
+        info!(days, "срок хранения выгруженных агенту файлов изменён");
+    }
     settings_dto(&state)
+}
+
+/// Записать папку выгрузки (`None` или пусто — убрать): каталог должен существовать и не быть
+/// корнем диска или частью данных AIOWA.
+fn set_export_dir(state: &AppState, path: Option<&str>) -> CmdResult<McpSettingsDto> {
+    let value = match path.map(str::trim).filter(|p| !p.is_empty()) {
+        Some(p) => crate::export::check_root_choice(std::path::Path::new(p), state.store.path().parent().unwrap_or(std::path::Path::new(".")))?,
+        None => String::new(),
+    };
+    state.store.set_state(state.account, EXPORT_DIR_KEY, Some(&value)).map_err(err)?;
+    info!(chosen = !value.is_empty(), "папка выгрузки для агентов (MCP) изменена");
+    settings_dto(state)
+}
+
+#[tauri::command(async)]
+pub(crate) fn mcp_export_dir_set(path: Option<String>, state: State<'_, AppState>) -> CmdResult<McpSettingsDto> {
+    set_export_dir(&state, path.as_deref())
+}
+
+/// Системный диалог выбора папки выгрузки; отмена — `None`, настройка не меняется.
+#[tauri::command]
+pub(crate) async fn mcp_export_dir_pick(app: tauri::AppHandle, state: State<'_, AppState>) -> CmdResult<Option<McpSettingsDto>> {
+    use tauri::Manager;
+    let mut dialog = rfd::AsyncFileDialog::new().set_title("Папка выгрузки для агента");
+    if let Some(window) = app.get_webview_window("main") {
+        dialog = dialog.set_parent(&window);
+    }
+    let Some(folder) = dialog.pick_folder().await else { return Ok(None) };
+    set_export_dir(&state, Some(&folder.path().display().to_string())).map(Some)
+}
+
+/// Показать выгруженный файл в Проводнике — только тот, что записан в журнале выгрузок.
+#[tauri::command]
+pub(crate) async fn mcp_export_reveal(path: String, state: State<'_, AppState>) -> CmdResult<()> {
+    if state.store.mcp_export_by_path(state.account, path.trim()).map_err(err)?.is_none() {
+        return Err("Этого файла нет среди выгруженных агенту".into());
+    }
+    let target = std::path::PathBuf::from(path.trim());
+    tauri::async_runtime::spawn_blocking(move || crate::ondemand::reveal_in_explorer(&target)).await.map_err(err)?
 }
 
 #[cfg(test)]
@@ -977,6 +1069,81 @@ mod tests {
         // Теперь весь файл читается из базы без пояснений.
         let whole = ok(&s, "get_attachment", json!({ "attachment_id": id })).await;
         assert_eq!((whole["ocr_pages"].as_array().map(Vec::len), whole.get("ocr_note")), (Some(23), None));
+    }
+
+    #[tokio::test]
+    async fn attachments_are_exported_only_into_the_chosen_folder() {
+        let (s, store, acc) = server("export");
+        enable(&store, acc);
+        rpc(&s, "initialize", json!({ "protocolVersion": "2025-06-18", "clientInfo": { "name": "Claude", "version": "1" } })).await;
+        // У вложения «смета.pdf» есть файл в кэше; второе письмо несёт программу.
+        let found = ok(&s, "search_mail", json!({ "query": "насосы" })).await;
+        let with_file = found["messages"].as_array().unwrap().iter().find(|m| m["has_attachments"] == true).unwrap()["message_id"].as_i64().unwrap();
+        let row = store.attachments_of_item(with_file).unwrap().remove(0);
+        store.save_attachment(&row.todo(), b"PDF-DATA-169", Some("application/pdf"), aiowa_store::AttachmentText::Unsupported).unwrap();
+        let id = row.attachment_pk;
+        let (inbox, _) = store.folder_by_distinguished(acc, "inbox").unwrap().unwrap();
+        let program = AttachmentMeta { id: "att-exe".into(), name: Some("setup.exe".into()), content_type: Some("application/octet-stream".into()), size: Some(500), is_inline: false, content_id: None };
+        store.store_full_messages(acc, inbox, &[message("X", "Программа установки", "2026-11-19T12:00:00Z", "<p>См. вложение.</p>", vec![program])]).unwrap();
+        let exe_message = ok(&s, "search_mail", json!({ "query": "программа установки" })).await["messages"][0]["message_id"].as_i64().unwrap();
+        let exe = store.attachments_of_item(exe_message).unwrap()[0].attachment_pk;
+
+        // Папка не выбрана: отказ с подсказкой, на диск ничего не записано.
+        let (is_error, text) = call(&s, "export_attachment", json!({ "attachment_ids": [id] })).await;
+        assert!(is_error && text.contains("Папка выгрузки не задана") && text.contains("настройки AIOWA"), "{text}");
+        assert!(store.mcp_exports_recent(acc, 5).unwrap().is_empty());
+
+        let out = std::env::temp_dir().join(format!("aiowa-mcp-export-out-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&out);
+        std::fs::create_dir_all(&out).unwrap();
+        store.set_state(acc, EXPORT_DIR_KEY, Some(&out.display().to_string())).unwrap();
+        let files = |dir: &std::path::Path| std::fs::read_dir(dir).unwrap().filter_map(|e| e.ok()).filter(|e| e.path().is_file()).count();
+
+        // Выгрузка: файл в папке под именем «номер-имя», размер тот же.
+        let done = ok(&s, "export_attachment", json!({ "attachment_ids": [id] })).await;
+        let file = &done["exported"][0];
+        assert_eq!((file["attachment_id"].as_i64(), file["name"].as_str(), file["size"].as_i64(), file["already_exported"].as_bool()), (Some(id), Some("смета.pdf"), Some(12), Some(false)));
+        let path = std::path::PathBuf::from(file["path"].as_str().unwrap());
+        assert_eq!(std::fs::read(&path).unwrap(), b"PDF-DATA-169");
+        assert_eq!(path.file_name().and_then(|n| n.to_str()), Some(format!("{id}-смета.pdf").as_str()));
+        assert!(path.starts_with(done["export_root"].as_str().unwrap()) && done.get("failed").is_none(), "{done}");
+        // Повтор — без дубля; с overwrite — заново.
+        let again = ok(&s, "export_attachment", json!({ "attachment_ids": [id] })).await;
+        assert_eq!((again["exported"][0]["already_exported"].as_bool(), again["exported"][0]["path"].as_str(), files(&out)), (Some(true), file["path"].as_str(), 1));
+        assert_eq!(ok(&s, "export_attachment", json!({ "attachment_id": id, "overwrite": true })).await["exported"][0]["already_exported"], false);
+
+        // Подпапка — одно имя; путь наружу отклоняется, и на диск ничего не пишется.
+        let sub = ok(&s, "export_attachment", json!({ "attachment_ids": [id], "subfolder": "Тендер" })).await;
+        assert!(std::path::Path::new(sub["exported"][0]["path"].as_str().unwrap()).starts_with(out.join("Тендер").canonicalize().map(|p| crate::export::plain(&p)).unwrap()));
+        for bad in [r"..\..\Windows", "a/b", "C:", ".."] {
+            let (is_error, text) = call(&s, "export_attachment", json!({ "attachment_ids": [id], "subfolder": bad })).await;
+            assert!(is_error && text.contains("subfolder"), "{bad}: {text}");
+        }
+        assert_eq!((files(&out), files(&out.join("Тендер"))), (1, 1));
+
+        // Программа не выгружается; в общем вызове — отказ по ней и выгрузка остального.
+        let (is_error, text) = call(&s, "export_attachment", json!({ "attachment_ids": [exe] })).await;
+        assert!(is_error && text.starts_with("blocked_type"), "{text}");
+        let mixed = ok(&s, "export_attachment", json!({ "attachment_ids": [exe, id, 999_999] })).await;
+        assert_eq!(mixed["exported"].as_array().map(Vec::len), Some(1));
+        assert_eq!(mixed["failed"].as_array().unwrap().iter().map(|f| (f["attachment_id"].as_i64().unwrap(), f["error"].as_str().unwrap())).collect::<Vec<_>>(), [(exe, "blocked_type"), (999_999, "not_found")]);
+        // Неверные параметры.
+        for args in [json!({}), json!({ "attachment_ids": [] }), json!({ "attachment_ids": (1..=21).collect::<Vec<i64>>() }), json!({ "attachment_ids": ["x"] })] {
+            let (is_error, text) = call(&s, "export_attachment", args).await;
+            assert!(is_error && text.contains("attachment_ids"), "{text}");
+        }
+
+        // Журнал выгрузок: что, куда и кому; повтор без перезаписи записи не добавляет.
+        let log = store.mcp_exports_recent(acc, 10).unwrap();
+        assert_eq!(log.len(), 2, "файл в папке и файл в подпапке");
+        assert!(log.iter().all(|e| e.attachment_pk == id && e.client == "Claude 1" && e.size == 12 && std::path::Path::new(&e.path).is_file()));
+        // Срок хранения: выгрузка старше срока убирается при следующем вызове, свежая остаётся.
+        let old = log.iter().find(|e| e.path.contains("Тендер")).unwrap();
+        store.mcp_export_add(acc, &aiowa_store::McpExport { at: now_ms() - 40 * 24 * 3600 * 1000, ..old.clone() }).unwrap();
+        ok(&s, "export_attachment", json!({ "attachment_ids": [id] })).await;
+        assert!(!std::path::Path::new(&old.path).exists() && path.is_file());
+        assert_eq!(store.mcp_exports_recent(acc, 10).unwrap().len(), 1);
+        assert_eq!(export_settings(&store, acc), (Some(out.display().to_string()), crate::export::KEEP_DAYS));
     }
 
     #[test]

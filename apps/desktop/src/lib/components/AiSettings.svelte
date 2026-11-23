@@ -11,7 +11,7 @@
    * агентов — что и сколько отдано.
    */
   import { onMount } from "svelte";
-  import { api, errorMessage, type AiJournal, type AiMode, type AiPlace, type AiProfile, type AiProviderKind, type AiSettings, type AiSettingsPatch, type AiTest, type McpGroup, type McpSettings } from "../api";
+  import { api, errorMessage, formatSize, type AiJournal, type AiMode, type AiPlace, type AiProfile, type AiProviderKind, type AiSettings, type AiSettingsPatch, type AiTest, type McpGroup, type McpSettings } from "../api";
   import { copyText } from "../contact";
   import ConfirmPopover from "./ConfirmPopover.svelte";
 
@@ -261,7 +261,7 @@
     }
   }
 
-  async function setMcp(patch: { enabled?: boolean; groups?: McpGroup[]; ocr?: boolean }) {
+  async function setMcp(patch: { enabled?: boolean; groups?: McpGroup[]; ocr?: boolean; export_keep_days?: number }) {
     try {
       mcp = await api.mcpSettingsSet(patch);
       flash("Сохранено");
@@ -286,6 +286,42 @@
     // «drafts» — не вид данных, а разрешение готовить письма: в списке видов его нет, флажок свой.
     const all: McpGroup[] = [...MCP_GROUPS.map((g) => g.id), "drafts"];
     void setMcp({ groups: all.filter((g) => (g === id ? on : mcp!.groups.includes(g))) });
+  }
+
+  /** Папка выгрузки: системный диалог; отмена ничего не меняет. */
+  async function pickExportDir() {
+    try {
+      const next = await api.mcpExportDirPick();
+      if (next) {
+        mcp = next;
+        flash("Сохранено");
+      }
+    } catch (e) {
+      flash(errorMessage(e), true);
+    }
+  }
+
+  async function clearExportDir() {
+    try {
+      mcp = await api.mcpExportDirSet(null);
+      flash("Сохранено");
+    } catch (e) {
+      flash(errorMessage(e), true);
+    }
+  }
+
+  function setKeepDays(input: HTMLInputElement) {
+    const days = Math.round(Number(input.value));
+    if (Number.isFinite(days) && days >= 1 && days <= 365) void setMcp({ export_keep_days: days });
+    else if (mcp) input.value = String(mcp.export_keep_days);
+  }
+
+  async function revealExport(path: string) {
+    try {
+      await api.mcpExportReveal(path);
+    } catch (e) {
+      flash(errorMessage(e), true);
+    }
   }
 
   async function copyMcp(text: string) {
@@ -524,6 +560,38 @@
             Разрешить агентам готовить письма
           </label>
           <p class="hint" id="{uid}-mcp-drafts">Агент сможет подготовить письмо — новое, ответ или пересылку, с файлами с этого компьютера и вложениями из других писем. Оно появится в AIOWA полосой «Черновик от агента»; отправить его можешь только ты. На сервер агент ничего не пишет.</p>
+          <div class="field">
+            <span class="label sub">Папка выгрузки для агента</span>
+            <p class="hint">Когда агенту мало текста и нужен сам файл — таблица, скан, документ, — он просит AIOWA положить вложение в эту папку. Выбери обычную рабочую папку и подключи её же в приложении агента. Пока папка не выбрана, выгрузка не работает. Программы и сценарии не выгружаются.</p>
+            <div class="code-row">
+              <code class="mono code" id="{uid}-mcp-export-dir">{m.export_dir ?? "не выбрана"}</code>
+              <button class="btn small" onclick={() => void pickExportDir()}>Выбрать…</button>
+              {#if m.export_dir}<button class="btn small" onclick={() => void clearExportDir()}>Убрать</button>{/if}
+            </div>
+            {#if m.export_dir}
+              <label class="keep">
+                Хранить выгруженное, дней
+                <input type="number" class="num" min="1" max="365" value={m.export_keep_days} onchange={(e) => setKeepDays(e.currentTarget)} />
+              </label>
+              <p class="hint">Файлы старше срока AIOWA удаляет сама — только те, что выгрузила она и которые с тех пор не меняли.</p>
+            {/if}
+            {#if m.exports.length}
+              <table class="table">
+                <caption class="caption">Выгружено агенту</caption>
+                <thead><tr><th>Когда</th><th>Файл</th><th>Клиент</th><th class="n">Размер</th></tr></thead>
+                <tbody>
+                  {#each m.exports as x (x.path)}
+                    <tr>
+                      <td>{tf.format(new Date(x.at_ms))}</td>
+                      <td><button class="file-link" title="{x.path}&#10;Показать в Проводнике" onclick={() => void revealExport(x.path)}>{x.name}</button></td>
+                      <td>{x.client}</td>
+                      <td class="n">{formatSize(x.size)}</td>
+                    </tr>
+                  {/each}
+                </tbody>
+              </table>
+            {/if}
+          </div>
           <div class="field">
             <span class="label sub">Как подключить</span>
             <p class="hint">Claude Code — выполнить в терминале один раз:</p>
@@ -880,6 +948,24 @@
 
   .add-label {
     color: var(--fg-3);
+  }
+  .keep {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+  }
+  .file-link {
+    padding: 0;
+    border: 0;
+    background: none;
+    color: var(--accent);
+    font: inherit;
+    text-align: left;
+    cursor: pointer;
+    overflow-wrap: anywhere;
+  }
+  .file-link:hover {
+    text-decoration: underline;
   }
   .code-row {
     display: flex;

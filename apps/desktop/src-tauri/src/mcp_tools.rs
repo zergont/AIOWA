@@ -12,6 +12,7 @@
 //! о сокращении. В журнал приложения содержимое не пишется.
 
 use crate::compose::{self, ComposeKindDto, PickedFile};
+use crate::export::{self, ExportError};
 use crate::mcp::{Core, Group};
 use crate::pages::{OcrMode, PagesError};
 use aiowa_ai::mailtext::{strip_hidden_html, strip_invisible};
@@ -132,6 +133,24 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
                     "max_chars": { "type": "integer", "minimum": 0, "maximum": 200_000, "description": "Предел извлечённого текста, по умолчанию 30000; 0 — без текста" }
                 },
                 "required": ["attachment_id"]
+            })
+        },
+    },
+    ToolSpec {
+        name: "export_attachment",
+        group: Group::Attachments,
+        read_only: false,
+        title: "Выгрузить вложение файлом",
+        description: "Выгрузить вложения файлами в папку выгрузки — обычную папку, которую пользователь выбрал в настройках AIOWA и подключил к тебе. Вызывай, когда текста из get_attachment недостаточно: нужен сам файл, его вид или точные данные таблицы. Файл копируется под именем «<attachment_id>-<исходное имя>»; если его ещё нет на диске, он скачивается с почтового сервера. Повторная выгрузка без overwrite дубля не создаёт (already_exported). Исполняемые файлы и сценарии не выгружаются (blocked_type). Путь из ответа годится для параметра files в create_draft. Если папка не задана, инструмент объяснит пользователю, где её выбрать.",
+        schema: || {
+            json!({
+                "type": "object",
+                "properties": {
+                    "attachment_ids": { "type": "array", "items": { "type": "integer" }, "minItems": 1, "maxItems": 20, "description": "Вложения: attachment_id из get_message или get_conversation" },
+                    "subfolder": { "type": "string", "description": "Подпапка внутри папки выгрузки — одно имя, например по теме письма" },
+                    "overwrite": { "type": "boolean", "description": "Перезаписать файл, если он уже выгружен; по умолчанию нет" }
+                },
+                "required": ["attachment_ids"]
             })
         },
     },
@@ -966,6 +985,91 @@ async fn find_contacts(core: &Core, args: &Value) -> ToolResult {
 
 // --- вызов -----------------------------------------------------------------------------------
 
+// --- выгрузка вложений файлами ---------------------------------------------------------------
+
+fn export_error(e: ExportError) -> ToolError {
+    match e {
+        ExportError::Invalid(why) => ToolError::invalid(why),
+        ExportError::Failed(why) => ToolError::failed(why),
+    }
+}
+
+/// Одно вложение — в папку выгрузки. Отказ: код для агента и пояснение.
+async fn export_one(core: &Core, ctx: &Ctx, root: &std::path::Path, subfolder: Option<&str>, attachment_pk: i64, overwrite: bool, client: &str) -> Result<Value, (&'static str, String)> {
+    let row = {
+        let ctx = ctx.clone();
+        blocking(move || db(ctx.store.attachment_of_account(ctx.account, attachment_pk))).await.map_err(|e| ("error", e.message))?.ok_or_else(|| ("not_found", format!("Вложения {attachment_pk} нет в локальной базе")))?
+    };
+    if export::blocked(row.name.as_deref()) {
+        return Err(("blocked_type", "Исполняемые файлы и сценарии не выгружаются".into()));
+    }
+    if row.size.is_some_and(|s| s.max(0) as u64 > export::MAX_BYTES) {
+        return Err(("too_large", format!("Файл больше {} МБ", export::MAX_BYTES / (1024 * 1024))));
+    }
+    let cached = match row.local_path.clone().filter(|p| p.is_file()) {
+        Some(path) => path,
+        None => {
+            let _net = core.net();
+            crate::ondemand::ensure_cached(&core.state, &core.sync, &core.od, attachment_pk).await.map_err(|e| ("download_failed", format!("Файл не скачан с сервера: {e}")))?
+        }
+    };
+    let file_name = export::export_name(attachment_pk, row.name.as_deref());
+    let done = {
+        let (root, sub) = (root.to_path_buf(), subfolder.map(String::from));
+        blocking(move || export::export_file(&root, sub.as_deref(), &file_name, &cached, overwrite).map_err(export_error)).await.map_err(|e| (if e.outcome == "invalid" { "invalid" } else { "error" }, e.message))?
+    };
+    if !done.already {
+        let (store, account) = (ctx.store.clone(), ctx.account);
+        let entry = aiowa_store::McpExport { export_pk: 0, at: crate::now_ms(), attachment_pk, name: done.name.clone(), path: done.path.clone(), size: done.size as i64, client: client.to_string() };
+        if let Err(e) = blocking(move || db(store.mcp_export_add(account, &entry))).await {
+            warn!(attachment_pk, error = %e.message, "MCP: выгрузка не записана в журнал");
+        }
+    }
+    Ok(json!({ "attachment_id": attachment_pk, "name": row.name, "path": done.path, "size": done.size, "already_exported": done.already }))
+}
+
+async fn export_attachment(core: &Core, args: &Value, client: &str) -> ToolResult {
+    let wrong_ids = || ToolError::invalid(format!("Параметр attachment_ids — список номеров вложений (attachment_id из get_message), от 1 до {}", export::FILES_PER_CALL));
+    let number = |v: &Value| v.as_i64().or_else(|| v.as_str().and_then(|s| s.trim().parse().ok())).filter(|n| *n > 0).ok_or_else(wrong_ids);
+    let mut ids: Vec<i64> = match arg(args, "attachment_ids").or_else(|| arg(args, "attachment_id")) {
+        Some(Value::Array(list)) => list.iter().map(number).collect::<ToolResult<_>>()?,
+        Some(one) => vec![number(one)?],
+        None => return Err(wrong_ids()),
+    };
+    let mut seen = HashSet::new();
+    ids.retain(|id| seen.insert(*id));
+    if ids.is_empty() || ids.len() > export::FILES_PER_CALL {
+        return Err(wrong_ids());
+    }
+    let subfolder = arg_str(args, "subfolder")?.map(str::trim).filter(|s| !s.is_empty()).map(export::check_subfolder).transpose().map_err(export_error)?;
+    let overwrite = arg_bool(args, "overwrite", false)?;
+    let ctx = Ctx::of(core);
+    let (configured, keep_days) = crate::mcp::export_settings(&ctx.store, ctx.account);
+    let Some(configured) = configured else {
+        return Err(ToolError { outcome: "disabled", message: "Папка выгрузки не задана, на диск ничего не записано. Её выбирает пользователь: настройки AIOWA → вкладка «ИИ» → «Доступ для агентов (MCP)» → «Папка выгрузки для агента»; эту же папку нужно подключить к агенту.".into() });
+    };
+    let root = blocking(move || export::open_root(&configured).map_err(export_error)).await?;
+    // Заодно — срок хранения: старые выгруженные файлы убираются.
+    {
+        let (store, account, root) = (ctx.store.clone(), ctx.account, root.clone());
+        blocking(move || Ok(export::sweep(&store, account, Some(&root), keep_days, crate::now_ms()))).await?;
+    }
+    let (mut exported, mut failed) = (Vec::new(), Vec::new());
+    for id in ids {
+        match export_one(core, &ctx, &root, subfolder.as_deref(), id, overwrite, client).await {
+            Ok(file) => exported.push(file),
+            Err((code, message)) => failed.push((id, code, message)),
+        }
+    }
+    if exported.is_empty() {
+        let (_, code, message) = &failed[0];
+        let more = if failed.len() > 1 { format!(" (и ещё {} вложений не выгружено)", failed.len() - 1) } else { String::new() };
+        return Err(ToolError { outcome: if *code == "blocked_type" { "denied" } else if *code == "not_found" { "not_found" } else { "error" }, message: format!("{code}: {message}{more}") });
+    }
+    let failed: Vec<Value> = failed.into_iter().map(|(id, code, message)| json!({ "attachment_id": id, "error": code, "message": message })).collect();
+    Ok(ToolOutput { items: exported.len(), value: compact(vec![("export_root", json!(export::plain(&root))), ("exported", Value::Array(exported)), ("failed", Value::Array(failed))]) })
+}
+
 // --- письмо от агента ------------------------------------------------------------------------
 
 /// Копии файлов для письма агента: вложения других писем (если файла нет в кэше — с сервера) и
@@ -1054,6 +1158,7 @@ async fn create_draft(core: &Core, args: &Value, client: &str) -> ToolResult {
 pub(crate) async fn run(core: &Core, name: &str, args: &Value, client: &str) -> ToolResult {
     match name {
         "create_draft" => create_draft(core, args, client).await,
+        "export_attachment" => export_attachment(core, args, client).await,
         "search_mail" => search_mail(core, args).await,
         "get_conversation" => get_conversation(core, args).await,
         "get_message" => get_message(core, args).await,
@@ -1122,9 +1227,10 @@ mod tests {
             assert!(names.insert(t.name), "имя {} повторяется", t.name);
             let d = describe(t);
             assert_eq!(d["inputSchema"]["type"], "object", "{}", t.name);
-            // Записывает что-то один инструмент — письмо агента; остальные только читают.
-            assert_eq!(d["annotations"]["readOnlyHint"], t.name != "create_draft", "{}", t.name);
-            assert_eq!(t.read_only, t.group != Group::Drafts, "{}", t.name);
+            // Пишут два инструмента: письмо агента — в локальные черновики, выгрузка — в папку выгрузки.
+            let writes = matches!(t.name, "create_draft" | "export_attachment");
+            assert_eq!(d["annotations"]["readOnlyHint"], !writes, "{}", t.name);
+            assert_eq!(t.read_only, !writes, "{}", t.name);
             assert!(spec(t.name).is_some());
         }
     }

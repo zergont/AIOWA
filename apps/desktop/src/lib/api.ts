@@ -1389,6 +1389,11 @@ export const api = {
   /** Доступ внешних агентов к почте через MCP-сервер AIOWA: настройки и журнал обращений. */
   mcpSettings: () => invoke<McpSettings>("mcp_settings"),
   mcpSettingsSet: (patch: McpSettingsPatch) => invoke<McpSettings>("mcp_settings_set", { patch }),
+  /** Папка выгрузки вложений для агента: системный диалог (отмена — null), запись пути (null — убрать). */
+  mcpExportDirPick: () => invoke<McpSettings | null>("mcp_export_dir_pick"),
+  mcpExportDirSet: (path: string | null) => invoke<McpSettings>("mcp_export_dir_set", { path }),
+  /** Показать выгруженный агенту файл в Проводнике (только файл из журнала выгрузок). */
+  mcpExportReveal: (path: string) => invoke<void>("mcp_export_reveal", { path }),
   /** Доступен ли «Совет» (ИИ включён, модель назначена) и какая модель его даёт. */
   aiAdviceStatus: () => invoke<AiAdviceStatus>("ai_advice_status"),
   /** «Что уйдёт в модель»: собранный промпт без отправки. */
@@ -1556,6 +1561,16 @@ export interface McpCall {
   outcome: string;
 }
 
+/** Вложение, выгруженное агенту файлом в папку выгрузки. */
+export interface McpExport {
+  at_ms: number;
+  /** Имя файла в папке выгрузки. */
+  name: string;
+  path: string;
+  size: number;
+  client: string;
+}
+
 export interface McpSettings {
   enabled: boolean;
   groups: McpGroup[];
@@ -1567,6 +1582,12 @@ export interface McpSettings {
   ocr: boolean;
   /** Языки распознавания Windows (`ru+en-US`); null — распознавать на этом компьютере нечем. */
   ocr_language: string | null;
+  /** Папка выгрузки вложений для агента; null — не выбрана, выгрузка не работает. */
+  export_dir: string | null;
+  /** Сколько дней хранятся выгруженные файлы. */
+  export_keep_days: number;
+  /** Последние выгрузки, свежие первыми. */
+  exports: McpExport[];
   recent: McpCall[];
   month_calls: number;
   month_items: number;
@@ -1577,6 +1598,7 @@ export interface McpSettingsPatch {
   enabled?: boolean;
   groups?: McpGroup[];
   ocr?: boolean;
+  export_keep_days?: number;
 }
 
 /**

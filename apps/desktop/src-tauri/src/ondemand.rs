@@ -370,7 +370,7 @@ pub(crate) async fn reveal_saved(path: String) -> CmdResult<()> {
     tauri::async_runtime::spawn_blocking(move || reveal_in_explorer(&target)).await.map_err(err)?
 }
 
-fn reveal_in_explorer(target: &Path) -> CmdResult<()> {
+pub(crate) fn reveal_in_explorer(target: &Path) -> CmdResult<()> {
     #[cfg(windows)]
     if target.is_file() {
         use std::os::windows::process::CommandExt as _;

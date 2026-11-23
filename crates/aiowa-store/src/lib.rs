@@ -43,7 +43,7 @@ pub use contacts::{ContactApplyStats, ContactFolderInfo, ContactRecipient, Conta
 pub use directory::ContactLocalStats;
 pub use drafts::{LocalDraft, ORIGIN_AGENT_NEW};
 pub use identity::{login_key, read_summary, DbAccount, DbSummary, MailboxIdentity};
-pub use mcp_log::{McpCall, McpUsage};
+pub use mcp_log::{McpCall, McpExport, McpUsage};
 pub use pages::{AttachmentPage, PAGE_EXTRACTED, PAGE_OCR};
 pub use schema::{FETCH_FAILED, TEXT_FAILED, TEXT_OK, TEXT_PENDING, TEXT_UNSUPPORTED};
 

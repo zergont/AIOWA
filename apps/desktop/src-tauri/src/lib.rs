@@ -81,6 +81,7 @@ mod mailbox;
 mod mail_dark;
 mod navigation;
 mod mcp;
+mod export;
 mod mcp_tools;
 mod pages;
 mod notify;
@@ -973,6 +974,9 @@ pub fn run() {
             notify::notify_set_toasts,
             mcp::mcp_settings,
             mcp::mcp_settings_set,
+            mcp::mcp_export_dir_set,
+            mcp::mcp_export_dir_pick,
+            mcp::mcp_export_reveal,
             notify::mail_item_pk,
             window_close_guard,
             window_close_confirmed,
