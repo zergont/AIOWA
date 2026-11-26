@@ -261,7 +261,7 @@
     }
   }
 
-  async function setMcp(patch: { enabled?: boolean; groups?: McpGroup[]; ocr?: boolean; export_keep_days?: number; page_pictures?: boolean }) {
+  async function setMcp(patch: { enabled?: boolean; groups?: McpGroup[]; ocr?: boolean; ocr_background?: boolean; ocr_months?: number; export_keep_days?: number; page_pictures?: boolean }) {
     try {
       mcp = await api.mcpSettingsSet(patch);
       flash("Сохранено");
@@ -314,6 +314,12 @@
     const days = Math.round(Number(input.value));
     if (Number.isFinite(days) && days >= 1 && days <= 365) void setMcp({ export_keep_days: days });
     else if (mcp) input.value = String(mcp.export_keep_days);
+  }
+
+  function setOcrMonths(input: HTMLInputElement) {
+    const months = Math.round(Number(input.value));
+    if (Number.isFinite(months) && months >= 1 && months <= 120) void setMcp({ ocr_months: months });
+    else if (mcp) input.value = String(mcp.ocr_months);
   }
 
   async function revealExport(path: string) {
@@ -555,6 +561,23 @@
               В Windows не установлено распознавание текста: Параметры → Время и язык → Язык и регион → языковые компоненты.
             {/if}
           </p>
+          {#if m.ocr_language}
+            {@const ocrOn = m.ocr && m.groups.includes("attachments")}
+            <label class="check">
+              <input type="checkbox" checked={m.ocr_background && ocrOn} disabled={!ocrOn} onchange={(e) => void setMcp({ ocr_background: e.currentTarget.checked })} aria-describedby="{uid}-mcp-ocr-bg" />
+              Распознавать сканы заранее
+            </label>
+            {#if m.ocr_background && ocrOn}
+              <label class="keep">
+                Письма за последние, месяцев
+                <input type="number" class="num" min="1" max="120" value={m.ocr_months} onchange={(e) => setOcrMonths(e.currentTarget)} />
+              </label>
+            {/if}
+            <p class="hint" id="{uid}-mcp-ocr-bg">
+              Пока AIOWA открыта, она сама понемногу распознаёт сканы в уже скачанных вложениях писем за этот срок. Письмо после этого находится поиском по словам из скана — и у агента, и в окне.
+              {#if m.ocr_background && ocrOn}В очереди: {m.ocr_waiting}. {/if}Распознано вложений: {m.ocr_recognized}.
+            </p>
+          {/if}
           <label class="check">
             <input type="checkbox" checked={m.page_pictures} disabled={!m.groups.includes("attachments")} onchange={(e) => void setMcp({ page_pictures: e.currentTarget.checked })} aria-describedby="{uid}-mcp-pictures" />
             Показывать агенту страницы вложений картинками

@@ -10,7 +10,7 @@ use rusqlite::types::ValueRef;
 use rusqlite::Connection;
 use tracing::info;
 
-pub const CURRENT_VERSION: i64 = 20;
+pub const CURRENT_VERSION: i64 = 21;
 
 /// Состояния текста вложения (`attachments.text_state`).
 pub const TEXT_PENDING: i64 = 0;
@@ -701,6 +701,13 @@ pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
         conn.pragma_update(None, "user_version", 20)?;
         info!("схема базы обновлена до версии 20: журнал выгрузок вложений для агентов");
     }
+    if version < 21 {
+        // Когда фоновая очередь распознавания разобрала вложение (`NULL` — ещё нет). По отметке
+        // очередь не возвращается к файлу, в котором распознавать нечего или который не открылся.
+        add_column_if_missing(conn, "attachments", "ocr_at", "INTEGER")?;
+        conn.pragma_update(None, "user_version", 21)?;
+        info!("схема базы обновлена до версии 21: фоновая очередь распознавания сканов");
+    }
     Ok(())
 }
 
@@ -1069,6 +1076,28 @@ mod tests {
         assert!(plan.contains("items_from_lower"), "{plan}");
         let plan: String = conn.query_row("EXPLAIN QUERY PLAN SELECT item_pk FROM recipients WHERE lower(email) = 'a@x.ru'", [], |r| r.get::<_, String>(3)).unwrap();
         assert!(plan.contains("recipients_email_lower"), "{plan}");
+    }
+
+    #[test]
+    fn migrates_v20_database_to_ocr_queue_mark() {
+        // База версии 20: у вложений нет отметки очереди распознавания. Миграция повторяема, уже
+        // скачанные вложения остаются «не разобранными» — очередь возьмёт их сама.
+        let conn = Connection::open_in_memory().unwrap();
+        register_functions(&conn).unwrap();
+        migrate(&conn).unwrap();
+        conn.execute_batch("ALTER TABLE attachments DROP COLUMN ocr_at;").unwrap();
+        conn.pragma_update(None, "user_version", 20).unwrap();
+        conn.execute("INSERT INTO accounts(account_id, host, login, created_at) VALUES (1, 'h', 'u', 0)", []).unwrap();
+        conn.execute("INSERT INTO folders(folder_pk, account_id, server_id, display_name, updated_at) VALUES (1, 1, 'F', 'Входящие', 0)", []).unwrap();
+        conn.execute("INSERT INTO items(item_pk, account_id, server_id, folder_pk, subject, updated_at) VALUES (7, 1, 'I', 1, 'тема', 0)", []).unwrap();
+        conn.execute("INSERT INTO attachments(item_pk, server_id, name, local_path, pages_total) VALUES (7, 'A', 'скан.pdf', 'C:/cache/1-скан.pdf', 2)", []).unwrap();
+        assert!(!has_column(&conn, "attachments", "ocr_at").unwrap());
+        migrate(&conn).unwrap();
+        migrate(&conn).unwrap();
+        let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(v, CURRENT_VERSION);
+        let (mark, pages): (Option<i64>, Option<i64>) = conn.query_row("SELECT ocr_at, pages_total FROM attachments WHERE server_id = 'A'", [], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+        assert_eq!((mark, pages), (None, Some(2)));
     }
 
     #[test]

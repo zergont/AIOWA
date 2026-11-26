@@ -49,12 +49,18 @@ pub(crate) struct PageOut {
 }
 
 /// Текст запрошенных страниц вложения.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct Paged {
     pub pages_total: u32,
     pub pages: Vec<PageOut>,
     /// Пояснение: распознан не весь файл, распознавание недоступно или не удалось.
     pub note: Option<String>,
+    /// Страницы, до которых распознавание в этом вызове не дошло: предел страниц или времени.
+    pub left: Vec<u32>,
+    /// Сколько страниц распознано этим вызовом.
+    pub recognized_now: usize,
+    /// Файл для распознавания не открылся: распознавать на этом компьютере нечем.
+    pub unavailable: bool,
 }
 
 impl Paged {
@@ -215,7 +221,7 @@ pub(crate) fn paged_text(store: &Store, row: &AttachmentRow, file: Option<&Path>
                 }
                 Err(OcrError::Unavailable(why)) => {
                     notes.push(format!("Распознавание текста недоступно: {why}."));
-                    return Ok(Some(Paged { pages_total: 1, pages: vec![PageOut { page: 1, source: PageSource::None, text: String::new() }], note: Some(notes.join(" ")) }));
+                    return Ok(Some(Paged { pages_total: 1, pages: vec![PageOut { page: 1, source: PageSource::None, text: String::new() }], note: Some(notes.join(" ")), unavailable: true, ..Default::default() }));
                 }
                 Err(e) => return Err(PagesError::Failed(format!("Картинка не открылась: {e}"))),
             },
@@ -235,6 +241,7 @@ pub(crate) fn paged_text(store: &Store, row: &AttachmentRow, file: Option<&Path>
 
     // 3. Распознавание страниц без текста: не больше предела за вызов, остальное — с пояснением.
     let todo: Vec<u32> = wanted.iter().copied().filter(|p| needs_ocr(known.get(p), mode, min_chars)).collect();
+    let (mut left_pages, mut recognized_now, mut unavailable) = (Vec::new(), 0, false);
     if !todo.is_empty() {
         match file {
             None => notes.push(format!("Файл не скачан с сервера: страницы {} не распознаны.", ranges(&todo))),
@@ -246,7 +253,10 @@ pub(crate) fn paged_text(store: &Store, row: &AttachmentRow, file: Option<&Path>
                     };
                     match aiowa_ocr::Document::open(kind, &data) {
                         Ok(doc) => document = Some(doc),
-                        Err(OcrError::Unavailable(why)) => notes.push(format!("Распознавание текста недоступно: {why}.")),
+                        Err(OcrError::Unavailable(why)) => {
+                            unavailable = true;
+                            notes.push(format!("Распознавание текста недоступно: {why}."));
+                        }
                         Err(e) => notes.push(format!("Файл не открылся для распознавания: {e}.")),
                     }
                 }
@@ -278,6 +288,7 @@ pub(crate) fn paged_text(store: &Store, row: &AttachmentRow, file: Option<&Path>
                     if !left.is_empty() {
                         notes.push(format!("За один вызов распознаётся не больше {OCR_PAGES_PER_CALL} страниц. Не распознаны страницы {}: запросите их параметром pages.", ranges(&left)));
                     }
+                    (left_pages, recognized_now) = (left, done);
                 }
             }
         }
@@ -298,7 +309,38 @@ pub(crate) fn paged_text(store: &Store, row: &AttachmentRow, file: Option<&Path>
             PageOut { page: *page, source, text: text.to_string() }
         })
         .collect();
-    Ok(Some(Paged { pages_total: total, pages, note: (!notes.is_empty()).then(|| notes.join(" ")) }))
+    Ok(Some(Paged { pages_total: total, pages, note: (!notes.is_empty()).then(|| notes.join(" ")), left: left_pages, recognized_now, unavailable }))
+}
+
+/// Файлы для тестов распознавания.
+#[cfg(test)]
+pub(crate) mod testing {
+    /// PDF с надписями встроенным шрифтом, по одной на страницу: у страницы есть текстовый слой,
+    /// а нарисованная, она читается распознаванием — как скан.
+    pub(crate) fn text_pdf(pages: &[&str]) -> Vec<u8> {
+        let mut objs: Vec<String> = vec!["<< /Type /Catalog /Pages 2 0 R >>".into()];
+        let kids: String = (0..pages.len()).map(|i| format!("{} 0 R ", 4 + i * 2)).collect();
+        objs.push(format!("<< /Type /Pages /Kids [{kids}] /Count {} >>", pages.len()));
+        objs.push("<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>".into());
+        for (i, text) in pages.iter().enumerate() {
+            objs.push(format!("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 3 0 R >> >> /Contents {} 0 R >>", 5 + i * 2));
+            let content = format!("BT /F1 22 Tf 40 700 Td ({text}) Tj ET");
+            objs.push(format!("<< /Length {} >>\nstream\n{content}\nendstream", content.len()));
+        }
+        let mut out = String::from("%PDF-1.4\n");
+        let mut offsets = Vec::new();
+        for (i, o) in objs.iter().enumerate() {
+            offsets.push(out.len());
+            out.push_str(&format!("{} 0 obj\n{o}\nendobj\n", i + 1));
+        }
+        let xref = out.len();
+        out.push_str(&format!("xref\n0 {}\n0000000000 65535 f \n", objs.len() + 1));
+        for off in offsets {
+            out.push_str(&format!("{off:010} 00000 n \n"));
+        }
+        out.push_str(&format!("trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n", objs.len() + 1));
+        out.into_bytes()
+    }
 }
 
 #[cfg(test)]
@@ -343,7 +385,7 @@ mod tests {
 
     #[test]
     fn answer_names_the_source_and_marks_pages() {
-        let out = |pages: &[(u32, PageSource, &str)]| Paged { pages_total: 9, pages: pages.iter().map(|(page, source, text)| PageOut { page: *page, source: *source, text: (*text).into() }).collect(), note: None };
+        let out = |pages: &[(u32, PageSource, &str)]| Paged { pages_total: 9, pages: pages.iter().map(|(page, source, text)| PageOut { page: *page, source: *source, text: (*text).into() }).collect(), note: None, ..Default::default() };
         let mixed = out(&[(1, PageSource::Extracted, "Титул"), (2, PageSource::Ocr, "Скан"), (3, PageSource::None, "")]);
         assert_eq!((mixed.text_source(), mixed.ocr_pages()), ("mixed", vec![2]));
         assert_eq!(mixed.text(), "--- стр. 1 ---\nТитул\n\n--- стр. 2 ---\nСкан\n\n--- стр. 3 ---\n(текста нет)");

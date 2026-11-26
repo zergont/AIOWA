@@ -34,10 +34,10 @@ use tracing::{debug, info, warn};
 
 /// Ключ командной строки, которым клиент запускает сервер.
 pub(crate) const FLAG: &str = "--mcp";
-const ENABLED_KEY: &str = "mcp.enabled";
+pub(crate) const ENABLED_KEY: &str = "mcp.enabled";
 const GROUPS_KEY: &str = "mcp.groups";
 /// Распознавать ли сканы во вложениях (`0` — нет); по умолчанию да: это то же чтение вложений.
-const OCR_KEY: &str = "mcp.ocr";
+pub(crate) const OCR_KEY: &str = "mcp.ocr";
 /// Порог «на странице нет текста», символов; ключа нет — `pages::PAGE_MIN_CHARS`.
 const OCR_MIN_CHARS_KEY: &str = "mcp.ocr_min_chars";
 /// Папка выгрузки вложений для агента; пусто — выгрузка не настроена.
@@ -143,6 +143,12 @@ pub(crate) fn ocr_settings(store: &Store, account: AccountId) -> (bool, usize) {
     let enabled = get(OCR_KEY).as_deref() != Some("0");
     let min_chars = get(OCR_MIN_CHARS_KEY).and_then(|v| v.trim().parse::<usize>().ok()).filter(|n| (1..=5000).contains(n)).unwrap_or(crate::pages::PAGE_MIN_CHARS);
     (enabled, min_chars)
+}
+
+/// Могут ли агенты сейчас читать вложения: доступ включён, вид данных открыт, режим не «Только
+/// свои модели». Пока это так, работает и фоновая очередь распознавания (`ocr_queue`).
+pub(crate) fn attachments_open(store: &Store, account: AccountId) -> bool {
+    McpConfig::load(store, account).refusal(Group::Attachments).is_none()
 }
 
 /// Можно ли показывать агенту страницы вложений картинками (`get_attachment_pages`).
@@ -500,6 +506,14 @@ pub(crate) struct McpSettingsDto {
     ocr: bool,
     /// Язык распознавания Windows (`ru`); `None` — распознавать на этом компьютере нечем.
     ocr_language: Option<String>,
+    /// Распознавать ли сканы заранее, фоновой очередью (`ocr_queue`).
+    ocr_background: bool,
+    /// За сколько последних месяцев очередь берёт письма.
+    ocr_months: u32,
+    /// Сколько вложений ждёт в очереди.
+    ocr_waiting: i64,
+    /// У скольких вложений на страницах распознан текст.
+    ocr_recognized: i64,
     /// Папка выгрузки вложений для агента; `None` — не выбрана, выгрузка не работает.
     export_dir: Option<String>,
     /// Сколько дней хранятся выгруженные файлы.
@@ -520,6 +534,8 @@ fn settings_dto(state: &AppState) -> CmdResult<McpSettingsDto> {
     let month = state.store.mcp_usage_since(state.account, now_ms() - 30 * 24 * 3600 * 1000).map_err(err)?;
     let (export_dir, export_keep_days) = export_settings(&state.store, state.account);
     let exports = state.store.mcp_exports_recent(state.account, 15).map_err(err)?;
+    let (ocr_background, ocr_months) = crate::ocr_queue::settings(&state.store, state.account);
+    let (ocr_waiting, ocr_recognized) = state.store.ocr_queue_stats(state.account, crate::ocr_queue::since_ms(ocr_months, now_ms())).map_err(err)?;
     Ok(McpSettingsDto {
         enabled: cfg.enabled && !cfg.own_only,
         groups: cfg.groups,
@@ -527,6 +543,10 @@ fn settings_dto(state: &AppState) -> CmdResult<McpSettingsDto> {
         command: std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_default(),
         ocr: ocr_settings(&state.store, state.account).0,
         ocr_language: aiowa_ocr::language().ok().filter(|l| !l.is_empty()),
+        ocr_background,
+        ocr_months,
+        ocr_waiting,
+        ocr_recognized,
         export_dir,
         export_keep_days,
         exports: exports.into_iter().map(|e| McpExportDto { at_ms: e.at, name: e.name, path: e.path, size: e.size, client: e.client }).collect(),
@@ -548,6 +568,8 @@ pub(crate) struct McpPatch {
     enabled: Option<bool>,
     groups: Option<Vec<Group>>,
     ocr: Option<bool>,
+    ocr_background: Option<bool>,
+    ocr_months: Option<u32>,
     export_keep_days: Option<u32>,
     page_pictures: Option<bool>,
 }
@@ -572,6 +594,17 @@ pub(crate) fn mcp_settings_set(patch: McpPatch, state: State<'_, AppState>) -> C
     if let Some(ocr) = patch.ocr {
         state.store.set_state(state.account, OCR_KEY, Some(if ocr { "1" } else { "0" })).map_err(err)?;
         info!(ocr, "распознавание сканов для агентов (MCP) переключено");
+    }
+    if let Some(on) = patch.ocr_background {
+        state.store.set_state(state.account, crate::ocr_queue::BACKGROUND_KEY, Some(if on { "1" } else { "0" })).map_err(err)?;
+        info!(on, "фоновое распознавание сканов переключено");
+    }
+    if let Some(months) = patch.ocr_months {
+        if !(1..=crate::ocr_queue::MONTHS_MAX).contains(&months) {
+            return Err(format!("Срок для фонового распознавания — от 1 до {} месяцев", crate::ocr_queue::MONTHS_MAX));
+        }
+        state.store.set_state(state.account, crate::ocr_queue::MONTHS_KEY, Some(&months.to_string())).map_err(err)?;
+        info!(months, "срок писем для фонового распознавания изменён");
     }
     if let Some(on) = patch.page_pictures {
         state.store.set_state(state.account, PICTURES_KEY, Some(if on { "1" } else { "0" })).map_err(err)?;
@@ -629,6 +662,7 @@ pub(crate) async fn mcp_export_reveal(path: String, state: State<'_, AppState>) 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pages::testing::text_pdf;
     use aiowa_core::{AttachmentMeta, BodyType, CalendarEvent, CalendarItemType, ContactEmail, ContactItem, ConversationId, FlagStatus, Folder, FolderId, FreeBusy, Importance, ItemId, MessageBody, MessageFull, MessageMeta, Participant, ResponseType};
     use jiff::Timestamp;
 
@@ -976,33 +1010,6 @@ mod tests {
         let log = store.mcp_calls_recent(acc, 30).unwrap();
         assert_eq!(log.iter().filter(|c| c.tool == "create_draft" && c.outcome == "ok").map(|c| c.items).collect::<Vec<_>>(), [1, 1, 1]);
         assert!(log.iter().all(|c| c.client == "Claude Code 2.1"));
-    }
-
-    /// PDF с надписями встроенным шрифтом, по одной на страницу: у страницы есть текстовый слой,
-    /// а нарисованная, она читается распознаванием — как скан.
-    fn text_pdf(pages: &[&str]) -> Vec<u8> {
-        let mut objs: Vec<String> = vec!["<< /Type /Catalog /Pages 2 0 R >>".into()];
-        let kids: String = (0..pages.len()).map(|i| format!("{} 0 R ", 4 + i * 2)).collect();
-        objs.push(format!("<< /Type /Pages /Kids [{kids}] /Count {} >>", pages.len()));
-        objs.push("<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>".into());
-        for (i, text) in pages.iter().enumerate() {
-            objs.push(format!("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 3 0 R >> >> /Contents {} 0 R >>", 5 + i * 2));
-            let content = format!("BT /F1 22 Tf 40 700 Td ({text}) Tj ET");
-            objs.push(format!("<< /Length {} >>\nstream\n{content}\nendstream", content.len()));
-        }
-        let mut out = String::from("%PDF-1.4\n");
-        let mut offsets = Vec::new();
-        for (i, o) in objs.iter().enumerate() {
-            offsets.push(out.len());
-            out.push_str(&format!("{} 0 obj\n{o}\nendobj\n", i + 1));
-        }
-        let xref = out.len();
-        out.push_str(&format!("xref\n0 {}\n0000000000 65535 f \n", objs.len() + 1));
-        for off in offsets {
-            out.push_str(&format!("{off:010} 00000 n \n"));
-        }
-        out.push_str(&format!("trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n", objs.len() + 1));
-        out.into_bytes()
     }
 
     #[tokio::test]

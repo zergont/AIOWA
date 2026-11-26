@@ -84,6 +84,7 @@ mod mcp;
 mod export;
 mod mcp_tools;
 mod pages;
+mod ocr_queue;
 mod notify;
 mod ondemand;
 mod people;
@@ -820,6 +821,8 @@ pub fn run() {
                     updates::start(app.handle().clone());
                     // Письмо, подготовленное агентом через MCP-сервер, появляется в окне само.
                     mcp::watch_agent_drafts(app.handle().clone());
+                    // Сканы во вложениях недавних писем распознаются заранее: их находит поиск.
+                    ocr_queue::start(app.handle().clone());
                 }
                 Ok(())
             }

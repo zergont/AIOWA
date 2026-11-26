@@ -1582,6 +1582,14 @@ export interface McpSettings {
   ocr: boolean;
   /** Языки распознавания Windows (`ru+en-US`); null — распознавать на этом компьютере нечем. */
   ocr_language: string | null;
+  /** Распознавать ли сканы заранее, в фоне: письмо находится поиском по словам из скана. */
+  ocr_background: boolean;
+  /** За сколько последних месяцев фоновое распознавание берёт письма. */
+  ocr_months: number;
+  /** Сколько скачанных вложений ждёт фонового распознавания. */
+  ocr_waiting: number;
+  /** У скольких вложений есть распознанные страницы. */
+  ocr_recognized: number;
   /** Папка выгрузки вложений для агента; null — не выбрана, выгрузка не работает. */
   export_dir: string | null;
   /** Сколько дней хранятся выгруженные файлы. */
@@ -1600,6 +1608,8 @@ export interface McpSettingsPatch {
   enabled?: boolean;
   groups?: McpGroup[];
   ocr?: boolean;
+  ocr_background?: boolean;
+  ocr_months?: number;
   export_keep_days?: number;
   page_pictures?: boolean;
 }
