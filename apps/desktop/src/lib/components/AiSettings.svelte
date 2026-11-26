@@ -575,7 +575,8 @@
             {/if}
             <p class="hint" id="{uid}-mcp-ocr-bg">
               Пока AIOWA открыта, она сама понемногу распознаёт сканы в уже скачанных вложениях писем за этот срок. Письмо после этого находится поиском по словам из скана — и у агента, и в окне.
-              {#if m.ocr_background && ocrOn}В очереди: {m.ocr_waiting}. {/if}Распознано вложений: {m.ocr_recognized}.
+              {#if m.ocr_background && ocrOn}В очереди: {m.ocr_waiting}.{/if}
+              Распознано вложений: {m.ocr_recognized}.
             </p>
           {/if}
           <label class="check">
